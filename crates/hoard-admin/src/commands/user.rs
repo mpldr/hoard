@@ -12,6 +12,9 @@ pub enum UserCommand {
         /// Grant admin privileges
         #[arg(long)]
         admin: bool,
+        /// Password (non-interactive; if omitted, prompts securely)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// List all users
     List,
@@ -27,15 +30,19 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
     db::run_migrations(&pool).await?;
 
     match cmd {
-        UserCommand::Create { username, admin } => {
+        UserCommand::Create { username, admin, password: pw_flag } => {
             use hoard_core::hashing::hash_password;
 
-            // Read password securely from stdin
-            let password = rpassword::prompt_password("Password: ")?;
-            let confirm = rpassword::prompt_password("Confirm:  ")?;
-            if password != confirm {
-                anyhow::bail!("Passwords do not match");
-            }
+            let password = if let Some(p) = pw_flag {
+                p
+            } else {
+                let p1 = rpassword::prompt_password("Password: ")?;
+                let p2 = rpassword::prompt_password("Confirm:  ")?;
+                if p1 != p2 {
+                    anyhow::bail!("Passwords do not match");
+                }
+                p1
+            };
             if password.len() < 8 {
                 anyhow::bail!("Password must be at least 8 characters");
             }

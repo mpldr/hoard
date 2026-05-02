@@ -1,15 +1,20 @@
-mod config;
-
+use hoard_server::{config::{Config, LogFormat}, db};
 use anyhow::Result;
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
 use clap::Parser;
-use config::{Config, LogFormat};
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tracing::info;
+
+use hoard_server::auth::require_auth;
+use hoard_server::routes::{auth as auth_routes, health};
 
 #[derive(Parser)]
 #[command(name = "hoard-server", version, about = "Hoard save-sync server")]
 struct Args {
-    /// Path to configuration file
     #[arg(long, default_value = "/etc/hoard/config.toml")]
     config: PathBuf,
 }
@@ -29,29 +34,55 @@ async fn main() -> Result<()> {
         "starting hoard-server"
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("received ctrl-c, shutting down");
+    // Ensure data subdirectories exist
+    for dir in &["data", "tmp", "trash"] {
+        tokio::fs::create_dir_all(cfg.storage.data_dir.join(dir)).await?;
+    }
+
+    let pool = db::connect(&cfg.database.url, cfg.database.max_connections).await?;
+    db::run_migrations(&pool).await?;
+
+    let state = Arc::new(health::ServerState {
+        pool: pool.clone(),
+        config: cfg.clone(),
+        start_time: Instant::now(),
+    });
+
+    // Routes that require auth
+    let authed = Router::new()
+        .route("/v1/auth/whoami", get(auth_routes::whoami))
+        .layer(middleware::from_fn_with_state(pool.clone(), require_auth));
+
+    let app = Router::new()
+        .route("/v1/health", get(health::handler))
+        .merge(authed)
+        .with_state(state);
+
+    let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
+    info!(%addr, "listening");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            info!("received ctrl-c, shutting down");
+        })
+        .await?;
+
     Ok(())
 }
 
 fn init_logging(cfg: &Config) {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-    let filter = EnvFilter::try_new(&cfg.logging.level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
+    let filter = EnvFilter::try_new(&cfg.logging.level).unwrap_or_else(|_| EnvFilter::new("info"));
     match cfg.logging.format {
-        LogFormat::Json => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().json())
-                .init();
-        }
-        LogFormat::Pretty => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().pretty())
-                .init();
-        }
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().json())
+            .init(),
+        LogFormat::Pretty => tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().pretty())
+            .init(),
     }
 }

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hoard-core = { path = "../hoard-core" }
+hoard-server = { path = "../hoard-server" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }
@@ -22,5 +23,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 figment = { workspace = true }
-time = { workspace = true }
+time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 uuid = { workspace = true }
+rpassword = "7"
+regex = "1"

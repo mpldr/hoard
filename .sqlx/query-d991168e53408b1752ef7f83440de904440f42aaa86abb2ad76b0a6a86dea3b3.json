@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT slug, display_name, engine, save_paths_json FROM games\n             WHERE slug LIKE ? OR display_name LIKE ?\n             ORDER BY slug LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "display_name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "save_paths_json",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "d991168e53408b1752ef7f83440de904440f42aaa86abb2ad76b0a6a86dea3b3"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE saves SET client_os=? WHERE id=?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "48601c2a1e991712dc51807f5532273bef3198de3f829a44d3c3b633f7b86cbe"
+}

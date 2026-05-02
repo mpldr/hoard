@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT game_slug, label FROM saves WHERE id=? AND user_id=?",
+  "describe": {
+    "columns": [
+      {
+        "name": "game_slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "label",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "722e2a189e68b44a55f7e745611bc00cb6dee3955322e30a11a4c1670bec4951"
+}

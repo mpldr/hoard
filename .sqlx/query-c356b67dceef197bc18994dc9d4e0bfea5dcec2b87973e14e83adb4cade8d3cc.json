@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE saves SET label=? WHERE id=?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "c356b67dceef197bc18994dc9d4e0bfea5dcec2b87973e14e83adb4cade8d3cc"
+}

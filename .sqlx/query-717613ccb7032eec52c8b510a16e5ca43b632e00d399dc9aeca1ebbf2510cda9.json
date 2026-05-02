@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM saves WHERE id=?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "717613ccb7032eec52c8b510a16e5ca43b632e00d399dc9aeca1ebbf2510cda9"
+}

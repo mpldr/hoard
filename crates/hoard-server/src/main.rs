@@ -10,7 +10,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tracing::info;
 
 use hoard_server::auth::require_auth;
-use hoard_server::routes::{auth as auth_routes, health};
+use hoard_server::routes::{auth as auth_routes, games as game_routes, health, saves as save_routes};
 
 #[derive(Parser)]
 #[command(name = "hoard-server", version, about = "Hoard save-sync server")]
@@ -51,6 +51,17 @@ async fn main() -> Result<()> {
     // Routes that require auth
     let authed = Router::new()
         .route("/v1/auth/whoami", get(auth_routes::whoami))
+        // Games
+        .route("/v1/games", get(game_routes::list))
+        .route("/v1/games/:slug", get(game_routes::get_one))
+        // Saves
+        .route("/v1/saves", get(save_routes::list).post(save_routes::create))
+        .route(
+            "/v1/saves/:id",
+            get(save_routes::get_one)
+                .patch(save_routes::patch)
+                .delete(save_routes::delete),
+        )
         .layer(middleware::from_fn_with_state(pool.clone(), require_auth));
 
     let app = Router::new()

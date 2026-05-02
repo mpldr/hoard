@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT slug, display_name, engine, save_paths_json FROM games WHERE slug = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "display_name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "save_paths_json",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "391592f532a1645686370fbd4d70d70a32802cb166ce4480375dd5a4423bfe06"
+}

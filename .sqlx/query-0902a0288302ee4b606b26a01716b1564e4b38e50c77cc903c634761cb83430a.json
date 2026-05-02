@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE saves SET local_path_hint=? WHERE id=?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "0902a0288302ee4b606b26a01716b1564e4b38e50c77cc903c634761cb83430a"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO saves (id, user_id, game_slug, label, local_path_hint, client_os)\n         VALUES (?,?,?,?,?,?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "bb8d8ae71feafa29415807773f31a291410f777f40af08fe2461e10552175113"
+}

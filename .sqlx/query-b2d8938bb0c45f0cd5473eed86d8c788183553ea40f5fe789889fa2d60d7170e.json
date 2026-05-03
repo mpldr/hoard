@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id FROM snapshots WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b2d8938bb0c45f0cd5473eed86d8c788183553ea40f5fe789889fa2d60d7170e"
+}

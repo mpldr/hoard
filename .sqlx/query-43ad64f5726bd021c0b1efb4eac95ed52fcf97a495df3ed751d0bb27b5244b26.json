@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE saves SET latest_version_num=? WHERE id=?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "43ad64f5726bd021c0b1efb4eac95ed52fcf97a495df3ed751d0bb27b5244b26"
+}

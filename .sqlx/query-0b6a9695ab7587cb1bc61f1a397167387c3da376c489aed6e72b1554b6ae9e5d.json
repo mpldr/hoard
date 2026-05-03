@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT latest_version_num FROM saves WHERE id=?",
+  "describe": {
+    "columns": [
+      {
+        "name": "latest_version_num",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0b6a9695ab7587cb1bc61f1a397167387c3da376c489aed6e72b1554b6ae9e5d"
+}

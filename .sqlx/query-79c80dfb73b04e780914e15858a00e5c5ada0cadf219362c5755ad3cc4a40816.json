@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?",
+  "describe": {
+    "columns": [
+      {
+        "name": "storage_quota_bytes",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "storage_used_bytes",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "79c80dfb73b04e780914e15858a00e5c5ada0cadf219362c5755ad3cc4a40816"
+}

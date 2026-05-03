@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT relative_path, size_bytes, sha256 FROM snapshot_files\n         WHERE snapshot_id=? ORDER BY relative_path",
+  "describe": {
+    "columns": [
+      {
+        "name": "relative_path",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "size_bytes",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "sha256",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "15bbd7efc4e38380c5092308dd2ad69aeea9056fc119f1aa02a0eee86cc8d864"
+}

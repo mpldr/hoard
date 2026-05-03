@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256)\n             VALUES (?,?,?,?,?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "b8e1349e3b4bc00793370440340ab1639b3203801c4b23fac3542d9e7b78f54b"
+}

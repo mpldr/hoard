@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO audit_log (id, user_id, event_type, entity_id)\n         VALUES (?,?,'snapshot.deleted',?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "38d949abb3de4c4c6dd7a4d93be24eef7f8836fc2a68f80588d7b55ba31494af"
+}

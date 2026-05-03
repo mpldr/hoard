@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO audit_log (id, user_id, event_type, entity_id)\n         VALUES (?,?,'snapshot.restored',?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "2454d31a3986c4d102702a303714abb4a1ac9efc1c2181e121fa7625f23e6860"
+}

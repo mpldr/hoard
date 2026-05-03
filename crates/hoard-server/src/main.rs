@@ -10,7 +10,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tracing::info;
 
 use hoard_server::auth::require_auth;
-use hoard_server::routes::{auth as auth_routes, games as game_routes, health, saves as save_routes};
+use hoard_server::cleanup;
+use hoard_server::routes::{
+    auth as auth_routes, games as game_routes, health, saves as save_routes,
+    snapshots as snap_routes,
+};
 
 #[derive(Parser)]
 #[command(name = "hoard-server", version, about = "Hoard save-sync server")]
@@ -62,7 +66,36 @@ async fn main() -> Result<()> {
                 .patch(save_routes::patch)
                 .delete(save_routes::delete),
         )
+        // Snapshots
+        .route(
+            "/v1/saves/:save_id/snapshots",
+            get(snap_routes::list).post(snap_routes::create),
+        )
+        .route(
+            "/v1/saves/:save_id/snapshots/:version",
+            get(snap_routes::detail).delete(snap_routes::soft_delete),
+        )
+        .route(
+            "/v1/saves/:save_id/snapshots/:version/download",
+            get(snap_routes::download),
+        )
+        .route(
+            "/v1/saves/:save_id/snapshots/:version/restore",
+            post(snap_routes::restore),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            (cfg.storage.max_snapshot_size_mb as usize) * 1024 * 1024 + 16 * 1024 * 1024,
+        ))
         .layer(middleware::from_fn_with_state(pool.clone(), require_auth));
+
+    // Spawn periodic cleanup task
+    let cleanup_pool = pool.clone();
+    let cleanup_data = cfg.storage.data_dir.clone();
+    let cleanup_tmp_h = cfg.retention.tmp_cleanup_hours;
+    let cleanup_trash_d = cfg.retention.trash_retention_days;
+    tokio::spawn(async move {
+        cleanup::run_periodic(cleanup_pool, cleanup_data, cleanup_tmp_h, cleanup_trash_d).await;
+    });
 
     let app = Router::new()
         .route("/v1/health", get(health::handler))

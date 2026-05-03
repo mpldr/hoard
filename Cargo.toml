@@ -62,6 +62,7 @@ time = { version = "0.3", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Misc
+tokio-stream = "0.1"
 figment = { version = "0.10", features = ["toml", "env"] }
 directories = "5"
 indicatif = "0.17"

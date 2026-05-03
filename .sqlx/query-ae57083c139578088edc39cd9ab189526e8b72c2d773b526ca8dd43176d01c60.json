@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) FROM snapshots WHERE save_id=? AND version_num=? AND deleted_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ae57083c139578088edc39cd9ab189526e8b72c2d773b526ca8dd43176d01c60"
+}

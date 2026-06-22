@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.3] — 2026-06-22
+
+### Added
+- **Hoard Screen: editor más cómodo.** Redimensiona los paneles con
+  manejadores en las esquinas/lados o con el teclado, escribe el tamaño y la
+  posición exactos, y recorta viendo la ventana entera con la zona recortada
+  atenuada.
+- **Hoard Screen: vídeo protegido sin pantalla en negro.** Opción por panel
+  para conservar el modo normal de la ventana cuando un servicio con DRM
+  (Prime Video, Netflix…) saldría en negro al ponerlo sobre el juego; además
+  se avisa en el selector cuando una app marca su contenido como protegido.
+
+### Fixed
+- **Hoard Screen con monitores a distinta escala.** Con escalado (DPI)
+  distinto entre pantallas, los paneles salían desplazados o con tamaño
+  incorrecto en el monitor secundario. Ahora el overlay usa coordenadas
+  físicas por monitor.
+- **Wrapped: la racha se partía al cruzar el domingo.** Los días se ordenan
+  cronológicamente, así los contadores cuentan días consecutivos reales.
+
 ## [2.4.2] — 2026-06-21
 
 ### Added

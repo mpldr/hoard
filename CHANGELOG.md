@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.4] — 2026-06-23
+
+### Fixed
+- **Hoard Screen: paneles que no se veían y parpadeaban al editar.** Al
+  arrastrar un panel en el editor, la ventana adoptada robaba el foco en cada
+  movimiento y parpadeaba entre su sitio viejo y el nuevo sin asentarse; ahora
+  se coloca de forma estable.
+- **Hoard Screen: los clics no pasaban al juego.** Las apps basadas en
+  Chromium (Discord, navegadores) seguían capturando el clic en modo Juego.
+  Ahora el clic atraviesa el panel hasta el juego de verdad (salvo en un panel
+  de vídeo con su opción de paso de clics desactivada).
+- **Horas de juego fantasma.** El detector atribuía las mismas horas a juegos
+  que no habías abierto cuando algo de fondo (p. ej. Steam Cloud) tocaba sus
+  guardados mientras jugabas a otro. Ahora una sesión solo cuenta para el
+  juego real.
+
 ## [2.4.3] — 2026-06-22
 
 ### Added

@@ -2948,6 +2948,46 @@ async fn run_backup_with_retry(
 /// Returns whether any tracked game is currently running, so the caller can
 /// throttle the poll cadence (fast while a game is up, slow when idle).
 #[allow(clippy::too_many_arguments)]
+/// Filtra las señales de correlación carpeta→proceso para que sólo cuenten
+/// PLAYTIME las fiables, eliminando las horas-fantasma. `candidates` son tuplas
+/// `(proc_name_lower, save_id, game_slug)` de saves SIN manifest cuya carpeta
+/// tiene una observación de correlación válida; `configured` son los
+/// process-names ya declarados por juegos CON manifest.
+///
+/// Dos vetos, derivados del bug real (un proceso de Rust acumulando horas para
+/// Ark/Minecraft/Offworld/REPO porque algo de fondo —Steam Cloud— reescribió
+/// sus carpetas de save mientras Rust corría):
+///  (a) un proceso ya configurado en OTRO juego con manifest pertenece a ESE
+///      juego, no a la carpeta que casualmente tocó;
+///  (b) un proceso atado a varios `game_slug` distintos es ruido de fondo, no
+///      "estás jugando" a ninguno de ellos.
+/// Devuelve `(proc_name_lower, save_id)` aceptadas, un único save por proceso
+/// (un juego con varias carpetas no duplica horas). Las observaciones quedan
+/// intactas para la detección de carpetas, que es revisable.
+fn accept_correlation_signals<'a>(
+    candidates: &[(String, &'a str, &'a str)],
+    configured: &HashSet<String>,
+) -> Vec<(String, &'a str)> {
+    let mut slugs_per_proc: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (pname, _, slug) in candidates {
+        slugs_per_proc.entry(pname).or_default().insert(slug);
+    }
+    let mut out: Vec<(String, &'a str)> = Vec::new();
+    let mut taken: HashSet<&str> = HashSet::new();
+    for (pname, save_id, _) in candidates {
+        if configured.contains(pname) {
+            continue; // (a)
+        }
+        if slugs_per_proc.get(pname.as_str()).map_or(0, |s| s.len()) != 1 {
+            continue; // (b)
+        }
+        if taken.insert(pname.as_str()) {
+            out.push((pname.clone(), save_id));
+        }
+    }
+    out
+}
+
 fn process_poll(
     sys: &mut System,
     slots: &mut HashMap<String, SaveSlot>,
@@ -2978,17 +3018,23 @@ fn process_poll(
     // only games add up to ~16 extra slots.
     let mut name_index: HashMap<String, Vec<&str>> = HashMap::new();
     let mut dir_slots: Vec<(&str, &Path)> = Vec::new();
+    // Señales de correlación candidatas `(proc_name_lower, save_id, game_slug)`,
+    // recogidas aparte para vetar las ambiguas ANTES de que cuenten horas (ver
+    // `accept_correlation_signals`).
+    let mut corr_candidates: Vec<(String, &str, &str)> = Vec::new();
     for slot in slots.values() {
         if slot.save.processes.is_empty() {
             // Correlation-learned launch signal (ADR 0020, storefront- y
             // juego-agnóstico): si Hoard ya observó algún proceso de JUEGO
             // escribiendo en la carpeta de este save, ese proceso es la señal
-            // de "estás jugando". Lo inyectamos en el name_index igual que un
-            // proceso configurado, así el playtime se acumula para CUALQUIER
-            // juego —no sólo el catálogo hardcodeado— en cuanto se haya visto
-            // un guardado durante una sesión. Sin esto, un juego fuera de la
-            // lista (p. ej. EU5 bajo Proton, cuyo exe no cae bajo
-            // `steam_install_dir`) nunca entra en `running` y no suma horas.
+            // de "estás jugando". Sin esto, un juego fuera de la lista (p. ej.
+            // EU5 bajo Proton, cuyo exe no cae bajo `steam_install_dir`) nunca
+            // entra en `running` y no suma horas. PERO la atribución
+            // carpeta→proceso es ruidosa: si algo de fondo (Steam Cloud) reescribe
+            // la carpeta de save de OTRO juego mientras corre éste, esa carpeta
+            // queda correlacionada con este proceso. Para detección eso es
+            // inocuo (revisable); para PLAYTIME acumularía horas fantasma. Por
+            // eso aquí sólo recogemos candidatos y filtramos abajo.
             if let Some(obs) = corr_store.signal_for(&slot.save.local_path) {
                 // Re-valida la observación contra las reglas ACTUALES y exige
                 // un exe en disco: blinda contra entradas basura grabadas por
@@ -2999,10 +3045,11 @@ fn process_poll(
                 if obs.exe.is_some()
                     && crate::correlation::is_game_like(&obs.process_name, obs.exe.as_deref())
                 {
-                    name_index
-                        .entry(obs.process_name.to_lowercase())
-                        .or_default()
-                        .push(slot.save.save_id.as_str());
+                    corr_candidates.push((
+                        obs.process_name.to_lowercase(),
+                        slot.save.save_id.as_str(),
+                        slot.save.game_slug.as_str(),
+                    ));
                 }
             }
             // Legacy fallback only when no process names are configured.
@@ -3017,6 +3064,14 @@ fn process_poll(
                 .or_default()
                 .push(slot.save.save_id.as_str());
         }
+    }
+
+    // Inyecta sólo las señales de correlación que sobreviven al filtro
+    // anti horas-fantasma (los process-names ya configurados son los de juegos
+    // con manifest).
+    let configured: HashSet<String> = name_index.keys().cloned().collect();
+    for (pname, save_id) in accept_correlation_signals(&corr_candidates, &configured) {
+        name_index.entry(pname).or_default().push(save_id);
     }
 
     let mut running: HashSet<String> = HashSet::new();
@@ -3295,6 +3350,63 @@ mod tests {
 
         // Sin nuevos cambios: silencio.
         assert!(probe_detect_writes(&mut probes).is_empty());
+    }
+
+    #[test]
+    fn correlation_rejects_shared_process_phantom_hours() {
+        // El bug real: el proceso de Rust quedó correlacionado con las carpetas
+        // de save de cuatro juegos NO jugados (Steam Cloud las reescribió
+        // mientras Rust corría). Un proceso atado a >1 juego es ruido: no debe
+        // dar horas a ninguno.
+        let configured: HashSet<String> = ["rustclient.exe".to_string()].into_iter().collect();
+        let candidates = vec![
+            ("rustclient.exe".to_string(), "ark", "ark-survival-ascended"),
+            ("rustclient.exe".to_string(), "mc", "minecraft-java"),
+            ("rustclient.exe".to_string(), "off", "offworld-trading"),
+            ("rustclient.exe".to_string(), "repo", "r-e-p-o"),
+        ];
+        let accepted = accept_correlation_signals(&candidates, &configured);
+        assert!(
+            accepted.is_empty(),
+            "un proceso compartido por varios juegos no debe acumular horas: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn correlation_accepts_exclusive_off_catalog_game() {
+        // El caso legítimo que la correlación existe para rescatar: un juego sin
+        // manifest (EU5 bajo Proton) cuyo propio exe escribió su save. Proceso
+        // exclusivo de un juego y no configurado en ningún otro ⇒ cuenta.
+        let configured: HashSet<String> = HashSet::new();
+        let candidates = vec![("eu5.exe".to_string(), "eu5-save", "europa-universalis-5")];
+        let accepted = accept_correlation_signals(&candidates, &configured);
+        assert_eq!(accepted, vec![("eu5.exe".to_string(), "eu5-save")]);
+    }
+
+    #[test]
+    fn correlation_one_save_per_process_no_double_count() {
+        // Un mismo juego con dos carpetas rastreadas: el proceso es exclusivo de
+        // ese slug, pero sólo debe inyectarse UNA vez (marcar las dos duplicaría
+        // las horas del mismo juego).
+        let configured: HashSet<String> = HashSet::new();
+        let candidates = vec![
+            ("eu5.exe".to_string(), "save-a", "eu5"),
+            ("eu5.exe".to_string(), "save-b", "eu5"),
+        ];
+        let accepted = accept_correlation_signals(&candidates, &configured);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].0, "eu5.exe");
+    }
+
+    #[test]
+    fn correlation_rejects_configured_process_of_another_game() {
+        // Aunque el proceso de Rust sólo hubiera ensuciado UNA carpeta ajena,
+        // está configurado como proceso de Rust (manifest): pertenece a Rust,
+        // no a la carpeta que tocó.
+        let configured: HashSet<String> = ["rustclient.exe".to_string()].into_iter().collect();
+        let candidates = vec![("rustclient.exe".to_string(), "ark", "ark-survival-ascended")];
+        let accepted = accept_correlation_signals(&candidates, &configured);
+        assert!(accepted.is_empty());
     }
 
     #[test]

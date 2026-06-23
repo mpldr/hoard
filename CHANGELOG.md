@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.11] — 2026-06-23
+
+### Added
+- **Hoard Screen: clics en paneles en modo compatibilidad.** En un panel compat,
+  al apagar "Clics pasan al juego" el overlay reenvía el ratón (clic y rueda) a
+  la ventana, así puedes pausar/cambiar el vídeo sin perder el recorte limpio.
+  Antes el panel capturado era solo-vista.
+
 ## [2.4.10] — 2026-06-23
 
 ### Fixed

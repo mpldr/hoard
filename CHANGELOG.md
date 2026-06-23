@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.9] — 2026-06-23
+
+### Added
+- **Hoard Screen: modo compatibilidad Chromium (por panel).** Nuevo botón
+  debajo de "Clics pasan al juego" que recorta limpio las ventanas de
+  Brave/Discord y demás apps Chromium/Electron (su recorte normal dejaba un
+  borde gris). Captura la ventana y compone el recorte, y aparca la ventana real
+  fuera de pantalla para que el vídeo siga reproduciéndose. Aviso en la propia
+  UI: en algunos casos (DRM, overlays de hardware) la ventana puede salir en
+  negro al reproducir.
+
 ## [2.4.8] — 2026-06-23
 
 ### Fixed

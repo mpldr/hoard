@@ -372,6 +372,29 @@ pub async fn refresh_active_session() -> Result<CloudCreds> {
     Ok(fresh)
 }
 
+/// Block until no token refresh is in flight, for graceful shutdown.
+///
+/// Supabase rotates the refresh token on every use and revokes the previous
+/// one. `refresh_active_session` holds `refresh_gate` across the whole
+/// network call *and* the `update_tokens` persist, so if we acquire the same
+/// lock we know no rotation is mid-flight (the new pair is already on disk).
+/// Tearing the process down between GoTrue rotating server-side and us
+/// persisting would orphan the new token: next launch replays the stale one,
+/// trips reuse-detection, and the user is silently signed out. Callers bound
+/// this with a timeout so a wedged refresh can never block quit.
+pub async fn await_refresh_quiescent() {
+    let _guard = refresh_gate().lock().await;
+}
+
+/// Synchronous, time-bounded wrapper around [`await_refresh_quiescent`] for the
+/// Tauri event loop (tray Quit / `ExitRequested`), which isn't async. Waits at
+/// most 8 s so a wedged refresh can never prevent the app from quitting.
+pub fn wait_for_refresh_quiescent_blocking() {
+    let _ = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(Duration::from_secs(8), await_refresh_quiescent()).await
+    });
+}
+
 // ---- commands ---------------------------------------------------------
 
 /// Resolve the public URL the OAuth login flow starts from. The desktop UI

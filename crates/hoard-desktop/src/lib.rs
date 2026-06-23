@@ -379,6 +379,13 @@ pub fn run() {
     // close-to-tray, which is the default). Quitting goes through the tray's
     // Quit menu item or `app.exit(0)`.
     app.run(|app_handle, event| {
+        // Don't tear the process down mid token-rotation: a refresh that GoTrue
+        // already rotated server-side but we haven't persisted yet would orphan
+        // the new token and sign the user out on next launch. Bounded wait.
+        if let RunEvent::ExitRequested { .. } = event {
+            crate::commands::cloud::wait_for_refresh_quiescent_blocking();
+            return;
+        }
         if let RunEvent::WindowEvent {
             label,
             event: WindowEvent::CloseRequested { api, .. },

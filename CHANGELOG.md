@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.7] — 2026-06-23
+
+### Fixed
+- **Cierre de sesión al cerrar la app.** Si cerrabas Hoard justo mientras
+  renovaba la sesión en segundo plano, el token rotado no llegaba a guardarse y
+  al reabrir te sacaba de la cuenta. Ahora el cierre espera a que termine esa
+  renovación antes de salir.
+
 ## [2.4.6] — 2026-06-23
 
 ### Fixed

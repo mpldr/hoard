@@ -94,6 +94,7 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_KEY_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
             echo "::warning::MINISIGN_SECRET_KEY not set — skipping signature. This release will NOT be installable via the in-app server upgrade."
@@ -107,6 +108,27 @@ jobs:
               minisign -S -s minisign.key -m "$TARBALL"
             test -f "$TARBALL.minisig" || { echo "::error::signing produced no .minisig for $TARBALL"; exit 1; }
           done
+
+          # Also sign the desktop installers (.msi/.exe/.dmg/.AppImage/.deb).
+          # They're built+uploaded by the private hoard-build workflow, whose
+          # `gh release create` is what pushed this tag and triggered us — so by
+          # now they already exist on the release. Without a `<installer>.minisig`
+          # the in-app updater treats the build as Unsigned and only DOWNLOADS it
+          # instead of running the installer (see MINISIGN_PUBKEY +
+          # verify_installer_signature in hoard-desktop/.../updates.rs). We sign
+          # here, in the same isolated key-holding job, rather than copying the
+          # secret into hoard-build (ADR 0017).
+          mkdir -p inst
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir inst \
+            --pattern '*.msi' --pattern '*-setup.exe' --pattern '*.dmg' \
+            --pattern '*.AppImage' --pattern '*.deb' || true
+          for f in inst/*; do
+            [ -f "$f" ] || continue
+            printf '%s\n' "${MINISIGN_KEY_PASSWORD:-}" | minisign -S -s minisign.key -m "$f"
+            test -f "$f.minisig" || { echo "::error::signing produced no .minisig for $f"; exit 1; }
+            cp "$f.minisig" dist/
+          done
+
           rm -f minisign.key
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

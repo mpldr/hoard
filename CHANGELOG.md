@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.8] — 2026-06-23
+
+### Fixed
+- **Cierre de sesión por archivo de sesión truncado.** El archivo de sesión se
+  guarda ahora de forma atómica; cerrar la app a mitad de escritura ya no lo
+  corrompe ni te saca de la cuenta al reabrir.
+- **Subidas grandes que se quedaban en "Subiendo…".** Las subidas y descargas
+  de copias ya no tienen límite de tiempo fijo (un save de varios GB lo
+  superaba y mataba la transferencia); ahora se dejan terminar.
+- **Hoard Screen: tiradores de recorte descolocados.** Los tiradores ahora
+  siguen el recuadro recortado en vez de quedarse centrados en la ventana
+  completa.
+
 ## [2.4.7] — 2026-06-23
 
 ### Fixed

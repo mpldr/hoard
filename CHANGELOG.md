@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.5] — 2026-06-23
+
+### Fixed
+- **Hoard Screen: borde gris al recortar.** Recortar una ventana (Explorador,
+  apps normales) dejaba un borde gris/negro alrededor en modo Juego. Ahora el
+  recorte queda limpio.
+
+### Known issues
+- Recortar navegadores basados en Chromium (Brave, Chrome) no es fiable: la
+  app reescribe su propia forma de ventana y deshace el recorte. Usa la ventana
+  sin recortar para vídeo de navegador.
+
 ## [2.4.4] — 2026-06-23
 
 ### Fixed

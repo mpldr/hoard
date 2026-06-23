@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.10] — 2026-06-23
+
+### Fixed
+- **Hoard Screen: calidad de imagen en modo compatibilidad.** El compositor
+  escalaba por vecino-más-próximo, así que un panel en compat (captura
+  reescalada) se veía bloqueado y con colores raros frente a la ventana real.
+  Ahora usa muestreo bilineal (1:1 sigue exacto). La nota del toggle aclara
+  que en compat el panel es solo-vista (no clicable): para interactuar,
+  desactívalo o usa el modo edición.
+
 ## [2.4.9] — 2026-06-23
 
 ### Added

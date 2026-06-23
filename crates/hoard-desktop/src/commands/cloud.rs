@@ -168,14 +168,22 @@ fn write_session(s: &CloudSessionFile) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(s).context("serializing cloud session")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    // Atomic write: a plain truncate+write leaves the session file half-written
+    // if the process dies mid-write (e.g. quit during a background refresh),
+    // and a truncated TOML fails to parse on next launch → spurious sign-out.
+    // Write to a sibling temp file then rename over the target (atomic on the
+    // same filesystem), so a reader only ever sees the old or the new file.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path)?.permissions();
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
         perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms)?;
+        std::fs::set_permissions(&tmp, perms)?;
     }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

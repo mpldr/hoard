@@ -107,6 +107,14 @@ pub struct ApiClient {
     /// agent's client via [`ApiClient::set_token`] without rebuilding it.
     token: Arc<RwLock<String>>,
     http: Client,
+    /// Second client for snapshot uploads/downloads. Same headers as `http`
+    /// but with **no per-request total timeout** — a multi-GB save (Paradox
+    /// grand-strategy is the worst case) on a residential upload link blows
+    /// past any fixed timeout, which previously killed the request mid-flight
+    /// and silently hung the dashboard "Subiendo…" pill. A TCP keepalive
+    /// surfaces a genuinely dead connection; a slow-but-progressing upload is
+    /// left to finish.
+    upload_http: Client,
     /// Lazily-probed `/v1/health` `mode` (`Some("cloud")` on the SaaS
     /// deployment, `None`/absent self-hosted). Cached behind an `Arc` so the
     /// many `ApiClient` clones in flight share a single probe. Only cached on
@@ -123,10 +131,19 @@ impl ApiClient {
             .timeout(Duration::from_secs(60))
             // Long-lived stream uploads/downloads handle their own timeouts via streaming
             .build()?;
+        let upload_http = Client::builder()
+            .user_agent(concat!("hoard-agent/", env!("CARGO_PKG_VERSION")))
+            // No total timeout: snapshot bodies are arbitrary size. The TCP
+            // keepalive RSTs a connection that genuinely stopped flowing, while
+            // a slow-but-progressing upload is left to finish.
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(None)
+            .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: Arc::new(RwLock::new(token.into())),
             http,
+            upload_http,
             mode: Arc::new(OnceCell::new()),
         })
     }
@@ -577,7 +594,7 @@ impl ApiClient {
         version: i64,
     ) -> Result<reqwest::Response> {
         let resp = self
-            .http
+            .upload_http
             .get(self.url(&format!(
                 "/v1/saves/{}/snapshots/{}/download",
                 save_id, version
@@ -624,7 +641,7 @@ impl ApiClient {
         form: reqwest::multipart::Form,
     ) -> Result<Snapshot> {
         let resp = self
-            .http
+            .upload_http
             .post(self.url(&format!("/v1/saves/{}/snapshots", save_id)))
             .header("authorization", self.auth_header())
             .multipart(form)

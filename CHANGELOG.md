@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.6] — 2026-06-23
+
+### Fixed
+- **Hoard Screen: la app refleja el tamaño real de la ventana.** Si una ventana
+  no puede hacerse tan pequeña como pides, el editor ahora se ajusta a su tamaño
+  mínimo real en vez de quedarse mostrando una medida imposible (80×60).
+- **Hoard Screen: sin barra de título ni borde en modo Juego.** Al recortar
+  (Configuración, Explorador, etc.) ya no queda la barra superior ni el marco de
+  la ventana: el panel muestra solo el contenido. La barra/marco vuelven en el
+  editor para poder mover y redimensionar.
+
+### Changed
+- **Hoard Screen: los paneles pueden sobresalir de la pantalla.** En el editor
+  puedes sacar un panel por los bordes del monitor (dejando un trozo agarrable
+  para recuperarlo), igual que con una ventana normal.
+
 ## [2.4.5] — 2026-06-23
 
 ### Fixed

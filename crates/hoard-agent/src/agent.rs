@@ -1221,6 +1221,18 @@ const IDLE_POLL_MULT: u32 = 4;
 /// so we bias toward catching games.
 const HEAVY_PROCESS_CPU_PCT: f32 = 25.0;
 
+/// CPU floor (sysinfo `cpu_usage()`, donde 100.0 = un núcleo al máximo) para
+/// que un match por CORRELACIÓN cuente como "el juego está corriendo". Los
+/// process-names declarados por manifest cuentan haya o no CPU (un juego en
+/// pausa sigue "corriendo"), pero la atribución carpeta→proceso de la
+/// correlación es ruidosa: una utilidad de fondo (RTSS, ctfmon, taskhostw,
+/// RadeonSoftware…) que toca una carpeta de save queda correlacionada y, en
+/// reposo a ~0%, dispararía un "arrancó" falso y un barrier de auto-restore
+/// falso. Exigir CPU real separa un juego fuera de catálogo en juego activo de
+/// un helper en reposo. Por debajo de `HEAVY_PROCESS_CPU_PCT` para que un juego
+/// moderadamente activo siga contando.
+const CORRELATION_MIN_CPU_PCT: f32 = 5.0;
+
 /// Backoff applied when an auto-restore fails with a 404: the save is tracked
 /// locally but has no record/snapshot on the backend we're talking to (e.g.
 /// saves carried over from another account, or a stale `state.json` entry).
@@ -3066,12 +3078,16 @@ fn process_poll(
         }
     }
 
-    // Inyecta sólo las señales de correlación que sobreviven al filtro
-    // anti horas-fantasma (los process-names ya configurados son los de juegos
-    // con manifest).
+    // Las señales de correlación NO se mezclan con los process-names de
+    // manifest: van a un índice aparte porque un match por correlación sólo
+    // cuenta como "jugando" si el proceso tiene CPU real en este tick (ver
+    // `CORRELATION_MIN_CPU_PCT`). Sólo se inyectan las que sobreviven al filtro
+    // anti horas-fantasma (los process-names configurados son de juegos con
+    // manifest).
     let configured: HashSet<String> = name_index.keys().cloned().collect();
+    let mut corr_index: HashMap<String, Vec<&str>> = HashMap::new();
     for (pname, save_id) in accept_correlation_signals(&corr_candidates, &configured) {
-        name_index.entry(pname).or_default().push(save_id);
+        corr_index.entry(pname).or_default().push(save_id);
     }
 
     let mut running: HashSet<String> = HashSet::new();
@@ -3081,6 +3097,15 @@ fn process_poll(
         // Proton/Wine where the wineprefix process keeps the .exe name.
         if !name_index.is_empty() {
             if let Some(ids) = name_index.get(&name) {
+                running.extend(ids.iter().map(|id| id.to_string()));
+            }
+        }
+        // Match por correlación: sólo cuenta si el proceso está realmente
+        // activo este tick. Un util de fondo mal correlacionado con una carpeta
+        // de save vive a ~0% y no debe parecer un juego corriendo (ni disparar
+        // "arrancó" ni el barrier de auto-restore).
+        if !corr_index.is_empty() && proc.cpu_usage() >= CORRELATION_MIN_CPU_PCT {
+            if let Some(ids) = corr_index.get(&name) {
                 running.extend(ids.iter().map(|id| id.to_string()));
             }
         }
@@ -3104,6 +3129,7 @@ fn process_poll(
         // via `name_index` (their launch is already handled by the barrier).
         if proc.cpu_usage() >= HEAVY_PROCESS_CPU_PCT
             && !name_index.contains_key(&name)
+            && !corr_index.contains_key(&name)
             && !reported_heavy.contains(pid)
             && crate::correlation::is_game_like(&name, proc.exe())
         {

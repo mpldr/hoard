@@ -341,6 +341,11 @@ pub async fn refresh_active_session() -> Result<CloudCreds> {
     // freshly-rotated creds instead of replaying our now-stale token.
     if let Some((at, creds)) = last.as_ref() {
         if at.elapsed() < REFRESH_REUSE_WINDOW {
+            // Reuse the just-rotated creds, but still push them at the agent:
+            // its client may have been registered after the flight that minted
+            // them (so it never saw that `update_tokens`), and the agent never
+            // re-reads creds on its own.
+            crate::commands::agent::update_agent_token(&creds.access_token);
             return Ok(creds.clone());
         }
     }
@@ -363,6 +368,9 @@ pub async fn refresh_active_session() -> Result<CloudCreds> {
                 .filter(|c| !c.refresh_token.trim().is_empty() && c.refresh_token != attempted);
             if let Some(c) = healed {
                 tracing::debug!("cloud: refresh token was rotated elsewhere; adopting disk creds");
+                // This path skips `update_tokens`, so push the adopted token at
+                // the agent here too or it keeps 401'ing on the stale one.
+                crate::commands::agent::update_agent_token(&c.access_token);
                 *last = Some((Instant::now(), c.clone()));
                 return Ok(c);
             }

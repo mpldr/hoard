@@ -106,6 +106,17 @@ const NON_GAME_PROCESS: &[&str] = &[
     "plugplay.exe",
     "rpcss.exe",
     "conhost.exe",
+    // Overlays / utilidades de fondo observadas correlacionándose por error con
+    // carpetas de save (RivaTuner, AMD, herramientas de Windows). Tocan/observan
+    // carpetas (Steam Cloud reescribe el save mientras corren) pero no son el
+    // juego. Match por substring del nombre.
+    "ctfmon",
+    "taskhost",
+    "rtss",
+    "encoderserver",
+    "rivatuner",
+    "radeonsoftware",
+    "windhawk",
     // El propio Hoard.
     "hoard",
 ];
@@ -220,10 +231,24 @@ impl CorrelationStore {
     /// Carga el store; un fichero ausente o corrupto produce uno vacío
     /// (las observaciones son recolectables de nuevo, no son críticas).
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut store: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        store.prune_invalid();
+        store
+    }
+
+    /// Descarta observaciones que ya no superan las reglas ACTUALES de
+    /// `is_game_like` o que no tienen exe en disco. Limpia el store envenenado
+    /// por versiones previas con filtros más laxos: utilidades de fondo
+    /// (`ctfmon`, `RTSS`, `taskhostw`, `RadeonSoftware`…) e hilos de kernel sin
+    /// exe (`System`) que se colaban como "juego" y disparaban "arrancó". Es
+    /// self-heal: en cuanto una sesión real reescriba la carpeta, se aprende de
+    /// nuevo la correlación correcta.
+    fn prune_invalid(&mut self) {
+        self.observations
+            .retain(|_, o| o.exe.is_some() && is_game_like(&o.process_name, o.exe.as_deref()));
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -326,6 +351,44 @@ mod tests {
         // Un juego cualquiera pasa.
         assert!(is_game_like("eldenring.exe", None));
         assert!(is_game_like("Hades.exe", None));
+    }
+
+    #[test]
+    fn is_game_like_rejects_background_overlays_and_tools() {
+        // Utilidades de fondo observadas correlacionándose por error con
+        // carpetas de save (caso real del store envenenado).
+        for n in [
+            "ctfmon.exe",
+            "taskhostw.exe",
+            "RTSS.exe",
+            "EncoderServer.exe",
+            "RadeonSoftware.exe",
+            "windhawk.exe",
+        ] {
+            assert!(!is_game_like(n, None), "{n} debería filtrarse");
+        }
+    }
+
+    #[test]
+    fn load_prunes_poisoned_observations() {
+        // Store con las entradas reales del bug: utils de fondo y sin exe.
+        let json = r#"{"observations":{
+            "/saves/ark":{"dir":"/saves/ark","process_name":"RTSS.exe","exe":"C:/RivaTuner/RTSS.exe","observed_at_ms":1,"hits":9},
+            "/saves/repo":{"dir":"/saves/repo","process_name":"ctfmon.exe","exe":"C:/Windows/System32/ctfmon.exe","observed_at_ms":1,"hits":9},
+            "/saves/ksp":{"dir":"/saves/ksp","process_name":"windhawk.exe","exe":null,"observed_at_ms":1,"hits":9},
+            "/saves/eu5":{"dir":"/saves/eu5","process_name":"System","exe":null,"observed_at_ms":1,"hits":9},
+            "/saves/real":{"dir":"/saves/real","process_name":"eldenring.exe","exe":"D:/Games/eldenring.exe","observed_at_ms":1,"hits":9}
+        }}"#;
+        let tmp = std::env::temp_dir().join(format!("hoard-corr-prune-{}.json", now_ms()));
+        std::fs::write(&tmp, json).unwrap();
+        let store = CorrelationStore::load(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        // Sólo sobrevive el juego de verdad.
+        assert_eq!(store.len(), 1);
+        assert!(store.signal_for(Path::new("/saves/real")).is_some());
+        assert!(store.signal_for(Path::new("/saves/ark")).is_none());
+        assert!(store.signal_for(Path::new("/saves/repo")).is_none());
+        assert!(store.signal_for(Path::new("/saves/ksp")).is_none());
     }
 
     #[test]

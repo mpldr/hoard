@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.12] — 2026-06-24
+
+### Fixed
+- **Hoard Cloud: la sesión dejaba de funcionar sola.** El agente conservaba un
+  token caducado y devolvía 401 en cada auto-restaurar/copia hasta reiniciar la
+  app, aunque el sincronizador seguía bien. Ahora el token renovado se reinyecta
+  al agente en cada ciclo y en los atajos de refresco, así no vuelve a "expirar".
+- **Falsos "X arrancó".** Juegos fuera de catálogo aparecían como arrancados sin
+  estarlo porque una utilidad de fondo (RTSS, ctfmon, etc.) quedaba ligada a la
+  carpeta de save. Ahora la correlación exige uso real de CPU y filtra esos
+  procesos, con limpieza del histórico envenenado.
+- **Hoard Screen: clics en modo Fill.** En un panel estirado (Fill) el clic se
+  mapeaba con la geometría de Fit y caía en el sitio equivocado.
+- **Hoard Screen: restaurar la ventana.** Endurecido el restaurado de la ventana
+  capturada (desminimizar + redibujar) para que no se quede en negro.
+
 ## [2.4.11] — 2026-06-23
 
 ### Added

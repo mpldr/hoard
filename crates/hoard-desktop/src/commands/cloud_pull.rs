@@ -411,6 +411,18 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         },
     );
 
+    // Keep the agent's long-lived client token in lock-step with the JWT we
+    // just proved works (this request succeeded). The targeted
+    // refresh→`update_agent_token` push can miss — the agent client may be
+    // registered after a refresh already ran, or `refresh_active_session` can
+    // return via its reuse-window / healed-disk short-circuits without touching
+    // the agent — and the agent never re-reads creds from disk on its own. When
+    // that happens it 401s on *every* auto-restore/backup/CAS until the app is
+    // restarted, even though the poller (which reloads disk each tick) keeps
+    // working. This per-tick resync caps that drift at one interval. Cheap: it
+    // just swaps a shared `RwLock<String>`.
+    crate::commands::agent::update_agent_token(&access_token);
+
     // Grab the agent handle once: we use it both to refresh its cloud-version
     // cache (every tick) and to force-restore advanced saves (sync global).
     let handle = app

@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mapeaba con la geometría de Fit y caía en el sitio equivocado.
 - **Hoard Screen: restaurar la ventana.** Endurecido el restaurado de la ventana
   capturada (desminimizar + redibujar) para que no se quede en negro.
+- **Hoard Screen: fluidez en modo compatibilidad.** El overlay redibujaba y
+  recomponía toda la pantalla en cada fotograma (un `UpdateLayeredWindow` de
+  pantalla completa), lo que dejaba el vídeo en compat a ~10fps con uso alto de
+  CPU. Ahora ajusta la ventana al tamaño del panel y solo compone/presenta esa
+  zona, y reutiliza la textura de captura en vez de recrearla cada fotograma.
 
 ## [2.4.11] — 2026-06-23
 

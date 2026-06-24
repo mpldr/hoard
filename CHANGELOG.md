@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.4.13] — 2026-06-24
+
+### Changed
+- **Hoard Screen: mucho menos CPU y vídeo más fluido en modo compatibilidad.**
+  El overlay solo recompone y vuelve a presentar cuando llega un fotograma nuevo
+  o cambia la escena, en lugar de repintar a 30fps fijos: un panel quieto (nota,
+  imagen, vídeo en pausa) deja de consumir, y un vídeo activo se dibuja a su
+  cadencia real. Además los fotogramas se pasan por referencia compartida en
+  lugar de copiar varios MB por tick, y el escalado del compositor pasó de
+  interpolación en coma flotante a punto fijo con atajo 1:1, abaratando cada
+  fotograma compuesto.
+
 ## [2.4.12] — 2026-06-24
 
 ### Fixed

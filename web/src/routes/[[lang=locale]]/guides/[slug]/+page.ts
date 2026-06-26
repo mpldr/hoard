@@ -11,9 +11,9 @@ export const load = ({ params }) => {
 
 /**
  * Enumerate every (locale × slug) combo so each guide is prerendered in all 8
- * languages. English carries no `lang` segment, so its entries omit the key.
+ * languages. Each slug is emitted at the bare path (English, no `lang`) AND
+ * under every locale prefix — including `/en/...`, an explicit alias of the
+ * bare English guide.
  */
 export const entries = () =>
-  guideSlugs().flatMap((slug) =>
-    LOCALES.map((lang) => (lang === DEFAULT_LOCALE ? { slug } : { lang, slug }))
-  );
+  guideSlugs().flatMap((slug) => [{ slug }, ...LOCALES.map((lang) => ({ lang, slug }))]);

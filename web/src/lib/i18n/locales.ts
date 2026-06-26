@@ -67,10 +67,12 @@ export function withLocale(path: string, l: Locale): string {
   return `${prefix}${path}`;
 }
 
-/** Drop the locale prefix from a pathname. `/es/pricing` → '/pricing', `/es` → '/'. */
+/** Drop the locale prefix from a pathname. `/es/pricing` → '/pricing',
+ *  `/en/pricing` → '/pricing', `/es` → '/'. Strips `en` too: it's an alias
+ *  prefix, so the bare path is the canonical form. */
 export function stripLocale(pathname: string): string {
   const seg = pathname.split('/')[1];
-  if ((PREFIXED_LOCALES as readonly string[]).includes(seg)) {
+  if ((LOCALES as readonly string[]).includes(seg)) {
     return pathname.slice(seg.length + 1) || '/';
   }
   return pathname || '/';

@@ -1,10 +1,12 @@
-import { PREFIXED_LOCALES } from './locales';
+import { LOCALES } from './locales';
 
 /**
  * Prerender entries for a page under `[[lang=locale]]`. SvelteKit's default
- * `*` entry already generates the prefix-less English variant (the optional
- * param has no required value); this adds one entry per prefixed locale so
- * `/es/...`, `/de/...`, … are emitted too. Re-export as `entries` from each
- * marketing `+page.ts`.
+ * `*` entry generates the prefix-less variant (the optional param absent),
+ * which serves English at the bare path (`/guides`). This adds one prefixed
+ * entry per locale — *including* `en` — so `/en/...`, `/es/...`, `/de/...`, …
+ * are all emitted. `/en/x` is an explicit alias of the bare `/x` (same English
+ * content; the page's canonical points back at the bare URL). Re-export as
+ * `entries` from each marketing `+page.ts`.
  */
-export const localeEntries = () => PREFIXED_LOCALES.map((lang) => ({ lang }));
+export const localeEntries = () => LOCALES.map((lang) => ({ lang }));

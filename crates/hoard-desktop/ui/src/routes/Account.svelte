@@ -147,20 +147,34 @@
         pct: 0,
         color: "bg-emerald-500",
         unlimited: true,
+        status: "ok" as const,
       };
     }
     const pct = Math.max(
       0,
       Math.min(100, Math.round((a.storage_used_bytes / a.storage_limit_bytes) * 100)),
     );
+    // The server reports the authoritative pressure level (it knows the
+    // plan-specific purge threshold: 80% free / 90% pro). Prefer it; fall back
+    // to the raw % only for older servers that don't send `storage_status`.
+    const status = a.storage_status ?? "ok";
     const color =
-      pct >= 90 ? "bg-rose-500" : pct >= 75 ? "bg-amber-500" : "bg-emerald-500";
+      status === "full" || pct >= 100
+        ? "bg-rose-500"
+        : status === "purging"
+          ? "bg-amber-500"
+          : pct >= 90
+            ? "bg-rose-500"
+            : pct >= 75
+              ? "bg-amber-500"
+              : "bg-emerald-500";
     return {
       usedLabel: formatBytes(a.storage_used_bytes),
       capLabel: formatBytes(a.storage_limit_bytes),
       pct,
       color,
       unlimited: false,
+      status,
     };
   });
 
@@ -402,6 +416,11 @@
               style={`width: ${storageView.unlimited ? 100 : storageView.pct}%`}
             ></div>
           </div>
+          {#if storageView.status === "purging"}
+            <p class="mt-1.5 text-xs text-amber-400">{$_("account.storage_purging")}</p>
+          {:else if storageView.status === "full"}
+            <p class="mt-1.5 text-xs text-rose-400">{$_("account.storage_full")}</p>
+          {/if}
         </div>
       {/if}
 

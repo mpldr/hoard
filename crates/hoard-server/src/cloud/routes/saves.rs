@@ -382,6 +382,16 @@ pub async fn commit_upload(
         tracing::warn!(error = %e, user_id = %user.user_id, "bandwidth: record failed on upload");
     }
 
+    // Reclaim space if over the plan threshold (purges old content-addressed
+    // versions; off the response path).
+    let st = state.clone();
+    let uid = user.user_id;
+    tokio::spawn(async move {
+        if let Err(e) = crate::cloud::purge::maybe_purge(&st, uid).await {
+            tracing::warn!(error = ?e, user_id = %uid, "quota purge after commit failed");
+        }
+    });
+
     Ok(Json(UploadCommitOut {
         save_id,
         version_num: version,
@@ -922,6 +932,16 @@ pub async fn cas_commit(
         "cas_commit: committed"
     );
 
+    // Reclaim space if this commit pushed the user over their plan threshold.
+    // Off the response path: a slow R2 delete sweep mustn't delay the client.
+    let st = state.clone();
+    let uid = user.user_id;
+    tokio::spawn(async move {
+        if let Err(e) = crate::cloud::purge::maybe_purge(&st, uid).await {
+            tracing::warn!(error = ?e, user_id = %uid, "quota purge after commit failed");
+        }
+    });
+
     Ok(Json(UploadCommitOut {
         save_id,
         version_num: version,
@@ -1419,7 +1439,7 @@ pub async fn delete_save(
 /// blob's refcount reaches zero (the cloud_blobs trigger credits the freed
 /// storage on the 0-transition). Best-effort: a failure here only leaks a blob,
 /// recoverable by a later sweep, so errors are logged not propagated.
-async fn release_blobs<I>(state: &CloudState, user_id: Uuid, blobs: I)
+pub(crate) async fn release_blobs<I>(state: &CloudState, user_id: Uuid, blobs: I)
 where
     I: IntoIterator<Item = (String, i64)>,
 {

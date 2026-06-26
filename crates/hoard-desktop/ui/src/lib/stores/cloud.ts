@@ -48,6 +48,10 @@ export type CloudAccount = {
   renews_at: string | null;
   /** RFC3339 — populated only when the user has scheduled a cancellation. */
   cancel_at: string | null;
+  /** Storage pressure: `"ok"` (green), `"purging"` (orange — old versions are
+   *  being auto-deleted to free room) or `"full"` (red — at the hard limit,
+   *  sync stopped). Absent on older servers → treat as `"ok"`. */
+  storage_status?: "ok" | "purging" | "full";
 };
 
 type CloudState = {

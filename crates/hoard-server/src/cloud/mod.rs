@@ -25,6 +25,7 @@ pub mod entitlements;
 pub mod errors;
 pub mod plans;
 pub mod polar;
+pub mod purge;
 pub mod quota;
 pub mod r2;
 pub mod routes;

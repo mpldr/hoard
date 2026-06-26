@@ -109,10 +109,19 @@ pub struct CloudAccount {
     pub subscription_status: Option<String>,
     pub renews_at: Option<String>,
     pub cancel_at: Option<String>,
+    /// Storage pressure: `"ok"` (green), `"purging"` (orange — old versions are
+    /// being auto-deleted to make room) or `"full"` (red — at the hard limit,
+    /// uploads rejected). `#[serde(default)]` → `"ok"` on older servers.
+    #[serde(default = "default_storage_status")]
+    pub storage_status: String,
 }
 
 fn default_forever() -> bool {
     true
+}
+
+fn default_storage_status() -> String {
+    "ok".to_string()
 }
 
 /// Carry the access_token through method calls without persisting it on every

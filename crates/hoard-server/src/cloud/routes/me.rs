@@ -52,6 +52,29 @@ pub struct Me {
     pub max_save_size_bytes: i64,
     pub bandwidth_window_secs: i32,
     pub bandwidth_quota_bytes: i64,
+    /// Storage pressure state for the UI gauge:
+    /// - `"ok"`      — under the auto-purge threshold (green).
+    /// - `"purging"` — at/over threshold; old versions are auto-deleted to make
+    ///   room (orange: the user is losing old history).
+    /// - `"full"`    — at the hard limit; nothing left to reclaim, sync uploads
+    ///   are rejected (red).
+    pub storage_status: &'static str,
+}
+
+/// Derive the storage gauge state from the deduped footprint vs. the plan's
+/// limit and per-plan auto-purge threshold.
+fn storage_status(plan: Plan, used: i64, limit: u64) -> &'static str {
+    let limit = limit as i64;
+    if limit <= 0 {
+        return "ok";
+    }
+    if used >= limit {
+        "full"
+    } else if used as f64 >= limit as f64 * crate::cloud::purge::purge_threshold(plan) {
+        "purging"
+    } else {
+        "ok"
+    }
 }
 
 /// GET /v1/me — current user's profile + plan + usage. Auto-creates the
@@ -132,6 +155,7 @@ pub async fn get_me(
         saves_limit: limits.saves_tracked.map(|n| n as i32).unwrap_or(-1),
         version_history_forever: limits.version_history_forever,
         max_save_size_bytes: bytes_or_unlimited(limits.max_save_size_bytes),
+        storage_status: storage_status(plan, row.4, limits.storage_bytes),
         bandwidth_window_secs: limits.bandwidth_window_secs as i32,
         bandwidth_quota_bytes: bytes_or_unlimited(limits.bandwidth_quota_bytes),
     }))

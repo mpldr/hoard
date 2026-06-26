@@ -68,7 +68,7 @@
       <h2>3. Planes y suscripciones</h2>
       <p>
         El plan Free es gratuito y se ofrece tal cual, con los límites publicados en
-        <a href="/pricing">la página de precios</a>. El plan Pro es de pago, con facturación
+        <a href={$localeHref('/pricing')}>la página de precios</a>. El plan Pro es de pago, con facturación
         recurrente mensual o anual. Los precios mostrados incluyen los impuestos aplicables a
         consumidores en la Unión Europea.
       </p>
@@ -222,7 +222,7 @@
       <h2>3. Plans and subscriptions</h2>
       <p>
         The Free plan is offered at no cost with the limits published on the
-        <a href="/pricing">pricing page</a>. The Pro plan is paid with recurring monthly or
+        <a href={$localeHref('/pricing')}>pricing page</a>. The Pro plan is paid with recurring monthly or
         annual billing. Prices displayed include applicable taxes for consumers in the
         European Union.
       </p>

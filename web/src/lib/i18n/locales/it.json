@@ -62,7 +62,7 @@
   "selfhost.body": "Il server è un unico binario Rust con licenza AGPL-3.0. Nessun account, nessuna quota, nessun limite oltre al tuo disco. Gira benissimo su un Raspberry Pi.",
   "selfhost.cta": "Guida all'installazione su GitHub",
   "cta_section.title": "Gratis finché non lo superi.",
-  "cta_section.body": "1 GB, 3 dispositivi, sync e cronologia completa, senza carta. Pro a 4,49 €/mese quando la tua libreria lo richiede.",
+  "cta_section.body": "1 GB, 3 dispositivi, sync e cronologia completa, senza carta. Pro da 1,49 €/mese quando la tua libreria lo richiede.",
   "cta_section.cta": "Scarica gratis",
   "cta_section.cta_os": "Scarica per {platform}",
   "cta_section.subnote": "Oppure prendi il binario per qualsiasi piattaforma da",

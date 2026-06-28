@@ -13,7 +13,7 @@
   let cycle = $state<BillingCycle>('monthly');
 
   // Yearly discount derived from the real prices in plans.ts — never typed
-  // by hand. 12 × 4,49 € = 53,88 € vs 35,99 € ⇒ 33 %.
+  // by hand. 12 × 1,49 € = 17,88 € vs 14,90 € ⇒ 17 % (two months free).
   const yearlySavingsPct = Math.round(
     (1 - PLANS.pro.priceYearly / (PLANS.pro.priceMonthly * 12)) * 100
   );

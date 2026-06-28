@@ -62,7 +62,7 @@
   "selfhost.body": "服务器是 AGPL-3.0 下的单个 Rust 二进制文件。无需账户，没有配额，除了你的磁盘没有别的限制。在 Raspberry Pi 上也能流畅运行。",
   "selfhost.cta": "GitHub 上的安装指南",
   "cta_section.title": "在你用超之前都免费。",
-  "cta_section.body": "1 GB、3 台设备、同步与完整历史，无需银行卡。当你的游戏库需要时，每月 4.49 欧元升级 Pro。",
+  "cta_section.body": "1 GB、3 台设备、同步与完整历史，无需银行卡。当你的游戏库需要时，每月 1.49 欧元起升级 Pro。",
   "cta_section.cta": "免费下载",
   "cta_section.cta_os": "为 {platform} 下载",
   "cta_section.subnote": "或从这里获取任意平台的二进制文件",

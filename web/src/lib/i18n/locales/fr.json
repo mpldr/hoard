@@ -62,7 +62,7 @@
   "selfhost.body": "Le serveur est un unique binaire Rust sous AGPL-3.0. Pas de compte, pas de quotas, pas d'autre limite que ton disque. Tourne sans souci sur un Raspberry Pi.",
   "selfhost.cta": "Guide d'installation sur GitHub",
   "cta_section.title": "Gratuit jusqu'à ce que tu le dépasses.",
-  "cta_section.body": "1 Go, 3 appareils, sync et historique complet, sans carte. Pro à 4,49 €/mois quand ta bibliothèque le demande.",
+  "cta_section.body": "1 Go, 3 appareils, sync et historique complet, sans carte. Pro à partir de 1,49 €/mois quand ta bibliothèque le demande.",
   "cta_section.cta": "Télécharger gratuitement",
   "cta_section.cta_os": "Télécharger pour {platform}",
   "cta_section.subnote": "Ou récupère le binaire pour n'importe quelle plateforme depuis",

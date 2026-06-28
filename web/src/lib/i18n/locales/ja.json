@@ -62,7 +62,7 @@
   "selfhost.body": "サーバーはAGPL-3.0の単一Rustバイナリです。アカウント不要、クォータなし、ディスク以外の制限なし。Raspberry Piでも問題なく動きます。",
   "selfhost.cta": "GitHubのインストールガイド",
   "cta_section.title": "足りなくなるまで無料。",
-  "cta_section.body": "1 GB、3デバイス、同期と完全な履歴、カード不要。ライブラリが求めたら月額4.49ユーロのPro。",
+  "cta_section.body": "1 GB、3デバイス、同期と完全な履歴、カード不要。ライブラリが求めたら月額1.49ユーロからのPro。",
   "cta_section.cta": "無料でダウンロード",
   "cta_section.cta_os": "{platform}用にダウンロード",
   "cta_section.subnote": "または、任意のプラットフォーム向けのバイナリはこちらから",

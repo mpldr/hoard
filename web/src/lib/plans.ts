@@ -24,15 +24,18 @@ export const PLANS: Record<PlanId, PlanLimits> = {
   },
   pro: {
     id: 'pro',
-    storageBytes: 50 * GB,
+    // Pro x1 base tier. Higher tiers (+25 GB steps) only change storageBytes,
+    // never the plan; sold via storage stepper -> server resolves the product.
+    storageBytes: 25 * GB,
     devices: null,
     saves: null,
     versionHistoryForever: true,
     maxSaveSizeBytes: 2 * GB,
     bandwidthQuotaBytes: 5 * GB,
     bandwidthWindowSecs: 15 * 60,
-    priceMonthly: 4.49,
-    priceYearly: 35.99
+    priceMonthly: 1.49,
+    // Yearly = monthly × 10 (two months free).
+    priceYearly: 14.9
   }
 };
 

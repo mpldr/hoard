@@ -2,7 +2,7 @@
 title: "How to back up your game saves automatically"
 description: "Set up automatic, versioned cloud backups for your PC game saves with Hoard — so a crash, reinstall or bad mod can never wipe your progress."
 order: 1
-updated: 2026-06-16
+updated: 2026-06-28
 ---
 
 Losing a save file means losing hours of progress. Hoard backs up your PC game saves automatically and keeps a full version history, so you can always go back.
@@ -10,6 +10,8 @@ Losing a save file means losing hours of progress. Hoard backs up your PC game s
 ## What Hoard backs up
 
 Hoard detects the save folders of the games you play and copies them to your own cloud — either Hoard Cloud or a server you host yourself. Every backup is versioned, so older copies are never overwritten.
+
+To find where each game stores its saves, Hoard reads the same community save-location database that powers Ludusavi, so detection works out of the box for thousands of titles. The difference is what happens next: instead of leaving the backup on your disk, Hoard versions it in the cloud automatically.
 
 ## Set up automatic backups
 
@@ -24,3 +26,5 @@ From now on every session is captured without you doing anything.
 ## Tip: check your history
 
 Open a game's **History** tab to see every backup with its date and size. From there you can restore any previous version in one click. Your saves travel encrypted, are stored in the EU, and you can export or delete them whenever you want.
+
+Already use a local backup tool like Ludusavi? You can keep it — but if you want those backups to land in the cloud and sync between machines without scripting Rclone yourself, that's exactly what Hoard automates. See [Ludusavi vs Hoard](/guides/ludusavi-alternative) for a fair comparison.

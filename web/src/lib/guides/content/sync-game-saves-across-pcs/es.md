@@ -1,8 +1,8 @@
 ---
 title: "Cómo sincronizar partidas guardadas entre varios PC"
-description: "Juega al mismo juego en tu sobremesa y tu portátil sin perder progreso. Aprende a sincronizar tus partidas guardadas entre PC automáticamente con Hoard."
+description: "Juega al mismo juego en tu sobremesa y tu portátil sin perder progreso. Sincroniza tus partidas entre PC automáticamente con Hoard: sincronización en la nube gestionada, sin montar Ludusavi y Rclone a mano."
 order: 2
-updated: 2026-06-16
+updated: 2026-06-28
 ---
 
 Si juegas en más de un ordenador —un sobremesa en casa y un portátil de viaje— Hoard mantiene tus partidas sincronizadas para que siempre retomes donde lo dejaste.
@@ -17,6 +17,12 @@ Hoard sube cada partida a tu nube y descarga la última versión en tus otros eq
 2. Inicia sesión con la **misma cuenta** en cada equipo, o conéctalos al mismo servidor autoalojado.
 3. Añade los mismos juegos a tu **Biblioteca** en cada PC. Hoard los empareja por juego, así que una partida guardada en uno aparece en los demás.
 4. Mantén el **modo automático** activado. Hoard sube cuando terminas de jugar y descarga la última versión antes de empezar.
+
+## ¿Vienes de Ludusavi?
+
+Ludusavi es una gran herramienta open source para hacer copias y restaurar partidas en local, y puede subir esas copias a una nube que configures tú mismo con Rclone. Pero sincronizar entre dispositivos es algo que montas a mano: programas la copia, configuras el remoto y luego restauras en el otro PC antes de jugar.
+
+Hoard convierte eso en sincronización gestionada. Usa los mismos datos comunitarios de ubicación de partidas que Ludusavi para encontrar tus saves, y luego sube tras cada sesión y descarga la última versión antes de la siguiente, en todos los PC de tu cuenta y con historial versionado en la nube. Sin remotos de Rclone, sin scripts. Y, como Ludusavi, Hoard es open source y se puede autoalojar. Mira la [comparativa completa con Ludusavi](/guides/ludusavi-alternative).
 
 ## Evitar conflictos
 

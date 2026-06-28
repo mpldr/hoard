@@ -2,13 +2,23 @@
   import { _, locale } from 'svelte-i18n';
   import Seo from '$lib/components/Seo.svelte';
   import { localeHref } from '$lib/i18n/href';
-  import { DEFAULT_LOCALE, isLocale, SITE_URL, withLocale, HREFLANG, type Locale } from '$lib/i18n/locales';
+  import { DEFAULT_LOCALE, isLocale, SITE_URL, withLocale, localePrefix, HREFLANG, type Locale } from '$lib/i18n/locales';
   import { ArrowLeft } from 'lucide-svelte';
 
   let { data } = $props();
   const guide = $derived(data.guide);
   const active = $derived<Locale>(isLocale($locale) ? ($locale as Locale) : DEFAULT_LOCALE);
   const url = $derived(SITE_URL + withLocale(`/guides/${guide.slug}`, active));
+
+  // Guide bodies use root-relative links (e.g. /guides/ludusavi-alternative).
+  // The HTML is parsed once per locale-file, so prefix in-app links with the
+  // active locale here — otherwise a Spanish page would link to bare English.
+  // English prefix is '' (no change); external/anchor/mailto links don't match.
+  const localizedHtml = $derived(
+    localePrefix(active)
+      ? guide.html.replace(/href="\/(?!\/)/g, `href="${localePrefix(active)}/`)
+      : guide.html
+  );
 
   const articleLd = $derived(
     `<script type="application/ld+json">${JSON.stringify({
@@ -59,7 +69,7 @@
   {/if}
 
   <div class="prose mt-8">
-    {@html guide.html}
+    {@html localizedHtml}
   </div>
 
   <div class="mt-14 rounded-xl border border-line bg-surface p-6">

@@ -2,7 +2,7 @@
 title: "Cómo hacer copias de seguridad de tus partidas automáticamente"
 description: "Configura copias de seguridad automáticas y versionadas en la nube de tus partidas de PC con Hoard, para que un fallo, una reinstalación o un mod problemático nunca borren tu progreso."
 order: 1
-updated: 2026-06-16
+updated: 2026-06-28
 ---
 
 Perder una partida guardada significa perder horas de progreso. Hoard hace copias de seguridad de tus partidas de PC automáticamente y guarda un historial completo de versiones, para que siempre puedas volver atrás.
@@ -10,6 +10,8 @@ Perder una partida guardada significa perder horas de progreso. Hoard hace copia
 ## Qué guarda Hoard
 
 Hoard detecta las carpetas de guardado de los juegos a los que juegas y las copia a tu propia nube: Hoard Cloud o un servidor que alojes tú mismo. Cada copia está versionada, así que las versiones antiguas nunca se sobrescriben.
+
+Para saber dónde guarda cada juego sus partidas, Hoard usa la misma base de datos comunitaria de ubicaciones que utiliza Ludusavi, así que la detección funciona desde el primer momento con miles de títulos. La diferencia está en lo que pasa después: en vez de dejar la copia en tu disco, Hoard la versiona en la nube automáticamente.
 
 ## Configura las copias automáticas
 
@@ -24,3 +26,5 @@ A partir de ahí cada sesión queda guardada sin que hagas nada.
 ## Consejo: revisa tu historial
 
 Abre la pestaña **Historial** de un juego para ver cada copia con su fecha y tamaño. Desde ahí puedes restaurar cualquier versión anterior con un clic. Tus partidas viajan cifradas, se almacenan en la UE y puedes exportarlas o borrarlas cuando quieras.
+
+¿Ya usas una herramienta de copia local como Ludusavi? Puedes seguir usándola, pero si quieres que esas copias acaben en la nube y se sincronicen entre equipos sin montar Rclone a mano, eso es justo lo que Hoard automatiza. Mira [Ludusavi frente a Hoard](/guides/ludusavi-alternative) para una comparativa justa.

@@ -22,6 +22,7 @@ pub mod playtime;
 pub mod playtime_catalog;
 pub mod prefs;
 pub mod presets;
+pub mod proclist;
 pub mod restore;
 pub mod roots;
 pub mod scoring;

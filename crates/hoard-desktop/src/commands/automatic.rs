@@ -299,6 +299,9 @@ pub async fn run_scan(app: &AppHandle) {
             local_path: game.found_paths[0].to_string_lossy().into_owned(),
             display_name: Some(game.display_name),
             steam_app_id: game.steam_app_id.map(|v| v as i64),
+            // Auto-detected real games: derive preset/processes from the slug.
+            preset: None,
+            processes: None,
         };
         // Don't abort the batch over one game — a single 422/409 on an old
         // server shouldn't stop the other nine from being tracked.

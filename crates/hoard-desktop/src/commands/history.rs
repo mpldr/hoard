@@ -282,6 +282,7 @@ pub async fn restore_snapshot(
                 paused: false,
                 preset: None,
                 set_hash: None,
+                processes: Vec::new(),
             }
         });
         entry.local_path = p.clone();
@@ -459,6 +460,9 @@ pub async fn set_save_paused(
             snapshot.label,
             snapshot.local_path,
             snapshot.preset.as_deref(),
+            // Carry the persisted process pins so a re-attached emulator save
+            // keeps its play-detection without waiting for an agent restart.
+            snapshot.processes.clone(),
         );
         attach_save_if_running(&state, watched).await;
     }
@@ -510,6 +514,9 @@ pub async fn set_save_preset(
             snapshot.label,
             snapshot.local_path,
             snapshot.preset.as_deref(),
+            // Carry the persisted process pins so a re-attached emulator save
+            // keeps its play-detection without waiting for an agent restart.
+            snapshot.processes.clone(),
         );
         attach_save_if_running(&state, watched).await;
     }
@@ -559,6 +566,9 @@ pub async fn set_save_local_path(
             snapshot.label,
             snapshot.local_path,
             snapshot.preset.as_deref(),
+            // Carry the persisted process pins so a re-attached emulator save
+            // keeps its play-detection without waiting for an agent restart.
+            snapshot.processes.clone(),
         );
         attach_save_if_running(&state, watched).await;
     }

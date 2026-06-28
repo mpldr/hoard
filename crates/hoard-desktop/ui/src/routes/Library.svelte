@@ -37,6 +37,7 @@
   import Cover from "../lib/components/Cover.svelte";
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
+  import AddEmulatorModal from "../lib/components/AddEmulatorModal.svelte";
   import * as api from "../lib/api";
   import type {
     Confidence,
@@ -52,6 +53,43 @@
 
   let report = $state<DetectionReport | null>(null);
   let tracked = $state<TrackedSave[]>([]);
+  // Manual "Add emulator" dialog (independent of the detection flow).
+  let emulatorModalOpen = $state(false);
+
+  // Manually-added emulator saves carry a synthesized slug: `emu-<id>` for a
+  // catalog pick or `emu-<slugified name>` for a custom one. The Library shows
+  // them alongside detected games, so map the slug back to a friendly name and
+  // flag them as emulators instead of printing the raw `emu-melonds`.
+  const EMU_NAMES: Record<string, string> = {
+    pcsx2: "PCSX2",
+    rpcs3: "RPCS3",
+    duckstation: "DuckStation",
+    ppsspp: "PPSSPP",
+    dolphin: "Dolphin",
+    cemu: "Cemu",
+    ryujinx: "Ryujinx",
+    citra: "Citra",
+    retroarch: "RetroArch",
+    mgba: "mGBA",
+    melonds: "melonDS",
+    project64: "Project64",
+  };
+  function isEmu(slug: string): boolean {
+    return slug.startsWith("emu-");
+  }
+  /** Friendly display name for a tracked save's slug. Emulators resolve to
+   *  their catalog name (or a title-cased custom name); everything else keeps
+   *  the slug, exactly as the list rendered before. */
+  function displayName(slug: string): string {
+    if (!isEmu(slug)) return slug;
+    const id = slug.slice(4);
+    if (EMU_NAMES[id]) return EMU_NAMES[id];
+    return id
+      .split("-")
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+  }
   // Playtime-only games (Fortnite, Rust…): tracked for hours, never backed up.
   let playtimeGames = $state<PlaytimeGameInfo[]>([]);
   let playtimeBusy = $state(new Set<string>());
@@ -715,10 +753,16 @@
         {/if}
       </p>
     </div>
-    <Button onclick={runScan} loading={scanning}>
-      <RefreshCw size={16} />
-      {scanning ? $_("library.scanning") : report ? $_("library.rescan") : $_("library.scan_now")}
-    </Button>
+    <div class="flex shrink-0 items-center gap-2">
+      <Button variant="secondary" onclick={() => (emulatorModalOpen = true)}>
+        <Gamepad2 size={16} />
+        {$_("emulators.add_button")}
+      </Button>
+      <Button onclick={runScan} loading={scanning}>
+        <RefreshCw size={16} />
+        {scanning ? $_("library.scanning") : report ? $_("library.rescan") : $_("library.scan_now")}
+      </Button>
+    </div>
   </header>
 
   {#if localSaves.length > 0}
@@ -740,24 +784,49 @@
       >
         {#each localSaves as save (save.save_id)}
           <div
-            class="group flex items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
+            class="group flex items-start justify-between gap-2 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
           >
             <Cover
               appId={appIdBySlug.get(save.game_slug) ?? null}
               slug={save.game_slug}
-              name={save.game_slug}
-              class="h-9 w-9 rounded-md"
+              name={displayName(save.game_slug)}
+              class="h-9 w-9 shrink-0 rounded-md"
               initialClass="text-sm"
             />
             <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-1.5">
+                <p
+                  class="truncate text-sm font-medium text-zinc-100"
+                  title={save.game_slug}
+                >
+                  {displayName(save.game_slug)}
+                </p>
+                {#if isEmu(save.game_slug)}
+                  <span
+                    class="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-300"
+                  >
+                    {$_("library.emulator_badge")}
+                  </span>
+                {/if}
+              </div>
               <p
-                class="truncate text-sm font-medium text-zinc-100"
-                title={save.game_slug}
+                class="mt-0.5 flex items-center gap-1 text-[11px] text-zinc-500"
+                title={save.local_path}
               >
-                {save.game_slug}
+                <FolderOpen size={11} class="shrink-0" />
+                <span class="truncate">{save.local_path}</span>
               </p>
-              <p class="truncate text-[11px] text-zinc-500">
-                {save.label}
+              <p class="mt-0.5 flex items-center gap-1.5 text-[11px]">
+                <span
+                  class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
+                    ? 'bg-amber-400'
+                    : 'bg-emerald-400'}"
+                ></span>
+                <span class={save.paused ? "text-amber-400" : "text-emerald-400/90"}>
+                  {save.paused
+                    ? $_("library.paused_badge")
+                    : $_("library.monitored_badge")}
+                </span>
               </p>
             </div>
             <span
@@ -1291,6 +1360,14 @@
        button on a Steam-only detection card. Explains why we don't have a
        path and offers an explicit "pick folder" action — no surprise OS
        dialog. -->
+  <AddEmulatorModal
+    open={emulatorModalOpen}
+    onClose={() => (emulatorModalOpen = false)}
+    onAdded={(saved) => {
+      tracked = [...tracked, saved];
+    }}
+  />
+
   <Modal
     open={alertGame !== null}
     title={$_("library.no_save_alert_title", {

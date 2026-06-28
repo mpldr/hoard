@@ -425,7 +425,15 @@ fn hydrate_watched_saves(_state: &State<'_, AppState>) -> anyhow::Result<Vec<Wat
             label: save_state.label,
             local_path: save_state.local_path,
             steam_install_dir,
-            processes: resolve_processes(&save_state.game_slug),
+            // A manually-pinned process list (emulator saves) wins; otherwise
+            // derive from the slug as before. Persisting it on `SaveState` is
+            // what keeps a manual emulator's play-detection alive across
+            // restarts — its slug isn't in the built-in catalog.
+            processes: if save_state.processes.is_empty() {
+                resolve_processes(&save_state.game_slug)
+            } else {
+                save_state.processes.clone()
+            },
             policy,
             known_version: save_state.last_version_num,
             set_hash: save_state.set_hash.clone(),
@@ -495,6 +503,7 @@ pub(crate) fn watched_save_from(
     label: String,
     local_path: PathBuf,
     preset: Option<&str>,
+    processes_override: Vec<String>,
 ) -> WatchedSave {
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
     let steam_install_dir = steam_apps
@@ -502,7 +511,13 @@ pub(crate) fn watched_save_from(
         .find(|a| name_matches(&a.name, &game_slug))
         .map(|a| a.install_dir.clone());
     let policy = resolve_policy(&game_slug, preset);
-    let processes = resolve_processes(&game_slug);
+    // Manual pin (emulator saves) wins; otherwise fall back to the slug-derived
+    // built-in list so normal tracked games behave exactly as before.
+    let processes = if processes_override.is_empty() {
+        resolve_processes(&game_slug)
+    } else {
+        processes_override
+    };
     WatchedSave {
         save_id,
         game_slug,

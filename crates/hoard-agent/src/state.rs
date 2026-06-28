@@ -35,6 +35,16 @@ pub struct SaveState {
     /// loading without migration.
     #[serde(default)]
     pub set_hash: Option<String>,
+    /// Manually-pinned process executable names that mark this save as
+    /// "playing" (case-insensitive exact match in the agent's process poll).
+    /// Empty = derive from the slug via [`crate::presets::builtin_processes_for`]
+    /// as before. This is how a manually-added emulator save (whose slug isn't
+    /// in any catalog) keeps its "is the user playing" signal across restarts:
+    /// the user-picked emulator exe is persisted here instead of being
+    /// recomputed from the slug. `default` keeps older `state.json` files
+    /// loading without migration.
+    #[serde(default)]
+    pub processes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

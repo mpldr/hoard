@@ -304,6 +304,19 @@ pub struct AddGameArgs {
     pub display_name: Option<String>,
     #[serde(default)]
     pub steam_app_id: Option<i64>,
+    /// Pin a sync preset id (see [`presets::ALL_PRESETS`]) instead of letting
+    /// the built-in catalog decide. Manually-added emulator saves pass
+    /// `backup_only` here so Hoard never restores the cloud copy over an
+    /// in-progress local save. `None` = built-in default (unchanged behaviour
+    /// for normal tracked games).
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// Pin the process executable names that mark this save as "playing"
+    /// (emulator exes chosen by the user). Persisted on `SaveState` so the
+    /// play-detection survives restarts. `None` = derive from the slug, exactly
+    /// as before for normal games.
+    #[serde(default)]
+    pub processes: Option<Vec<String>>,
 }
 
 /// Begin tracking a detected game. Creates a Save on the server and writes
@@ -316,6 +329,14 @@ pub async fn add_game_to_tracking(
 ) -> Result<TrackedSave, String> {
     let client = current_client(&state)?;
     let label = args.label.unwrap_or_else(|| "main".to_string());
+
+    // Optional manual overrides (emulator saves). Both fall back to the
+    // existing slug-derived behaviour, so normal tracked games are unaffected.
+    let pinned_processes = args.processes.clone().unwrap_or_default();
+    let preset_name: Option<String> = args
+        .preset
+        .clone()
+        .or_else(|| presets::builtin_preset_for(&args.game_slug).map(str::to_string));
 
     let local_path = PathBuf::from(&args.local_path);
     if local_path.as_os_str().is_empty() {
@@ -357,11 +378,13 @@ pub async fn add_game_to_tracking(
                 last_backup_at: None,
                 last_version_num: None,
                 paused: false,
-                // Auto-assign our built-in preset for known-quirky games so
-                // the right sync behaviour applies from the first backup; the
-                // user can override it later.
-                preset: presets::builtin_preset_for(&args.game_slug).map(str::to_string),
+                // Auto-assign our built-in preset for known-quirky games (or
+                // the caller's pinned one — `backup_only` for emulators) so the
+                // right sync behaviour applies from the first backup; the user
+                // can override it later.
+                preset: preset_name.clone(),
                 set_hash: None,
+                processes: pinned_processes.clone(),
             },
         );
         cli_state.save(&path).map_err(|e| e.to_string())?;
@@ -372,11 +395,12 @@ pub async fn add_game_to_tracking(
             args.game_slug.clone(),
             label.clone(),
             local_path.clone(),
-            presets::builtin_preset_for(&args.game_slug),
+            preset_name.as_deref(),
+            pinned_processes.clone(),
         );
         attach_save_if_running(&state, watched).await;
 
-        let preset = presets::builtin_preset_for(&args.game_slug).map(str::to_string);
+        let preset = preset_name.clone();
         return Ok(TrackedSave {
             save_id,
             game_slug: args.game_slug,
@@ -440,8 +464,9 @@ pub async fn add_game_to_tracking(
             last_backup_at: None,
             last_version_num: None,
             paused: false,
-            preset: presets::builtin_preset_for(&save.game_slug).map(str::to_string),
+            preset: preset_name.clone(),
             set_hash: None,
+            processes: pinned_processes.clone(),
         },
     );
     cli_state.save(&path).map_err(|e| e.to_string())?;
@@ -453,7 +478,8 @@ pub async fn add_game_to_tracking(
         args.game_slug.clone(),
         save.label.clone(),
         local_path.clone(),
-        presets::builtin_preset_for(&save.game_slug),
+        preset_name.as_deref(),
+        pinned_processes.clone(),
     );
     attach_save_if_running(&state, watched).await;
 
@@ -462,7 +488,7 @@ pub async fn add_game_to_tracking(
     // retrack) they restore the snapshot history into the Library card.
     let last_version_num = save.latest_version_num;
     let total_size_bytes = save.total_size_bytes.unwrap_or(0);
-    let preset = presets::builtin_preset_for(&save.game_slug).map(str::to_string);
+    let preset = preset_name.clone();
     Ok(TrackedSave {
         save_id: save.id,
         game_slug: save.game_slug,
@@ -533,6 +559,11 @@ pub async fn adopt_save(
             paused: false,
             preset: preset.clone(),
             set_hash: None,
+            // Adopt re-binds an existing cloud save on a fresh machine; process
+            // pins are per-machine and not carried here. Normal games derive
+            // from the slug; an adopted emulator gets its play-detection on the
+            // next manual add or agent restart.
+            processes: Vec::new(),
         },
     );
     cli_state.save(&path).map_err(|e| e.to_string())?;
@@ -544,6 +575,7 @@ pub async fn adopt_save(
         args.label.clone(),
         local_path.clone(),
         preset.as_deref(),
+        Vec::new(),
     );
     attach_save_if_running(&state, watched).await;
 
@@ -761,15 +793,17 @@ pub async fn rename_save_label(
     // Update local state with the new label so subsequent backups land in
     // the right directory and the UI doesn't have to refetch.
     let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let (local_path_string, preset) = if let Some(entry) = cli_state.saves.get_mut(&save_id) {
-        entry.label = updated.label.clone();
-        (
-            entry.local_path.to_string_lossy().into_owned(),
-            entry.preset.clone(),
-        )
-    } else {
-        (String::new(), None)
-    };
+    let (local_path_string, preset, processes) =
+        if let Some(entry) = cli_state.saves.get_mut(&save_id) {
+            entry.label = updated.label.clone();
+            (
+                entry.local_path.to_string_lossy().into_owned(),
+                entry.preset.clone(),
+                entry.processes.clone(),
+            )
+        } else {
+            (String::new(), None, Vec::new())
+        };
     cli_state.save(&path).map_err(|e| e.to_string())?;
 
     // Re-attach to the running agent so its in-memory WatchedSave picks up
@@ -783,6 +817,7 @@ pub async fn rename_save_label(
             updated.label.clone(),
             local_path.clone(),
             preset.as_deref(),
+            processes.clone(),
         );
         attach_save_if_running(&state, watched).await;
     }

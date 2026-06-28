@@ -183,8 +183,44 @@ export function addGameToTracking(args: {
   local_path: string;
   display_name?: string;
   steam_app_id?: number | null;
+  /** Pin a sync preset (manual emulator adds pass `"backup_only"`). */
+  preset?: string;
+  /** Pin the process exe names that mark this save as "playing". */
+  processes?: string[];
 }): Promise<TrackedSave> {
   return invoke<TrackedSave>("add_game_to_tracking", { args });
+}
+
+/** One curated emulator, with native-save folders resolved for this host. */
+export interface EmulatorPreset {
+  id: string;
+  display_name: string;
+  system: string;
+  processes: string[];
+  /** Existing save folders found on this machine; first is the best default.
+   *  May be empty — then the user must pick the folder by hand. */
+  save_paths: string[];
+}
+
+/** One live process candidate for the emulator picker. */
+export interface RunningProcess {
+  /** Executable name as the OS reports it (matches `processes` verbatim). */
+  name: string;
+  /** Peak CPU usage; the list is sorted by it so the active emulator is first. */
+  cpu: number;
+}
+
+/** Curated emulator catalog (suggested folders + exes) for the "Add emulator"
+ *  dialog. Hoard free: the resulting save is tracked via `addGameToTracking`
+ *  with `processes`/`preset` pinned — no detection-pipeline changes. */
+export function listEmulatorPresets(): Promise<EmulatorPreset[]> {
+  return invoke<EmulatorPreset[]>("list_emulator_presets");
+}
+
+/** Live snapshot of game-like processes, sorted by CPU, for the process
+ *  picker: open the emulator, refresh, pick the top entry. */
+export function listRunningProcesses(): Promise<RunningProcess[]> {
+  return invoke<RunningProcess[]>("list_running_processes");
 }
 
 /** Adopt (vincular) a cloud save from another machine: bind a local folder on

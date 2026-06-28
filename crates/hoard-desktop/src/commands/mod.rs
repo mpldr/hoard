@@ -12,6 +12,7 @@ pub mod cloud;
 pub mod cloud_pull;
 pub mod cloud_realtime;
 pub mod covers;
+pub mod emulators;
 pub mod error;
 pub mod history;
 pub mod library;

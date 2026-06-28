@@ -595,6 +595,11 @@ pub async fn remember_save(
         // so re-remembering a save doesn't force a redundant next upload.
         let prev_hash = state.saves.get(save_id).and_then(|s| s.set_hash.clone());
         let prev_preset = state.saves.get(save_id).and_then(|s| s.preset.clone());
+        let prev_processes = state
+            .saves
+            .get(save_id)
+            .map(|s| s.processes.clone())
+            .unwrap_or_default();
         state.saves.insert(
             save_id.to_string(),
             SaveState {
@@ -606,6 +611,7 @@ pub async fn remember_save(
                 paused: was_paused,
                 preset: prev_preset,
                 set_hash: prev_hash,
+                processes: prev_processes,
             },
         );
     } else if let Some(existing) = state.saves.get(save_id).cloned() {

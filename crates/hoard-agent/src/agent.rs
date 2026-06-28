@@ -736,8 +736,16 @@ async fn run_agent(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(AgentCommand::AddSave(save)) => {
+                        let added_id = save.save_id.clone();
                         handle_add(
                             &mut slots, *save, &fs_tx, &api, &events_tx, &cmd_tx, &config,
+                        );
+                        // Baseline a freshly-added save that already holds
+                        // content. When auto-restore is in flight (`restoring`)
+                        // this no-ops and the post-restore path below handles
+                        // it instead, so we never upload pre-restore content.
+                        maybe_schedule_initial_backup(
+                            &mut slots, &added_id, &api, &events_tx, &config, &done_tx, &cmd_tx,
                         );
                     }
                     Some(AgentCommand::RearmWatcher(id)) => {
@@ -779,6 +787,14 @@ async fn run_agent(
                                 );
                             }
                         }
+                        // Restore has settled: if the slot still has no baseline
+                        // (server was empty / 404 and the local folder holds
+                        // content the watcher never saw written — the manual
+                        // emulator-save case), take the first snapshot now
+                        // instead of waiting on an fs write or the hourly sweep.
+                        maybe_schedule_initial_backup(
+                            &mut slots, &id, &api, &events_tx, &config, &done_tx, &cmd_tx,
+                        );
                     }
                     Some(AgentCommand::SetAutoRestore(enabled)) => {
                         let was = config.auto_restore;
@@ -1194,6 +1210,64 @@ fn handle_add(
             );
         }
     }
+}
+
+/// Ensure a freshly-added save with existing on-disk content gets a first
+/// snapshot without waiting on a filesystem write or the hourly backup sweep.
+///
+/// Motivating case: emulator saves. The user points Hoard at a folder that
+/// already holds a `.sav` the agent never observed being written, so no fs
+/// event ever fires (`has_pending` stays false, the GameStopped path skips),
+/// and the hourly sweep — the only other path to a first backup — may not run
+/// for a long time (it restarts whenever the app relaunches). The result is a
+/// tracked save that never reaches the cloud (`last_backup_at = None`).
+///
+/// Fires only when the slot has no baseline yet (never backed up, no known
+/// set-hash, nothing already queued) and the folder isn't empty, so it's a
+/// one-shot for the add and a no-op for every established save. Reuses
+/// `SweepStaggered` so the queued row stays quiet in the feed; the resulting
+/// upload still announces normally. Skipped while `restoring` so we never
+/// upload pre-restore content — the post-restore caller re-checks once the
+/// restore has settled.
+#[allow(clippy::too_many_arguments)]
+fn maybe_schedule_initial_backup(
+    slots: &mut HashMap<String, SaveSlot>,
+    save_id: &str,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    config: &AgentConfig,
+    done_tx: &mpsc::Sender<BackupDone>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+) {
+    let needs = match slots.get(save_id) {
+        Some(slot) => {
+            !slot.save.track_only
+                && !slot.restoring
+                && slot.last_backup_at.is_none()
+                && slot.last_set_hash.is_none()
+                && slot.next_scheduled_backup_at.is_none()
+                && !is_path_empty_or_missing(&slot.save.local_path)
+        }
+        None => false,
+    };
+    if !needs {
+        return;
+    }
+    tracing::info!(
+        save_id = %save_id,
+        "agent: scheduling initial baseline backup for freshly-added save with existing content"
+    );
+    schedule_backup(
+        slots,
+        save_id,
+        BackupReason::SweepStaggered,
+        Duration::from_secs(2),
+        api,
+        events_tx,
+        config,
+        done_tx,
+        cmd_tx,
+    );
 }
 
 /// Minimum interval between successive auto-restore attempts for the
@@ -1779,8 +1853,14 @@ async fn run_auto_restore(
     // it against a folder that hadn't changed, exhausting the 15-min cloud
     // quota (429 storm) and starving real uploads. A genuine cross-device
     // update bumps the server version above `known_version` and still pulls.
+    // A locally empty/missing folder is the one case where "already on the
+    // latest version" is a lie worth pulling for: the user wiped the save
+    // (manual cleanup, uninstall, deleted folder) and the cloud copy is the
+    // only one left. Restoring it is exactly what they want, so don't let the
+    // version gate short-circuit an empty folder — fall through to the download
+    // even when `known >= v`.
     if let (Some(v), Some(known)) = (latest, known_version) {
-        if known >= v {
+        if known >= v && !is_path_empty_or_missing(&save.local_path) {
             tracing::debug!(
                 save_id = %save.save_id,
                 version = v,

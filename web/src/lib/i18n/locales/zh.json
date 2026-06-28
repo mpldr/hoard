@@ -33,6 +33,7 @@
   "sync.demo_laptop": "笔记本",
   "sync.demo_synced": "已是最新",
   "sync.demo_note": "客户端与服务器比对版本，只传输发生变化的部分。",
+  "sync.guides_link": "分步指南",
   "how.kicker": "02 — 工作原理",
   "how.title": "三步。无需设置。",
   "how.subtitle": "装好应用，登录一次，然后忘掉它的存在。",

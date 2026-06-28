@@ -190,6 +190,13 @@
             </li>
           {/each}
         </ul>
+        <a
+          href={$localeHref('/guides')}
+          class="link-underline mt-6 inline-flex items-center gap-1.5 text-sm font-medium text-accent ring-focus hover:text-emerald-300"
+        >
+          {$_('sync.guides_link')}
+          <ArrowRight class="h-4 w-4" />
+        </a>
       </div>
 
       <div class="reveal" use:reveal={{ delay: 100 }}>

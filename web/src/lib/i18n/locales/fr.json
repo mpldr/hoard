@@ -33,6 +33,7 @@
   "sync.demo_laptop": "portable",
   "sync.demo_synced": "à jour",
   "sync.demo_note": "Le client compare les versions avec le serveur et ne transfère que ce qui a changé.",
+  "sync.guides_link": "Guides pas à pas",
   "how.kicker": "02 — Comment ça marche",
   "how.title": "Trois étapes. Aucune configuration.",
   "how.subtitle": "Installe l'app, connecte-toi une fois, et oublie qu'elle est là.",

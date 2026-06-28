@@ -33,6 +33,7 @@
   "sync.demo_laptop": "Laptop",
   "sync.demo_synced": "aktuell",
   "sync.demo_note": "Der Client vergleicht die Versionen mit dem Server und überträgt nur, was sich geändert hat.",
+  "sync.guides_link": "Schritt-für-Schritt-Anleitungen",
   "how.kicker": "02 — So funktioniert es",
   "how.title": "Drei Schritte. Kein Setup.",
   "how.subtitle": "App installieren, einmal anmelden und vergessen, dass sie da ist.",

@@ -33,6 +33,7 @@
   "sync.demo_laptop": "ノートPC",
   "sync.demo_synced": "最新",
   "sync.demo_note": "クライアントはサーバーとバージョンを比較し、変更があった分だけを転送します。",
+  "sync.guides_link": "ステップバイステップガイド",
   "how.kicker": "02 — 仕組み",
   "how.title": "3ステップ。セットアップ不要。",
   "how.subtitle": "アプリをインストールし、一度ログインすれば、あとはその存在を忘れて大丈夫。",

@@ -87,6 +87,7 @@
   "pricing.note_lockin_title": "Sem aprisionamento",
   "pricing.note_lockin_body": "Exporta cada save no formato original do jogo. Faz self-host do mesmo binário quando quiseres.",
   "pricing.compare_title": "Comparar linha a linha",
+  "pricing.compare_feature": "Funcionalidade",
   "pricing.compare_subtitle": "O que cada plano inclui, sem rodeios.",
   "pricing.compare_storage": "Armazenamento",
   "pricing.compare_devices": "Dispositivos",

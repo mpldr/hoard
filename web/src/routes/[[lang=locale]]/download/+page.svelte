@@ -205,6 +205,8 @@
     {$_('download.selfhost_note')}
     <a
       href="https://github.com/rleeon/hoard#self-host"
+      target="_blank"
+      rel="noopener noreferrer"
       class="link-underline text-accent ring-focus hover:text-emerald-300"
     >
       GitHub

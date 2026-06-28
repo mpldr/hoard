@@ -87,6 +87,7 @@
   "pricing.note_lockin_title": "No lock-in",
   "pricing.note_lockin_body": "Export every save in the game's original format. Self-host the same binary anytime.",
   "pricing.compare_title": "Compare row by row",
+  "pricing.compare_feature": "Feature",
   "pricing.compare_subtitle": "What each plan includes, flat.",
   "pricing.compare_storage": "Storage",
   "pricing.compare_devices": "Devices",

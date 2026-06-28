@@ -87,6 +87,7 @@
   "pricing.note_lockin_title": "ロックインなし",
   "pricing.note_lockin_body": "各セーブをゲームの元のフォーマットでエクスポート。同じバイナリをいつでもセルフホストできます。",
   "pricing.compare_title": "項目ごとに比較",
+  "pricing.compare_feature": "機能",
   "pricing.compare_subtitle": "各プランに含まれるものを、ありのままに。",
   "pricing.compare_storage": "ストレージ",
   "pricing.compare_devices": "デバイス",

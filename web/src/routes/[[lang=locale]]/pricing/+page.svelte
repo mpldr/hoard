@@ -123,7 +123,7 @@
 
 <section class="mx-auto max-w-6xl px-4 py-16 sm:px-6 sm:py-24">
   <div class="mx-auto max-w-2xl text-center">
-    <p class="kicker justify-center">Pricing</p>
+    <p class="kicker justify-center">{$_('nav.pricing')}</p>
     <h1 class="mt-3 text-balance text-4xl font-semibold text-ink sm:text-5xl">
       {$_('pricing.title')}
     </h1>
@@ -211,7 +211,7 @@
       <div
         class="grid grid-cols-[1.6fr_1fr_1fr] items-center gap-0 border-b border-line bg-bg px-5 py-3 font-mono text-[11px] font-medium uppercase tracking-wider text-ink-faint"
       >
-        <div>Feature</div>
+        <div>{$_('pricing.compare_feature')}</div>
         <div class="text-center">{$_('plan.free')}</div>
         <div class="text-center text-accent">{$_('plan.pro')}</div>
       </div>

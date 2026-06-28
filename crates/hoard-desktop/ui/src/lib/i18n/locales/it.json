@@ -534,6 +534,8 @@
   "account.storage": "Spazio",
   "account.storage_purging": "Liberazione spazio — eliminazione delle versioni di salvataggio più vecchie per restare entro il limite.",
   "account.storage_full": "Spazio pieno — sincronizzazione in pausa. Elimina salvataggi o passa a un piano superiore.",
+  "account.storage_export_warning": "Hai superato il limite e le vecchie versioni dei salvataggi vengono eliminate. Scarica subito una copia di tutti i tuoi dati per non perdere nulla di importante.",
+  "account.storage_downgrade_pending": "Il tuo spazio scenderà a {size} il {date} (ancora {days} giorni). Fino ad allora mantieni lo spazio attuale: esporta i dati o libera spazio prima che si riduca.",
   "account.devices": "Dispositivi",
   "account.saves": "Salvataggi",
   "account.status_active": "Attivo",

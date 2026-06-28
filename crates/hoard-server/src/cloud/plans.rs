@@ -59,7 +59,10 @@ impl Plan {
             },
             Plan::Pro => PlanLimits {
                 plan: self,
-                storage_bytes: 50 * GB,
+                // Base tier (Pro x1). The effective limit can be larger when
+                // the user bought a higher storage tier — see
+                // `effective_storage_limit` and `STORAGE_STEP_BYTES`.
+                storage_bytes: 25 * GB,
                 devices: u32::MAX,
                 saves_tracked: None,
                 version_history_forever: true,
@@ -99,6 +102,30 @@ pub struct PlanLimits {
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
 
+/// Storage tier step. Pro sells in +25 GB increments (Pro x1 = 25 GB base,
+/// x2 = 50, x3 = 75, …). Each step is its own Polar product; the resolved
+/// size is stored per-user in `profiles.storage_limit_bytes` by the webhook.
+/// Kept here so the landing/checkout copy and the server agree on one number.
+pub const STORAGE_STEP_BYTES: u64 = 25 * GB;
+
+/// The storage limit actually enforced for a user, given their plan and the
+/// optional per-user override column (`profiles.storage_limit_bytes`,
+/// NULL = use the plan default).
+///
+/// Free always gets the plan default regardless of any override left behind —
+/// a guard so a stale value from a lapsed Pro tier can never grant a free
+/// account extra room. Pro honours a positive override (the bought tier) and
+/// falls back to the 25 GB base when it's NULL/0.
+pub fn effective_storage_limit(plan: Plan, override_bytes: Option<i64>) -> u64 {
+    match plan {
+        Plan::Free => Plan::Free.limits().storage_bytes,
+        Plan::Pro => match override_bytes {
+            Some(b) if b > 0 => b as u64,
+            _ => Plan::Pro.limits().storage_bytes,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +145,7 @@ mod tests {
     #[test]
     fn pro_limits_match_spec() {
         let l = Plan::Pro.limits();
-        assert_eq!(l.storage_bytes, 50 * GB);
+        assert_eq!(l.storage_bytes, 25 * GB);
         assert_eq!(l.devices, u32::MAX);
         assert_eq!(l.saves_tracked, None);
         assert!(l.version_history_forever);
@@ -137,5 +164,25 @@ mod tests {
         assert_eq!(Plan::from_str("proplus"), Some(Plan::Pro));
         assert_eq!(Plan::from_str("pro+"), Some(Plan::Pro));
         assert_eq!(Plan::from_str("pro_plus"), Some(Plan::Pro));
+    }
+
+    #[test]
+    fn effective_storage_limit_honours_tier_and_guards_free() {
+        // Free ignores any override.
+        assert_eq!(
+            effective_storage_limit(Plan::Free, Some(200 * GB as i64)),
+            1 * GB
+        );
+        assert_eq!(effective_storage_limit(Plan::Free, None), 1 * GB);
+        // Pro falls back to the 25 GB base when NULL/0/negative.
+        assert_eq!(effective_storage_limit(Plan::Pro, None), 25 * GB);
+        assert_eq!(effective_storage_limit(Plan::Pro, Some(0)), 25 * GB);
+        assert_eq!(effective_storage_limit(Plan::Pro, Some(-5)), 25 * GB);
+        // Pro honours a bought tier (e.g. x4 = 100 GB).
+        assert_eq!(
+            effective_storage_limit(Plan::Pro, Some(100 * GB as i64)),
+            100 * GB
+        );
+        assert_eq!(STORAGE_STEP_BYTES, 25 * GB);
     }
 }

@@ -52,6 +52,13 @@ export type CloudAccount = {
    *  being auto-deleted to free room) or `"full"` (red — at the hard limit,
    *  sync stopped). Absent on older servers → treat as `"ok"`. */
   storage_status?: "ok" | "purging" | "full";
+  /** Set while a storage downgrade is scheduled but not yet applied: the limit
+   *  the account will drop to (bytes). During this grace window the user keeps
+   *  the larger limit and nothing is purged. `null`/absent = no pending change. */
+  pending_storage_limit_bytes?: number | null;
+  /** RFC3339 — when the pending downgrade takes effect (end of grace window).
+   *  `null`/absent = no pending change. */
+  storage_limit_change_at?: string | null;
 };
 
 type CloudState = {

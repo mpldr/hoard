@@ -17,7 +17,7 @@
 //! reclaimable size is only the bytes of blobs nothing else references).
 
 use crate::cloud::errors::CloudError;
-use crate::cloud::plans::Plan;
+use crate::cloud::plans::{effective_storage_limit, Plan};
 use crate::cloud::routes::saves::release_blobs;
 use crate::cloud::state::CloudState;
 use uuid::Uuid;
@@ -144,16 +144,21 @@ pub fn plan_quota_purge(
 /// Returns the number of versions deleted. Best-effort and idempotent: safe to
 /// call after every commit.
 pub async fn maybe_purge(state: &CloudState, user_id: Uuid) -> Result<usize, CloudError> {
-    let row: Option<(String, i64)> =
-        sqlx::query_as("SELECT plan, storage_bytes FROM profiles WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-    let Some((plan_s, used)) = row else {
+    // Promote a downgrade whose grace window has elapsed before we read the
+    // limit — until then the user keeps their larger limit and nothing here
+    // purges.
+    crate::cloud::quota::apply_due_downgrade(&state.pool, user_id).await?;
+    let row: Option<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT plan, storage_bytes, storage_limit_bytes FROM profiles WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((plan_s, used, limit_override)) = row else {
         return Ok(0);
     };
     let plan = Plan::from_str(&plan_s).unwrap_or(Plan::Free);
-    let limit = plan.limits().storage_bytes as i64;
+    let limit = effective_storage_limit(plan, limit_override) as i64;
     let target = (limit as f64 * purge_threshold(plan)) as i64;
     if used <= target {
         return Ok(0);

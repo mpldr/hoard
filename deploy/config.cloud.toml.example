@@ -88,16 +88,51 @@ interval = "year"
 # Polar (Merchant of Record). access_token + webhook_secret come from env
 # (HOARD__CLOUD__POLAR__ACCESS_TOKEN / __WEBHOOK_SECRET); product UUIDs go
 # here. The handler at POST /v1/webhooks/polar matches by product_id.
+#
+# Storage tiers: Pro sells in +25 GB steps (Pro x1 = 25 GB, x2 = 50, …).
+# Each step is its OWN Polar product per interval; `storage_gb` tells the
+# server how much that product grants (written to profiles.storage_limit_bytes
+# by the webhook). One entry per (tier, interval). Add x3/x4/… by creating the
+# products in Polar and appending entries here. Omitting `storage_gb` means the
+# plan default (25 GB), which keeps an old single-tier config working.
+#
+# IMPORTANT: replace the placeholder UUIDs with the real product IDs from your
+# Polar dashboard. Downgrades must be issued with proration_behavior=next_period
+# so the limit only shrinks at the period boundary.
+# Grace window (days) a user keeps their old, larger storage limit after
+# downgrading to a tier below their current usage. Nothing is purged during the
+# window and /v1/me advertises the pending change so the app can warn first.
+# Default 14. Cloud-only; self-hosted has no quotas.
+# storage_downgrade_grace_days = 14
+
 [cloud.polar]
 access_token = ""
 webhook_secret = ""
 
+# --- Pro x1 (25 GB) — base ---
 [[cloud.polar.products]]
 product_id = "4404a328-9289-4077-b25b-162ecd1d6ed3"
 plan = "pro"
 interval = "month"
+storage_gb = 25
 
 [[cloud.polar.products]]
 product_id = "77d81015-7c9d-4009-b2a6-e0c0a0901899"
 plan = "pro"
 interval = "year"
+storage_gb = 25
+
+# --- Pro x2 (50 GB) ---
+# [[cloud.polar.products]]
+# product_id = "<polar-uuid-pro-x2-month>"
+# plan = "pro"
+# interval = "month"
+# storage_gb = 50
+#
+# [[cloud.polar.products]]
+# product_id = "<polar-uuid-pro-x2-year>"
+# plan = "pro"
+# interval = "year"
+# storage_gb = 50
+
+# --- Pro x3 (75 GB), x4 (100 GB), x5 (125 GB), x6 (150 GB) … same shape ---

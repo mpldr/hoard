@@ -183,6 +183,12 @@ pub struct CloudConfig {
     /// 402 responses so the client can offer an upgrade link.
     #[serde(default = "default_upgrade_url")]
     pub upgrade_url: String,
+    /// Grace window (days) a user keeps their old, larger storage limit after
+    /// dropping to a smaller tier whose size is below their current footprint.
+    /// Nothing is purged during the window and `/v1/me` advertises the pending
+    /// change. Defaults to 14. Cloud-only — self-hosted has no quotas.
+    #[serde(default = "default_storage_downgrade_grace_days")]
+    pub storage_downgrade_grace_days: u64,
 }
 
 fn default_aud() -> String {
@@ -193,6 +199,9 @@ fn default_jwks_refresh_secs() -> u64 {
 }
 fn default_upgrade_url() -> String {
     "https://hoard.services/upgrade".to_string()
+}
+fn default_storage_downgrade_grace_days() -> u64 {
+    14
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -263,11 +272,41 @@ impl PolarConfig {
     }
 
     /// Resolve our (plan, interval) pair → the Polar product UUID to buy.
+    /// With storage tiers there are several Pro products per interval; this
+    /// returns the smallest-storage one (the base, Pro x1) so callers that
+    /// don't care about a tier get a deterministic default. Use
+    /// `product_for_storage` to pick a specific tier.
     pub fn product_for(&self, plan: &str, interval: &str) -> Option<&str> {
         self.products
             .iter()
-            .find(|p| p.plan == plan && p.interval == interval)
+            .filter(|p| p.plan == plan && p.interval == interval)
+            .min_by_key(|p| p.storage_gb.unwrap_or(0))
             .map(|p| p.product_id.as_str())
+    }
+
+    /// Resolve (plan, interval, storage_gb) → the exact tier's product UUID.
+    /// `storage_gb == None` matches the base product (Pro x1).
+    pub fn product_for_storage(
+        &self,
+        plan: &str,
+        interval: &str,
+        storage_gb: Option<u64>,
+    ) -> Option<&str> {
+        self.products
+            .iter()
+            .find(|p| p.plan == plan && p.interval == interval && p.storage_gb == storage_gb)
+            .map(|p| p.product_id.as_str())
+    }
+
+    /// Storage size (bytes) sold by a given Polar product UUID. `None` if the
+    /// product isn't configured or carries no `storage_gb` (treated as the
+    /// plan default by `effective_storage_limit`).
+    pub fn storage_bytes_for_product(&self, product_id: &str) -> Option<u64> {
+        self.products
+            .iter()
+            .find(|p| p.product_id == product_id)
+            .and_then(|p| p.storage_gb)
+            .map(|gb| gb * 1024 * 1024 * 1024)
     }
 }
 
@@ -276,6 +315,11 @@ pub struct PolarProduct {
     pub product_id: String, // UUID
     pub plan: String,       // 'pro'
     pub interval: String,   // 'month' | 'year'
+    /// Storage this tier grants, in GB (Pro x1 = 25, x2 = 50, …). Written to
+    /// `profiles.storage_limit_bytes` by the webhook. `None`/omitted means the
+    /// plan default (so an old single-tier config keeps working).
+    #[serde(default)]
+    pub storage_gb: Option<u64>,
 }
 
 impl Config {

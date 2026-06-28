@@ -178,6 +178,23 @@
     };
   });
 
+  /** Scheduled storage downgrade not yet in effect. While this is set the user
+   *  keeps their current (larger) limit and nothing is purged — they have
+   *  until `at` to export or trim. `null` when no change is pending. */
+  const pendingDowngrade = $derived.by(() => {
+    const a = account;
+    if (!a?.storage_limit_change_at || a.pending_storage_limit_bytes == null) {
+      return null;
+    }
+    const at = new Date(a.storage_limit_change_at);
+    const days = Math.max(0, Math.ceil((at.getTime() - Date.now()) / 86_400_000));
+    return {
+      newLimitLabel: formatBytes(a.pending_storage_limit_bytes),
+      dateLabel: at.toLocaleDateString(),
+      days,
+    };
+  });
+
   const devicesView = $derived.by(() => {
     const a = account;
     if (!a) return null;
@@ -416,10 +433,52 @@
               style={`width: ${storageView.unlimited ? 100 : storageView.pct}%`}
             ></div>
           </div>
+          {#if pendingDowngrade}
+            <div class="mt-2 rounded-lg border border-sky-500/40 bg-sky-500/10 p-2.5">
+              <p class="text-xs text-sky-200/90">
+                {$_("account.storage_downgrade_pending", {
+                  values: {
+                    size: pendingDowngrade.newLimitLabel,
+                    date: pendingDowngrade.dateLabel,
+                    days: pendingDowngrade.days,
+                  },
+                })}
+              </p>
+              <div class="mt-2">
+                <Button
+                  variant="secondary"
+                  loading={busyAction === "export"}
+                  disabled={busyAction !== null}
+                  onclick={handleExport}
+                >
+                  <Download size={14} />
+                  {$_("account.export_all")}
+                </Button>
+              </div>
+            </div>
+          {/if}
           {#if storageView.status === "purging"}
             <p class="mt-1.5 text-xs text-amber-400">{$_("account.storage_purging")}</p>
           {:else if storageView.status === "full"}
             <p class="mt-1.5 text-xs text-rose-400">{$_("account.storage_full")}</p>
+          {/if}
+          {#if storageView.status === "purging" || storageView.status === "full"}
+            <div
+              class="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5"
+            >
+              <p class="text-xs text-amber-200/90">{$_("account.storage_export_warning")}</p>
+              <div class="mt-2">
+                <Button
+                  variant="secondary"
+                  loading={busyAction === "export"}
+                  disabled={busyAction !== null}
+                  onclick={handleExport}
+                >
+                  <Download size={14} />
+                  {$_("account.export_all")}
+                </Button>
+              </div>
+            </div>
           {/if}
         </div>
       {/if}

@@ -534,6 +534,8 @@
   "account.storage": "Armazenamento",
   "account.storage_purging": "Liberando espaço — apagando suas versões de save mais antigas para não passar do limite.",
   "account.storage_full": "Armazenamento cheio — sincronização pausada. Apague saves ou faça upgrade do plano.",
+  "account.storage_export_warning": "Você passou do seu limite e versões antigas dos saves estão sendo apagadas. Baixe agora uma cópia de todos os seus dados para não perder nada importante.",
+  "account.storage_downgrade_pending": "Seu armazenamento cai para {size} em {date} (faltam {days} dias). Até lá você mantém seu espaço atual: exporte seus dados ou libere espaço antes da redução.",
   "account.devices": "Dispositivos",
   "account.saves": "Saves",
   "account.status_active": "Ativa",

@@ -534,6 +534,8 @@
   "account.storage": "Storage",
   "account.storage_purging": "Freeing space — deleting your oldest save versions to stay under quota.",
   "account.storage_full": "Storage full — sync paused. Delete saves or upgrade to keep syncing.",
+  "account.storage_export_warning": "You're over your quota and old save versions are being deleted. Download a copy of all your data now so nothing important is lost.",
+  "account.storage_downgrade_pending": "Your storage drops to {size} on {date} ({days} days left). You keep your current space until then — export your data or free up room before it shrinks.",
   "account.devices": "Devices",
   "account.saves": "Saves",
   "account.status_active": "Active",

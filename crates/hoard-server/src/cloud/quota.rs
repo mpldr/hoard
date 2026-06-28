@@ -51,17 +51,22 @@ pub async fn load(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Option<(PlanLimits, QuotaInfo)>, CloudError> {
-    let row: Option<(String, i64, i32)> = sqlx::query_as(
-        "SELECT plan, storage_bytes, devices_count FROM profiles WHERE user_id = $1",
+    let row: Option<(String, i64, i32, Option<i64>)> = sqlx::query_as(
+        "SELECT plan, storage_bytes, devices_count, storage_limit_bytes \
+         FROM profiles WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    let Some((plan_s, used, devs)) = row else {
+    let Some((plan_s, used, devs, limit_override)) = row else {
         return Ok(None);
     };
     let plan = Plan::from_str(&plan_s).unwrap_or(Plan::Free);
-    let limits = plan.limits();
+    let mut limits = plan.limits();
+    // Apply the per-user storage tier (Pro xN). Overriding here means every
+    // downstream consumer — including `check_storage`, which reads
+    // `limits.storage_bytes` directly — sees the bought limit.
+    limits.storage_bytes = super::plans::effective_storage_limit(plan, limit_override);
     let info = QuotaInfo {
         plan: plan.as_str(),
         used_bytes: used.max(0) as u64,
@@ -70,6 +75,78 @@ pub async fn load(
         devices_limit: limits.devices,
     };
     Ok(Some((limits, info)))
+}
+
+/// Settle a user's storage limit when a subscription becomes active, given the
+/// tier size the active product grants (`new_override`, bytes; `None` = the
+/// plan base). Called from the Polar webhook.
+///
+/// - Upgrade, or a downgrade that still fits the current footprint → apply
+///   immediately and clear any pending change.
+/// - Downgrade *below* the current footprint → don't shrink now; stash the new
+///   size in `pending_storage_limit_bytes` with a `storage_limit_change_at`
+///   deadline `STORAGE_DOWNGRADE_GRACE_DAYS` out. The user keeps the larger
+///   limit (no purging) until then and `/v1/me` advertises the change.
+pub async fn settle_storage_on_active(
+    pool: &PgPool,
+    user_id: Uuid,
+    plan: Plan,
+    new_override: Option<i64>,
+    grace_days: i64,
+) -> Result<(), CloudError> {
+    use crate::cloud::plans::effective_storage_limit;
+
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT storage_bytes, storage_limit_bytes FROM profiles WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((used, current_override)) = row else {
+        return Ok(());
+    };
+    let used = used.max(0);
+    let current_eff = effective_storage_limit(plan, current_override) as i64;
+    let new_eff = effective_storage_limit(plan, new_override) as i64;
+
+    if new_eff >= current_eff || used <= new_eff {
+        sqlx::query(
+            "UPDATE profiles SET storage_limit_bytes = $1, pending_storage_limit_bytes = NULL, \
+             storage_limit_change_at = NULL, updated_at = now() WHERE user_id = $2",
+        )
+        .bind(new_override)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE profiles SET pending_storage_limit_bytes = $1, \
+             storage_limit_change_at = now() + ($2::int * interval '1 day'), \
+             updated_at = now() WHERE user_id = $3",
+        )
+        .bind(new_override)
+        .bind(grace_days.max(0) as i32)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Promote a pending downgrade whose grace window has elapsed into the live
+/// limit. Idempotent and cheap — call before reading/enforcing the limit
+/// (`get_me`, `maybe_purge`). Rows without a due change are untouched.
+pub async fn apply_due_downgrade(pool: &PgPool, user_id: Uuid) -> Result<(), CloudError> {
+    sqlx::query(
+        "UPDATE profiles SET storage_limit_bytes = pending_storage_limit_bytes, \
+         pending_storage_limit_bytes = NULL, storage_limit_change_at = NULL, updated_at = now() \
+         WHERE user_id = $1 AND storage_limit_change_at IS NOT NULL \
+         AND storage_limit_change_at <= now()",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// True if `used + extra` would exceed `limit`. Saturating add to avoid

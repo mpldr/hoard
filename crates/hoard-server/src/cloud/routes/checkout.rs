@@ -27,6 +27,11 @@ pub struct CheckoutIn {
     pub plan: String,
     /// "month" | "year".
     pub interval: String,
+    /// Storage tier in GB (Pro x1 = 25, x2 = 50, …). Omitted/`None` buys the
+    /// base product. Resolved server-side to the concrete Polar product so
+    /// product IDs never travel through the browser.
+    #[serde(default)]
+    pub storage_gb: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,9 +65,15 @@ pub async fn create_checkout(
         )));
     }
 
-    let product_id = polar.product_for(&body.plan, &body.interval).ok_or_else(|| {
-        warn!(plan = %body.plan, interval = %body.interval, "checkout: no product for plan/interval");
-        CloudError::BadRequest("unknown plan/interval".into())
+    // A specific tier resolves to its exact product; no tier falls back to the
+    // base product for that (plan, interval).
+    let product_id = match body.storage_gb {
+        Some(gb) => polar.product_for_storage(&body.plan, &body.interval, Some(gb)),
+        None => polar.product_for(&body.plan, &body.interval),
+    }
+    .ok_or_else(|| {
+        warn!(plan = %body.plan, interval = %body.interval, storage_gb = ?body.storage_gb, "checkout: no product for plan/interval/tier");
+        CloudError::BadRequest("unknown plan/interval/tier".into())
     })?;
 
     // Polar metadata values must be strings/numbers/bools; user_id as string.

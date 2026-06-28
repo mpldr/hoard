@@ -534,6 +534,8 @@
   "account.storage": "Almacenamiento",
   "account.storage_purging": "Liberando espacio — borrando tus versiones de guardado más antiguas para no pasar del límite.",
   "account.storage_full": "Almacenamiento lleno — sincronización detenida. Borra partidas o mejora tu plan para seguir sincronizando.",
+  "account.storage_export_warning": "Has superado tu límite y se están borrando versiones antiguas de tus guardados. Descarga ahora una copia de todos tus datos para no perder nada importante.",
+  "account.storage_downgrade_pending": "Tu almacenamiento bajará a {size} el {date} (quedan {days} días). Hasta entonces conservas tu espacio actual: exporta tus datos o libera sitio antes de que se reduzca.",
   "account.devices": "Dispositivos",
   "account.saves": "Partidas",
   "account.status_active": "Activa",

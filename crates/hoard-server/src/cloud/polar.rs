@@ -326,6 +326,45 @@ pub async fn handle(
         {
             warn!(error = %e, "polar webhook: profile plan update failed");
         }
+        // Storage tier (Pro xN) this product grants. `None` (base/unconfigured)
+        // means the plan default. Upgrades apply at once; a downgrade below the
+        // user's footprint gets a grace window before it shrinks — see
+        // `settle_storage_on_active`. (Downgrades should be issued with
+        // `proration_behavior=next_period` so the user also keeps the bigger
+        // tier until their paid period ends.)
+        let storage_override: Option<i64> = cloud
+            .polar
+            .storage_bytes_for_product(product_id)
+            .map(|b| b as i64);
+        let plan_enum = crate::cloud::plans::Plan::from_str(plan)
+            .unwrap_or(crate::cloud::plans::Plan::Pro);
+        if let Err(e) = crate::cloud::quota::settle_storage_on_active(
+            &state.pool,
+            user_id,
+            plan_enum,
+            storage_override,
+            cloud.storage_downgrade_grace_days as i64,
+        )
+        .await
+        {
+            warn!(error = ?e, "polar webhook: settling storage tier failed");
+        }
+    } else if status == "expired" {
+        // Access pulled. Clear the tier override (and any pending downgrade) so
+        // a later fall-back to Free can't inherit a stale Pro limit
+        // (belt-and-suspenders; the Free branch of effective_storage_limit
+        // already ignores it).
+        if let Err(e) = sqlx::query(
+            "UPDATE profiles SET storage_limit_bytes = NULL, \
+             pending_storage_limit_bytes = NULL, storage_limit_change_at = NULL, \
+             updated_at = now() WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&state.pool)
+        .await
+        {
+            warn!(error = %e, "polar webhook: clearing storage override failed");
+        }
     }
 
     info!(
@@ -475,11 +514,13 @@ mod tests {
                 product_id: "4404a328-9289-4077-b25b-162ecd1d6ed3".into(),
                 plan: "pro".into(),
                 interval: "month".into(),
+                storage_gb: Some(25),
             },
             PolarProduct {
                 product_id: "77d81015-7c9d-4009-b2a6-e0c0a0901899".into(),
                 plan: "pro".into(),
                 interval: "year".into(),
+                storage_gb: Some(25),
             },
         ];
         assert_eq!(

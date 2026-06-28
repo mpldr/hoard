@@ -534,6 +534,8 @@
   "account.storage": "Stockage",
   "account.storage_purging": "Libération d’espace — suppression de tes plus anciennes versions de sauvegarde pour rester sous le quota.",
   "account.storage_full": "Stockage plein — synchronisation en pause. Supprime des sauvegardes ou passe à un plan supérieur.",
+  "account.storage_export_warning": "Tu as dépassé ton quota et les anciennes versions de sauvegarde sont en cours de suppression. Télécharge dès maintenant une copie de toutes tes données pour ne rien perdre d’important.",
+  "account.storage_downgrade_pending": "Ton stockage passera à {size} le {date} (encore {days} jours). Tu conserves ton espace actuel jusque-là : exporte tes données ou libère de la place avant la réduction.",
   "account.devices": "Appareils",
   "account.saves": "Sauvegardes",
   "account.status_active": "Active",

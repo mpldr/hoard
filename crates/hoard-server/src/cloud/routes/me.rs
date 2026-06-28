@@ -59,6 +59,13 @@ pub struct Me {
     /// - `"full"`    — at the hard limit; nothing left to reclaim, sync uploads
     ///   are rejected (red).
     pub storage_status: &'static str,
+    /// Set when a storage downgrade is scheduled but not yet in effect: the
+    /// limit the account will drop to. The client warns the user to export
+    /// before the deadline. `null` when no change is pending.
+    pub pending_storage_limit_bytes: Option<i64>,
+    /// RFC3339 instant the pending downgrade takes effect (end of the grace
+    /// window). `null` when nothing is pending.
+    pub storage_limit_change_at: Option<String>,
 }
 
 /// Derive the storage gauge state from the deduped footprint vs. the plan's
@@ -91,6 +98,9 @@ pub async fn get_me(
     // the recomputed `devices_count` is the one we return. Best-effort: a
     // client that sends no fingerprint (older builds) leaves the count alone.
     register_device(&state, &user, &headers).await?;
+    // Promote any downgrade whose grace window elapsed, so the limit + status
+    // we report are the live ones.
+    quota::apply_due_downgrade(&state.pool, user.user_id).await?;
 
     let row: (
         String,
@@ -101,8 +111,11 @@ pub async fn get_me(
         i32,
         time::OffsetDateTime,
         i64,
+        Option<i64>,
+        Option<i64>,
+        Option<time::OffsetDateTime>,
     ) = sqlx::query_as(
-        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes
+        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at
            FROM profiles WHERE user_id = $1",
     )
     .bind(user.user_id)
@@ -135,7 +148,14 @@ pub async fn get_me(
             .await?;
 
     let plan = Plan::from_str(&row.3).unwrap_or(Plan::Free);
-    let limits = plan.limits();
+    let mut limits = plan.limits();
+    // Per-user storage tier (Pro xN); NULL falls back to the plan default.
+    limits.storage_bytes = crate::cloud::plans::effective_storage_limit(plan, row.8);
+    // A pending downgrade exists iff a change instant is set; its target limit
+    // resolves the override the same way (NULL pending = the plan base).
+    let pending_change_at = row.10;
+    let pending_limit = pending_change_at
+        .map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
     Ok(Json(Me {
         user_id: user.user_id,
         email: row.0,
@@ -158,6 +178,8 @@ pub async fn get_me(
         storage_status: storage_status(plan, row.4, limits.storage_bytes),
         bandwidth_window_secs: limits.bandwidth_window_secs as i32,
         bandwidth_quota_bytes: bytes_or_unlimited(limits.bandwidth_quota_bytes),
+        pending_storage_limit_bytes: pending_limit,
+        storage_limit_change_at: pending_change_at.map(format_dt),
     }))
 }
 

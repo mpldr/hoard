@@ -1,27 +1,33 @@
 ---
 title: "Como sincronizar saves entre vários PCs"
-description: "Jogue o mesmo jogo no desktop e no notebook sem perder progresso. Aprenda a sincronizar os seus saves entre PCs automaticamente com o Hoard."
+description: "Joga o mesmo jogo no fixo e no portátil sem perder progresso. Sincroniza os teus saves entre PCs automaticamente com o Hoard — sincronização na nuvem gerida, sem configurar o Ludusavi e o Rclone à mão."
 order: 2
-updated: 2026-06-16
+updated: 2026-06-28
 ---
 
-Se você joga em mais de um computador — um desktop em casa e um notebook na rua — o Hoard mantém os seus saves sincronizados para você sempre continuar de onde parou.
+Se jogas em mais de um computador — um fixo em casa e um portátil em viagem — o Hoard mantém os teus saves sincronizados para que retomes sempre onde paraste.
 
-## Como a sincronização funciona
+## Como funciona a sincronização
 
-O Hoard faz backup de cada save na sua nuvem e baixa a versão mais recente nas suas outras máquinas. Quando você termina de jogar em um PC, o save mais novo já está esperando no próximo.
+O Hoard faz backup de cada save para a tua nuvem e descarrega a versão mais recente nas tuas outras máquinas. Quando acabas de jogar num PC, o save mais recente espera-te no seguinte.
 
-## Configure a sincronização
+## Configurar a sincronização
 
-1. Instale o **Hoard** em todos os PCs em que você joga (Windows, macOS ou Linux).
-2. Faça login com a **mesma conta** em cada máquina, ou conecte-as ao mesmo servidor self-hosted.
-3. Adicione os mesmos jogos à sua **Biblioteca** em cada PC. O Hoard os relaciona por jogo, então um save feito em um aparece nos outros.
-4. Deixe o **modo automático** ligado. O Hoard envia depois que você joga e baixa a versão mais recente antes de você começar.
+1. Instala o **Hoard** em cada PC onde jogas (Windows, macOS ou Linux).
+2. Inicia sessão com a **mesma conta** em cada máquina, ou liga-as ao mesmo servidor self-hosted.
+3. Adiciona os mesmos jogos à **Biblioteca** em cada PC. O Hoard associa-os por jogo, por isso um save feito num aparece nos outros.
+4. Mantém o **modo automático** ligado. O Hoard envia depois de jogares e descarrega a versão mais recente antes de começares.
 
-## Evitando conflitos
+## Vens do Ludusavi?
 
-O Hoard considera conflitos: compara os horários de modificação e mantém uma cópia local de qualquer save substituído, então uma sincronização nunca destrói progresso silenciosamente. Se um jogo ainda estiver aberto ou um save foi alterado nos últimos minutos, o Hoard espera.
+O Ludusavi é uma excelente ferramenta open source para fazer backup e restaurar saves localmente, e pode enviar esses backups para uma nuvem que configuras tu mesmo com o Rclone. Mas a sincronização entre dispositivos montas tu à mão: agendar o backup, configurar o remoto, e depois restaurar no outro PC antes de jogar.
+
+O Hoard transforma isso em sincronização gerida. Usa os mesmos dados comunitários de localização do Ludusavi para encontrar os teus saves, depois envia após cada sessão e descarrega a versão mais recente antes da seguinte — em cada PC da tua conta, com histórico versionado na nuvem. Sem remotos de Rclone, sem scripts. E como o Ludusavi, o Hoard é open source e pode ser self-hosted. Vê a [comparação completa com o Ludusavi](/guides/ludusavi-alternative).
+
+## Evitar conflitos
+
+O Hoard tem em conta os conflitos: compara as datas de modificação e guarda uma cópia local de qualquer save substituído, por isso uma sincronização nunca destrói progresso em silêncio. Se um jogo ainda estiver aberto ou um save foi tocado nos últimos minutos, o Hoard espera.
 
 ## Dica
 
-Dê a cada máquina um momento para terminar a sincronização antes de abrir um jogo — o painel mostra o status ao vivo, então você sabe que o save mais recente está no lugar.
+Dá a cada máquina um momento para terminar a sincronização antes de abrires um jogo — o painel mostra o estado em tempo real, por isso sabes que o save mais recente já está no sítio.

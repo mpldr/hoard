@@ -32,7 +32,7 @@
   // fragment never reaches the loopback server, and on Linux/Windows the OS
   // scheme handler frequently drops it from argv too. There's no log-leak
   // concern — 127.0.0.1 stays on the box and `hoard://` never hits a server.
-  function bounceToApp(s: Session) {
+  async function bounceToApp(s: Session) {
     const port = $page.url.searchParams.get('port');
     // CSRF nonce minted by the desktop app. Both handoff paths reject the
     // login unless we echo it back verbatim: the loopback listener checks it
@@ -49,10 +49,23 @@
       : `hoard://auth/callback?${qs}`;
     handoffUrl = url;
     message = $_('callback.desktop_return');
+    // The desktop app now owns this session. Drop the browser's copy so
+    // supabase-js doesn't keep auto-refreshing it in the background: two
+    // clients refreshing the same rotating refresh token make the second use
+    // trip GoTrue's reuse-detection ("refresh_token_already_used"), which
+    // revokes the whole family and silently signs out BOTH the browser and the
+    // app. scope:'local' only clears this browser's stored session — it does
+    // NOT revoke the token server-side, so the tokens we just handed the app
+    // stay valid.
+    try {
+      await supabase.auth.signOut({ scope: 'local' });
+    } catch {
+      // best-effort: a failed local sign-out must not block the handoff.
+    }
     window.location.href = url;
   }
 
-  function done(s: Session) {
+  async function done(s: Session) {
     if (isDesktop()) {
       bounceToApp(s);
       return;

@@ -188,9 +188,9 @@
   <!-- MOBILE: stacked plan cards -->
   <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
     <!-- Free card -->
-    <div class="relative overflow-hidden rounded-2xl border border-accent/20 bg-surface p-5">
+    <div class="relative overflow-hidden rounded-2xl border border-accent/25 bg-accent-tint/40 p-5">
       <div
-        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.07] to-transparent"
+        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.06] to-transparent"
       ></div>
       <div class="relative flex items-baseline justify-between gap-3">
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
@@ -278,8 +278,7 @@
         class="pointer-events-none absolute inset-0 grid grid-cols-[1.5fr_1fr_1.15fr]"
         aria-hidden="true"
       >
-        <div></div>
-        <div></div>
+        <div class="col-span-2 rounded-l-2xl border border-r-0 border-accent/15 bg-accent-tint/40"></div>
         <div
           class="rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
         >

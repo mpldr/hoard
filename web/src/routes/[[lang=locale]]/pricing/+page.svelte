@@ -225,7 +225,7 @@
     <div
       class="relative rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
     >
-      <div class="relative overflow-hidden rounded-[15px] bg-surface p-5">
+      <div class="relative overflow-hidden rounded-[15px] bg-accent-tint p-5">
         <div
           class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] via-accent/[0.03] to-transparent"
         ></div>
@@ -268,16 +268,28 @@
     </div>
   </div>
 
-  <!-- DESKTOP: single comparison table -->
-  <div
-    class="reveal mx-auto mt-12 hidden max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface sm:block"
-    use:reveal
-  >
-    <!-- Header: plan names, price, CTA -->
-    <div class="grid grid-cols-[1.5fr_1fr_1.15fr] items-stretch border-b border-line">
-      <div></div>
-      <!-- Free header -->
-      <div class="flex flex-col gap-2 border-l border-line p-5 text-center">
+  <!-- DESKTOP: single comparison grid; Pro column rendered as a filled,
+       glowing rectangle that spans the whole column. -->
+  <div class="reveal mx-auto mt-12 hidden max-w-3xl sm:block" use:reveal>
+    <div class="relative grid grid-cols-[1.5fr_1fr_1.15fr]">
+      <!-- Background highlight: fills the Pro column with a gradient-bordered
+           green panel across every row. -->
+      <div
+        class="pointer-events-none absolute inset-0 grid grid-cols-[1.5fr_1fr_1.15fr]"
+        aria-hidden="true"
+      >
+        <div></div>
+        <div></div>
+        <div
+          class="rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
+        >
+          <div class="h-full w-full rounded-[15px] bg-accent-tint"></div>
+        </div>
+      </div>
+
+      <!-- Header row -->
+      <div class="relative z-10 border-b border-line"></div>
+      <div class="relative z-10 flex flex-col gap-2 border-b border-l border-line p-5 text-center">
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
         <p class="text-xs text-ink-soft">{$_('pricing.free_forever')}</p>
         <div class="mt-auto pt-2">
@@ -286,39 +298,34 @@
           </Button>
         </div>
       </div>
-      <!-- Pro header (highlighted) -->
-      <div
-        class="relative flex flex-col gap-2 overflow-hidden border-l border-accent/50 bg-accent-tint/40 p-5 text-center"
-      >
-        <div
-          class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] to-transparent"
-        ></div>
+      <div class="relative z-10 flex flex-col gap-2 p-5 text-center">
         <h3
-          class="relative flex items-center justify-center gap-1.5 font-display text-lg font-semibold text-ink"
+          class="flex items-center justify-center gap-1.5 font-display text-lg font-semibold text-ink"
         >
           <Sparkles class="h-4 w-4 text-accent" />Hoard Pro
         </h3>
-        <div class="relative flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
+        <div class="flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
           <span class="font-display text-3xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
           <span class="text-xs text-ink-soft">{proSuffix}</span>
           {#if cycle === 'yearly'}
             <s class="w-full text-xs tabular-nums text-ink-faint">{fullYearLabel}</s>
           {/if}
         </div>
-        <div class="relative mt-auto pt-2">
+        <div class="mt-auto pt-2">
           <Button variant="primary" full onclick={() => choose('pro')}>
             {$_('pricing.cta_buy_pro')}
           </Button>
         </div>
       </div>
-    </div>
 
-    <!-- Feature rows -->
-    {#each rows as row (row.label)}
-      <div
-        class="grid grid-cols-[1.5fr_1fr_1.15fr] items-center border-b border-line text-sm last:border-b-0"
-      >
-        <div class="px-5 py-3 {row.brand ? 'font-medium text-ink' : 'text-ink-soft'}">
+      <!-- Feature rows (each emits 3 grid cells) -->
+      {#each rows as row, i (row.label)}
+        {@const last = i === rows.length - 1}
+        <div
+          class="relative z-10 px-5 py-3 text-sm {last ? '' : 'border-b border-line'} {row.brand
+            ? 'font-medium text-ink'
+            : 'text-ink-soft'}"
+        >
           {#if row.brand}
             <span class="inline-flex items-center gap-1.5">
               <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>{row.label}
@@ -337,16 +344,18 @@
             {row.label}
           {/if}
         </div>
-        <div class="flex items-center justify-center border-l border-line px-2 py-3">
+        <div
+          class="relative z-10 flex items-center justify-center border-l border-line px-2 py-3 text-sm {last
+            ? ''
+            : 'border-b'}"
+        >
           {@render val(row.free, false)}
         </div>
-        <div
-          class="flex items-center justify-center border-l border-accent/40 bg-accent-tint/40 px-2 py-3"
-        >
+        <div class="relative z-10 flex items-center justify-center px-2 py-3 text-sm">
           {@render val(row.pro, true)}
         </div>
-      </div>
-    {/each}
+      {/each}
+    </div>
   </div>
 
   <!-- Notes -->

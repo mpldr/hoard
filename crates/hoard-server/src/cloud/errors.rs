@@ -12,6 +12,13 @@ use serde::Serialize;
 pub enum CloudError {
     Unauthorized(&'static str),
     Forbidden(&'static str),
+    /// Like `Forbidden`, but carries a stable machine-readable `code` so the
+    /// client can localize the message instead of showing the English
+    /// `message` fallback (which older clients that don't know the code show).
+    ForbiddenCode {
+        code: &'static str,
+        message: &'static str,
+    },
     NotFound(&'static str),
     BadRequest(String),
     Conflict(&'static str),
@@ -36,6 +43,9 @@ impl IntoResponse for CloudError {
                 (StatusCode::UNAUTHORIZED, "unauthorized", (*m).to_string())
             }
             CloudError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", (*m).to_string()),
+            CloudError::ForbiddenCode { code, message } => {
+                (StatusCode::FORBIDDEN, *code, (*message).to_string())
+            }
             CloudError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", (*m).to_string()),
             CloudError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
             CloudError::Conflict(m) => (StatusCode::CONFLICT, "conflict", (*m).to_string()),

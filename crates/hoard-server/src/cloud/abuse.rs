@@ -10,12 +10,11 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 /// Max distinct *free* accounts we let share one device fingerprint. Pro
-/// accounts don't count toward it and are never blocked — they paid. Generous
-/// on purpose: a household sharing one PC stays under it, while bulk
-/// free-account farming on a single machine trips it. The fingerprint is
-/// client-supplied and the client is open source, so this is a speed bump for
-/// casual abuse, not a cryptographic barrier — don't over-invest in it.
-pub const MAX_FREE_ACCOUNTS_PER_DEVICE: i64 = 3;
+/// accounts don't count toward it and are never blocked — they paid. The
+/// fingerprint is client-supplied and the client is open source, so this is a
+/// speed bump for casual abuse, not a cryptographic barrier — don't
+/// over-invest in it.
+pub const MAX_FREE_ACCOUNTS_PER_DEVICE: i64 = 2;
 
 /// Collapse an email to a canonical identity so aliases of the same inbox map
 /// to one value:

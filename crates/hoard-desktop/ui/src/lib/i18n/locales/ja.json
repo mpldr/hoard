@@ -514,6 +514,7 @@
   "account.signin_hint": "Google・GitHub・Discord・Apple のいずれかでサインインできるよう、ブラウザを開きます。",
   "account.signin_success": "Hoard Cloud にサインインしました。",
   "account.signin_failed": "サインインに失敗しました: {error}",
+  "errors.device_free_cap": "ごめんなさい、あなたのせいではありません。Hoard の無料プランは贈り物です。これを提供し続けるために、同じデバイスで複数のアカウントを許可することはできません。ここで別のアカウントを追加するには Pro にアップグレードしてください。",
   "account.session_expired": "Hoard Cloud のセッションが期限切れになりました。もう一度サインインしてください。",
   "account.opened_browser": "ブラウザでサインインを開きました。",
   "account.feature_storage": "ストレージ",

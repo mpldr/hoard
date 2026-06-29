@@ -514,6 +514,7 @@
   "account.signin_hint": "Abrimos o navegador para você entrar com Google, GitHub, Discord ou Apple.",
   "account.signin_success": "Conectado à Hoard Cloud.",
   "account.signin_failed": "Falha no login: {error}",
+  "errors.device_free_cap": "Desculpe — não é você. O plano Free do Hoard é um presente e, para podermos continuar a oferecê-lo, não podemos permitir várias contas no mesmo dispositivo. Faça upgrade para o Pro para adicionar outra conta aqui.",
   "account.session_expired": "Sua sessão do Hoard Cloud expirou. Faça login novamente.",
   "account.opened_browser": "Login aberto no navegador.",
   "account.feature_storage": "Armazenamento",

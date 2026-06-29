@@ -514,6 +514,7 @@
   "account.signin_hint": "Wir öffnen deinen Browser, damit du dich mit Google, GitHub, Discord oder Apple anmelden kannst.",
   "account.signin_success": "Bei Hoard Cloud angemeldet.",
   "account.signin_failed": "Anmeldung fehlgeschlagen: {error}",
+  "errors.device_free_cap": "Tut uns leid – es liegt nicht an dir. Hoards Free-Tarif ist ein Geschenk, und damit wir ihn weiter verschenken können, dürfen wir nicht mehrere Konten auf demselben Gerät zulassen. Wechsle zu Pro, um hier ein weiteres Konto hinzuzufügen.",
   "account.session_expired": "Deine Hoard-Cloud-Sitzung ist abgelaufen. Melde dich erneut an.",
   "account.opened_browser": "Anmeldung in deinem Browser geöffnet.",
   "account.feature_storage": "Speicher",

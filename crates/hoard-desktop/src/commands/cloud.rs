@@ -984,11 +984,27 @@ fn format_http_error(status: StatusCode, body: &str) -> String {
         return body.to_string();
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        // Errors with a known machine-readable `code` are localized in the UI:
+        // we return `i18n:<key>` and the Svelte layer renders the translation.
+        if let Some(code) = v.get("code").and_then(|x| x.as_str()) {
+            if let Some(key) = i18n_key_for_code(code) {
+                return format!("i18n:{key}");
+            }
+        }
         if let Some(msg) = v.get("error").and_then(|x| x.as_str()) {
             return format!("Hoard Cloud: {msg} ({status})");
         }
     }
     format!("Hoard Cloud returned {status}: {body}")
+}
+
+/// Map a server error `code` to a UI i18n key, when the client knows it. The
+/// English `error` text is the fallback for codes we don't recognise.
+fn i18n_key_for_code(code: &str) -> Option<&'static str> {
+    match code {
+        "device_free_cap" => Some("errors.device_free_cap"),
+        _ => None,
+    }
 }
 
 fn prettify(err: anyhow::Error) -> String {

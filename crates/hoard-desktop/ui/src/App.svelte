@@ -253,7 +253,14 @@
       },
       (e) => {
         const msg = typeof e === "string" ? e : (e as Error).message;
-        toastInfo($_("account.signin_failed", { values: { error: msg } }));
+        // The Rust side returns `i18n:<key>` for errors that should be shown
+        // localized (e.g. the per-device free-account cap). Render the
+        // translation on its own instead of wrapping it in "sign-in failed".
+        if (msg.startsWith("i18n:")) {
+          toastInfo($_(msg.slice(5)));
+        } else {
+          toastInfo($_("account.signin_failed", { values: { error: msg } }));
+        }
       },
     );
 

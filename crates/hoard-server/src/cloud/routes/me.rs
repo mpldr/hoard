@@ -320,9 +320,14 @@ async fn enforce_device_account_cap(
     .await?;
 
     if count >= abuse::MAX_FREE_ACCOUNTS_PER_DEVICE {
-        return Err(CloudError::Forbidden(
-            "too many free accounts on this device — upgrade to Pro to add more",
-        ));
+        // Coded so the client can localize it; the message is the English
+        // fallback older clients render verbatim.
+        return Err(CloudError::ForbiddenCode {
+            code: "device_free_cap",
+            message: "Sorry — it's not you. Hoard's Free plan is a gift, and to keep \
+                      giving it away we can't allow several accounts on the same device. \
+                      Upgrade to Pro to add another account here.",
+        });
     }
     Ok(())
 }

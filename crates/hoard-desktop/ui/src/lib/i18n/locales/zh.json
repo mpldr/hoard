@@ -514,6 +514,7 @@
   "account.signin_hint": "我们会打开浏览器,使用 Google、GitHub、Discord 或 Apple 登录。",
   "account.signin_success": "已登录 Hoard 云。",
   "account.signin_failed": "登录失败:{error}",
+  "errors.device_free_cap": "抱歉,不是你的问题。Hoard 的免费套餐是一份礼物,为了能继续免费提供,我们无法允许同一设备上存在多个账户。升级到 Pro 即可在此添加另一个账户。",
   "account.session_expired": "你的 Hoard 云会话已过期。请重新登录。",
   "account.opened_browser": "已在浏览器中打开登录。",
   "account.feature_storage": "存储空间",

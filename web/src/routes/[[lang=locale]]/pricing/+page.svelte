@@ -188,9 +188,9 @@
   <!-- MOBILE: stacked plan cards -->
   <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
     <!-- Free card -->
-    <div class="relative overflow-hidden rounded-2xl border border-line-strong bg-surface p-5">
+    <div class="relative overflow-hidden rounded-2xl border border-accent/20 bg-surface p-5">
       <div
-        class="pointer-events-none absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-white/[0.03] to-transparent"
+        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.07] to-transparent"
       ></div>
       <div class="relative flex items-baseline justify-between gap-3">
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
@@ -221,16 +221,17 @@
       </div>
     </div>
 
-    <!-- Pro card (highlighted) -->
+    <!-- Pro card (highlighted) — gradient border on all 4 sides, hermetic -->
     <div
-      class="relative overflow-hidden rounded-2xl border border-accent/60 bg-surface p-5 shadow-xl shadow-accent-deep/25 ring-1 ring-accent/15"
+      class="relative rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
     >
-      <div
-        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] via-accent/[0.03] to-transparent"
-      ></div>
-      <div
-        class="pointer-events-none absolute -right-20 -top-20 h-44 w-44 rounded-full bg-accent/20 blur-3xl"
-      ></div>
+      <div class="relative overflow-hidden rounded-[15px] bg-surface p-5">
+        <div
+          class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] via-accent/[0.03] to-transparent"
+        ></div>
+        <div
+          class="pointer-events-none absolute -right-20 -top-20 h-44 w-44 rounded-full bg-accent/20 blur-3xl"
+        ></div>
       <div class="relative flex items-start justify-between gap-3">
         <h3 class="flex items-center gap-1.5 font-display text-lg font-semibold text-ink">
           <Sparkles class="h-4 w-4 text-accent" />Hoard Pro
@@ -262,6 +263,7 @@
         <Button variant="primary" full onclick={() => choose('pro')}>
           {$_('pricing.cta_buy_pro')}
         </Button>
+      </div>
       </div>
     </div>
   </div>

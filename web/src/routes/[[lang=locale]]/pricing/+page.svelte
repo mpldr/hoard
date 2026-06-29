@@ -173,17 +173,97 @@
     </span>
   </div>
 
-  <!-- Single comparison table -->
+  {#snippet val(cell: Cell, pro: boolean)}
+    {#if cell.kind === 'text'}
+      <span class="font-mono text-xs {pro ? 'font-medium text-accent' : 'text-ink-soft'}"
+        >{cell.value}</span
+      >
+    {:else if cell.kind === 'check'}
+      <Check class="h-4 w-4 shrink-0 {pro ? 'text-accent' : 'text-ink-soft'}" />
+    {:else}
+      <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-ink-faint/50"></span>
+    {/if}
+  {/snippet}
+
+  <!-- MOBILE: stacked plan cards -->
+  <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
+    <!-- Free card -->
+    <div class="rounded-2xl border border-line bg-surface p-5">
+      <div class="flex items-baseline justify-between gap-3">
+        <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
+        <span class="text-sm text-ink-soft">{$_('pricing.free_forever')}</span>
+      </div>
+      <ul class="mt-4 space-y-3 text-sm">
+        {#each rows as row (row.label)}
+          <li class="flex items-center justify-between gap-3">
+            <span class={row.brand && row.free.kind === 'none' ? 'text-ink-faint' : 'text-ink-soft'}>
+              {row.label}
+            </span>
+            {#if row.brand && row.free.kind === 'none'}
+              <span
+                class="shrink-0 rounded-full bg-bg px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint"
+              >
+                {$_('pricing.pro_only')}
+              </span>
+            {:else}
+              {@render val(row.free, false)}
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      <div class="mt-5">
+        <Button variant="secondary" full onclick={() => choose('free')}>
+          {$_('pricing.cta_download_free')}
+        </Button>
+      </div>
+    </div>
+
+    <!-- Pro card (highlighted) -->
+    <div class="rounded-2xl border border-accent/40 bg-accent-tint/30 p-5">
+      <div class="flex items-start justify-between gap-3">
+        <h3 class="font-display text-lg font-semibold text-ink">Hoard Pro</h3>
+        <div class="text-right">
+          <div class="flex items-baseline justify-end gap-1">
+            <span class="font-display text-2xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
+            <span class="text-xs text-ink-soft">{proSuffix}</span>
+          </div>
+          {#if cycle === 'yearly'}
+            <s class="text-xs tabular-nums text-ink-faint">{fullYearLabel}</s>
+          {/if}
+        </div>
+      </div>
+      <ul class="mt-4 space-y-3 text-sm">
+        {#each rows as row (row.label)}
+          <li>
+            <div class="flex items-center justify-between gap-3">
+              <span class={row.brand ? 'font-medium text-ink' : 'text-ink-soft'}>{row.label}</span>
+              {@render val(row.pro, true)}
+            </div>
+            {#if row.brand && row.info}
+              <p class="mt-1 text-xs leading-relaxed text-ink-faint">{$_(row.info)}</p>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      <div class="mt-5">
+        <Button variant="primary" full onclick={() => choose('pro')}>
+          {$_('pricing.cta_buy_pro')}
+        </Button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DESKTOP: single comparison table -->
   <div
-    class="reveal mx-auto mt-12 max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface"
+    class="reveal mx-auto mt-12 hidden max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface sm:block"
     use:reveal
   >
     <!-- Header: plan names, price, CTA -->
     <div class="grid grid-cols-[1.5fr_1fr_1.15fr] items-stretch border-b border-line">
-      <div class="hidden sm:block"></div>
+      <div></div>
       <!-- Free header -->
-      <div class="flex flex-col gap-2 border-l border-line p-4 text-center sm:p-5">
-        <h3 class="font-display text-base font-semibold text-ink sm:text-lg">Hoard Free</h3>
+      <div class="flex flex-col gap-2 border-l border-line p-5 text-center">
+        <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
         <p class="text-xs text-ink-soft">{$_('pricing.free_forever')}</p>
         <div class="mt-auto pt-2">
           <Button variant="secondary" full onclick={() => choose('free')}>
@@ -192,18 +272,14 @@
         </div>
       </div>
       <!-- Pro header (highlighted) -->
-      <div
-        class="relative flex flex-col gap-2 border-l border-accent/40 bg-accent-tint/40 p-4 text-center sm:p-5"
-      >
-        <h3 class="font-display text-base font-semibold text-ink sm:text-lg">Hoard Pro</h3>
+      <div class="flex flex-col gap-2 border-l border-accent/40 bg-accent-tint/40 p-5 text-center">
+        <h3 class="font-display text-lg font-semibold text-ink">Hoard Pro</h3>
         <div class="flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
-          <span class="font-display text-2xl font-bold tabular-nums text-ink sm:text-3xl">
-            {proPriceLabel}
-          </span>
+          <span class="font-display text-3xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
           <span class="text-xs text-ink-soft">{proSuffix}</span>
-          {#if cycle === 'yearly'}<s class="w-full text-xs tabular-nums text-ink-faint"
-              >{fullYearLabel}</s
-            >{/if}
+          {#if cycle === 'yearly'}
+            <s class="w-full text-xs tabular-nums text-ink-faint">{fullYearLabel}</s>
+          {/if}
         </div>
         <div class="mt-auto pt-2">
           <Button variant="primary" full onclick={() => choose('pro')}>
@@ -214,13 +290,11 @@
     </div>
 
     <!-- Feature rows -->
-    {#each rows as row, i (row.label)}
+    {#each rows as row (row.label)}
       <div
         class="grid grid-cols-[1.5fr_1fr_1.15fr] items-center border-b border-line text-sm last:border-b-0"
       >
-        <div
-          class="px-4 py-3 sm:px-5 {row.brand ? 'font-medium text-ink' : 'text-ink-soft'}"
-        >
+        <div class="px-5 py-3 {row.brand ? 'font-medium text-ink' : 'text-ink-soft'}">
           {#if row.brand}
             <span class="inline-flex items-center gap-1.5">
               <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>{row.label}
@@ -239,28 +313,13 @@
             {row.label}
           {/if}
         </div>
-        <!-- Free cell -->
-        <div class="flex items-center justify-center border-l border-line px-2 py-3 text-center">
-          {#if row.free.kind === 'text'}
-            <span class="font-mono text-xs text-ink-soft">{row.free.value}</span>
-          {:else if row.free.kind === 'check'}
-            <Check class="h-4 w-4 text-ink-soft" />
-          {:else}
-            <span class="h-1.5 w-1.5 rounded-full bg-ink-faint/50" title={$_('pricing.pro_only')}
-            ></span>
-          {/if}
+        <div class="flex items-center justify-center border-l border-line px-2 py-3">
+          {@render val(row.free, false)}
         </div>
-        <!-- Pro cell -->
         <div
-          class="flex items-center justify-center border-l border-accent/40 bg-accent-tint/40 px-2 py-3 text-center"
+          class="flex items-center justify-center border-l border-accent/40 bg-accent-tint/40 px-2 py-3"
         >
-          {#if row.pro.kind === 'text'}
-            <span class="font-mono text-xs font-medium text-accent">{row.pro.value}</span>
-          {:else if row.pro.kind === 'check'}
-            <Check class="h-4 w-4 text-accent" />
-          {:else}
-            <span class="h-1.5 w-1.5 rounded-full bg-ink-faint/50"></span>
-          {/if}
+          {@render val(row.pro, true)}
         </div>
       </div>
     {/each}

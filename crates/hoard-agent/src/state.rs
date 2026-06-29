@@ -78,6 +78,21 @@ pub struct CliState {
     /// the other. `default` keeps older `state.json` files loading.
     #[serde(default)]
     pub playtime_excluded: HashSet<String>,
+    /// Cloud account (`/v1/me` user_id) the `saves` map was last synced
+    /// against. The save↔remote mapping in [`Self::saves`] (and especially
+    /// each row's `last_version_num`) is per-account: a `save_id` and its
+    /// version counter only mean anything for the account that owns it on the
+    /// server. When the user signs into a *different* account, replaying the
+    /// previous account's `last_version_num` makes the next upload claim a
+    /// `base_version` the new account's save has never had → the server
+    /// rejects it `non_fast_forward` and sync wedges. We stamp the active
+    /// account here and wipe `saves` on a mismatch (see
+    /// [`Self::reset_for_account_switch`]). `None`/absent = never stamped
+    /// (pre-this-field state files, or a fresh install). The device-level
+    /// prefs (`manual_paths`, `ignored_slugs`, `playtime_excluded`) are NOT
+    /// per-account and deliberately survive the switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cloud_account_id: Option<String>,
 }
 
 impl CliState {
@@ -190,11 +205,110 @@ impl CliState {
     pub fn include_playtime(&mut self, slug: &str) {
         self.playtime_excluded.remove(slug);
     }
+
+    /// Reconcile the per-account sync state with the account that just signed
+    /// in. If `account_id` differs from the stamped [`Self::last_cloud_account_id`]
+    /// (including the first stamp after a session existed under another
+    /// account), the `saves` map belongs to the *previous* account — its
+    /// `save_id`s and `last_version_num`s are meaningless (and actively
+    /// harmful: they make the next upload claim a stale `base_version` and get
+    /// rejected `non_fast_forward`). Clear it so detection re-adopts every save
+    /// fresh against the new account, then re-stamp. Device-level prefs
+    /// (`manual_paths`, `ignored_slugs`, `playtime_excluded`) are kept.
+    ///
+    /// Returns `true` when the account changed and `saves` was wiped, so the
+    /// caller can persist and re-seed the agent. A no-op (same account, or the
+    /// very first login on a clean install with no tracked saves) returns
+    /// `false`.
+    pub fn reset_for_account_switch(&mut self, account_id: &str) -> bool {
+        if self.last_cloud_account_id.as_deref() == Some(account_id) {
+            return false;
+        }
+        // First stamp on a clean slate (no prior account, nothing tracked):
+        // adopt the id without disturbing anything.
+        let first_clean_stamp = self.last_cloud_account_id.is_none() && self.saves.is_empty();
+        self.last_cloud_account_id = Some(account_id.to_string());
+        if first_clean_stamp {
+            return false;
+        }
+        let dropped = self.saves.len();
+        self.saves.clear();
+        if dropped > 0 {
+            tracing::info!(
+                account_id,
+                dropped,
+                "state: cloud account changed — cleared per-account save mappings"
+            );
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn save_state(slug: &str) -> SaveState {
+        SaveState {
+            local_path: PathBuf::from(format!("/saves/{slug}")),
+            game_slug: slug.to_string(),
+            label: "default".to_string(),
+            last_backup_at: None,
+            last_version_num: Some(34),
+            paused: false,
+            preset: None,
+            set_hash: None,
+            processes: vec![],
+        }
+    }
+
+    #[test]
+    fn account_switch_wipes_saves_but_keeps_device_prefs() {
+        let mut st = CliState::default();
+        st.saves.insert("save-a".into(), save_state("factorio"));
+        st.set_manual_path("stellaris", PathBuf::from("/data/stellaris"));
+        st.add_ignored_slug("dwarf-fortress".into());
+
+        // First stamp against account A: existing saves means this is NOT a
+        // clean slate, so it counts as a switch and wipes them.
+        assert!(st.reset_for_account_switch("acct-A"));
+        assert!(st.saves.is_empty());
+        // Device-level prefs survive the switch.
+        assert_eq!(st.manual_paths.len(), 1);
+        assert!(st.is_ignored("dwarf-fortress"));
+        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-A"));
+
+        // Re-login to the SAME account is a no-op.
+        st.saves.insert("save-b".into(), save_state("ck3"));
+        assert!(!st.reset_for_account_switch("acct-A"));
+        assert_eq!(st.saves.len(), 1);
+
+        // Switching to a DIFFERENT account wipes again.
+        assert!(st.reset_for_account_switch("acct-B"));
+        assert!(st.saves.is_empty());
+        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-B"));
+    }
+
+    #[test]
+    fn first_login_on_clean_install_is_noop() {
+        // No prior account, nothing tracked: the very first login just adopts
+        // the id without reporting a switch (so the agent isn't needlessly
+        // restarted on a fresh install).
+        let mut st = CliState::default();
+        assert!(!st.reset_for_account_switch("acct-A"));
+        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-A"));
+    }
+
+    #[test]
+    fn account_id_round_trips_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let mut st = CliState::default();
+        st.reset_for_account_switch("acct-A");
+        st.save(&path).unwrap();
+        let loaded = CliState::load(&path).unwrap();
+        assert_eq!(loaded.last_cloud_account_id.as_deref(), Some("acct-A"));
+    }
 
     /// `manual_paths` survives a save → load round-trip and a missing field
     /// in older `state.json` files deserialises as an empty map.

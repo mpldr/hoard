@@ -488,6 +488,44 @@ pub async fn cloud_complete_login(
     save_creds(&access, &refresh, &base, &me).map_err(|e| format!("Couldn't save session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
 
+    // Account-switch hygiene. `state.json`'s save↔remote mappings (and their
+    // per-row `last_version_num` cursors) only mean anything for the account
+    // they were synced against. Signing into a *different* account and then
+    // replaying the old cursors makes the next upload claim a `base_version`
+    // the new account's save never had → the server rejects it
+    // `non_fast_forward` and sync wedges (observed: a save stuck failing to
+    // upload right after switching accounts). Wipe the per-account mappings on
+    // a mismatch so the agent re-adopts every save fresh against this account
+    // — exactly like a clean install linking to existing server saves. Device
+    // prefs (manual paths, ignored slugs, playtime) are NOT per-account and
+    // survive. Runs here, before the frontend re-spawns the agent (which
+    // hydrates from `state.json`), so the agent never sees the stale cursors.
+    match hoard_agent::state::CliState::load_default() {
+        Ok((mut st, path)) => {
+            if st.reset_for_account_switch(&me.user_id) {
+                if let Err(e) = st.save(&path) {
+                    tracing::warn!(error = %e, "cloud: couldn't persist state after account-switch reset");
+                }
+                // A running agent still holds the previous account's slots
+                // (and their version cursors) in memory — logout doesn't stop
+                // it, so a plain disk wipe wouldn't reach it until the next app
+                // launch. Restart it so it re-hydrates from the just-cleared
+                // `state.json`. Only when it was actually running: we don't want
+                // a login to spin up watching where there was none.
+                let running = state.agent.lock().unwrap().is_some();
+                if running {
+                    let _ = crate::commands::agent::stop_agent(app.clone(), app.state()).await;
+                    if let Err(e) =
+                        crate::commands::agent::start_agent(app.clone(), app.state()).await
+                    {
+                        tracing::warn!(error = %e, "cloud: agent restart after account switch failed");
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cloud: couldn't load state for account-switch check"),
+    }
+
     // Boot the cloud-pull poller so LiveStatus has fresh manifest data
     // within `prefs.cloud_poll_interval_secs`. Read the interval from
     // disk so the just-logged-in session honours the user's last choice.

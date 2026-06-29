@@ -8,7 +8,7 @@
   import { reveal } from '$lib/actions/reveal';
   import { get } from 'svelte/store';
   import { localeHref } from '$lib/i18n/href';
-  import { Check, Receipt, Unlock, HelpCircle } from 'lucide-svelte';
+  import { Check, Receipt, Unlock, HelpCircle, Sparkles } from 'lucide-svelte';
 
   let cycle = $state<BillingCycle>('monthly');
 
@@ -219,9 +219,19 @@
     </div>
 
     <!-- Pro card (highlighted) -->
-    <div class="rounded-2xl border border-accent/40 bg-accent-tint/30 p-5">
-      <div class="flex items-start justify-between gap-3">
-        <h3 class="font-display text-lg font-semibold text-ink">Hoard Pro</h3>
+    <div
+      class="relative overflow-hidden rounded-2xl border border-accent/50 bg-gradient-to-b from-accent-tint via-surface to-surface p-5 shadow-xl shadow-accent-deep/20"
+    >
+      <div
+        class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent to-transparent"
+      ></div>
+      <div
+        class="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-accent/15 blur-3xl"
+      ></div>
+      <div class="relative flex items-start justify-between gap-3">
+        <h3 class="flex items-center gap-1.5 font-display text-lg font-semibold text-ink">
+          <Sparkles class="h-4 w-4 text-accent" />Hoard Pro
+        </h3>
         <div class="text-right">
           <div class="flex items-baseline justify-end gap-1">
             <span class="font-display text-2xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
@@ -232,7 +242,7 @@
           {/if}
         </div>
       </div>
-      <ul class="mt-4 space-y-3 text-sm">
+      <ul class="relative mt-4 space-y-3 text-sm">
         {#each rows as row (row.label)}
           <li>
             <div class="flex items-center justify-between gap-3">
@@ -245,7 +255,7 @@
           </li>
         {/each}
       </ul>
-      <div class="mt-5">
+      <div class="relative mt-5">
         <Button variant="primary" full onclick={() => choose('pro')}>
           {$_('pricing.cta_buy_pro')}
         </Button>
@@ -272,8 +282,15 @@
         </div>
       </div>
       <!-- Pro header (highlighted) -->
-      <div class="flex flex-col gap-2 border-l border-accent/40 bg-accent-tint/40 p-5 text-center">
-        <h3 class="font-display text-lg font-semibold text-ink">Hoard Pro</h3>
+      <div
+        class="relative flex flex-col gap-2 overflow-hidden border-l border-accent/40 bg-gradient-to-b from-accent-tint to-surface p-5 text-center"
+      >
+        <div
+          class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent to-transparent"
+        ></div>
+        <h3 class="flex items-center justify-center gap-1.5 font-display text-lg font-semibold text-ink">
+          <Sparkles class="h-4 w-4 text-accent" />Hoard Pro
+        </h3>
         <div class="flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
           <span class="font-display text-3xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
           <span class="text-xs text-ink-soft">{proSuffix}</span>

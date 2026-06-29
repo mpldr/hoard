@@ -46,17 +46,12 @@
       <li use:reveal class="reveal">
         <a
           href={$localeHref(`/guides/${g.slug}`)}
-          class="group block rounded-xl border border-line bg-surface p-5 ring-focus transition-colors hover:border-line-strong"
+          class="group block rounded-xl border p-5 ring-focus transition-colors {g.featured
+            ? 'border-accent bg-accent-tint hover:border-accent-deep'
+            : 'border-line bg-surface hover:border-line-strong'}"
         >
           <div class="flex items-start justify-between gap-4">
             <div>
-              {#if g.featured}
-                <span
-                  class="mb-2 inline-flex items-center rounded-full border border-accent/30 bg-accent-tint px-2.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-accent"
-                >
-                  {$_('guides.featured_badge')}
-                </span>
-              {/if}
               <h2 class="font-display text-lg font-semibold text-ink">{g.title}</h2>
               <p class="mt-1.5 text-sm leading-relaxed text-ink-soft">{g.description}</p>
             </div>

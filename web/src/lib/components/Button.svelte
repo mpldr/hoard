@@ -1,5 +1,5 @@
 <script lang="ts">
-  type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
+  type Variant = 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
   type Size = 'sm' | 'md' | 'lg';
 
   interface Props {
@@ -39,6 +39,8 @@
     primary: 'bg-accent text-pine hover:bg-emerald-300',
     secondary:
       'border border-line-strong bg-surface text-ink hover:border-ink/30 hover:bg-bg',
+    outline:
+      'border border-accent/40 bg-accent/[0.07] text-ink hover:border-accent/70 hover:bg-accent/15',
     ghost: 'text-ink-soft hover:bg-ink/5 hover:text-ink',
     danger: 'bg-red-700 text-white hover:bg-red-600'
   };

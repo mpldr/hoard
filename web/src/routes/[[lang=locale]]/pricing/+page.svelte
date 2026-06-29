@@ -188,7 +188,7 @@
   <!-- MOBILE: stacked plan cards -->
   <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
     <!-- Free card -->
-    <div class="relative overflow-hidden rounded-2xl border border-accent/30 bg-accent/[0.15] p-5">
+    <div class="relative overflow-hidden rounded-2xl border border-accent/25 bg-accent/[0.11] p-5">
       <div
         class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.06] to-transparent"
       ></div>
@@ -215,7 +215,7 @@
         {/each}
       </ul>
       <div class="relative mt-5">
-        <Button variant="secondary" full onclick={() => choose('free')}>
+        <Button variant="outline" full onclick={() => choose('free')}>
           {$_('pricing.cta_download_free')}
         </Button>
       </div>
@@ -278,7 +278,7 @@
         class="pointer-events-none absolute inset-0 grid grid-cols-[1.5fr_1fr_1.15fr]"
         aria-hidden="true"
       >
-        <div class="col-span-2 -mr-4 rounded-l-2xl border border-r-0 border-accent/30 bg-accent/[0.15]"></div>
+        <div class="col-span-2 -mr-4 rounded-l-2xl border border-r-0 border-accent/25 bg-accent/[0.11]"></div>
         <div
           class="rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
         >
@@ -292,7 +292,7 @@
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
         <p class="text-xs text-ink-soft">{$_('pricing.free_forever')}</p>
         <div class="mt-auto pt-2">
-          <Button variant="secondary" full onclick={() => choose('free')}>
+          <Button variant="outline" full onclick={() => choose('free')}>
             {$_('pricing.cta_download_free')}
           </Button>
         </div>

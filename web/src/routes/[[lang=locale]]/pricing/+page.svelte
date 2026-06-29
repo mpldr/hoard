@@ -8,7 +8,7 @@
   import { reveal } from '$lib/actions/reveal';
   import { get } from 'svelte/store';
   import { localeHref } from '$lib/i18n/href';
-  import { Check, Receipt, Unlock, Monitor, BarChart3 } from 'lucide-svelte';
+  import { Check, Receipt, Unlock, HelpCircle } from 'lucide-svelte';
 
   let cycle = $state<BillingCycle>('monthly');
 
@@ -58,7 +58,7 @@
   });
 
   type Cell = { kind: 'text'; value: string } | { kind: 'check' } | { kind: 'none' };
-  type Row = { label: string; brand?: boolean; free: Cell; pro: Cell };
+  type Row = { label: string; brand?: boolean; info?: string; free: Cell; pro: Cell };
 
   const rows: Row[] = $derived([
     {
@@ -94,31 +94,18 @@
     {
       label: 'Hoard Wrapped',
       brand: true,
+      info: 'pricing.wrapped_body',
       free: { kind: 'none' },
       pro: { kind: 'check' }
     },
     {
       label: 'Hoard Screen',
       brand: true,
+      info: 'pricing.screen_body',
       free: { kind: 'none' },
       pro: { kind: 'check' }
     }
   ]);
-
-  const showcase = [
-    {
-      icon: BarChart3,
-      name: 'Hoard Wrapped',
-      title: 'pricing.wrapped_title',
-      body: 'pricing.wrapped_body'
-    },
-    {
-      icon: Monitor,
-      name: 'Hoard Screen',
-      title: 'pricing.screen_title',
-      body: 'pricing.screen_body'
-    }
-  ];
 
   const notes = [
     { icon: Check, title: 'pricing.note_cancel_title', body: 'pricing.note_cancel_body' },
@@ -206,21 +193,17 @@
       </div>
       <!-- Pro header (highlighted) -->
       <div
-        class="relative flex flex-col gap-1 border-l border-accent/40 bg-accent-tint/40 p-4 text-center sm:p-5"
+        class="relative flex flex-col gap-2 border-l border-accent/40 bg-accent-tint/40 p-4 text-center sm:p-5"
       >
-        <span
-          class="absolute left-1/2 top-0 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent-deep px-3 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-white"
-        >
-          {$_('pricing.popular_badge')}
-        </span>
         <h3 class="font-display text-base font-semibold text-ink sm:text-lg">Hoard Pro</h3>
-        <div class="flex flex-wrap items-baseline justify-center gap-x-1.5">
+        <div class="flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
           <span class="font-display text-2xl font-bold tabular-nums text-ink sm:text-3xl">
             {proPriceLabel}
           </span>
-          {#if cycle === 'yearly'}<s class="text-xs tabular-nums text-ink-faint">{fullYearLabel}</s
-            >{/if}
           <span class="text-xs text-ink-soft">{proSuffix}</span>
+          {#if cycle === 'yearly'}<s class="w-full text-xs tabular-nums text-ink-faint"
+              >{fullYearLabel}</s
+            >{/if}
         </div>
         <div class="mt-auto pt-2">
           <Button variant="primary" full onclick={() => choose('pro')}>
@@ -241,6 +224,16 @@
           {#if row.brand}
             <span class="inline-flex items-center gap-1.5">
               <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>{row.label}
+              {#if row.info}
+                <button
+                  type="button"
+                  class="ring-focus inline-grid h-4 w-4 place-items-center rounded-full text-ink-faint transition-colors hover:text-accent"
+                  title={$_(row.info)}
+                  aria-label={$_(row.info)}
+                >
+                  <HelpCircle class="h-3.5 w-3.5" />
+                </button>
+              {/if}
             </span>
           {:else}
             {row.label}
@@ -273,32 +266,8 @@
     {/each}
   </div>
 
-  <!-- Pro-exclusive showcase -->
-  <div class="mt-16 grid gap-5 sm:grid-cols-2">
-    {#each showcase as s, i (s.name)}
-      <div
-        class="reveal flex flex-col rounded-2xl border border-accent/30 bg-accent-tint/30 p-6"
-        use:reveal={{ delay: i * 90 }}
-      >
-        <div class="flex items-center gap-3">
-          <span class="grid h-10 w-10 place-items-center rounded-xl bg-accent-deep text-white">
-            <s.icon class="h-5 w-5" />
-          </span>
-          <div>
-            <p class="font-mono text-[10px] font-medium uppercase tracking-wider text-accent">
-              {$_('pricing.popular_badge')}
-            </p>
-            <h3 class="font-display text-lg font-semibold text-ink">{s.name}</h3>
-          </div>
-        </div>
-        <p class="mt-3 font-medium text-ink">{$_(s.title)}</p>
-        <p class="mt-1.5 text-sm leading-relaxed text-ink-soft">{$_(s.body)}</p>
-      </div>
-    {/each}
-  </div>
-
   <!-- Notes -->
-  <div class="mt-12 grid gap-5 text-sm sm:grid-cols-3">
+  <div class="mt-16 grid gap-5 text-sm sm:grid-cols-3">
     {#each notes as n, i (n.title)}
       <div class="reveal rounded-2xl border border-line bg-surface p-6" use:reveal={{ delay: i * 80 }}>
         <div class="flex items-center gap-2.5">

@@ -23,6 +23,10 @@ kill_timeout = "10s"
   HOARD__LOGGING__LEVEL = "info"
   HOARD__LOGGING__FORMAT = "json"
   HOARD__DATABASE__BACKEND = "postgres"
+  # Per-machine Postgres pool. The Supabase pooler caps session-mode clients at
+  # 15; with up to 3 machines (autoscale) 3×5 = 15 stays under the ceiling.
+  # Avoids "EMAXCONNSESSION max clients reached" rejections under load.
+  HOARD__DATABASE__MAX_CONNECTIONS = "5"
 
 [http_service]
   internal_port = 8082

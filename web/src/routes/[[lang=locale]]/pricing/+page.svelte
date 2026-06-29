@@ -1,61 +1,55 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
-  import PlanCard from '$lib/components/PlanCard.svelte';
   import Seo from '$lib/components/Seo.svelte';
-  import { PLANS, formatPlanQuota, formatMaxSaveSize, formatBandwidthQuota } from '$lib/plans';
+  import Button from '$lib/components/Button.svelte';
+  import { PLANS, formatPlanQuota, formatMaxSaveSize } from '$lib/plans';
   import type { BillingCycle, PlanId } from '$lib/types';
   import { goto } from '$app/navigation';
   import { reveal } from '$lib/actions/reveal';
   import { get } from 'svelte/store';
   import { localeHref } from '$lib/i18n/href';
-  import { Check, Receipt, Unlock } from 'lucide-svelte';
+  import { Check, Receipt, Unlock, Monitor, BarChart3 } from 'lucide-svelte';
 
   let cycle = $state<BillingCycle>('monthly');
 
-  // Yearly discount derived from the real prices in plans.ts — never typed
-  // by hand. 12 × 1,49 € = 17,88 € vs 14,90 € ⇒ 17 % (two months free).
-  const yearlySavingsPct = Math.round(
-    (1 - PLANS.pro.priceYearly / (PLANS.pro.priceMonthly * 12)) * 100
-  );
   let monthlyBtn = $state<HTMLButtonElement | null>(null);
   let yearlyBtn = $state<HTMLButtonElement | null>(null);
   let trackEl = $state<HTMLDivElement | null>(null);
 
-  function choose(plan: PlanId, c: BillingCycle) {
+  function choose(plan: PlanId) {
     if (plan === 'free') {
       goto(get(localeHref)('/download'));
       return;
     }
-    // Hand off to the confirmation flow. It checks for a session (bouncing to
-    // login first if needed), confirms the account, then creates the Polar
-    // checkout server-side. No checkout URL is built client-side anymore.
-    goto(`/checkout?plan=${plan}&cycle=${c}`);
+    goto(`/checkout?plan=${plan}&cycle=${cycle}`);
   }
 
-  // Compute thumb geometry from real button rects so the slider lands
-  // pixel-perfect on whichever tab is active. Uses an effect so the
-  // measurement re-runs when refs land or `cycle` flips.
-  let thumbStyle = $state('opacity:0;');
+  const proPrice = $derived(cycle === 'monthly' ? PLANS.pro.priceMonthly : PLANS.pro.priceYearly);
+  const proPriceLabel = $derived(
+    `${proPrice.toLocaleString('es-ES', { minimumFractionDigits: 2 })} €`
+  );
+  const proSuffix = $derived(cycle === 'monthly' ? $_('pricing.per_month') : $_('pricing.per_year'));
+  // Struck full-year price when yearly is selected (two months free).
+  const fullYearLabel = $derived(
+    `${(PLANS.pro.priceMonthly * 12).toLocaleString('es-ES', { minimumFractionDigits: 2 })} €`
+  );
 
+  // Slider thumb geometry, measured off the real button rects.
+  let thumbStyle = $state('opacity:0;');
   function measure() {
     if (!trackEl || !monthlyBtn || !yearlyBtn) return;
     const trackRect = trackEl.getBoundingClientRect();
     const target = cycle === 'monthly' ? monthlyBtn : yearlyBtn;
-    const targetRect = target.getBoundingClientRect();
-    const left = targetRect.left - trackRect.left;
-    const width = targetRect.width;
-    thumbStyle = `left:${left}px; width:${width}px;`;
+    const r = target.getBoundingClientRect();
+    thumbStyle = `left:${r.left - trackRect.left}px; width:${r.width}px;`;
   }
-
   $effect(() => {
-    // touch reactive deps
     void cycle;
     void trackEl;
     void monthlyBtn;
     void yearlyBtn;
     measure();
   });
-
   $effect(() => {
     if (typeof window === 'undefined') return;
     const onResize = () => measure();
@@ -63,54 +57,68 @@
     return () => window.removeEventListener('resize', onResize);
   });
 
-  type Row = { label: string; free: string; pro: string };
-  const compareRows: Row[] = $derived([
+  type Cell = { kind: 'text'; value: string } | { kind: 'check' } | { kind: 'none' };
+  type Row = { label: string; brand?: boolean; free: Cell; pro: Cell };
+
+  const rows: Row[] = $derived([
     {
-      label: $_('pricing.compare_storage'),
-      free: formatPlanQuota('free'),
-      pro: formatPlanQuota('pro')
+      label: $_('pricing.row_storage'),
+      free: { kind: 'text', value: formatPlanQuota('free') },
+      pro: { kind: 'text', value: formatPlanQuota('pro') }
     },
     {
-      label: $_('pricing.compare_devices'),
-      free: '3',
-      pro: $_('pricing.compare_unlimited')
+      label: $_('pricing.row_devices'),
+      free: { kind: 'text', value: '3' },
+      pro: { kind: 'text', value: $_('pricing.val_unlimited') }
     },
     {
-      label: $_('pricing.compare_saves'),
-      free: $_('pricing.compare_unlimited'),
-      pro: $_('pricing.compare_unlimited')
+      label: $_('pricing.row_history'),
+      free: { kind: 'check' },
+      pro: { kind: 'check' }
     },
     {
-      label: $_('pricing.compare_history'),
-      free: $_('pricing.compare_forever'),
-      pro: $_('pricing.compare_forever')
+      label: $_('pricing.row_save_size'),
+      free: { kind: 'text', value: formatMaxSaveSize('free') },
+      pro: { kind: 'text', value: formatMaxSaveSize('pro') }
     },
     {
-      label: $_('pricing.compare_save_size'),
-      free: formatMaxSaveSize('free'),
-      pro: formatMaxSaveSize('pro')
+      label: $_('pricing.row_sync'),
+      free: { kind: 'check' },
+      pro: { kind: 'check' }
     },
     {
-      label: $_('pricing.compare_bandwidth'),
-      free: formatBandwidthQuota('free'),
-      pro: formatBandwidthQuota('pro')
+      label: $_('pricing.row_export'),
+      free: { kind: 'check' },
+      pro: { kind: 'check' }
     },
     {
-      label: $_('pricing.compare_export'),
-      free: $_('pricing.compare_yes'),
-      pro: $_('pricing.compare_yes')
+      label: 'Hoard Wrapped',
+      brand: true,
+      free: { kind: 'none' },
+      pro: { kind: 'check' }
     },
     {
-      label: $_('pricing.compare_support'),
-      free: $_('pricing.compare_email'),
-      pro: $_('pricing.compare_email')
-    },
-    {
-      label: $_('pricing.compare_selfhost'),
-      free: $_('pricing.compare_anytime'),
-      pro: $_('pricing.compare_anytime')
+      label: 'Hoard Screen',
+      brand: true,
+      free: { kind: 'none' },
+      pro: { kind: 'check' }
     }
   ]);
+
+  const showcase = [
+    {
+      icon: BarChart3,
+      name: 'Hoard Wrapped',
+      title: 'pricing.wrapped_title',
+      body: 'pricing.wrapped_body'
+    },
+    {
+      icon: Monitor,
+      name: 'Hoard Screen',
+      title: 'pricing.screen_title',
+      body: 'pricing.screen_body'
+    }
+  ];
 
   const notes = [
     { icon: Check, title: 'pricing.note_cancel_title', body: 'pricing.note_cancel_body' },
@@ -121,7 +129,7 @@
 
 <Seo path="/pricing" key="pricing" />
 
-<section class="mx-auto max-w-6xl px-4 py-16 sm:px-6 sm:py-24">
+<section class="mx-auto max-w-5xl px-4 py-16 sm:px-6 sm:py-24">
   <div class="mx-auto max-w-2xl text-center">
     <p class="kicker justify-center">{$_('nav.pricing')}</p>
     <h1 class="mt-3 text-balance text-4xl font-semibold text-ink sm:text-5xl">
@@ -132,6 +140,7 @@
     </p>
   </div>
 
+  <!-- Billing toggle -->
   <div class="mt-10 flex flex-col items-center gap-3">
     <div
       bind:this={trackEl}
@@ -170,74 +179,130 @@
       </button>
     </div>
     <span
-      class="inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent-tint px-2.5 py-0.5 font-mono text-[11px] font-medium text-accent transition-opacity duration-300"
+      class="inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent-tint px-2.5 py-0.5 text-[11px] font-semibold text-accent transition-opacity duration-300"
       style="opacity: {cycle === 'yearly' ? '1' : '0.55'};"
     >
-      {$_('pricing.save_badge', { values: { pct: yearlySavingsPct } })}
-      {$_('pricing.toggle_yearly').toLowerCase()}
+      {$_('pricing.yearly_badge')}
     </span>
   </div>
 
-  <div class="mx-auto mt-12 grid max-w-3xl gap-6 sm:grid-cols-2">
-    <div class="reveal" use:reveal={{ delay: 0 }}>
-      <PlanCard
-        plan={PLANS.free}
-        {cycle}
-        onChoose={choose}
-        ctaLabel={$_('pricing.cta_download_free')}
-      />
+  <!-- Single comparison table -->
+  <div
+    class="reveal mx-auto mt-12 max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface"
+    use:reveal
+  >
+    <!-- Header: plan names, price, CTA -->
+    <div class="grid grid-cols-[1.5fr_1fr_1.15fr] items-stretch border-b border-line">
+      <div class="hidden sm:block"></div>
+      <!-- Free header -->
+      <div class="flex flex-col gap-2 border-l border-line p-4 text-center sm:p-5">
+        <h3 class="font-display text-base font-semibold text-ink sm:text-lg">Hoard Free</h3>
+        <p class="text-xs text-ink-soft">{$_('pricing.free_forever')}</p>
+        <div class="mt-auto pt-2">
+          <Button variant="secondary" full onclick={() => choose('free')}>
+            {$_('pricing.cta_download_free')}
+          </Button>
+        </div>
+      </div>
+      <!-- Pro header (highlighted) -->
+      <div
+        class="relative flex flex-col gap-1 border-l border-accent/40 bg-accent-tint/40 p-4 text-center sm:p-5"
+      >
+        <span
+          class="absolute left-1/2 top-0 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent-deep px-3 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-white"
+        >
+          {$_('pricing.popular_badge')}
+        </span>
+        <h3 class="font-display text-base font-semibold text-ink sm:text-lg">Hoard Pro</h3>
+        <div class="flex flex-wrap items-baseline justify-center gap-x-1.5">
+          <span class="font-display text-2xl font-bold tabular-nums text-ink sm:text-3xl">
+            {proPriceLabel}
+          </span>
+          {#if cycle === 'yearly'}<s class="text-xs tabular-nums text-ink-faint">{fullYearLabel}</s
+            >{/if}
+          <span class="text-xs text-ink-soft">{proSuffix}</span>
+        </div>
+        <div class="mt-auto pt-2">
+          <Button variant="primary" full onclick={() => choose('pro')}>
+            {$_('pricing.cta_buy_pro')}
+          </Button>
+        </div>
+      </div>
     </div>
-    <div class="reveal" use:reveal={{ delay: 100 }}>
-      <PlanCard
-        plan={PLANS.pro}
-        {cycle}
-        featured
-        onChoose={choose}
-        ctaLabel={$_('pricing.cta_buy_pro')}
-      />
-    </div>
+
+    <!-- Feature rows -->
+    {#each rows as row, i (row.label)}
+      <div
+        class="grid grid-cols-[1.5fr_1fr_1.15fr] items-center border-b border-line text-sm last:border-b-0"
+      >
+        <div
+          class="px-4 py-3 sm:px-5 {row.brand ? 'font-medium text-ink' : 'text-ink-soft'}"
+        >
+          {#if row.brand}
+            <span class="inline-flex items-center gap-1.5">
+              <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>{row.label}
+            </span>
+          {:else}
+            {row.label}
+          {/if}
+        </div>
+        <!-- Free cell -->
+        <div class="flex items-center justify-center border-l border-line px-2 py-3 text-center">
+          {#if row.free.kind === 'text'}
+            <span class="font-mono text-xs text-ink-soft">{row.free.value}</span>
+          {:else if row.free.kind === 'check'}
+            <Check class="h-4 w-4 text-ink-soft" />
+          {:else}
+            <span class="h-1.5 w-1.5 rounded-full bg-ink-faint/50" title={$_('pricing.pro_only')}
+            ></span>
+          {/if}
+        </div>
+        <!-- Pro cell -->
+        <div
+          class="flex items-center justify-center border-l border-accent/40 bg-accent-tint/40 px-2 py-3 text-center"
+        >
+          {#if row.pro.kind === 'text'}
+            <span class="font-mono text-xs font-medium text-accent">{row.pro.value}</span>
+          {:else if row.pro.kind === 'check'}
+            <Check class="h-4 w-4 text-accent" />
+          {:else}
+            <span class="h-1.5 w-1.5 rounded-full bg-ink-faint/50"></span>
+          {/if}
+        </div>
+      </div>
+    {/each}
   </div>
 
-  <!-- Comparison table -->
-  <div class="reveal mt-24" use:reveal>
-    <div class="mx-auto max-w-2xl text-center">
-      <h2 class="text-balance text-2xl font-semibold text-ink sm:text-3xl">
-        {$_('pricing.compare_title')}
-      </h2>
-      <p class="mt-2 text-sm text-ink-soft">{$_('pricing.compare_subtitle')}</p>
-    </div>
-
-    <div class="mx-auto mt-8 max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface">
+  <!-- Pro-exclusive showcase -->
+  <div class="mt-16 grid gap-5 sm:grid-cols-2">
+    {#each showcase as s, i (s.name)}
       <div
-        class="grid grid-cols-[1.6fr_1fr_1fr] items-center gap-0 border-b border-line bg-bg px-5 py-3 font-mono text-[11px] font-medium uppercase tracking-wider text-ink-faint"
+        class="reveal flex flex-col rounded-2xl border border-accent/30 bg-accent-tint/30 p-6"
+        use:reveal={{ delay: i * 90 }}
       >
-        <div>{$_('pricing.compare_feature')}</div>
-        <div class="text-center">{$_('plan.free')}</div>
-        <div class="text-center text-accent">{$_('plan.pro')}</div>
-      </div>
-      {#each compareRows as row (row.label)}
-        <div
-          class="grid grid-cols-[1.6fr_1fr_1fr] items-center gap-0 border-b border-line px-5 py-3 text-sm last:border-b-0"
-        >
-          <div class="text-ink">{row.label}</div>
-          <div class="text-center font-mono text-xs text-ink-soft">{row.free}</div>
-          <div class="text-center font-mono text-xs font-medium text-accent">{row.pro}</div>
+        <div class="flex items-center gap-3">
+          <span class="grid h-10 w-10 place-items-center rounded-xl bg-accent-deep text-white">
+            <s.icon class="h-5 w-5" />
+          </span>
+          <div>
+            <p class="font-mono text-[10px] font-medium uppercase tracking-wider text-accent">
+              {$_('pricing.popular_badge')}
+            </p>
+            <h3 class="font-display text-lg font-semibold text-ink">{s.name}</h3>
+          </div>
         </div>
-      {/each}
-    </div>
+        <p class="mt-3 font-medium text-ink">{$_(s.title)}</p>
+        <p class="mt-1.5 text-sm leading-relaxed text-ink-soft">{$_(s.body)}</p>
+      </div>
+    {/each}
   </div>
 
   <!-- Notes -->
-  <div class="mt-16 grid gap-5 text-sm sm:grid-cols-3">
+  <div class="mt-12 grid gap-5 text-sm sm:grid-cols-3">
     {#each notes as n, i (n.title)}
-      <div
-        class="reveal rounded-2xl border border-line bg-surface p-6"
-        use:reveal={{ delay: i * 80 }}
-      >
+      <div class="reveal rounded-2xl border border-line bg-surface p-6" use:reveal={{ delay: i * 80 }}>
         <div class="flex items-center gap-2.5">
-          <span
-            class="grid h-8 w-8 place-items-center rounded-lg bg-accent-tint text-accent"
-          >
+          <span class="grid h-8 w-8 place-items-center rounded-lg bg-accent-tint text-accent">
             <n.icon class="h-4 w-4" />
           </span>
           <h3 class="font-semibold text-ink">{$_(n.title)}</h3>

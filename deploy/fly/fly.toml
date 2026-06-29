@@ -27,6 +27,14 @@ kill_timeout = "10s"
   # 15; with up to 3 machines (autoscale) 3×5 = 15 stays under the ceiling.
   # Avoids "EMAXCONNSESSION max clients reached" rejections under load.
   HOARD__DATABASE__MAX_CONNECTIONS = "5"
+  # Per-IP rate limit. Defaults (20/s, burst 60) are too tight for a legit
+  # client: a full library re-sync after install fires a burst of one request
+  # per tracked save, blows past burst 60, and the governor 429s it. The app
+  # then shows "Limitada", waits 60s, retries, and loops forever. Raise the
+  # ceiling so a normal sync passes; this is still a safety net against
+  # runaway loops (the real cost control is the storage/bandwidth quota).
+  HOARD__SERVER__RATE_LIMIT__PER_SECOND = "50"
+  HOARD__SERVER__RATE_LIMIT__BURST = "600"
 
 [http_service]
   internal_port = 8082

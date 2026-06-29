@@ -188,12 +188,15 @@
   <!-- MOBILE: stacked plan cards -->
   <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
     <!-- Free card -->
-    <div class="rounded-2xl border border-line bg-surface p-5">
-      <div class="flex items-baseline justify-between gap-3">
+    <div class="relative overflow-hidden rounded-2xl border border-line-strong bg-surface p-5">
+      <div
+        class="pointer-events-none absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-white/[0.03] to-transparent"
+      ></div>
+      <div class="relative flex items-baseline justify-between gap-3">
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
         <span class="text-sm text-ink-soft">{$_('pricing.free_forever')}</span>
       </div>
-      <ul class="mt-4 space-y-3 text-sm">
+      <ul class="relative mt-4 space-y-3 text-sm">
         {#each rows as row (row.label)}
           <li class="flex items-center justify-between gap-3">
             <span class={row.brand && row.free.kind === 'none' ? 'text-ink-faint' : 'text-ink-soft'}>
@@ -211,7 +214,7 @@
           </li>
         {/each}
       </ul>
-      <div class="mt-5">
+      <div class="relative mt-5">
         <Button variant="secondary" full onclick={() => choose('free')}>
           {$_('pricing.cta_download_free')}
         </Button>
@@ -220,13 +223,13 @@
 
     <!-- Pro card (highlighted) -->
     <div
-      class="relative overflow-hidden rounded-2xl border border-accent/50 bg-gradient-to-b from-accent-tint via-surface to-surface p-5 shadow-xl shadow-accent-deep/20"
+      class="relative overflow-hidden rounded-2xl border border-accent/60 bg-surface p-5 shadow-xl shadow-accent-deep/25 ring-1 ring-accent/15"
     >
       <div
-        class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent to-transparent"
+        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] via-accent/[0.03] to-transparent"
       ></div>
       <div
-        class="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-accent/15 blur-3xl"
+        class="pointer-events-none absolute -right-20 -top-20 h-44 w-44 rounded-full bg-accent/20 blur-3xl"
       ></div>
       <div class="relative flex items-start justify-between gap-3">
         <h3 class="flex items-center gap-1.5 font-display text-lg font-semibold text-ink">
@@ -283,22 +286,24 @@
       </div>
       <!-- Pro header (highlighted) -->
       <div
-        class="relative flex flex-col gap-2 overflow-hidden border-l border-accent/40 bg-gradient-to-b from-accent-tint to-surface p-5 text-center"
+        class="relative flex flex-col gap-2 overflow-hidden border-l border-accent/50 bg-accent-tint/40 p-5 text-center"
       >
         <div
-          class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent to-transparent"
+          class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] to-transparent"
         ></div>
-        <h3 class="flex items-center justify-center gap-1.5 font-display text-lg font-semibold text-ink">
+        <h3
+          class="relative flex items-center justify-center gap-1.5 font-display text-lg font-semibold text-ink"
+        >
           <Sparkles class="h-4 w-4 text-accent" />Hoard Pro
         </h3>
-        <div class="flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
+        <div class="relative flex flex-wrap items-baseline justify-center gap-x-1.5 gap-y-0.5">
           <span class="font-display text-3xl font-bold tabular-nums text-ink">{proPriceLabel}</span>
           <span class="text-xs text-ink-soft">{proSuffix}</span>
           {#if cycle === 'yearly'}
             <s class="w-full text-xs tabular-nums text-ink-faint">{fullYearLabel}</s>
           {/if}
         </div>
-        <div class="mt-auto pt-2">
+        <div class="relative mt-auto pt-2">
           <Button variant="primary" full onclick={() => choose('pro')}>
             {$_('pricing.cta_buy_pro')}
           </Button>

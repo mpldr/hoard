@@ -269,5 +269,6 @@
   "guides.back": "Tutte le guide",
   "guides.updated": "Aggiornato",
   "guides.cta_title": "Pronto a proteggere i tuoi salvataggi?",
-  "guides.cta_text": "Scarica Hoard e configura backup automatici e versionati in un paio di minuti."
+  "guides.cta_text": "Scarica Hoard e configura backup automatici e versionati in un paio di minuti.",
+  "guides.featured_badge": "Importante"
 }

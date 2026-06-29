@@ -16,6 +16,8 @@ export type GuideMeta = {
   description: string;
   /** Lower sorts first in the index. */
   order: number;
+  /** Highlighted with an "important" badge in the index. */
+  featured: boolean;
   /** ISO date of the last meaningful edit; feeds JSON-LD + sitemap. */
   updated: string;
 };
@@ -88,6 +90,7 @@ for (const [path, src] of Object.entries(raw)) {
     title: meta.title ?? slug,
     description: meta.description ?? '',
     order: Number(meta.order ?? 999),
+    featured: meta.featured === 'true',
     updated: meta.updated ?? '',
     // Hardened by the `walkTokens` hook above (raw HTML dropped, unsafe URL
     // schemes neutralized) before it reaches `{@html}`.

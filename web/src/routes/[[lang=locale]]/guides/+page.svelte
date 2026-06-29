@@ -50,6 +50,13 @@
         >
           <div class="flex items-start justify-between gap-4">
             <div>
+              {#if g.featured}
+                <span
+                  class="mb-2 inline-flex items-center rounded-full border border-accent/30 bg-accent-tint px-2.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-accent"
+                >
+                  {$_('guides.featured_badge')}
+                </span>
+              {/if}
               <h2 class="font-display text-lg font-semibold text-ink">{g.title}</h2>
               <p class="mt-1.5 text-sm leading-relaxed text-ink-soft">{g.description}</p>
             </div>

@@ -269,5 +269,6 @@
   "guides.back": "All guides",
   "guides.updated": "Updated",
   "guides.cta_title": "Ready to protect your saves?",
-  "guides.cta_text": "Download Hoard and set up automatic, versioned backups in a couple of minutes."
+  "guides.cta_text": "Download Hoard and set up automatic, versioned backups in a couple of minutes.",
+  "guides.featured_badge": "Important"
 }

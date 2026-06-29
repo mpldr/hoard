@@ -269,5 +269,6 @@
   "guides.back": "Todas las guías",
   "guides.updated": "Actualizado",
   "guides.cta_title": "¿Listo para proteger tus partidas?",
-  "guides.cta_text": "Descarga Hoard y configura copias automáticas y versionadas en un par de minutos."
+  "guides.cta_text": "Descarga Hoard y configura copias automáticas y versionadas en un par de minutos.",
+  "guides.featured_badge": "Importante"
 }

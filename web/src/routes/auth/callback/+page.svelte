@@ -3,7 +3,7 @@
   import { _ } from 'svelte-i18n';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { supabase } from '$lib/auth/supabase';
+  import { supabase, dropLocalSession } from '$lib/auth/supabase';
   import { safeNext } from '$lib/safeNext';
   import { CheckCircle2 } from 'lucide-svelte';
   import type { Session } from '@supabase/supabase-js';
@@ -49,19 +49,12 @@
       : `hoard://auth/callback?${qs}`;
     handoffUrl = url;
     message = $_('callback.desktop_return');
-    // The desktop app now owns this session. Drop the browser's copy so
-    // supabase-js doesn't keep auto-refreshing it in the background: two
-    // clients refreshing the same rotating refresh token make the second use
-    // trip GoTrue's reuse-detection ("refresh_token_already_used"), which
-    // revokes the whole family and silently signs out BOTH the browser and the
-    // app. scope:'local' only clears this browser's stored session — it does
-    // NOT revoke the token server-side, so the tokens we just handed the app
-    // stay valid.
-    try {
-      await supabase.auth.signOut({ scope: 'local' });
-    } catch {
-      // best-effort: a failed local sign-out must not block the handoff.
-    }
+    // The desktop app now owns this session (it shares this tab's refresh-token
+    // family). Stop this tab from auto-refreshing it in the background and drop
+    // its persisted copy — WITHOUT a server-side logout. See dropLocalSession:
+    // signOut({ scope: 'local' }) hits POST /logout and would revoke the shared
+    // session, signing the app out too.
+    await dropLocalSession();
     window.location.href = url;
   }
 

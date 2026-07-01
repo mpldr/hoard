@@ -38,7 +38,7 @@ import type {
 import * as api from "../api";
 import { prefs } from "./prefs";
 import { seedWatcher } from "./live";
-import { toastSuccess, toastError, toastInfo } from "./toasts";
+import { toastSuccess, toastError } from "./toasts";
 
 export type SaveActivity = {
   state:
@@ -240,18 +240,16 @@ function applyEvent(ev: AgentEvent) {
       break;
     }
     case "backup_skipped_empty": {
-      // Saw an fs event that resolved to an empty/missing folder. We did
-      // *not* push an empty snapshot to the server (that would silently
-      // overwrite the user's last good copy). Toast the situation so the
-      // user knows nothing was uploaded and can flip auto-restore on if
-      // they wanted the cloud copy pulled back instead.
+      // The folder resolved to empty/missing so we did *not* push an empty
+      // snapshot (that would silently overwrite the user's last good copy on
+      // the server). This is a benign, recurring condition — the
+      // reconciliation sweep re-checks the folder every cycle, and a
+      // mis-detected/empty tracked folder (or a game that never wrote a save
+      // yet) would fire this on every tick. So don't toast or notify; just
+      // reflect the save as idle. Users who want the cloud copy pulled into an
+      // empty folder enable "Restore from cloud when a save folder is empty"
+      // in Settings.
       patch(ev.save_id, { state: "idle", error: undefined, will_retry: undefined });
-      const t = get(i18n);
-      toastInfo(
-        t("library.backup_skipped_empty_toast", {
-          values: { name: ev.game_slug },
-        }),
-      );
       break;
     }
   }

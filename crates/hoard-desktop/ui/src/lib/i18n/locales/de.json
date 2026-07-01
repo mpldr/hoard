@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Sucht, wo der normale Scan nicht sucht: Wine/Proton-Prefixe, Flatpak, Snap, Emulatoren.",
   "library.auto_restored_toast": "{name} aus der Cloud wiederhergestellt (v{version}, {count, plural, one {# Datei} other {# Dateien}}).",
   "library.auto_restore_failed_toast": "{name} konnte nicht automatisch wiederhergestellt werden: {error}",
-  "library.backup_skipped_empty_toast": "{name} nicht gesichert: der Save-Ordner ist leer. Aktiviere „Cloud-Wiederherstellung“ in den Einstellungen, wenn stattdessen die Cloud-Kopie geholt werden soll.",
+  "library.backup_skipped_empty_toast": "{name} nicht gesichert: der Save-Ordner ist leer. Wenn stattdessen die Cloud-Kopie geholt werden soll, aktiviere „Aus der Cloud wiederherstellen, wenn der Save-Ordner leer ist“ in den Einstellungen.",
   "library.backup_too_large_toast": "{name} konnte nicht gesichert werden: {size} überschreitet das Limit von {limit} pro Spielstand deines Tarifs. Wechsle zu Pro oder verkleinere den Save-Ordner.",
   "library.backup_too_large_generic_toast": "{name} konnte nicht gesichert werden: überschreitet das Größenlimit pro Spielstand deines Tarifs.",
   "library.backup_trimmed_toast": "{name} gesichert, aber dein Tarif reicht nicht: {omitted} ältere Spielstände ({size}) wurden nicht hochgeladen. Wechsle zu Pro, um alle zu behalten.",

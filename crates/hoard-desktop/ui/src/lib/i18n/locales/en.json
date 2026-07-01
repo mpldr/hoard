@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Looks where the normal scan doesn't: Wine/Proton prefixes, Flatpak, Snap, emulators.",
   "library.auto_restored_toast": "Restored {name} from the cloud (v{version}, {count, plural, one {# file} other {# files}}).",
   "library.auto_restore_failed_toast": "Couldn't auto-restore {name}: {error}",
-  "library.backup_skipped_empty_toast": "Didn't back up {name}: the save folder is empty. Turn on auto-restore in Settings if you want the cloud copy pulled back instead.",
+  "library.backup_skipped_empty_toast": "Didn't back up {name}: the save folder is empty. To pull the cloud copy back instead, turn on “Restore from cloud when a save folder is empty” in Settings.",
   "library.backup_too_large_toast": "Couldn't back up {name}: {size} is over your plan's {limit} per-save limit. Upgrade to Pro or trim the save folder.",
   "library.backup_too_large_generic_toast": "Couldn't back up {name}: it's over your plan's per-save size limit.",
   "library.backup_trimmed_toast": "Backed up {name}, but your plan wasn't big enough: {omitted} older saves ({size}) weren't uploaded. Upgrade to Pro to keep them all.",

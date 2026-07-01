@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "查看常规扫描不会检查的位置：Wine/Proton 前缀、Flatpak、Snap、模拟器。",
   "library.auto_restored_toast": "已从云端恢复 {name}（v{version}，{count, plural, other {# 个文件}}）。",
   "library.auto_restore_failed_toast": "无法自动恢复 {name}：{error}",
-  "library.backup_skipped_empty_toast": "未备份 {name}：存档文件夹为空。若想改为从云端拉取备份，请在设置中开启自动恢复。",
+  "library.backup_skipped_empty_toast": "未备份 {name}：存档文件夹为空。若想改为从云端拉取备份，请在设置中开启“存档文件夹为空时从云端恢复”。",
   "library.backup_too_large_toast": "无法备份 {name}：{size} 超过了你套餐每个存档 {limit} 的上限。请升级到 Pro 或精简存档文件夹。",
   "library.backup_too_large_generic_toast": "无法备份 {name}：超过了你套餐每个存档的大小上限。",
   "library.backup_trimmed_toast": "已备份 {name}，但你的套餐容量不足：{omitted} 个较旧的存档（{size}）未上传。升级到 Pro 即可全部保留。",

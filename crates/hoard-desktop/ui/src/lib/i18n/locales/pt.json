@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Procura onde a verificação normal não vai: prefixos Wine/Proton, Flatpak, Snap, emuladores.",
   "library.auto_restored_toast": "{name} restaurado da nuvem (v{version}, {count, plural, one {# ficheiro} other {# ficheiros}}).",
   "library.auto_restore_failed_toast": "Não foi possível restaurar automaticamente {name}: {error}",
-  "library.backup_skipped_empty_toast": "Sem cópia de {name}: a pasta do save está vazia. Ativa a restauração automática nas definições se quiseres que se descarregue a cópia da nuvem.",
+  "library.backup_skipped_empty_toast": "Sem cópia de {name}: a pasta do save está vazia. Se quiseres que se descarregue a cópia da nuvem, ativa “Restaurar da nuvem quando a pasta do save estiver vazia” nas definições.",
   "library.backup_too_large_toast": "Não foi possível fazer backup de {name}: {size} ultrapassa o limite de {limit} por save do teu plano. Muda para Pro ou reduz a pasta do save.",
   "library.backup_too_large_generic_toast": "Não foi possível fazer backup de {name}: ultrapassa o limite de tamanho por save do teu plano.",
   "library.backup_trimmed_toast": "Backup de {name} feito, mas o teu plano não chega: {omitted} saves antigos ({size}) não foram enviados. Muda para Pro para os guardar todos.",

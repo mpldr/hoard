@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Cherche là où l'analyse normale ne va pas : préfixes Wine/Proton, Flatpak, Snap, émulateurs.",
   "library.auto_restored_toast": "{name} restauré depuis le cloud (v{version}, {count, plural, one {# fichier} other {# fichiers}}).",
   "library.auto_restore_failed_toast": "Impossible de restaurer automatiquement {name} : {error}",
-  "library.backup_skipped_empty_toast": "Pas de sauvegarde de {name} : le dossier de sauvegarde est vide. Activez la restauration automatique dans les paramètres pour récupérer la copie du cloud à la place.",
+  "library.backup_skipped_empty_toast": "Pas de sauvegarde de {name} : le dossier de sauvegarde est vide. Pour récupérer la copie du cloud à la place, activez « Restaurer depuis le cloud quand le dossier de sauvegarde est vide » dans les paramètres.",
   "library.backup_too_large_toast": "Impossible de sauvegarder {name} : {size} dépasse la limite de {limit} par sauvegarde de votre offre. Passez à Pro ou réduisez le dossier de sauvegarde.",
   "library.backup_too_large_generic_toast": "Impossible de sauvegarder {name} : dépasse la limite de taille par sauvegarde de votre offre.",
   "library.backup_trimmed_toast": "{name} sauvegardé, mais votre offre ne suffit pas : {omitted} anciennes sauvegardes ({size}) n'ont pas été envoyées. Passez à Pro pour toutes les garder.",

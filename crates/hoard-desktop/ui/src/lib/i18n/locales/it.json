@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Cerca dove la scansione normale non arriva: prefissi Wine/Proton, Flatpak, Snap, emulatori.",
   "library.auto_restored_toast": "{name} ripristinato dal cloud (v{version}, {count, plural, one {# file} other {# file}}).",
   "library.auto_restore_failed_toast": "Impossibile ripristinare automaticamente {name}: {error}",
-  "library.backup_skipped_empty_toast": "Nessun backup di {name}: la cartella del salvataggio è vuota. Attiva il ripristino automatico nelle impostazioni se vuoi recuperare invece la copia dal cloud.",
+  "library.backup_skipped_empty_toast": "Nessun backup di {name}: la cartella del salvataggio è vuota. Se vuoi recuperare invece la copia dal cloud, attiva “Ripristina dal cloud quando la cartella del salvataggio è vuota” nelle impostazioni.",
   "library.backup_too_large_toast": "Impossibile fare il backup di {name}: {size} supera il limite di {limit} per salvataggio del tuo piano. Passa a Pro o riduci la cartella dei salvataggi.",
   "library.backup_too_large_generic_toast": "Impossibile fare il backup di {name}: supera il limite di dimensione per salvataggio del tuo piano.",
   "library.backup_trimmed_toast": "Backup di {name} fatto, ma il tuo piano non basta: {omitted} salvataggi vecchi ({size}) non sono stati caricati. Passa a Pro per tenerli tutti.",

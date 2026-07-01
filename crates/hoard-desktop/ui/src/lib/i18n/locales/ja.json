@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "通常のスキャンが見ない場所を調べます：Wine/Proton プレフィックス、Flatpak、Snap、エミュレーター。",
   "library.auto_restored_toast": "{name} をクラウドから復元しました (v{version}、{count, plural, other {# ファイル}})。",
   "library.auto_restore_failed_toast": "{name} を自動復元できませんでした: {error}",
-  "library.backup_skipped_empty_toast": "{name} はバックアップしませんでした: セーブフォルダーが空です。代わりにクラウドからコピーを取得したい場合は、設定で自動復元をオンにしてください。",
+  "library.backup_skipped_empty_toast": "{name} はバックアップしませんでした: セーブフォルダーが空です。代わりにクラウドからコピーを取得したい場合は、設定で「セーブフォルダーが空のときクラウドから復元」をオンにしてください。",
   "library.backup_too_large_toast": "{name} をバックアップできませんでした: {size} はプランの1セーブあたりの上限 {limit} を超えています。Pro にアップグレードするか、セーブフォルダーを整理してください。",
   "library.backup_too_large_generic_toast": "{name} をバックアップできませんでした: プランの1セーブあたりのサイズ上限を超えています。",
   "library.backup_trimmed_toast": "{name} をバックアップしましたが、プランの容量が足りません: 古いセーブ {omitted} 件（{size}）はアップロードされませんでした。すべて保存するには Pro にアップグレードしてください。",

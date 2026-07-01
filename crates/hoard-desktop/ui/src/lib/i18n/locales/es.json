@@ -175,7 +175,7 @@
   "library.deep_scan_hint": "Mira donde el escaneo normal no: prefijos Wine/Proton, Flatpak, Snap, emuladores.",
   "library.auto_restored_toast": "Se restauró {name} desde la nube (v{version}, {count, plural, one {# archivo} other {# archivos}}).",
   "library.auto_restore_failed_toast": "No se pudo restaurar {name} automáticamente: {error}",
-  "library.backup_skipped_empty_toast": "No se hizo copia de {name}: la carpeta del save está vacía. Activa “Restauración automática” en ajustes si quieres que se descargue la copia de la nube.",
+  "library.backup_skipped_empty_toast": "No se hizo copia de {name}: la carpeta del save está vacía. Si quieres que se descargue la copia de la nube, activa “Restaurar desde la nube cuando la carpeta del save esté vacía” en Ajustes.",
   "library.backup_too_large_toast": "No se pudo subir {name}: {size} supera el límite de {limit} por partida de tu plan. Sube a Pro o reduce la carpeta de guardado.",
   "library.backup_too_large_generic_toast": "No se pudo subir {name}: supera el límite de tamaño por partida de tu plan.",
   "library.backup_trimmed_toast": "Copia de {name} hecha, pero tu plan no llega: {omitted} partidas antiguas ({size}) no se subieron. Sube a Pro para guardarlas todas.",

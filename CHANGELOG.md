@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.4.13] — 2026-07-01
+## [1.0.0] — beta
+
+> **Renumeración.** Hoard pasa a **1.0** como primera beta pública. Toda la
+> numeración anterior (0.x, 1.x dev, 2.x) era de desarrollo: sus tags y
+> releases se han retirado de GitHub y queda una única 1.0. Los bloques de
+> abajo se conservan como histórico interno.
 
 ### Changed
 - **Partidas grandes en Hoard Cloud: la copia funciona aunque tu plan no llegue.**
@@ -2420,7 +2425,7 @@ internationalisation.
 - `set_save_local_path` no longer rejects paths that haven't been
   created yet — it `mkdir -p`s them.
 
-## [1.0.0] — 2026-05-08
+## [1.0.0 dev] — 2026-05-08
 
 First stable release. The desktop app, server, and CLI are now considered
 stable; the HTTP API and on-disk schema will only change in
@@ -2636,5 +2641,3 @@ least once before 1.0.**
 
 [Unreleased]: https://github.com/rleeon/hoard/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/rleeon/hoard/releases/tag/v1.0.0
-[0.2.0]: https://github.com/rleeon/hoard/releases/tag/v0.2.0
-[0.1.0]: https://github.com/rleeon/hoard/releases/tag/v0.1.0

@@ -59,8 +59,6 @@
     initCloudSessionWatch,
     openUpgradePage,
     planLabel,
-    premiumUnlocked,
-    trialDaysLeft,
   } from "./lib/stores/cloud";
   import {
     automaticState,
@@ -68,7 +66,14 @@
   } from "./lib/stores/automatic";
   import { toastInfo, toastSuccess } from "./lib/stores/toasts";
   import { prefs, hydratePrefs } from "./lib/stores/prefs";
-  import { PRO_DEV_UNLOCK } from "./lib/stores/entitlements";
+  import {
+    entitlements,
+    refreshEntitlements,
+    featureDaysLeft,
+    featureUnlocked,
+    PRO_DEV_UNLOCK,
+    type FeatureKey,
+  } from "./lib/stores/entitlements";
   import * as api from "./lib/api";
   import {
     checkForUpdates,
@@ -445,13 +450,16 @@
     icon: typeof Home;
     children: NavLink[];
   };
-  // A premium feature (Hoard-Screen / Hoard-Wrapped): navigable when
-  // `$premiumUnlocked`, otherwise rendered locked with an upgrade CTA.
+  // A premium feature (Hoard-Screen / Hoard-Wrapped): navigable while the
+  // server entitlement allows it — paid Pro, an active trial, or a trial not
+  // yet started (opening the page is what starts the one-week clock).
+  // Otherwise rendered locked with an upgrade CTA.
   type NavFeature = {
     kind: "feature";
     labelKey: string;
     icon: typeof Home;
     route: string;
+    feature: FeatureKey;
   };
   type NavEntry = NavLink | NavGroup | NavFeature;
 
@@ -473,6 +481,19 @@
       /* private mode / storage disabled — toggle still works for the session */
     }
   }
+
+  // Keep the per-feature entitlement snapshot (nav gating + tooltips for
+  // Hoard-Screen / Hoard-Wrapped) in step with the cloud session: boot
+  // hydrate, sign-in, sign-out and account switches all change the account
+  // identity, so key the refresh on `user_id`. The store caches `null` when
+  // signed out, which renders both items locked.
+  let lastEntitlementsUser: string | null | undefined = undefined;
+  $effect(() => {
+    const key = $cloud.account?.user_id ?? null;
+    if (key === lastEntitlementsUser) return;
+    lastEntitlementsUser = key;
+    void refreshEntitlements();
+  });
 
   // Click on a locked premium item. A signed-in cloud user is sent to the
   // pricing page to upgrade; a self-hosted / signed-out user is sent to
@@ -505,8 +526,8 @@
         { kind: "link", labelKey: "nav.map", icon: MapIcon, route: "/map" },
       ],
     },
-    { kind: "feature", labelKey: "nav.hoard_screen", icon: MonitorPlay, route: "/hoard-screen" },
-    { kind: "feature", labelKey: "nav.hoard_wrapped", icon: Sparkles, route: "/hoard-wrapped" },
+    { kind: "feature", labelKey: "nav.hoard_screen", icon: MonitorPlay, route: "/hoard-screen", feature: "screen" },
+    { kind: "feature", labelKey: "nav.hoard_wrapped", icon: Sparkles, route: "/hoard-wrapped", feature: "wrapple" },
     { kind: "link", labelKey: "nav.settings", icon: SettingsIcon, route: "/settings" },
   ]);
 
@@ -636,17 +657,23 @@
             {@render navLink(entry, false)}
           {:else if entry.kind === "feature"}
             {@const active = $location === entry.route}
-            <!-- Server entitlement (`$premiumUnlocked`) decides; `PRO_DEV_UNLOCK`
-                 is the owner's local test override, never set in public builds. -->
-            {#if PRO_DEV_UNLOCK || $premiumUnlocked}
+            <!-- The per-feature server entitlement decides; `PRO_DEV_UNLOCK` is
+                 the owner's local test override, never set in public builds.
+                 `trial_available` stays navigable: the trial only starts when
+                 the user actually opens the page (first look), never from
+                 here. -->
+            {@const fs = $entitlements?.features[entry.feature] ?? null}
+            {#if PRO_DEV_UNLOCK || featureUnlocked(fs) || fs?.state === "trial_available"}
               <button
                 type="button"
                 aria-label={$_(entry.labelKey)}
                 aria-current={active ? "page" : undefined}
                 onclick={() => push(entry.route)}
-                title={$cloud.account?.plan === "free" && $trialDaysLeft > 0
-                  ? $_("nav.trial_days_left", { values: { n: $trialDaysLeft } })
-                  : undefined}
+                title={fs?.state === "trial"
+                  ? $_("nav.trial_days_left", { values: { n: featureDaysLeft(fs) } })
+                  : fs?.state === "trial_available"
+                    ? $_("pro.trial_available", { values: { n: fs.days } })
+                    : undefined}
                 class="group flex w-full items-center gap-3 rounded-md border-l-2 px-3 py-2 text-sm transition-colors duration-150
                   {active
                   ? 'border-emerald-500 bg-zinc-800/50 text-zinc-50'

@@ -3,11 +3,12 @@
 //! begin on first use of a Pro *content* endpoint. The authoritative check is
 //! always per-endpoint `entitlements::require_feature`, never this response.
 //!
-//! `POST /v1/cloud/features/:feature/activate` — the mutating counterpart used
-//! when the user actually opens a Pro feature. It starts the one-month trial on
-//! first use (idempotent) and returns the resulting [`FeatureState`], or `402`
-//! once the window has elapsed. This is the endpoint that turns a `Free`
-//! account's first click into an active `trial`.
+//! `POST /v1/cloud/features/:feature/activate` — the mutating counterpart the
+//! client calls when the user opens a Pro feature's page for the first time.
+//! It starts the one-week trial (idempotent — reopening never restarts the
+//! clock) and returns the resulting [`FeatureState`], or `402` once the window
+//! has elapsed. This is the endpoint that turns a `Free` account's first look
+//! into an active `trial`.
 
 use crate::cloud::auth::CloudUser;
 use crate::cloud::entitlements::{self, Feature, FeatureState};

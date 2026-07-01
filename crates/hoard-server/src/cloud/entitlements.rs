@@ -3,15 +3,18 @@
 //! The build-time `pro` feature only decides whether the Pro *code* is
 //! compiled into the binary. The real lock is here: every Pro content endpoint
 //! calls [`require_feature`] and gets a `402` unless the caller is on paid Pro
-//! or inside an active one-month trial. Value is anchored server-side (wrapple
+//! or inside an active one-week trial. Value is anchored server-side (wrapple
 //! generated here, screen assets served from R2) so a patched OSS client can't
 //! fake entitlement — it can show the locked UI but never produce the content.
 //!
 //! Two entry points:
-//! - [`require_feature`] — mutating; used by content endpoints. Starts the
-//!   trial on a Free account's first use (idempotent), then enforces it.
+//! - [`require_feature`] — mutating; used by content endpoints and by
+//!   `POST /v1/cloud/features/:feature/activate` (the client calls it the
+//!   first time the user *opens* the feature's page — the trial clock starts
+//!   at first view, not at signup). Idempotent; also acts as a backstop so a
+//!   content endpoint can never be consumed without a running window.
 //! - [`feature_state`] — read-only; used by `GET /v1/cloud/entitlements` to
-//!   paint the UI badge/lock. Never starts a trial.
+//!   paint the UI badge/lock/countdown. Never starts a trial.
 
 use crate::cloud::errors::CloudError;
 use crate::cloud::plans::Plan;
@@ -20,8 +23,8 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// Trial length for Free accounts, in days. One month.
-pub const TRIAL_DAYS: i64 = 30;
+/// Trial length for Free accounts, in days. One week.
+pub const TRIAL_DAYS: i64 = 7;
 
 /// Pro features that can be gated and trialed independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

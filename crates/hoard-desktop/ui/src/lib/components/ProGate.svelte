@@ -6,9 +6,11 @@
   //   - trial_available / trial      → "Prueba: quedan N días"
   //   - trial_expired / signed-out   → "Función Pro" + upgrade CTA
   //
-  // The trial is one month per feature and starts on first real use; with the
-  // current placeholders a Free account stays in `trial_available`, so it shows
-  // the full window until the real content endpoints exist.
+  // The trial is one week per feature and normally starts automatically the
+  // first time the user opens the feature's page (`ProFeature` activates it on
+  // first look). The `trial_available` branch here is the fallback for when
+  // that auto-activation failed (offline, transient error): it shows the offer
+  // with a manual retry button instead of a dead end.
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
   import { _ } from "svelte-i18n";
@@ -38,8 +40,9 @@
 
   let starting = $state(false);
 
-  // Start the one-month trial. The server flips the feature to `trial`, which
-  // re-renders the parent gate into the real Pro UI.
+  // Start the one-week trial (retry path — the normal start is automatic on
+  // first look). The server flips the feature to `trial`, which re-renders the
+  // parent shell into the real Pro UI.
   async function startTrial() {
     if (starting) return;
     starting = true;

@@ -2,13 +2,14 @@
  * Per-feature Pro entitlements, mirrored from `GET /v1/cloud/entitlements`.
  *
  * The server is the source of truth (see `cloud/entitlements.rs`): the trial
- * starts on the first *use* of a Pro content endpoint and locks (HTTP 402) once
- * the one-month window elapses, independently per feature. This store is just a
- * reactive cache of that snapshot for painting the gate (badge / lock / days).
+ * starts the first time the user *opens* a feature's page (the route calls
+ * `activateFeature` on first view) and locks (HTTP 402) once the one-week
+ * window elapses, independently per feature. This store is just a reactive
+ * cache of that snapshot for painting the gate (badge / lock / countdown).
  *
- * Supersedes the legacy global `created_at + 30d` window in `./cloud.ts`, which
- * shared one clock across both features. That helper still backs other nav
- * gating; this one is per-feature and authoritative.
+ * Supersedes the legacy global `created_at + 30d` window that used to live in
+ * `./cloud.ts` (one clock shared across both features, ticking from signup).
+ * Nav gating and the feature routes now read this store exclusively.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -52,9 +53,9 @@ export async function refreshEntitlements(): Promise<Entitlements | null> {
   }
 }
 
-/** Open a feature: this is the call that actually *starts* the one-month trial
- *  on a Free account's first use, and is what flips `trial_available` →
- *  `trial`. The server is the source of truth and idempotent (the clock can't be
+/** Open a feature: this is the call that actually *starts* the one-week trial
+ *  the first time a Free user looks at the feature, and is what flips
+ *  `trial_available` → `trial`. The server is the source of truth and idempotent (the clock can't be
  *  restarted by re-opening). Returns the resulting state and patches it into the
  *  cached snapshot so the gate updates immediately. Returns `null` on failure
  *  (signed out, offline) so the caller keeps the locked fallback. */
@@ -86,8 +87,9 @@ export function featureDaysLeft(fs: FeatureState | null | undefined): number {
 }
 
 /** Whether a feature should render its REAL UI: paid Pro or an active trial.
- *  `trial_available` is intentionally NOT unlocked — the one-month clock hasn't
- *  started yet — and `trial_expired` is locked. This is the gate that makes the
+ *  `trial_available` is intentionally NOT unlocked — the trial clock hasn't
+ *  started yet (the route flips it via `activateFeature` on first view) —
+ *  and `trial_expired` is locked. This is the gate that makes the
  *  public binary safe: the Pro UI ships inside it, but only the server saying
  *  "entitled / trial" lets a user actually open it. */
 export function featureUnlocked(fs: FeatureState | null | undefined): boolean {

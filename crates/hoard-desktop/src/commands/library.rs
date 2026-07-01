@@ -1054,6 +1054,26 @@ pub(crate) fn current_client(state: &State<'_, AppState>) -> Result<ApiClient, S
     Err("Not logged in. Sign in again to continue.".to_string())
 }
 
+/// Recompute and install the active sync context from the current session,
+/// mirroring [`current_client`]'s self-hosted-wins-else-cloud selection. Call
+/// after any login/logout (and once at boot) so `CliState` reads and writes the
+/// per-context `saves` file that belongs to the session actually in use.
+/// Returns the installed context id, or `None` when fully signed out.
+pub(crate) fn sync_active_context(state: &AppState) -> Option<String> {
+    let ctx = if let Some(user) = state.user.lock().unwrap().clone() {
+        Some(hoard_agent::state::selfhosted_context(&user.server_url))
+    } else if let Ok(Some(cloud)) = crate::commands::cloud::load_active_creds() {
+        cloud
+            .user_id
+            .as_deref()
+            .map(hoard_agent::state::cloud_context)
+    } else {
+        None
+    };
+    hoard_agent::state::set_active_context(ctx.clone());
+    ctx
+}
+
 fn format_optional_time(t: Option<OffsetDateTime>) -> Option<String> {
     use time::format_description::well_known::Rfc3339;
     t.and_then(|x| x.format(&Rfc3339).ok())

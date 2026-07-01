@@ -79,6 +79,10 @@ impl AppState {
             pending_login_state: Mutex::new(None),
         };
         crate::commands::cloud::rehydrate(&state);
+        // Install the active sync context from the restored session BEFORE any
+        // command loads `CliState`, so per-context saves resolve to the right
+        // file (and the legacy monolithic `state.json` migrates into it).
+        crate::commands::library::sync_active_context(&state);
         state
     }
 }

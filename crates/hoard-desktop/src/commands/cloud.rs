@@ -137,6 +137,10 @@ pub struct CloudCreds {
     /// label `quota-reached` events. `None` when the session file
     /// pre-dates this snapshot — callers default to "free".
     pub plan: Option<String>,
+    /// Supabase `user_id` from the cached `/v1/me`. Keys the per-account sync
+    /// context (see `hoard_agent::state::cloud_context`). `None` on very old
+    /// session files that never cached the account snapshot.
+    pub user_id: Option<String>,
 }
 
 // ---- helpers ----------------------------------------------------------
@@ -251,6 +255,7 @@ fn load_creds() -> Result<Option<CloudCreds>> {
             session.server_url
         },
         plan: session.user.as_ref().map(|u| u.plan.clone()),
+        user_id: session.user.as_ref().map(|u| u.user_id.clone()),
     }))
 }
 
@@ -488,42 +493,30 @@ pub async fn cloud_complete_login(
     save_creds(&access, &refresh, &base, &me).map_err(|e| format!("Couldn't save session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
 
-    // Account-switch hygiene. `state.json`'s save↔remote mappings (and their
-    // per-row `last_version_num` cursors) only mean anything for the account
-    // they were synced against. Signing into a *different* account and then
-    // replaying the old cursors makes the next upload claim a `base_version`
-    // the new account's save never had → the server rejects it
-    // `non_fast_forward` and sync wedges (observed: a save stuck failing to
-    // upload right after switching accounts). Wipe the per-account mappings on
-    // a mismatch so the agent re-adopts every save fresh against this account
-    // — exactly like a clean install linking to existing server saves. Device
-    // prefs (manual paths, ignored slugs, playtime) are NOT per-account and
-    // survive. Runs here, before the frontend re-spawns the agent (which
-    // hydrates from `state.json`), so the agent never sees the stale cursors.
-    match hoard_agent::state::CliState::load_default() {
-        Ok((mut st, path)) => {
-            if st.reset_for_account_switch(&me.user_id) {
-                if let Err(e) = st.save(&path) {
-                    tracing::warn!(error = %e, "cloud: couldn't persist state after account-switch reset");
-                }
-                // A running agent still holds the previous account's slots
-                // (and their version cursors) in memory — logout doesn't stop
-                // it, so a plain disk wipe wouldn't reach it until the next app
-                // launch. Restart it so it re-hydrates from the just-cleared
-                // `state.json`. Only when it was actually running: we don't want
-                // a login to spin up watching where there was none.
-                let running = state.agent.lock().unwrap().is_some();
-                if running {
-                    let _ = crate::commands::agent::stop_agent(app.clone(), app.state()).await;
-                    if let Err(e) =
-                        crate::commands::agent::start_agent(app.clone(), app.state()).await
-                    {
-                        tracing::warn!(error = %e, "cloud: agent restart after account switch failed");
-                    }
-                }
+    // Switch the active sync context to this account. Each account/self-hosted
+    // server keeps its `saves` map (save_id → server version cursor) in its own
+    // `contexts/<id>.json`, so signing in here just points `CliState` at this
+    // account's file — no cross-account residue, and the previous account's
+    // cursors are preserved for when the user switches back (vs the old wipe,
+    // which threw them away and could wedge uploads with `non_fast_forward`).
+    // Device prefs (manual paths, ignored slugs, playtime) stay global.
+    let prev_ctx = hoard_agent::state::current_context_id();
+    let new_ctx = hoard_agent::state::cloud_context(&me.user_id);
+    hoard_agent::state::set_active_context(Some(new_ctx.clone()));
+    if prev_ctx != new_ctx {
+        // A running agent still holds the previous context's slots (and their
+        // version cursors) in memory — cloud logout doesn't stop it, so pointing
+        // the on-disk state at a new file wouldn't reach it until the next app
+        // launch. Restart it so it re-hydrates from this account's context.
+        // Only when it was actually running: a login shouldn't spin up watching
+        // where there was none.
+        let running = state.agent.lock().unwrap().is_some();
+        if running {
+            let _ = crate::commands::agent::stop_agent(app.clone(), app.state()).await;
+            if let Err(e) = crate::commands::agent::start_agent(app.clone(), app.state()).await {
+                tracing::warn!(error = %e, "cloud: agent restart after context switch failed");
             }
         }
-        Err(e) => tracing::warn!(error = %e, "cloud: couldn't load state for account-switch check"),
     }
 
     // Boot the cloud-pull poller so LiveStatus has fresh manifest data
@@ -619,6 +612,10 @@ pub async fn cloud_refresh_account(
 pub fn cloud_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     clear_creds().map_err(|e| format!("Couldn't clear session: {e}"))?;
     *state.cloud_account.lock().unwrap() = None;
+    // Repoint the active context at whatever session remains (a self-hosted
+    // login, or none) so a later self-hosted action doesn't keep writing into
+    // the logged-out account's context file.
+    crate::commands::library::sync_active_context(state.inner());
     // Stop the cloud-pull poller — otherwise it would keep tickling
     // `load_active_creds` and quietly do nothing forever.
     cloud_pull::stop(&app);

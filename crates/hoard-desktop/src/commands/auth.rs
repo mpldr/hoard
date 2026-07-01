@@ -112,6 +112,8 @@ pub async fn login(
     .map_err(|e| format!("Couldn't save credentials: {e}"))?;
 
     *state.user.lock().unwrap() = Some(user.clone());
+    // Point per-context state at this self-hosted server.
+    crate::commands::library::sync_active_context(state.inner());
     Ok(user)
 }
 
@@ -133,6 +135,8 @@ pub fn current_user(state: State<'_, AppState>) -> Option<UserInfo> {
 pub fn logout(state: State<'_, AppState>) -> Result<(), String> {
     credentials::clear().map_err(|e| format!("Couldn't clear credentials: {e}"))?;
     *state.user.lock().unwrap() = None;
+    // Repoint at whatever session remains (a cloud login, or none).
+    crate::commands::library::sync_active_context(state.inner());
     Ok(())
 }
 
@@ -164,6 +168,7 @@ pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, Strin
             if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::Unauthorized)) {
                 let _ = credentials::clear();
                 *state.user.lock().unwrap() = None;
+                crate::commands::library::sync_active_context(state.inner());
             }
             return Err(pretty_error(e));
         }

@@ -1,8 +1,60 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use time::OffsetDateTime;
+
+/// Process-wide identifier of the sync context whose `saves` map is live.
+///
+/// The `saves` map (save_id → version cursor + local path) only means anything
+/// for the account/server that owns those saves: a `save_id` and its
+/// `last_version_num` are minted server-side, so replaying one account's cursors
+/// against another (or against a self-hosted server) makes the next upload claim
+/// a `base_version` the target never had → `non_fast_forward`, and surfaces
+/// "saves from another account/self-hosted" residue. So each context keeps its
+/// `saves` in its own file (`contexts/<id>.json`); device-level prefs
+/// (`manual_paths`, `ignored_slugs`, `playtime_excluded`) stay global in
+/// `device.json`.
+///
+/// The desktop sets this at boot and on every login/logout/account switch
+/// (mirroring `current_client`'s self-hosted-wins-else-cloud selection). When
+/// unset — the headless CLI, which is self-hosted only — the id is derived from
+/// the configured server URL.
+static ACTIVE_CONTEXT: RwLock<Option<String>> = RwLock::new(None);
+
+/// Override the active sync context. `None` clears the override so the id falls
+/// back to the self-hosted server URL from [`crate::config::CliConfig`].
+pub fn set_active_context(ctx: Option<String>) {
+    *ACTIVE_CONTEXT.write().unwrap() = ctx;
+}
+
+/// Context id for a Hoard Cloud account, keyed by its Supabase `user_id` (a
+/// UUID, so already filesystem-safe).
+pub fn cloud_context(user_id: &str) -> String {
+    format!("cloud-{user_id}")
+}
+
+/// Context id for a self-hosted server. The URL can carry `:` and `/`, so we
+/// key on a short stable SHA-256 prefix of the normalised URL instead of the
+/// raw string.
+pub fn selfhosted_context(server_url: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(server_url.trim_end_matches('/').as_bytes());
+    format!("selfhosted-{}", hex::encode(&h.finalize()[..8]))
+}
+
+/// Resolve the id of the context whose `saves` file should be loaded now.
+pub fn current_context_id() -> String {
+    if let Some(ctx) = ACTIVE_CONTEXT.read().unwrap().clone() {
+        return ctx;
+    }
+    match crate::config::CliConfig::load_default() {
+        Ok((cfg, _)) => selfhosted_context(&cfg.server.url),
+        Err(_) => "default".to_string(),
+    }
+}
 
 /// Per-save local metadata: which directory on disk maps to which remote save.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,78 +130,168 @@ pub struct CliState {
     /// the other. `default` keeps older `state.json` files loading.
     #[serde(default)]
     pub playtime_excluded: HashSet<String>,
-    /// Cloud account (`/v1/me` user_id) the `saves` map was last synced
-    /// against. The save↔remote mapping in [`Self::saves`] (and especially
-    /// each row's `last_version_num`) is per-account: a `save_id` and its
-    /// version counter only mean anything for the account that owns it on the
-    /// server. When the user signs into a *different* account, replaying the
-    /// previous account's `last_version_num` makes the next upload claim a
-    /// `base_version` the new account's save has never had → the server
-    /// rejects it `non_fast_forward` and sync wedges. We stamp the active
-    /// account here and wipe `saves` on a mismatch (see
-    /// [`Self::reset_for_account_switch`]). `None`/absent = never stamped
-    /// (pre-this-field state files, or a fresh install). The device-level
-    /// prefs (`manual_paths`, `ignored_slugs`, `playtime_excluded`) are NOT
-    /// per-account and deliberately survive the switch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_cloud_account_id: Option<String>,
+}
+
+/// On-disk shape of `device.json`: the machine-level prefs that are identical
+/// across every account and self-hosted server. Split out of [`CliState`] so
+/// switching context never disturbs them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DevicePrefs {
+    #[serde(default)]
+    manual_paths: HashMap<String, PathBuf>,
+    #[serde(default)]
+    ignored_slugs: HashSet<String>,
+    #[serde(default)]
+    playtime_excluded: HashSet<String>,
+}
+
+/// On-disk shape of `contexts/<id>.json`: the per-context `saves` map (save_id
+/// → local metadata + server version cursor).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextSaves {
+    #[serde(default)]
+    saves: HashMap<String, SaveState>,
+}
+
+/// Read + deserialize a JSON state file, self-healing a corrupt one instead of
+/// aborting. These files are rebuildable caches (every tracked save re-adopts
+/// on the next detection pass), so a half-written file (crash, disk gremlin,
+/// hand-edit gone wrong) is moved aside for forensics and we start clean.
+fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    match serde_json::from_str::<T>(&text) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let backup = path.with_extension(format!(
+                "json.corrupt-{}",
+                OffsetDateTime::now_utc().unix_timestamp()
+            ));
+            match std::fs::rename(path, &backup) {
+                Ok(()) => tracing::warn!(
+                    error = %e, backup = %backup.display(),
+                    "state file was corrupt; backed it up and started fresh"
+                ),
+                Err(re) => tracing::warn!(
+                    error = %re, path = %path.display(),
+                    "state file is corrupt and couldn't be moved aside; ignoring it"
+                ),
+            }
+            Ok(T::default())
+        }
+    }
+}
+
+/// Serialize `value` to `path` (pretty JSON), creating the parent dir.
+fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(value).context("serializing state")?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// One-time migration of the pre-split monolithic `state.json`.
+///
+/// Before contexts, one `state.json` held both the device prefs and the `saves`
+/// map for whatever account/server was last used. On first load after the split
+/// we route that file's prefs into `device.json` and its `saves` into the file
+/// for the *currently active* context (which is exactly the context those saves
+/// belonged to, since it was the only one). Then we rename the legacy file aside
+/// so we neither re-migrate nor let a downgrade resurrect stale cursors.
+///
+/// Guarded so it runs at most once: if `device.json` already exists we've
+/// migrated (or started fresh post-split) and leave any lingering legacy file
+/// untouched.
+fn migrate_legacy_state(device_path: &Path, context_path: &Path) -> Result<()> {
+    let legacy = crate::config::CliConfig::state_dir()?.join("state.json");
+    if !legacy.exists() || device_path.exists() {
+        return Ok(());
+    }
+    let old: CliState = load_json(&legacy)?;
+    old.save_split(device_path, context_path)?;
+    let archived = legacy.with_extension("json.migrated");
+    match std::fs::rename(&legacy, &archived) {
+        Ok(()) => tracing::info!(
+            saves = old.saves.len(),
+            context = %context_path.display(),
+            "state: migrated monolithic state.json into device.json + per-context saves"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "state: migrated state.json but couldn't archive the old file"
+        ),
+    }
+    Ok(())
 }
 
 impl CliState {
-    pub fn default_path() -> Result<PathBuf> {
-        let dir = crate::config::CliConfig::state_dir()?;
-        Ok(dir.join("state.json"))
+    /// Global `device.json` path: machine-level prefs shared across contexts.
+    pub fn device_path() -> Result<PathBuf> {
+        Ok(crate::config::CliConfig::state_dir()?.join("device.json"))
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        match serde_json::from_str::<CliState>(&text) {
-            Ok(st) => Ok(st),
-            Err(e) => {
-                // A corrupt state.json (half-written on a crash, disk gremlin,
-                // a hand-edit gone wrong) used to abort startup with a bare
-                // "parsing <path>" error and brick the app. But this file is a
-                // rebuildable cache — every tracked save re-adopts on the next
-                // detection pass — so we self-heal instead: move the bad file
-                // aside for forensics and start from a clean default.
-                let backup = path.with_extension(format!(
-                    "json.corrupt-{}",
-                    OffsetDateTime::now_utc().unix_timestamp()
-                ));
-                match std::fs::rename(path, &backup) {
-                    Ok(()) => tracing::warn!(
-                        error = %e,
-                        backup = %backup.display(),
-                        "state.json was corrupt; backed it up and started fresh"
-                    ),
-                    Err(re) => tracing::warn!(
-                        error = %re,
-                        path = %path.display(),
-                        "state.json is corrupt and couldn't be moved aside; ignoring it"
-                    ),
-                }
-                Ok(Self::default())
-            }
+    /// Per-context saves file: `contexts/<id>.json`.
+    pub fn context_path_for(ctx: &str) -> Result<PathBuf> {
+        Ok(crate::config::CliConfig::state_dir()?
+            .join("contexts")
+            .join(format!("{ctx}.json")))
+    }
+
+    fn device_prefs(&self) -> DevicePrefs {
+        DevicePrefs {
+            manual_paths: self.manual_paths.clone(),
+            ignored_slugs: self.ignored_slugs.clone(),
+            playtime_excluded: self.playtime_excluded.clone(),
         }
     }
 
-    pub fn load_default() -> Result<(Self, PathBuf)> {
-        let path = Self::default_path()?;
-        Ok((Self::load(&path)?, path))
+    /// Load by merging the global device prefs with one context's saves. Used
+    /// by [`Self::load_default`]; exposed for tests with explicit paths.
+    pub fn load_split(device_path: &Path, context_path: &Path) -> Result<Self> {
+        let prefs: DevicePrefs = load_json(device_path)?;
+        let ctx: ContextSaves = load_json(context_path)?;
+        Ok(Self {
+            saves: ctx.saves,
+            manual_paths: prefs.manual_paths,
+            ignored_slugs: prefs.ignored_slugs,
+            playtime_excluded: prefs.playtime_excluded,
+        })
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let text = serde_json::to_string_pretty(self).context("serializing state")?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    /// Write device prefs and the context's saves to their two files.
+    pub fn save_split(&self, device_path: &Path, context_path: &Path) -> Result<()> {
+        save_json(device_path, &self.device_prefs())?;
+        save_json(
+            context_path,
+            &ContextSaves {
+                saves: self.saves.clone(),
+            },
+        )?;
         Ok(())
+    }
+
+    /// Load the state for the currently-active context (see [`ACTIVE_CONTEXT`]),
+    /// migrating a pre-split monolithic `state.json` on first run. Returns the
+    /// merged state plus the context's saves-file path, which the caller threads
+    /// straight back into [`Self::save`].
+    pub fn load_default() -> Result<(Self, PathBuf)> {
+        let device_path = Self::device_path()?;
+        let context_path = Self::context_path_for(&current_context_id())?;
+        migrate_legacy_state(&device_path, &context_path)?;
+        Ok((Self::load_split(&device_path, &context_path)?, context_path))
+    }
+
+    /// Persist the state. `context_path` is the per-context saves file returned
+    /// by [`Self::load_default`]; the device prefs always go to the single
+    /// global `device.json`.
+    pub fn save(&self, context_path: &Path) -> Result<()> {
+        self.save_split(&Self::device_path()?, context_path)
     }
 
     /// Record a manual save-folder override for `slug`. Subsequent calls to
@@ -205,43 +347,6 @@ impl CliState {
     pub fn include_playtime(&mut self, slug: &str) {
         self.playtime_excluded.remove(slug);
     }
-
-    /// Reconcile the per-account sync state with the account that just signed
-    /// in. If `account_id` differs from the stamped [`Self::last_cloud_account_id`]
-    /// (including the first stamp after a session existed under another
-    /// account), the `saves` map belongs to the *previous* account — its
-    /// `save_id`s and `last_version_num`s are meaningless (and actively
-    /// harmful: they make the next upload claim a stale `base_version` and get
-    /// rejected `non_fast_forward`). Clear it so detection re-adopts every save
-    /// fresh against the new account, then re-stamp. Device-level prefs
-    /// (`manual_paths`, `ignored_slugs`, `playtime_excluded`) are kept.
-    ///
-    /// Returns `true` when the account changed and `saves` was wiped, so the
-    /// caller can persist and re-seed the agent. A no-op (same account, or the
-    /// very first login on a clean install with no tracked saves) returns
-    /// `false`.
-    pub fn reset_for_account_switch(&mut self, account_id: &str) -> bool {
-        if self.last_cloud_account_id.as_deref() == Some(account_id) {
-            return false;
-        }
-        // First stamp on a clean slate (no prior account, nothing tracked):
-        // adopt the id without disturbing anything.
-        let first_clean_stamp = self.last_cloud_account_id.is_none() && self.saves.is_empty();
-        self.last_cloud_account_id = Some(account_id.to_string());
-        if first_clean_stamp {
-            return false;
-        }
-        let dropped = self.saves.len();
-        self.saves.clear();
-        if dropped > 0 {
-            tracing::info!(
-                account_id,
-                dropped,
-                "state: cloud account changed — cleared per-account save mappings"
-            );
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -262,88 +367,117 @@ mod tests {
         }
     }
 
+    /// The core partition invariant: two contexts sharing one `device.json`
+    /// keep their `saves` maps fully separate (no cross-account/self-hosted
+    /// residue), while device-level prefs are shared. Mirrors production, where
+    /// every write goes through a state that was first loaded via `load_split`.
     #[test]
-    fn account_switch_wipes_saves_but_keeps_device_prefs() {
-        let mut st = CliState::default();
-        st.saves.insert("save-a".into(), save_state("factorio"));
-        st.set_manual_path("stellaris", PathBuf::from("/data/stellaris"));
-        st.add_ignored_slug("dwarf-fortress".into());
-
-        // First stamp against account A: existing saves means this is NOT a
-        // clean slate, so it counts as a switch and wipes them.
-        assert!(st.reset_for_account_switch("acct-A"));
-        assert!(st.saves.is_empty());
-        // Device-level prefs survive the switch.
-        assert_eq!(st.manual_paths.len(), 1);
-        assert!(st.is_ignored("dwarf-fortress"));
-        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-A"));
-
-        // Re-login to the SAME account is a no-op.
-        st.saves.insert("save-b".into(), save_state("ck3"));
-        assert!(!st.reset_for_account_switch("acct-A"));
-        assert_eq!(st.saves.len(), 1);
-
-        // Switching to a DIFFERENT account wipes again.
-        assert!(st.reset_for_account_switch("acct-B"));
-        assert!(st.saves.is_empty());
-        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-B"));
-    }
-
-    #[test]
-    fn first_login_on_clean_install_is_noop() {
-        // No prior account, nothing tracked: the very first login just adopts
-        // the id without reporting a switch (so the agent isn't needlessly
-        // restarted on a fresh install).
-        let mut st = CliState::default();
-        assert!(!st.reset_for_account_switch("acct-A"));
-        assert_eq!(st.last_cloud_account_id.as_deref(), Some("acct-A"));
-    }
-
-    #[test]
-    fn account_id_round_trips_to_disk() {
+    fn contexts_isolate_saves_but_share_device_prefs() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("state.json");
-        let mut st = CliState::default();
-        st.reset_for_account_switch("acct-A");
-        st.save(&path).unwrap();
-        let loaded = CliState::load(&path).unwrap();
-        assert_eq!(loaded.last_cloud_account_id.as_deref(), Some("acct-A"));
+        let device = tmp.path().join("device.json");
+        let ctx_a = tmp.path().join("contexts/cloud-A.json");
+        let ctx_b = tmp.path().join("contexts/cloud-B.json");
+
+        // Account A: one save + device-level prefs.
+        let mut a = CliState::default();
+        a.saves.insert("save-a".into(), save_state("factorio"));
+        a.set_manual_path("stellaris", PathBuf::from("/data/stellaris"));
+        a.add_ignored_slug("dwarf-fortress".into());
+        a.save_split(&device, &ctx_a).unwrap();
+
+        // Account B loads the shared device.json (inheriting A's prefs), adds
+        // its own save, and persists — exactly the load→mutate→save cycle the
+        // app runs.
+        let mut b = CliState::load_split(&device, &ctx_b).unwrap();
+        assert!(b.saves.is_empty(), "B's context starts with no saves");
+        assert_eq!(b.manual_paths.len(), 1, "B shares A's device prefs");
+        assert!(b.is_ignored("dwarf-fortress"));
+        b.saves.insert("save-b".into(), save_state("ck3"));
+        b.save_split(&device, &ctx_b).unwrap();
+
+        // Neither context can see the other's saves.
+        let a_loaded = CliState::load_split(&device, &ctx_a).unwrap();
+        assert!(a_loaded.saves.contains_key("save-a"));
+        assert!(!a_loaded.saves.contains_key("save-b"));
+        let b_loaded = CliState::load_split(&device, &ctx_b).unwrap();
+        assert!(b_loaded.saves.contains_key("save-b"));
+        assert!(!b_loaded.saves.contains_key("save-a"));
+        // A's device prefs survived B's write.
+        assert_eq!(a_loaded.manual_paths.len(), 1);
+        assert!(a_loaded.is_ignored("dwarf-fortress"));
     }
 
-    /// `manual_paths` survives a save → load round-trip and a missing field
-    /// in older `state.json` files deserialises as an empty map.
+    /// Distinct context ids per cloud account and per self-hosted URL.
     #[test]
-    fn manual_paths_round_trip_to_disk() {
+    fn context_ids_are_distinct_per_account_and_server() {
+        assert_ne!(cloud_context("user-a"), cloud_context("user-b"));
+        assert_ne!(
+            selfhosted_context("https://a.example"),
+            selfhosted_context("https://b.example")
+        );
+        // A trailing slash is normalised away, so it doesn't fork the context.
+        assert_eq!(
+            selfhosted_context("https://a.example"),
+            selfhosted_context("https://a.example/")
+        );
+        // Cloud and self-hosted never collide.
+        assert!(cloud_context("x").starts_with("cloud-"));
+        assert!(selfhosted_context("x").starts_with("selfhosted-"));
+    }
+
+    /// `manual_paths` survives a device.json round-trip; a missing context file
+    /// yields empty saves rather than an error.
+    #[test]
+    fn device_prefs_round_trip_and_missing_context_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("state.json");
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts/selfhosted-x.json");
 
         let mut state = CliState::default();
         state.set_manual_path("stellaris", PathBuf::from("/home/x/Stellaris/save games"));
         state.set_manual_path("ck3", PathBuf::from("/data/ck3"));
-        state.save(&path).unwrap();
+        state.save_split(&device, &ctx).unwrap();
 
-        let loaded = CliState::load(&path).unwrap();
+        let loaded = CliState::load_split(&device, &ctx).unwrap();
         assert_eq!(loaded.manual_paths.len(), 2);
         assert_eq!(
             loaded.manual_paths.get("stellaris"),
             Some(&PathBuf::from("/home/x/Stellaris/save games")),
         );
-        assert_eq!(
-            loaded.manual_paths.get("ck3"),
-            Some(&PathBuf::from("/data/ck3")),
-        );
+
+        // A brand-new context (no file yet) loads clean, keeping shared prefs.
+        let fresh_ctx = tmp.path().join("contexts/cloud-new.json");
+        let fresh = CliState::load_split(&device, &fresh_ctx).unwrap();
+        assert!(fresh.saves.is_empty());
+        assert_eq!(fresh.manual_paths.len(), 2);
     }
 
-    /// Pre-1.5 state files have no `manual_paths` key. Loading them must not
-    /// fail and must default to an empty map (no serde migration step).
+    /// A pre-split monolithic `state.json` (saves + prefs in one file)
+    /// deserialises into `CliState` and splits cleanly into the two files.
     #[test]
-    fn manual_paths_default_when_missing_from_disk() {
+    fn legacy_monolithic_state_splits_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("state.json");
-        std::fs::write(&path, "{\"saves\":{}}").unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts/cloud-legacy.json");
 
-        let loaded = CliState::load(&path).unwrap();
-        assert!(loaded.manual_paths.is_empty());
+        // Old format, including the now-removed `last_cloud_account_id` key,
+        // which serde must ignore rather than reject.
+        let legacy = r#"{
+            "saves": { "s1": {
+                "local_path": "/saves/factorio", "game_slug": "factorio",
+                "label": "default", "last_version_num": 7
+            }},
+            "manual_paths": { "ck3": "/data/ck3" },
+            "ignored_slugs": ["dwarf-fortress"],
+            "last_cloud_account_id": "old-account"
+        }"#;
+        let old: CliState = serde_json::from_str(legacy).unwrap();
+        old.save_split(&device, &ctx).unwrap();
+
+        let loaded = CliState::load_split(&device, &ctx).unwrap();
+        assert!(loaded.saves.contains_key("s1"));
+        assert_eq!(loaded.manual_paths.get("ck3"), Some(&PathBuf::from("/data/ck3")));
+        assert!(loaded.is_ignored("dwarf-fortress"));
     }
 
     /// `clear_manual_path` removes the entry; subsequent saves no longer

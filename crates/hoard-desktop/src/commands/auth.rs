@@ -296,7 +296,7 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
                 format!("Server replied with {status}: {body}")
             }
             ApiError::Network(e) => network_message(e),
-            ApiError::TooLarge => "The server says that's too big to upload.".into(),
+            ApiError::TooLarge(detail) => detail.human(),
             ApiError::RateLimited {
                 retry_after_seconds,
                 ..

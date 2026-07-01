@@ -17,8 +17,13 @@ pub enum ApiError {
     Forbidden,
     #[error("not found (404)")]
     NotFound,
-    #[error("payload too large (413): server max snapshot size exceeded")]
-    TooLarge,
+    /// 413. On Hoard Cloud the body carries the structured per-save cap
+    /// (`code:"save_too_large"` with `plan` / `limit_bytes` / `actual_bytes`),
+    /// so we can tell the user exactly which limit they hit and how big the
+    /// save was. Self-hosted 413s (raw quota) leave `0` and fall back to the
+    /// generic message.
+    #[error("{}", .0.human())]
+    TooLarge(SaveTooLarge),
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -37,6 +42,57 @@ pub enum ApiError {
     },
 }
 
+/// Structured body of a Hoard Cloud `save_too_large` 413. All fields default
+/// to zero/empty so a self-hosted 413 (or an unparseable body) still yields a
+/// usable [`ApiError::TooLarge`] via [`SaveTooLarge::human`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SaveTooLarge {
+    #[serde(default)]
+    pub plan: String,
+    #[serde(default)]
+    pub limit_bytes: u64,
+    #[serde(default)]
+    pub actual_bytes: u64,
+    #[serde(default)]
+    pub upgrade_url: Option<String>,
+}
+
+impl SaveTooLarge {
+    /// A human, diagnosable one-liner. Falls back to a generic sentence when
+    /// the structured fields are absent (self-hosted / unparseable body). The
+    /// desktop re-localizes the cloud case from the structured fields via the
+    /// `BackupTooLarge` agent event; this string is the log/CLI/self-hosted
+    /// surface.
+    pub fn human(&self) -> String {
+        if self.limit_bytes == 0 {
+            return "payload too large (413): exceeds the server's per-save size limit".into();
+        }
+        format!(
+            "save too large: {} exceeds the {} plan limit of {} per save",
+            fmt_bytes(self.actual_bytes),
+            if self.plan.is_empty() { "current" } else { &self.plan },
+            fmt_bytes(self.limit_bytes),
+        )
+    }
+}
+
+/// Coarse human byte size for error copy. Binary units, one decimal.
+fn fmt_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let n = n as f64;
+    if n >= GB {
+        format!("{:.1} GB", n / GB)
+    } else if n >= MB {
+        format!("{:.0} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.0} KB", n / KB)
+    } else {
+        format!("{n:.0} B")
+    }
+}
+
 impl ApiError {
     pub async fn from_response(resp: reqwest::Response) -> Self {
         let status = resp.status();
@@ -52,7 +108,9 @@ impl ApiError {
             StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
             StatusCode::FORBIDDEN => ApiError::Forbidden,
             StatusCode::NOT_FOUND => ApiError::NotFound,
-            StatusCode::PAYLOAD_TOO_LARGE => ApiError::TooLarge,
+            StatusCode::PAYLOAD_TOO_LARGE => {
+                ApiError::TooLarge(serde_json::from_str::<SaveTooLarge>(&body).unwrap_or_default())
+            }
             StatusCode::CONFLICT => ApiError::Conflict(extract_message(&body)),
             StatusCode::BAD_REQUEST => ApiError::BadRequest(extract_message(&body)),
             StatusCode::TOO_MANY_REQUESTS => {

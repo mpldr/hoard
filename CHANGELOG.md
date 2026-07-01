@@ -7,9 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.4.13] — 2026-06-24
+## [2.4.13] — 2026-07-01
 
 ### Changed
+- **Partidas grandes en Hoard Cloud: la copia funciona aunque tu plan no llegue.**
+  Cuando una carpeta de guardado supera el tope por partida de tu plan (típico
+  en Paradox: `save games` acumula cientos de MB de campañas y autosaves), el
+  cliente ya no falla la subida entera. Sube los guardados más recientes que
+  caben y omite los más antiguos (regla genérica por fecha+tamaño, sin lógica
+  por juego), y te avisa claramente de que tu plan se ha quedado corto: la
+  partida queda en estado ámbar «Parcial · plan corto» y un aviso te dice
+  cuántos guardados antiguos no se subieron y que Pro los guarda todos.
+- **El estado se particiona por contexto (cuenta cloud / self-hosted).** Cada
+  cuenta y cada servidor self-hosted guarda sus saves en su propio fichero, sin
+  residuos al cambiar de una a otra; migración automática del estado antiguo.
+
+### Fixed
+- **Errores 413 crípticos al superar el tope por partida.** El cliente
+  descartaba el cuerpo del 413 y mostraba «payload too large (413): server max
+  snapshot size exceeded» reintentando en cada cambio de carpeta. Ahora muestra
+  el límite y el tamaño reales, no reintenta en bucle y, cuando puede, recorta y
+  sube lo que cabe en vez de fallar.
+- **Carpeta de guardado vacía marcada como fallo.** Un save cuya carpeta existe
+  pero no tiene ficheros (p. ej. `Repo/saves` recién creada) ya no aparece como
+  «falló»; se registra como «nada que subir».
+- **Al iniciar sesión no arrancaba la vigilancia.** Tras entrar con la cuenta
+  cloud, los juegos se escaneaban pero no se monitorizaba ninguno hasta reiniciar
+  la app; ahora el agente y los schedulers arrancan en el propio login.
+
+### Screen
 - **Hoard Screen: mucho menos CPU y vídeo más fluido en modo compatibilidad.**
   El overlay solo recompone y vuelve a presentar cuando llega un fotograma nuevo
   o cambia la escena, en lugar de repintar a 30fps fijos: un panel quieto (nota,

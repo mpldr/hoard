@@ -47,6 +47,7 @@ export type SaveActivity = {
     | "scheduled"
     | "uploading"
     | "ok"
+    | "partial" // backed up, but the plan's per-save cap dropped old files
     | "failed";
   /** When the next backup is expected to fire (epoch ms), if scheduled. */
   next_backup_at?: number;
@@ -79,7 +80,9 @@ export const trayState = derived<
   if (states.some((s) => s === "uploading")) return "uploading";
   if (states.some((s) => s === "scheduled")) return "uploading";
   if (states.some((s) => s === "running")) return "running";
-  if (states.some((s) => s === "ok")) return "ok";
+  // "partial" still means the last sync succeeded — the tray stays green so we
+  // don't cry wolf; the plan-limit warning lives on the save row + toast.
+  if (states.some((s) => s === "ok" || s === "partial")) return "ok";
   return "idle";
 });
 
@@ -198,6 +201,44 @@ function applyEvent(ev: AgentEvent) {
       );
       break;
     }
+    case "backup_too_large": {
+      // The save is bigger than the plan's per-save cap, so it can never
+      // upload as-is. Not a transient failure and not "retrying" — show an
+      // actionable message (with the real limit/size) once and mark the row
+      // failed-without-retry so it stops spamming every folder change.
+      const msg =
+        ev.limit_bytes > 0
+          ? get(i18n)("library.backup_too_large_toast", {
+              values: {
+                name: ev.game_slug,
+                limit: formatBytes(ev.limit_bytes),
+                size: formatBytes(ev.actual_bytes),
+              },
+            })
+          : get(i18n)("library.backup_too_large_generic_toast", {
+              values: { name: ev.game_slug },
+            });
+      patch(ev.save_id, { state: "failed", error: msg, will_retry: false });
+      toastError(msg);
+      if (get(prefs)?.notify_on_failure) notify("Backup failed", msg);
+      break;
+    }
+    case "backup_trimmed": {
+      // The backup succeeded but the plan's per-save cap forced us to upload
+      // only the newest files. Not an error (a backup_success already fired),
+      // but the user must know their plan isn't enough for this save: mark the
+      // row amber "partial" and warn once.
+      const msg = get(i18n)("library.backup_trimmed_toast", {
+        values: {
+          name: ev.game_slug,
+          omitted: ev.omitted_files,
+          size: formatBytes(ev.omitted_bytes),
+        },
+      });
+      patch(ev.save_id, { state: "partial", error: msg, will_retry: false });
+      toastError(msg);
+      break;
+    }
     case "backup_skipped_empty": {
       // Saw an fs event that resolved to an empty/missing folder. We did
       // *not* push an empty snapshot to the server (that would silently
@@ -219,7 +260,8 @@ function applyEvent(ev: AgentEvent) {
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(0)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /** Subscribe to all `agent://*` channels. Idempotent — safe to call from
@@ -233,6 +275,8 @@ export async function subscribeAgent() {
     "agent://backup-started",
     "agent://backup-success",
     "agent://backup-failed",
+    "agent://backup-too-large",
+    "agent://backup-trimmed",
     "agent://save-auto-restored",
     "agent://save-auto-restore-failed",
     "agent://backup-skipped-empty",

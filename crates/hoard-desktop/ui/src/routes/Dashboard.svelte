@@ -141,6 +141,14 @@
           icon: Check,
           klass: "text-emerald-400",
         };
+      case "partial":
+        // Backed up, but the plan's per-save cap dropped older files. Amber
+        // (warning, not error) — sync works, the plan just isn't big enough.
+        return {
+          label: $_("dashboard.pill_partial"),
+          icon: AlertTriangle,
+          klass: "text-amber-400",
+        };
       case "failed":
         return {
           label: a.will_retry ? $_("dashboard.pill_failed_retry") : $_("dashboard.pill_failed"),

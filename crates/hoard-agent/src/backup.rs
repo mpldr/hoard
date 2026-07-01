@@ -20,6 +20,17 @@ use tokio::io::AsyncReadExt;
 use crate::api::{ApiClient, CloudCasFileEntry, CloudCasInit, Snapshot};
 use crate::state::{CliState, SaveState};
 
+/// The source directory exists but holds no regular files to upload (only
+/// empty subdirs, or nothing). Typed so the agent can treat it as "nothing to
+/// back up" (a `BackupSkippedEmpty`) rather than a red "falló" — pushing an
+/// empty snapshot would clobber the last good server copy. See
+/// `agent::run_backup_with_retry`.
+#[derive(Debug, thiserror::Error)]
+#[error("no files found in {path}")]
+pub struct EmptySource {
+    pub path: PathBuf,
+}
+
 /// One file enumerated from the source directory.
 #[derive(Debug, Clone)]
 pub struct UploadFile {
@@ -35,12 +46,32 @@ pub struct UploadFile {
     pub modified: Option<SystemTime>,
 }
 
+/// What a per-save-cap trim left out of an upload. See
+/// [`upload_directory_cloud`]'s trim-and-retry: when a save's logical size
+/// exceeds the plan's per-save cap, the client uploads the newest files that
+/// fit and reports the omitted tail here so the UI can tell the user their
+/// plan isn't big enough (Free) — the backup succeeded, but *partial*.
+#[derive(Debug, Clone)]
+pub struct TrimInfo {
+    pub kept_files: usize,
+    pub kept_bytes: u64,
+    pub omitted_files: usize,
+    pub omitted_bytes: u64,
+    /// Plan slug the cap belongs to (e.g. `"free"`), for the upgrade nudge.
+    pub plan: String,
+    /// The per-save cap in bytes that forced the trim.
+    pub limit_bytes: u64,
+}
+
 /// Result of a successful upload.
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
     pub snapshot: Snapshot,
     pub file_count: usize,
     pub total_bytes: u64,
+    /// `Some` when the save was too big for the plan's per-save cap and only
+    /// its newest files were uploaded; `None` when the whole save went up.
+    pub trimmed: Option<TrimInfo>,
 }
 
 /// Outcome of a skip-aware backup ([`upload_directory_checked`]).
@@ -236,7 +267,7 @@ where
 
     let files = walk_source(&source)?;
     if files.is_empty() {
-        bail!("no files found in {}", source.display());
+        return Err(EmptySource { path: source }.into());
     }
     let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
     let file_count = files.len();
@@ -336,6 +367,8 @@ where
         snapshot: snap,
         file_count,
         total_bytes,
+        // The self-hosted multipart path has no per-save cap trim.
+        trimmed: None,
     })
 }
 
@@ -360,49 +393,123 @@ async fn upload_directory_cloud<F>(
 where
     F: Fn(u64, u64),
 {
-    let file_count = files.len();
     progress(0, total_bytes);
 
-    // 1. Whole-file SHA-256 of every file — the dedup key.
-    let mut shas: Vec<String> = Vec::with_capacity(file_count);
+    // 1. Whole-file SHA-256 of every file — the dedup key. Hashed once up
+    //    front and cached by path so a per-save-cap trim-and-retry (below)
+    //    doesn't re-read the files.
+    let mut sha_by_path: HashMap<&str, String> = HashMap::with_capacity(files.len());
     for f in files {
-        shas.push(hash_file(&f.absolute_path).await?);
+        sha_by_path.insert(f.relative_path.as_str(), hash_file(&f.absolute_path).await?);
     }
 
-    // 2. Declare the manifest; the server replies with the blobs it lacks.
-    let manifest: Vec<CloudCasFileEntry> = files
-        .iter()
-        .zip(&shas)
-        .map(|(f, sha)| CloudCasFileEntry {
-            relative_path: f.relative_path.clone(),
-            sha256: sha.clone(),
-            size_bytes: f.size_bytes as i64,
-            modified_at: f
-                .modified
-                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64),
-        })
-        .collect();
+    // Working set, newest first, so if the save is too big for the plan's
+    // per-save cap we keep the most recent saves and drop the oldest — a
+    // generic rule (recency + size only, no per-game knowledge) that lets a
+    // huge Paradox `save games` folder back up *partially* instead of failing
+    // whole. `trimmed` records what was left out for the UI's "your plan isn't
+    // big enough" nudge.
+    let mut working: Vec<&UploadFile> = files.iter().collect();
+    working.sort_by(|a, b| b.modified.cmp(&a.modified));
+    let mut trimmed: Option<TrimInfo> = None;
 
-    let init = client
-        .cloud_cas_init(&CloudCasInit {
-            save_id: save_id.to_string(),
-            game_slug: game_slug.to_string(),
-            label: Some(label.to_string()),
-            device_name: None,
-            notes: None,
-            backup_only: false,
-            base_version,
-            files: manifest,
-        })
-        .await
-        .context("cloud cas init")?;
+    // 2/3/4. Declare manifest → upload missing blobs → commit. Wrapped in a
+    // loop so a per-save-cap 413 can trim the working set and retry exactly
+    // once (the trim can only shrink, so it converges).
+    let (init, by_sha, file_count, total_bytes) = loop {
+        let file_count = working.len();
+        let logical: u64 = working.iter().map(|f| f.size_bytes).sum();
 
-    // 3. Upload only the missing blobs. Files sharing a SHA upload once.
-    let mut by_sha: HashMap<&str, &UploadFile> = HashMap::new();
-    for (f, sha) in files.iter().zip(&shas) {
-        by_sha.entry(sha.as_str()).or_insert(f);
-    }
+        let manifest: Vec<CloudCasFileEntry> = working
+            .iter()
+            .map(|f| CloudCasFileEntry {
+                relative_path: f.relative_path.clone(),
+                sha256: sha_by_path[f.relative_path.as_str()].clone(),
+                size_bytes: f.size_bytes as i64,
+                modified_at: f
+                    .modified
+                    .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64),
+            })
+            .collect();
+
+        match client
+            .cloud_cas_init(&CloudCasInit {
+                save_id: save_id.to_string(),
+                game_slug: game_slug.to_string(),
+                label: Some(label.to_string()),
+                device_name: None,
+                notes: None,
+                backup_only: false,
+                base_version,
+                files: manifest,
+            })
+            .await
+        {
+            Ok(init) => {
+                // Files sharing a SHA upload once.
+                let mut by_sha: HashMap<&str, &UploadFile> = HashMap::new();
+                for f in &working {
+                    by_sha
+                        .entry(sha_by_path[f.relative_path.as_str()].as_str())
+                        .or_insert(*f);
+                }
+                break (init, by_sha, file_count, logical);
+            }
+            Err(e) => {
+                // Per-save size cap (413). Trim to the newest files that fit
+                // under the cap and retry once. Only trim on the first hit
+                // (`trimmed.is_none()`) so we can't loop.
+                let cap = if trimmed.is_none() {
+                    e.downcast_ref::<crate::api::ApiError>().and_then(|api_err| {
+                        match api_err {
+                            crate::api::ApiError::TooLarge(d) if d.limit_bytes > 0 => Some(d.clone()),
+                            _ => None,
+                        }
+                    })
+                } else {
+                    None
+                };
+                let Some(detail) = cap else {
+                    return Err(e).context("cloud cas init");
+                };
+                let limit = detail.limit_bytes;
+                let mut kept: Vec<&UploadFile> = Vec::new();
+                let mut kept_bytes = 0u64;
+                for f in &working {
+                    if kept_bytes + f.size_bytes <= limit {
+                        kept.push(*f);
+                        kept_bytes += f.size_bytes;
+                    }
+                }
+                if kept.is_empty() {
+                    // Even the single newest file is over the cap — nothing to
+                    // trim to; let the caller surface it as terminal too-large.
+                    return Err(e).context("cloud cas init");
+                }
+                let full_bytes: u64 = working.iter().map(|f| f.size_bytes).sum();
+                trimmed = Some(TrimInfo {
+                    kept_files: kept.len(),
+                    kept_bytes,
+                    omitted_files: working.len() - kept.len(),
+                    omitted_bytes: full_bytes - kept_bytes,
+                    plan: detail.plan.clone(),
+                    limit_bytes: limit,
+                });
+                tracing::warn!(
+                    save_id,
+                    game_slug,
+                    plan = %detail.plan,
+                    limit_bytes = limit,
+                    kept_files = kept.len(),
+                    omitted_files = working.len() - kept.len(),
+                    "cloud: save exceeds plan per-save cap — uploading only the newest files that fit"
+                );
+                working = kept;
+                continue;
+            }
+        }
+    };
     let upload_total: u64 = init
         .missing
         .iter()
@@ -467,6 +574,7 @@ where
         snapshot,
         file_count,
         total_bytes,
+        trimmed,
     })
 }
 
@@ -535,7 +643,7 @@ where
     }
     let files = walk_source(&canonical)?;
     if files.is_empty() {
-        bail!("no files found in {}", canonical.display());
+        return Err(EmptySource { path: canonical }.into());
     }
     let (prev_cheap, prev_content) = split_signature(prev_signature);
     let cheap = compute_set_signature(&files);

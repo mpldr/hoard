@@ -392,6 +392,26 @@ export type AgentEvent =
       retry_after_secs: number;
     }
   | {
+      type: "backup_too_large";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      plan: string;
+      limit_bytes: number;
+      actual_bytes: number;
+    }
+  | {
+      type: "backup_trimmed";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      kept_files: number;
+      omitted_files: number;
+      omitted_bytes: number;
+      plan: string;
+      limit_bytes: number;
+    }
+  | {
       type: "save_auto_restored";
       save_id: string;
       game_slug: string;

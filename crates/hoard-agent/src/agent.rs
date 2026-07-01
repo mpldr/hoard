@@ -248,6 +248,39 @@ pub enum AgentEvent {
         label: String,
         retry_after_secs: u32,
     },
+    /// The save is larger than the plan's per-save cap (413 `save_too_large`),
+    /// so the upload can never succeed as-is — retrying is pointless and would
+    /// just spam the feed every time the folder changes. Surfaced as its own
+    /// event (not a generic `BackupFailed`) so the UI can show an actionable
+    /// "supera el límite de tu plan, sube a Pro" message built from the
+    /// structured fields instead of a cryptic raw 413, and mark the save
+    /// terminal rather than "reintentando". `limit_bytes`/`actual_bytes` are
+    /// `0` for a self-hosted 413 with no structured body.
+    BackupTooLarge {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        plan: String,
+        limit_bytes: u64,
+        actual_bytes: u64,
+    },
+    /// The save was bigger than the plan's per-save cap, so the agent uploaded
+    /// only the newest files that fit and dropped the oldest (generic recency
+    /// trim — no per-game knowledge). The backup **succeeded** (a
+    /// `BackupSuccess` fires alongside), but it's *partial*: the UI surfaces an
+    /// amber "tu plan no llega, sube a Pro" state rather than a plain green
+    /// "ok", so a Free user knows their older saves aren't in the cloud even
+    /// though sync is working. `omitted_*` count what was left out.
+    BackupTrimmed {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        kept_files: u64,
+        omitted_files: u64,
+        omitted_bytes: u64,
+        plan: String,
+        limit_bytes: u64,
+    },
     /// The agent detected that the save's local folder was missing or empty
     /// on add and `Prefs::auto_restore` was enabled, so it downloaded the
     /// latest server snapshot into the folder. The UI uses this to toast
@@ -2750,6 +2783,25 @@ async fn run_backup_with_retry(
                         set_hash: Some(signature.clone()),
                     })
                     .await;
+                // Partial upload: the save was over the plan's per-save cap so
+                // only the newest files went up. Fire a second event *after*
+                // success so the UI's amber "plan too small" state wins over the
+                // green "ok" — the backup worked, but the user must know Free
+                // isn't enough for this save.
+                if let Some(t) = &o.trimmed {
+                    let _ = events_tx
+                        .send(AgentEvent::BackupTrimmed {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            kept_files: t.kept_files as u64,
+                            omitted_files: t.omitted_files as u64,
+                            omitted_bytes: t.omitted_bytes,
+                            plan: t.plan.clone(),
+                            limit_bytes: t.limit_bytes,
+                        })
+                        .await;
+                }
                 // Tell the agent loop to clear has_pending and cache the new
                 // signature. If the channel is full or the agent is shutting
                 // down we just drop the signal — worst case we re-upload an
@@ -2949,6 +3001,71 @@ async fn run_backup_with_retry(
                             return;
                         }
                     }
+                }
+                // Empty source (no regular files to upload): not a failure.
+                // Pushing an empty snapshot would clobber the last good server
+                // copy, so we skip exactly like the up-front empty-folder guard.
+                // Reached when the folder holds only subdirs / no files (e.g. an
+                // empty `Repo/saves`). Clear has_pending so a later write isn't
+                // blocked, and settle without a red "falló".
+                if e.chain().any(|c| c.is::<crate::backup::EmptySource>()) {
+                    tracing::info!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        "agent: backup skipped — source has no files to upload"
+                    );
+                    let _ = done_tx.try_send(BackupDone {
+                        save_id: save.save_id.clone(),
+                        new_set_hash: None,
+                        committed: false,
+                        version_num: None,
+                    });
+                    let _ = events_tx
+                        .send(AgentEvent::BackupSkippedEmpty {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                        })
+                        .await;
+                    return;
+                }
+                // Per-save size cap (413 `save_too_large`): the upload can never
+                // succeed as-is, so retrying just burns the budget and spams the
+                // feed. Emit a dedicated, actionable event and settle (clear
+                // has_pending) so it doesn't re-fire until the folder actually
+                // changes — no red "falló", no retry loop.
+                let too_large = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<crate::api::ApiError>())
+                    .and_then(|api_err| match api_err {
+                        crate::api::ApiError::TooLarge(d) => Some(d.clone()),
+                        _ => None,
+                    });
+                if let Some(detail) = too_large {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        plan = %detail.plan,
+                        limit_bytes = detail.limit_bytes,
+                        actual_bytes = detail.actual_bytes,
+                        "agent: backup rejected — save exceeds the plan's per-save size cap"
+                    );
+                    let _ = done_tx.try_send(BackupDone {
+                        save_id: save.save_id.clone(),
+                        new_set_hash: None,
+                        committed: false,
+                        version_num: None,
+                    });
+                    let _ = events_tx
+                        .send(AgentEvent::BackupTooLarge {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            plan: detail.plan.clone(),
+                            limit_bytes: detail.limit_bytes,
+                            actual_bytes: detail.actual_bytes,
+                        })
+                        .await;
+                    return;
                 }
                 // Bandwidth throttle (429): wait the server's exact
                 // window-slide time and retry without consuming the

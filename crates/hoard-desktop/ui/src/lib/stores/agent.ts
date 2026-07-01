@@ -269,17 +269,34 @@ export async function unsubscribeAgent() {
   lastTrayState = null;
 }
 
-/** Start the agent and subscribe. Called once after login. */
+/** In-flight `bootAgent` promise. Both `hydrateAuth` (self-hosted) and
+ *  `hydrateCloud` (cloud) can race to boot the agent on a cold start where the
+ *  user has both sessions; `start_agent` guards against a double spawn but has
+ *  an `await` between its "already running?" check and setting the handle, so
+ *  two concurrent calls could slip through. Deduping here closes that window. */
+let bootInFlight: Promise<void> | null = null;
+
+/** Start the agent and subscribe. Idempotent and safe to call from every login
+ *  path (self-hosted or cloud) and from the cold-start hydrate; concurrent
+ *  calls share a single boot. */
 export async function bootAgent() {
-  await ensureNotificationPermission();
-  const s = await api.startAgent();
-  status.set(s);
-  // Seed the live header's watcher dot from the boot status. The
-  // `agent://watcher-armed` events fire inside `start_agent` before
-  // `subscribeLive()` is wired, so without this the header stays on
-  // "watcher off" for the whole session even though saves are watched.
-  seedWatcher(s.watched_count);
-  await subscribeAgent();
+  if (bootInFlight) return bootInFlight;
+  bootInFlight = (async () => {
+    await ensureNotificationPermission();
+    const s = await api.startAgent();
+    status.set(s);
+    // Seed the live header's watcher dot from the boot status. The
+    // `agent://watcher-armed` events fire inside `start_agent` before
+    // `subscribeLive()` is wired, so without this the header stays on
+    // "watcher off" for the whole session even though saves are watched.
+    seedWatcher(s.watched_count);
+    await subscribeAgent();
+  })();
+  try {
+    await bootInFlight;
+  } finally {
+    bootInFlight = null;
+  }
 }
 
 /** Stop the agent and clear state. Called on logout. */

@@ -11,10 +11,12 @@
  * so this store is just a reactive view of `cloud_current_account()`.
  */
 
-import { writable, derived, type Readable } from "svelte/store";
+import { writable, derived, get, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
+import { bootAgent, shutdownAgent } from "./agent";
+import { auth } from "./auth";
 
 export type CloudAccount = {
   user_id: string;
@@ -127,6 +129,15 @@ export async function hydrateCloud(): Promise<void> {
       refreshCloud().catch((e) =>
         console.warn("initial cloud refresh failed:", e),
       );
+      // Resume background watching for a restored cloud session. Self-hosted
+      // does this in `hydrateAuth`, but a cloud-only user has no `$auth.user`,
+      // so without this the agent never boots on launch: tracked saves aren't
+      // watched, running games aren't detected, and "vigilancia" stays off
+      // until the user toggles Modo Automático or restarts. `bootAgent` is
+      // idempotent and dedups against a concurrent self-hosted boot.
+      bootAgent().catch((e) =>
+        console.warn("agent boot failed on cloud hydrate:", e),
+      );
     }
   } catch (e) {
     console.error("hydrateCloud failed:", e);
@@ -172,6 +183,13 @@ export async function completeCloudLogin(
       callbackState,
     });
     internal.set({ account, hydrated: true, loading: false });
+    // Boot the live agent for the freshly signed-in account so watching starts
+    // immediately — same as `signIn` does for self-hosted. Rust already pointed
+    // `CliState` at this account's context inside `cloud_complete_login`, so the
+    // watch list hydrates from the right file. Idempotent.
+    bootAgent().catch((e) =>
+      console.warn("agent boot failed on cloud sign-in:", e),
+    );
     return account;
   } catch (e) {
     internal.update(($s) => ({ ...$s, loading: false }));
@@ -184,6 +202,12 @@ export async function completeCloudLogin(
 export async function logoutCloud(): Promise<void> {
   await invoke<void>("cloud_logout");
   internal.set({ account: null, hydrated: true, loading: false });
+  // Stop watching once the cloud session is gone — unless a self-hosted
+  // session is still active, which keeps its own agent. Leaving it running
+  // would have it hammer a cleared token and 401 in a loop.
+  if (!get(auth).user) {
+    await shutdownAgent();
+  }
 }
 
 export type CloudExportJob = {

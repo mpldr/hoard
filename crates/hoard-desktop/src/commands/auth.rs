@@ -14,7 +14,7 @@
 use hoard_agent::api::{ApiClient, ApiError};
 use hoard_agent::credentials::{self, Credentials, UserSection};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::state::AppState;
 
@@ -75,6 +75,7 @@ pub async fn health_check(url: String) -> Result<HealthInfo, String> {
 /// the in-memory user cache.
 #[tauri::command]
 pub async fn login(
+    app: AppHandle,
     url: String,
     token: String,
     state: State<'_, AppState>,
@@ -114,6 +115,13 @@ pub async fn login(
     *state.user.lock().unwrap() = Some(user.clone());
     // Point per-context state at this self-hosted server.
     crate::commands::library::sync_active_context(state.inner());
+    // Rehydrate the Modo Automático schedulers for this session if the toggle
+    // was left on. A cold start does this in Tauri `setup()`; a hot login would
+    // otherwise leave the periodic scan/track/sweep dead until the next launch.
+    // (The UI also boots the agent via `signIn`; `run_scan` here is idempotent.)
+    if let Err(e) = crate::commands::automatic::restart_if_enabled(&app).await {
+        tracing::warn!(error = %e, "login: couldn't rehydrate automatic schedulers");
+    }
     Ok(user)
 }
 

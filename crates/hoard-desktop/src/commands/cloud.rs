@@ -519,6 +519,16 @@ pub async fn cloud_complete_login(
         }
     }
 
+    // Bring the Modo Automático schedulers up for this session if the user left
+    // the toggle on. On a cold start Tauri's `setup()` runs `restart_if_enabled`;
+    // a hot login (no restart) otherwise leaves the periodic scan/track/sweep
+    // dead — so freshly-detected games never get auto-tracked or watched, and
+    // the user sees "scanned but nothing is being monitored" until they restart
+    // or toggle the switch. `run_scan` inside also boots the agent (idempotent).
+    if let Err(e) = crate::commands::automatic::restart_if_enabled(&app).await {
+        tracing::warn!(error = %e, "cloud: couldn't rehydrate automatic schedulers after login");
+    }
+
     // Boot the cloud-pull poller so LiveStatus has fresh manifest data
     // within `prefs.cloud_poll_interval_secs`. Read the interval from
     // disk so the just-logged-in session honours the user's last choice.

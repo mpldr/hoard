@@ -375,9 +375,9 @@ mod tests {
         assert!(!p.autostart);
         assert!(!p.auto_restore);
         // 1.5.3: toggle off by default. 1.9.14: the single 6h interval was
-        // split into a cheap 5-min scan and an expensive 1h hash sweep.
+        // split into a cheap 10-min scan and an expensive 1h hash sweep.
         assert!(!p.automatic_mode);
-        assert_eq!(p.automatic_scan_interval_secs, 300);
+        assert_eq!(p.automatic_scan_interval_secs, 600);
         assert_eq!(p.automatic_backup_interval_secs, 3600);
         // 1.5.5: conflict backups retained for 14 days by default.
         assert_eq!(p.conflict_retention_days, 14);
@@ -410,7 +410,7 @@ mod tests {
         let parsed: Prefs =
             serde_json::from_str(legacy).expect("legacy prefs.json should still parse");
         assert!(!parsed.automatic_mode);
-        assert_eq!(parsed.automatic_scan_interval_secs, 300);
+        assert_eq!(parsed.automatic_scan_interval_secs, 600);
         assert_eq!(parsed.automatic_backup_interval_secs, 3600);
     }
 
@@ -428,7 +428,7 @@ mod tests {
             serde_json::from_str(legacy).expect("1.9.13 prefs.json should still parse");
         assert!(parsed.automatic_mode);
         // Old value (12h) is gone; new fields are at their defaults, not 12.
-        assert_eq!(parsed.automatic_scan_interval_secs, 300);
+        assert_eq!(parsed.automatic_scan_interval_secs, 600);
         assert_eq!(parsed.automatic_backup_interval_secs, 3600);
     }
 

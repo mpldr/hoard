@@ -38,7 +38,7 @@ import type {
 import * as api from "../api";
 import { prefs } from "./prefs";
 import { seedWatcher } from "./live";
-import { toastSuccess, toastError } from "./toasts";
+import { toastSuccess } from "./toasts";
 
 export type SaveActivity = {
   state:
@@ -193,12 +193,10 @@ function applyEvent(ev: AgentEvent) {
       break;
     }
     case "save_auto_restore_failed": {
-      const t = get(i18n);
-      toastError(
-        t("library.auto_restore_failed_toast", {
-          values: { name: ev.game_slug, error: ev.error },
-        }),
-      );
+      // Surfaced in the activity feed (see live.ts), not as a toast. A stale
+      // session token at launch made this fire once per tracked save — a burst
+      // of popups every start. The agent now suppresses the transient 401 at
+      // source; genuine per-save failures still land in the feed.
       break;
     }
     case "backup_too_large": {
@@ -219,7 +217,8 @@ function applyEvent(ev: AgentEvent) {
               values: { name: ev.game_slug },
             });
       patch(ev.save_id, { state: "failed", error: msg, will_retry: false });
-      toastError(msg);
+      // No toast: the activity feed carries this now (see live.ts). Native
+      // notification stays behind the user's opt-in `notify_on_failure`.
       if (get(prefs)?.notify_on_failure) notify("Backup failed", msg);
       break;
     }
@@ -236,7 +235,7 @@ function applyEvent(ev: AgentEvent) {
         },
       });
       patch(ev.save_id, { state: "partial", error: msg, will_retry: false });
-      toastError(msg);
+      // No toast — surfaced in the activity feed (see live.ts).
       break;
     }
     case "backup_skipped_empty": {

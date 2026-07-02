@@ -51,7 +51,16 @@ export type FeedEntry = {
     | "cloud_pull"
     | "quota_reached"
     | "offline"
-    | "online";
+    | "online"
+    // Per-save plan-limit outcomes — surfaced here (not as toasts) so the
+    // reconciliation sweep doesn't spam a popup per save on every launch.
+    | "backup_too_large"
+    | "backup_trimmed"
+    | "auto_restore_failed"
+    // Account-wide storage pressure, driven off the cloud account's
+    // `storage_status` (`purging` → amber, `full` → red).
+    | "storage_purging"
+    | "storage_full";
   /** Optional save_id / game_slug for renderers that want a hint. */
   save_id?: string;
   game_slug?: string;
@@ -63,6 +72,8 @@ export type FeedEntry = {
   retry_in?: number;
   plan?: string;
   error?: string;
+  /** Per-save cap in bytes, for the `backup_too_large` row. */
+  limit_bytes?: number;
 };
 
 const MAX_FEED_ENTRIES = 80;
@@ -316,6 +327,66 @@ export async function subscribeLive() {
       pushEntry({ kind: "offline" });
     }),
   );
+
+  // Plan-limit outcomes. These used to fire a toast per save from `agent.ts`,
+  // which meant a burst of popups every launch as the reconciliation sweep
+  // re-hit the same over-cap saves. They belong in the feed like any other
+  // per-save event; `agent.ts` still updates the Library row state.
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-too-large", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_too_large") return;
+      pushEntry({
+        kind: "backup_too_large",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        bytes: p.actual_bytes,
+        limit_bytes: p.limit_bytes,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-trimmed", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_trimmed") return;
+      pushEntry({
+        kind: "backup_trimmed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.omitted_files,
+        bytes: p.omitted_bytes,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://save-auto-restore-failed", (e) => {
+      const p = e.payload;
+      if (p.type !== "save_auto_restore_failed") return;
+      pushEntry({
+        kind: "auto_restore_failed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        error: p.error,
+      });
+    }),
+  );
+}
+
+/** Last account-wide storage pressure we pushed a feed row for, so a 30s
+ *  quota refresh that re-reports the same state doesn't spam the panel. */
+let lastStorageStatus: string | null = null;
+
+/** Called by the cloud store whenever the account is (re)loaded. Pushes a
+ *  single amber (`purging`) / red (`full`) feed row on entering that state,
+ *  and resets silently when it recovers to `ok`. */
+export function noteStorageStatus(status: string | undefined | null) {
+  const s = status ?? "ok";
+  if (s === lastStorageStatus) return;
+  lastStorageStatus = s;
+  if (s === "purging") pushEntry({ kind: "storage_purging" });
+  else if (s === "full") pushEntry({ kind: "storage_full" });
 }
 
 export async function unsubscribeLive() {
@@ -335,6 +406,7 @@ export function resetLive() {
   watcher.set({ armed: false, count: 0 });
   cloudLoop.set({ status: "unknown", last_ok_at: null, retry_in: null });
   activityFeed.set([]);
+  lastStorageStatus = null;
 }
 
 /** Reset only the cloud-loop dot to its neutral baseline, leaving the local

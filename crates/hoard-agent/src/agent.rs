@@ -1497,11 +1497,26 @@ fn spawn_auto_restore(
                 // remote was purged). It's not a transient failure — don't
                 // raise it to the user as an error and don't keep retrying on
                 // the short cooldown; park it on a long backoff (below).
-                not_on_server = matches!(e.downcast_ref::<ApiError>(), Some(ApiError::NotFound));
+                let api_err = e.downcast_ref::<ApiError>();
+                not_on_server = matches!(api_err, Some(ApiError::NotFound));
+                // A 401 is session-wide, not per-save: at launch the stored
+                // cloud JWT can be expired and the desktop's refresh path
+                // hasn't pushed a fresh token into this client yet, so the
+                // startup reconciliation sweep would emit one
+                // `SaveAutoRestoreFailed` per tracked save — a burst of "no se
+                // pudo restaurar" popups. Swallow it (the global cloud status
+                // already reflects the session problem) and let the normal
+                // short cooldown retry once the token is refreshed.
+                let unauthorized = matches!(api_err, Some(ApiError::Unauthorized));
                 if not_on_server {
                     tracing::debug!(
                         save_id = %save.save_id,
                         "agent: auto-restore — save not on server (404); backing off"
+                    );
+                } else if unauthorized {
+                    tracing::debug!(
+                        save_id = %save.save_id,
+                        "agent: auto-restore deferred — session unauthorized (token refresh pending)"
                     );
                 } else {
                     let chain = format!("{e:#}");

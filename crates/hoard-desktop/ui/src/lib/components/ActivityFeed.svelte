@@ -24,6 +24,9 @@
     RefreshCcw,
     Ban,
     WifiOff,
+    Scissors,
+    Trash2,
+    AlertTriangle,
     X,
   } from "lucide-svelte";
 
@@ -48,6 +51,11 @@
     quota_reached: Ban,
     offline: WifiOff,
     online: CheckCircle2,
+    backup_too_large: XCircle,
+    backup_trimmed: Scissors,
+    auto_restore_failed: XCircle,
+    storage_purging: Trash2,
+    storage_full: AlertTriangle,
   } as const;
 
   const TINTS = {
@@ -64,7 +72,23 @@
     quota_reached: "text-amber-400",
     offline: "text-rose-400",
     online: "text-emerald-400",
+    backup_too_large: "text-rose-400",
+    backup_trimmed: "text-amber-300",
+    auto_restore_failed: "text-rose-400",
+    storage_purging: "text-amber-400",
+    storage_full: "text-rose-400",
   } as const;
+
+  // Alert rows get a tinted "card" so plan-limit / storage-pressure events
+  // read at a glance: amber for reversible pressure (trimming / purging),
+  // red for a hard stop (over-cap upload, restore failure, storage full).
+  const ROW_ACCENT: Partial<Record<FeedEntry["kind"], string>> = {
+    backup_too_large: "border-l-2 border-rose-500/70 bg-rose-500/10",
+    auto_restore_failed: "border-l-2 border-rose-500/70 bg-rose-500/10",
+    storage_full: "border-l-2 border-rose-500/70 bg-rose-500/10",
+    backup_trimmed: "border-l-2 border-amber-500/70 bg-amber-500/10",
+    storage_purging: "border-l-2 border-amber-500/70 bg-amber-500/10",
+  };
 
   function relativeTime(at: number): string {
     const seconds = Math.round((Date.now() - at) / 1000);
@@ -126,6 +150,30 @@
         return $_("activity.offline");
       case "online":
         return $_("activity.online");
+      case "backup_too_large":
+        return $_("activity.backup_too_large", {
+          values: {
+            name,
+            size: formatBytes(e.bytes ?? 0),
+            limit: formatBytes(e.limit_bytes ?? 0),
+          },
+        });
+      case "backup_trimmed":
+        return $_("activity.backup_trimmed", {
+          values: {
+            name,
+            count: e.count ?? 0,
+            size: formatBytes(e.bytes ?? 0),
+          },
+        });
+      case "auto_restore_failed":
+        return $_("activity.auto_restore_failed", {
+          values: { name, error: e.error ?? "" },
+        });
+      case "storage_purging":
+        return $_("activity.storage_purging");
+      case "storage_full":
+        return $_("activity.storage_full");
     }
   }
 
@@ -185,7 +233,7 @@
     <ul class="max-h-[min(60vh,28rem)] divide-y divide-zinc-800/60 overflow-y-auto">
       {#each $activityFeed.slice(0, 50) as entry (entry.id)}
         {@const Icon = ICONS[entry.kind]}
-        <li class="flex items-start gap-3 px-3 py-2">
+        <li class="flex items-start gap-3 px-3 py-2 {ROW_ACCENT[entry.kind] ?? ''}">
           <span
             class="mt-0.5 shrink-0 {TINTS[entry.kind]}"
             aria-hidden="true"

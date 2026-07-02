@@ -17,6 +17,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { bootAgent, shutdownAgent } from "./agent";
 import { auth } from "./auth";
+import { noteStorageStatus } from "./live";
 
 export type CloudAccount = {
   user_id: string;
@@ -96,6 +97,7 @@ export async function hydrateCloud(): Promise<void> {
   try {
     const account = await invoke<CloudAccount | null>("cloud_current_account");
     internal.set({ account, hydrated: true, loading: false });
+    noteStorageStatus(account?.storage_status);
     // If we have an account, refresh once in the background so the bar
     // tracks reality instead of whatever was on disk at last sign-in.
     if (account) {
@@ -125,6 +127,7 @@ export async function refreshCloud(): Promise<CloudAccount> {
   try {
     const account = await invoke<CloudAccount>("cloud_refresh_account");
     internal.set({ account, hydrated: true, loading: false });
+    noteStorageStatus(account.storage_status);
     return account;
   } catch (e) {
     internal.update(($s) => ({ ...$s, loading: false }));

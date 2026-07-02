@@ -1,11 +1,15 @@
 //! `/v1/cloud/playtime` — cloud mirror of the agent's real-hours-played
 //! tracker, attributed per local day and per game, per device.
 //!
-//! - `POST` upserts a device's full breakdown of `(day, game, secs)` rows.
-//!   Counts only grow, so a conflict keeps the larger value (`GREATEST`): a
-//!   re-upload after a flush, or a stale device that fell behind, can never
-//!   shrink the truth. `device_fp` keeps two machines that played the same
-//!   game on the same day from clobbering each other.
+//! - `POST` replaces a device's full breakdown of `(day, game, secs)` rows:
+//!   the client's local playtime is monotonic (it only ever accrues, never
+//!   prunes), so each device is the sole source of truth for its own rows. We
+//!   wipe this `(user_id, device_fp)`'s rows and re-insert the payload inside
+//!   one transaction. This lets a device that legitimately has *nothing* for an
+//!   account (e.g. after the per-account playtime partition, a second account
+//!   that never played here) push an empty set and have its stale rows cleared,
+//!   instead of them lingering forever under a grow-only upsert. `device_fp`
+//!   keeps two machines that played the same game on the same day independent.
 //! - `GET` returns the device-merged aggregate in the same
 //!   `{ days, by_game, total_secs }` shape the recap reads locally, so the UI
 //!   can swap its source without reshaping. The synthetic `__other__` slug
@@ -92,6 +96,17 @@ pub async fn upload(
     }
 
     let mut tx = state.pool.begin().await?;
+
+    // Full replace for this device: drop its current rows, then re-insert the
+    // payload. The client's local store is monotonic, so this never loses
+    // history; an empty payload correctly clears a device that no longer has
+    // anything to attribute for this account.
+    sqlx::query("DELETE FROM playtime WHERE user_id = $1 AND device_fp = $2")
+        .bind(user.user_id)
+        .bind(fp)
+        .execute(&mut *tx)
+        .await?;
+
     let mut accepted = 0usize;
     for row in &body.rows {
         if row.secs == 0 || row.game_slug.is_empty() || !valid_day(&row.day) {

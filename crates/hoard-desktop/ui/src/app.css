@@ -159,6 +159,16 @@ select option {
   background-color: #15171a;
 }
 
+/* WebKitGTK (Linux) paints a black rectangle where a `backdrop-filter`
+   element repaints on hover — the sidebar's blur, sitting over the Wrapped
+   surface's translucent layers, triggers it every time a nav button lights up.
+   Drop the backdrop blur on Linux only; the semi-opaque gradient already reads
+   as a panel there. WebView2 (Windows) / WKWebView (macOS) keep the glass. */
+html.is-linux .sidebar-glass {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 /* ---- Motion --------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *,

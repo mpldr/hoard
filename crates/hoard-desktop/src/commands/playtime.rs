@@ -31,6 +31,9 @@ use crate::state::AppState;
 /// agent has observed a tracked game running for at least one poll interval.
 #[tauri::command]
 pub fn list_playtime() -> Result<PlaytimeSummary, String> {
+    // Idempotente: adopta el playtime legacy al contexto activo si aún no se
+    // hizo (p.ej. el recap se abre antes de que el agente arranque).
+    let _ = PlaytimeStore::migrate_legacy_into_current_context();
     let path = PlaytimeStore::default_path().map_err(|e| e.to_string())?;
     Ok(PlaytimeStore::load(&path).summary())
 }

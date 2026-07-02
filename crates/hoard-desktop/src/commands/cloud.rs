@@ -1077,6 +1077,10 @@ pub async fn cloud_sync_playtime(
 ) -> Result<hoard_agent::playtime::PlaytimeSummary, String> {
     use hoard_agent::playtime::{PlaytimeStore, PlaytimeSummary};
 
+    // Adopta el playtime legacy al contexto activo una sola vez (idempotente),
+    // para que el store que subimos sea el de esta cuenta y no el global.
+    let _ = PlaytimeStore::migrate_legacy_into_current_context();
+
     let local = || -> Result<PlaytimeSummary, String> {
         let path = PlaytimeStore::default_path().map_err(|e| e.to_string())?;
         Ok(PlaytimeStore::load(&path).summary())

@@ -113,9 +113,71 @@ pub struct PlaytimeRow {
 }
 
 impl PlaytimeStore {
-    /// Ruta por defecto en disco, junto a `state.json` / `correlation.json`.
+    /// Ruta del store para el contexto de sincronización activo (la cuenta
+    /// logueada / servidor self-hosted). Cada cuenta tiene su propio histórico,
+    /// igual que los `saves` viven en `contexts/<id>.json`: así el recap de una
+    /// cuenta no muestra —ni sube— las horas de otra en la misma máquina.
     pub fn default_path() -> Result<PathBuf> {
+        Self::path_for_context(&crate::state::current_context_id())
+    }
+
+    /// Ruta del store para un contexto concreto: `playtime/<ctx>.json`.
+    pub fn path_for_context(ctx: &str) -> Result<PathBuf> {
+        Ok(crate::config::CliConfig::state_dir()?
+            .join("playtime")
+            .join(format!("{ctx}.json")))
+    }
+
+    /// Ruta del fichero monolítico pre-partición (una sola historia global de
+    /// la máquina). Sólo se usa para migrarlo una vez al contexto activo.
+    fn legacy_path() -> Result<PathBuf> {
         Ok(crate::config::CliConfig::state_dir()?.join("playtime.json"))
+    }
+
+    /// Adopta una sola vez el `playtime.json` monolítico pre-partición.
+    ///
+    /// Antes de 1.0 el histórico del recap vivía en un único fichero global de
+    /// la máquina. Cuando el estado de sync se particionó por cuenta
+    /// (`contexts/<id>.json`) el playtime se quedó fuera, así que cada cuenta
+    /// que abría el recap veía —y resubía— la misma historia de toda la
+    /// máquina. En el primer arranque tras la actualización movemos ese fichero
+    /// legacy al contexto *activo* (la cuenta logueada al arrancar, o sea la
+    /// principal del usuario): su recap sobrevive y cualquier otra cuenta parte
+    /// de un histórico vacío y sin contaminar.
+    ///
+    /// Idempotente por `fs::rename`: cuando el legacy ya no está, la llamada no
+    /// hace nada, así que nunca puede readoptarse en otro contexto en un cambio
+    /// posterior. Si el contexto activo ya tuviera su propio fichero (no debería
+    /// en una primera actualización), el legacy se aparta como `.bak` en lugar
+    /// de pisarlo.
+    pub fn migrate_legacy_into_current_context() -> Result<()> {
+        let legacy = Self::legacy_path()?;
+        if !legacy.exists() {
+            return Ok(());
+        }
+        // Don't bury the history in the signed-out `default` bucket, where no
+        // account would ever surface it. Wait until a real context (a cloud
+        // account or a self-hosted server) is active — the agent re-runs this
+        // after login, and the recap commands run it too.
+        let ctx = crate::state::current_context_id();
+        if ctx == "default" {
+            return Ok(());
+        }
+        let target = Self::path_for_context(&ctx)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        if target.exists() {
+            // El contexto activo ya tiene su propio playtime; no lo pisamos.
+            // Apartamos el legacy para que deje de adoptarse en cambios futuros.
+            let bak = legacy.with_extension("pre-partition.bak");
+            let _ = std::fs::rename(&legacy, &bak);
+            return Ok(());
+        }
+        std::fs::rename(&legacy, &target)
+            .with_context(|| format!("adopting legacy playtime into {}", target.display()))?;
+        Ok(())
     }
 
     /// Carga el store; un fichero ausente o corrupto produce uno vacío (las

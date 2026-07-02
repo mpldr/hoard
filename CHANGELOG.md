@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **El recap (Wrapple) era el mismo en todas las cuentas.** Las horas jugadas
+  vivían en un único fichero global de la máquina, así que cada cuenta que abría
+  el recap veía —y subía al servidor— el histórico de toda la máquina. Ahora el
+  playtime se particiona por cuenta igual que los saves: el histórico legacy se
+  adopta una sola vez en la cuenta activa (tu principal) y cualquier otra cuenta
+  parte de cero. Además, la subida al servidor pasa a ser un reemplazo por
+  dispositivo, así que una cuenta que ya no tiene horas que aportar limpia sus
+  filas contaminadas la próxima vez que abre el recap.
+- **Cuadrado negro al pasar el ratón dentro de Wrapple (solo Linux).** Artefacto
+  de compositing de WebKitGTK: el `backdrop-filter` de la barra lateral, sobre
+  los glows difuminados del recap, pintaba un rectángulo negro al iluminarse un
+  botón. Los glows decorativos pasan a radial-gradients (sin `filter`) y en Linux
+  se quita el desenfoque de la barra lateral.
+
 ## [1.0.0] — beta
 
 > **Renumeración.** Hoard pasa a **1.0** como primera beta pública. Toda la

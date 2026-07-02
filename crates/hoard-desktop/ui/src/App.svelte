@@ -578,7 +578,7 @@
 {:else if isAppRoute}
   <div class="flex h-full">
     <aside
-      class="flex w-60 shrink-0 flex-col border-r border-white/[0.06] bg-gradient-to-b from-zinc-950/80 via-zinc-950/60 to-zinc-900/40 backdrop-blur-sm shadow-[inset_-1px_0_0_0_rgba(255,255,255,0.04)]"
+      class="sidebar-glass flex w-60 shrink-0 flex-col border-r border-white/[0.06] bg-gradient-to-b from-zinc-950/80 via-zinc-950/60 to-zinc-900/40 backdrop-blur-sm shadow-[inset_-1px_0_0_0_rgba(255,255,255,0.04)]"
     >
       <div class="flex items-center gap-2 px-4 py-4">
         <Logo size={36} class="shrink-0 rounded-lg" />

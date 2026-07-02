@@ -736,6 +736,12 @@ async fn run_agent(
 
     // PLAYTIME: horas reales por día local. Se alimenta en cada tick de poll
     // con los saves cuyo proceso de juego sigue vivo (ver `process_poll`).
+    // Adopta una vez el fichero legacy global al contexto activo antes de
+    // cargar, para que la cuenta principal conserve su histórico y el resto
+    // arranque vacío (el store se resuelve por contexto de sync).
+    if let Err(e) = crate::playtime::PlaytimeStore::migrate_legacy_into_current_context() {
+        tracing::debug!(error = %e, "agent: legacy playtime migration skipped");
+    }
     let playtime_path = crate::playtime::PlaytimeStore::default_path().ok();
     let mut playtime = playtime_path
         .as_deref()

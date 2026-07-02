@@ -1,6 +1,6 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
@@ -14,6 +14,26 @@
   let sent = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
+  // Seconds left before a resend is allowed. Non-zero disables the resend
+  // button so an impatient user can't hammer Supabase's OTP endpoint (which
+  // rate-limits and would start bouncing the requests).
+  let cooldown = $state(0);
+  let cooldownTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startCooldown(secs = 30) {
+    cooldown = secs;
+    if (cooldownTimer) clearInterval(cooldownTimer);
+    cooldownTimer = setInterval(() => {
+      cooldown -= 1;
+      if (cooldown <= 0 && cooldownTimer) {
+        clearInterval(cooldownTimer);
+        cooldownTimer = null;
+      }
+    }, 1000);
+  }
+  onDestroy(() => {
+    if (cooldownTimer) clearInterval(cooldownTimer);
+  });
   // Set when the user picks "use another account": suppresses the auto-forward
   // so they can sign in as someone else even though a session still lingers.
   let switching = $state(false);
@@ -105,11 +125,38 @@
     try {
       await auth.signInWithEmail(email, redirectTo);
       sent = true;
+      startCooldown();
     } catch (err) {
       error = (err as Error).message;
     } finally {
       busy = false;
     }
+  }
+
+  // Re-send the magic link to the same address. Gated behind the cooldown.
+  async function resend() {
+    if (busy || cooldown > 0 || !email) return;
+    error = null;
+    busy = true;
+    try {
+      await auth.signInWithEmail(email, redirectTo);
+      startCooldown();
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Back to the form to correct a mistyped address.
+  function useAnotherEmail() {
+    sent = false;
+    error = null;
+    if (cooldownTimer) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+    }
+    cooldown = 0;
   }
 </script>
 
@@ -188,6 +235,23 @@
           {$_('login.email_sent_desktop_note')}
         </div>
       {/if}
+      <div class="flex flex-col gap-2">
+        <button
+          class="ring-focus w-full rounded-lg border border-line px-4 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-bg disabled:opacity-50"
+          onclick={resend}
+          disabled={busy || cooldown > 0}
+        >
+          {cooldown > 0
+            ? $_('login.email_resend_wait', { values: { secs: cooldown } })
+            : $_('login.email_resend')}
+        </button>
+        <button
+          class="ring-focus w-full rounded-lg px-4 py-2 text-xs font-medium text-ink-faint transition-colors hover:text-ink-soft"
+          onclick={useAnotherEmail}
+        >
+          {$_('login.use_another_email')}
+        </button>
+      </div>
     {:else}
       <form class="space-y-3" onsubmit={withEmail}>
         <input

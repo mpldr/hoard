@@ -2221,6 +2221,7 @@ pub(crate) async fn restore_files_into(
                 let copied = tokio::fs::copy(&path, &dest)
                     .await
                     .with_context(|| format!("copying {} → {}", path.display(), dest.display()))?;
+                preserve_staging_mtime(&path, &dest).await;
                 stats.conflicts_resolved_remote += 1;
                 stats.bytes_restored += copied;
                 continue;
@@ -2233,6 +2234,7 @@ pub(crate) async fn restore_files_into(
             let copied = tokio::fs::copy(&path, &dest)
                 .await
                 .with_context(|| format!("copying {} → {}", path.display(), dest.display()))?;
+            preserve_staging_mtime(&path, &dest).await;
             stats.restored += 1;
             stats.bytes_restored += copied;
         }
@@ -2270,6 +2272,35 @@ pub(crate) async fn restore_files_into(
     }
 
     Ok(stats)
+}
+
+/// Re-stamp `dest` with `src`'s mtime after a copy. `fs::copy` writes the
+/// destination with mtime=now, but the staging tree carries the snapshot's
+/// original mtimes (restore.rs re-applies them on extraction) and they must
+/// survive into the live folder: a game that picks "continue" by
+/// most-recent file would otherwise see every restored save as brand-new
+/// and load the wrong one, and the follow-up merged-tree upload would
+/// record the inflated mtimes server-side, poisoning future merges on
+/// other devices. Best-effort: a failure only degrades ordering, never data.
+async fn preserve_staging_mtime(src: &Path, dest: &Path) {
+    let mtime = match tokio::fs::metadata(src).await.and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                src = %src.display(),
+                error = %e,
+                "restore: couldn't read staging mtime; destination keeps mtime=now"
+            );
+            return;
+        }
+    };
+    if let Err(e) = filetime::set_file_mtime(dest, filetime::FileTime::from_system_time(mtime)) {
+        tracing::warn!(
+            dest = %dest.display(),
+            error = %e,
+            "restore: couldn't re-apply snapshot mtime; destination keeps mtime=now"
+        );
+    }
 }
 
 /// True when the local file's mtime is more than 1s newer than the remote
@@ -4015,6 +4046,56 @@ mod tests {
         assert_eq!(std::fs::read(target.join("a.dat")).unwrap(), b"LOCAL-WORK");
         // No backup was created — `backup` is still empty.
         assert!(std::fs::read_dir(backup).unwrap().next().is_none());
+    }
+
+    /// Files written by the merge must keep the snapshot's mtime, not the
+    /// time of the restore. `fs::copy` alone stamps mtime=now, which made
+    /// every restored save look brand-new: games that pick "continue" by
+    /// most-recent file loaded the wrong save, and the follow-up upload
+    /// pushed the inflated mtimes to the server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_files_into_preserves_snapshot_mtimes() {
+        let source_tmp = tempfile::tempdir().unwrap();
+        let target_tmp = tempfile::tempdir().unwrap();
+        let backup_tmp = tempfile::tempdir().unwrap();
+        let source = source_tmp.path();
+        let target = target_tmp.path();
+        let backup = backup_tmp.path();
+
+        let old = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        // Plain restore: file missing locally.
+        write_file(&source.join("fresh.dat"), b"from-cloud");
+        set_mtime(&source.join("fresh.dat"), old);
+        // Conflict the remote wins: overwrite path.
+        write_file(&source.join("clash.dat"), b"remote-new");
+        write_file(&target.join("clash.dat"), b"local-old");
+        set_mtime(&source.join("clash.dat"), old + Duration::from_secs(20));
+        set_mtime(&target.join("clash.dat"), old);
+
+        let stats = restore_files_into(target, source, Some(backup))
+            .await
+            .unwrap();
+        assert_eq!(stats.restored, 1);
+        assert_eq!(stats.conflicts_resolved_remote, 1);
+
+        let mtime_of = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
+        let close = |a: std::time::SystemTime, b: std::time::SystemTime| {
+            let d = a
+                .duration_since(b)
+                .unwrap_or_else(|e| e.duration());
+            d < Duration::from_secs(1)
+        };
+        assert!(
+            close(mtime_of(target.join("fresh.dat")), old),
+            "restored file must carry the snapshot mtime, not now()"
+        );
+        assert!(
+            close(
+                mtime_of(target.join("clash.dat")),
+                old + Duration::from_secs(20)
+            ),
+            "conflict-overwritten file must carry the snapshot mtime, not now()"
+        );
     }
 
     /// Even with the remote winning by mtime, when `conflict_backup_dir`

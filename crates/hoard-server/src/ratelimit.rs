@@ -35,9 +35,17 @@ pub fn layer(cfg: &RateLimitConfig) -> Option<GovernorLayer<SmartIpKeyExtractor,
     let per_second = cfg.per_second.max(1);
     let burst = cfg.burst.max(1);
 
+    // CAUTION: `GovernorConfigBuilder::per_second(n)` does NOT mean "n
+    // requests per second" — it sets the replenish PERIOD to n seconds (one
+    // request every n seconds sustained). Shipping `.per_second(50)` here
+    // granted 1 req/50s after the burst, so any IP with a couple of live
+    // clients drained the bucket and then saw 429 ("Limitada") forever.
+    // Convert our requests-per-second config into the period governor wants.
+    let period = Duration::from_millis((1000 / per_second).max(1));
+
     let conf: Arc<RlConfig> = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(per_second)
+            .period(period)
             .burst_size(burst)
             .key_extractor(SmartIpKeyExtractor)
             .finish()

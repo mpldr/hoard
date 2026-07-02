@@ -48,8 +48,10 @@ pub struct RateLimitConfig {
     /// Master switch. Defaults on.
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
-    /// Sustained allowance: one cell replenishes every `1/per_second` seconds
-    /// per client IP.
+    /// Sustained allowance in requests per second per client IP (one cell
+    /// replenishes every `1/per_second` seconds). NOTE: this is our unit, not
+    /// tower_governor's — its builder method of the same name takes a period
+    /// in seconds; `ratelimit::layer` does the conversion.
     #[serde(default = "default_rate_limit_per_second")]
     pub per_second: u64,
     /// Burst capacity: how many requests can arrive back-to-back before the

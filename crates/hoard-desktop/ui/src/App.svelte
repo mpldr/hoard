@@ -41,7 +41,7 @@
   import Toaster from "./lib/components/Toaster.svelte";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
   import ErrorDialog from "./lib/components/ErrorDialog.svelte";
-  import LiveStatus from "./lib/components/LiveStatus.svelte";
+  import QuotaMini from "./lib/components/QuotaMini.svelte";
   import Logo from "./lib/components/Logo.svelte";
   import ActivityFeed from "./lib/components/ActivityFeed.svelte";
   import {
@@ -301,8 +301,8 @@
     // above will pick up phases mid-flight and the resulting tracked saves are
     // already in CliState by the time the user opens Library/Dashboard.
 
-    // Subscribe to the live event firehose once. LiveStatus + ActivityFeed
-    // read from the resulting stores; subscribing here (vs. in each
+    // Subscribe to the live event firehose once. ActivityFeed
+    // reads from the resulting stores; subscribing here (vs. in each
     // component's onMount) means a panel toggle doesn't tear down or
     // re-arm the listener and miss events in the gap.
     void subscribeLive();
@@ -738,10 +738,9 @@
            swaps between emerald (on) and rose (off); a transient scan
            phase pulses the icon while the background flow is running. -->
       <div class="border-t border-zinc-800/60 px-3 py-3 space-y-3">
-        <!-- Compact live status (watcher + cloud). Always rendered when in
-             the app shell — degrades to a neutral dot until the agent or
-             cloud loop come online. -->
-        <LiveStatus />
+        <!-- Compact storage bar (same colour scale as the dashboard's
+             QuotaBar). Hidden until auth hydrates. -->
+        <QuotaMini />
         <!-- Cloud account chip: avatar + plan (+ "Mejorar plan" when on Free),
              routing to /account. The signed-out "Iniciar sesión" entry now
              lives at the top of the nav, so we only render this when signed

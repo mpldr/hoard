@@ -223,7 +223,7 @@ impl Default for Prefs {
         Self {
             close_to_tray: true,
             notify_on_success: false,
-            notify_on_failure: false,
+            notify_on_failure: true,
             autostart: false,
             start_minimised: false,
             seen_tray_hint: false,
@@ -375,10 +375,11 @@ mod tests {
         // Existing defaults stay stable — guards against an accidental flip
         // of a `default_true` when somebody adds a new field.
         assert!(p.close_to_tray);
-        // 1.0.0: native notifications flipped to opt-in — the in-app feed and
-        // toasts are the default channel.
+        // 1.0.0: success notifications are opt-in (the in-app feed + toasts are
+        // the default channel); failures notify by default so a silent backup
+        // error doesn't slip by unnoticed.
         assert!(!p.notify_on_success);
-        assert!(!p.notify_on_failure);
+        assert!(p.notify_on_failure);
         assert!(!p.autostart);
         assert!(!p.auto_restore);
         // 1.5.3: toggle off by default. 1.9.14: the single 6h interval was

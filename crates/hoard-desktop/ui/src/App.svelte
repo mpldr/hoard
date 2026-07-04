@@ -8,7 +8,6 @@
     Settings as SettingsIcon,
     Sparkles,
     AlertCircle,
-    HardDrive,
     ScrollText,
     LogIn,
     RotateCw,
@@ -19,7 +18,6 @@
     Lock,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
-  import { formatBytes } from "./lib/utils/format";
 
   import Language from "./routes/Language.svelte";
   import ChooseMode from "./routes/ChooseMode.svelte";
@@ -40,7 +38,7 @@
   import Toaster from "./lib/components/Toaster.svelte";
   import TourOverlay from "./lib/components/TourOverlay.svelte";
   import AccountDeletedModal from "./lib/components/AccountDeletedModal.svelte";
-  import { loadTourDone, markTourDone } from "./lib/stores/onboarding";
+  import { loadTourSeen, markTourSeen } from "./lib/stores/onboarding";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
   import ErrorDialog from "./lib/components/ErrorDialog.svelte";
   import QuotaMini from "./lib/components/QuotaMini.svelte";
@@ -121,23 +119,31 @@
   let booted = $state(false);
   let updateModalOpen = $state(false);
 
-  // Guided app tour (T2). Opens once, the first time a session is present
-  // after boot — i.e. right after the user finishes onboarding. The persisted
-  // `tour_done` flag (onboarding store) makes it a one-shot; `tourChecked`
-  // guards against re-running the async check on every reactive tick.
+  // Guided app tour. Opens after onboarding whenever the *identity* you signed
+  // in as differs from the one the tour was last shown for — so switching
+  // accounts or self-hosting a different server replays it, while an ordinary
+  // relaunch of the same session stays quiet. forget/logout/delete clear the
+  // stored identity (see `clearTourSeen`), so reconnecting shows it again too.
   let showTour = $state(false);
-  let tourChecked = false;
+  let lastSigChecked: string | null = null;
+  const tourSig = $derived(
+    $auth.user
+      ? `self:${$auth.user.server_url}#${$auth.user.user_id}`
+      : $cloud.account
+        ? `cloud:${$cloud.account.user_id}`
+        : null,
+  );
   $effect(() => {
-    const hasSession = !!($auth.user || $cloud.account);
-    if (!booted || !hasSession || tourChecked) return;
-    tourChecked = true;
-    void loadTourDone().then((done) => {
-      if (!done) showTour = true;
+    const sig = tourSig;
+    if (!booted || !sig || sig === lastSigChecked) return;
+    lastSigChecked = sig;
+    void loadTourSeen().then((seen) => {
+      if (seen !== sig) showTour = true;
     });
   });
   async function finishTour() {
     showTour = false;
-    await markTourDone();
+    if (tourSig) await markTourSeen(tourSig);
   }
   let automaticMode = $state(false);
   let automaticBusy = $state(false);
@@ -379,29 +385,8 @@
     }
   });
 
-  // Sidebar plan-usage indicator. Reads straight from `$auth.user` which
-  // the `auth` store already refreshes every 30 s via `refreshQuota` —
-  // we don't poll here. Three shapes:
-  //   - `null`     when no user, or when remote+unlimited quota (rare cloud
-  //                edge case we don't pretend to render a bar for).
-  //   - `local`    when `is_local_server` — disk usage on your own box is
-  //                meaningless as a percentage, so we render a static
-  //                "Local server" label.
-  //   - `remote`   otherwise — used / quota bytes + percentage + colour
-  //                ramp (emerald < 75% < amber < 90% < rose).
-  const quotaInfo = $derived.by(() => {
-    const u = $auth.user;
-    if (!u) return null;
-    if (u.is_local_server) return { kind: "local" as const };
-    const quota = u.storage_quota_bytes;
-    if (quota === 0) return null; // unlimited cloud — no bar to draw.
-    const used = u.storage_used_bytes;
-    const rawPct = Math.round((used / quota) * 100);
-    const pct = Math.max(0, Math.min(rawPct, 100));
-    const barColor =
-      pct > 90 ? "bg-rose-500" : pct > 75 ? "bg-amber-500" : "bg-emerald-500";
-    return { kind: "remote" as const, used, quota, pct, barColor };
-  });
+  // Sidebar storage indicator lives in <QuotaMini /> now (footer) — it unifies
+  // the self-hosted and cloud sources; the old duplicate bar was removed.
 
   async function toggleAutomatic() {
     if (automaticBusy) return;
@@ -808,35 +793,6 @@
                 </button>
               {/if}
             </div>
-        {/if}
-        {#if quotaInfo}
-          {#if quotaInfo.kind === "local"}
-            <div
-              class="flex items-center gap-2 px-1 text-[11px] text-zinc-400"
-            >
-              <HardDrive size={12} />
-              <span>{$_("sidebar.plan_local")}</span>
-            </div>
-          {:else}
-            <div class="space-y-1 px-1">
-              <div
-                class="flex items-center justify-between text-[11px] text-zinc-400"
-              >
-                <span
-                  >{formatBytes(quotaInfo.used)} / {formatBytes(
-                    quotaInfo.quota,
-                  )}</span
-                >
-                <span>{quotaInfo.pct}%</span>
-              </div>
-              <div class="h-1.5 overflow-hidden rounded-full bg-zinc-800">
-                <div
-                  class="h-full rounded-full transition-all duration-500 {quotaInfo.barColor}"
-                  style="width: {Math.min(quotaInfo.pct, 100)}%"
-                ></div>
-              </div>
-            </div>
-          {/if}
         {/if}
         <button
           type="button"

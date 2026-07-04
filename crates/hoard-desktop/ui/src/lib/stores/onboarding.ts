@@ -12,10 +12,12 @@ import { LazyStore } from "@tauri-apps/plugin-store";
 const STORE_FILE = "onboarding.json";
 const KEY_STEP = "step";
 const KEY_URL = "url";
-/** Whether the post-onboarding app tour has already been shown. Persisted so
- *  the guided tour only pops once — the first time the user finishes signing
- *  in — and never nags on later launches. */
-const KEY_TOUR_DONE = "tour_done";
+/** Identity (account / server) the post-onboarding tour was last shown for.
+ *  We key the tour on *who* you signed in as, not a global "seen once" flag,
+ *  so it replays when you switch to a different account or self-host a
+ *  different server — but stays quiet on ordinary relaunches of the same
+ *  session. Cleared on forget/logout/delete so reconnecting shows it again. */
+const KEY_TOUR_SEEN = "tour_seen_for";
 
 /** Routes that make up the wizard, in order.
  *
@@ -71,14 +73,24 @@ export async function clearOnboarding(): Promise<void> {
   await store.save();
 }
 
-/** Has the guided app tour been shown yet? */
-export async function loadTourDone(): Promise<boolean> {
-  return (await store.get<boolean>(KEY_TOUR_DONE)) ?? false;
+/** The session identity (see {@link KEY_TOUR_SEEN}) the tour was last shown
+ *  for, or `null` if never. Compare against the current session to decide
+ *  whether to replay it. */
+export async function loadTourSeen(): Promise<string | null> {
+  return (await store.get<string>(KEY_TOUR_SEEN)) ?? null;
 }
 
-/** Mark the guided app tour as seen so it never auto-opens again. */
-export async function markTourDone(): Promise<void> {
-  await store.set(KEY_TOUR_DONE, true);
+/** Remember that the tour was shown for `sig` so it doesn't reopen for the
+ *  same account/server on the next launch. */
+export async function markTourSeen(sig: string): Promise<void> {
+  await store.set(KEY_TOUR_SEEN, sig);
+  await store.save();
+}
+
+/** Forget which session saw the tour, so the next sign-in — even to the same
+ *  account/server — replays it. Called from forget-server / logout / delete. */
+export async function clearTourSeen(): Promise<void> {
+  await store.delete(KEY_TOUR_SEEN);
   await store.save();
 }
 

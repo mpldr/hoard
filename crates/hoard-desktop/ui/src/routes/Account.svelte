@@ -36,7 +36,7 @@
     type CloudExportStatus,
   } from "../lib/stores/cloud";
   import { toastError, toastInfo } from "../lib/stores/toasts";
-  import { clearOnboarding } from "../lib/stores/onboarding";
+  import { clearOnboarding, clearTourSeen } from "../lib/stores/onboarding";
   import { formatBytes } from "../lib/utils/format";
 
   let busyAction = $state<
@@ -128,8 +128,10 @@
       // Reset the wizard so the next launch (and this navigation) lands on the
       // welcome screen, not a stale persisted step. Then leave /account
       // immediately instead of sitting on the signed-out view, which is what
-      // made it look like the session "came back".
+      // made it look like the session "came back". Clear the tour too so it
+      // replays when you sign into another account.
       await clearOnboarding();
+      await clearTourSeen();
       toastInfo($_("account.signed_out"));
       push("/onboarding/language");
     } catch (e) {
@@ -188,8 +190,14 @@
     busyAction = "delete";
     try {
       await deleteCloudAccount();
+      // Same exit as logout: drop the local session and land on the welcome
+      // flow instead of sitting on a stale /account view of a deleted account.
+      await logoutCloud();
+      await clearOnboarding();
+      await clearTourSeen();
       confirmDeleteOpen = false;
       toastInfo($_("account.delete_scheduled"));
+      push("/onboarding/language");
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {

@@ -49,6 +49,7 @@
     lastReport,
     triggerServerUpgrade,
   } from "../lib/stores/updates";
+  import { clearOnboarding, clearTourSeen } from "../lib/stores/onboarding";
 
   let saving = $state<string | null>(null);
   let signingOut = $state(false);
@@ -358,8 +359,14 @@
     signingOut = true;
     try {
       await signOut();
+      // Reset the wizard + tour so forgetting drops the user back on the
+      // welcome flow (instead of leaving them sitting in Settings), and the
+      // tour replays when they connect to a server again.
+      await clearOnboarding();
+      await clearTourSeen();
       forgetModalOpen = false;
       toastSuccess($_("settings.forgotten_toast"));
+      push("/onboarding/language");
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {

@@ -51,11 +51,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER hoard
 WORKDIR /var/lib/hoard
-EXPOSE 8080
+EXPOSE 12421
 
 # Healthcheck hits the unauthenticated /v1/health route.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost:8080/v1/health >/dev/null 2>&1 || exit 1
+    CMD wget -qO- http://localhost:12421/v1/health >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["hoard-server", "--config", "/etc/hoard/config.toml"]

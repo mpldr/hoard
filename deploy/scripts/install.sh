@@ -84,7 +84,7 @@ if [[ ! -f "$ETC_DIR/hoard.env" ]]; then
 # Optional environment overrides for hoard-server.
 # Keys use the HOARD__ prefix and double underscores to nest into TOML sections.
 # Examples:
-#   HOARD__SERVER__PORT=8080
+#   HOARD__SERVER__PORT=12421
 #   HOARD__LOGGING__LEVEL=debug
 EOF
   chown root:"$GROUP_NAME" "$ETC_DIR/hoard.env"

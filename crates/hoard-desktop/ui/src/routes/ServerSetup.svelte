@@ -21,22 +21,46 @@
     url = await loadUrl();
   });
 
-  // Accept a bare hostname ("mi-servidor.local", "192.168.1.20:8080") by
-  // prepending `https://` so the user doesn't have to remember the scheme.
+  // Accept a bare hostname ("ubserver", "192.168.1.20:12421") by prepending a
+  // scheme so the user doesn't have to remember it. Pick the scheme from the
+  // host: a local/private address (a self-hosted server with no reverse proxy)
+  // speaks plain HTTP, while a public domain is assumed to sit behind TLS.
+  // This avoids the classic trap of turning "myserver:12421" into an https://
+  // URL that a no-TLS LAN box can't answer — the #1 "can't reach" cause.
   // Returns `null` when the string can't be a host at all (contains spaces —
-  // e.g. someone typed a friendly name like "mi servidor"), so we can show a
-  // clearer hint instead of a confusing "can't reach" network error.
+  // e.g. someone typed a friendly name like "mi servidor").
   function normalizeUrl(raw: string): string | null {
     const s = raw.trim();
     if (!s) return null;
-    const withScheme =
-      s.startsWith("http://") || s.startsWith("https://")
-        ? s
-        : `https://${s}`;
+    let withScheme: string;
+    if (s.startsWith("http://") || s.startsWith("https://")) {
+      withScheme = s;
+    } else {
+      const host = s.replace(/[:/].*$/, "");
+      withScheme = `${isLocalHost(host) ? "http" : "https"}://${s}`;
+    }
     // A real host has no whitespace. Reject early; the address field is for a
     // URL, not a label.
     if (/\s/.test(withScheme.replace(/^https?:\/\//, ""))) return null;
     return withScheme;
+  }
+
+  // localhost, an *.local / single-label LAN name, or a loopback / RFC1918 /
+  // Tailscale-CGNAT IP → a no-TLS server we should reach over http://.
+  function isLocalHost(host: string): boolean {
+    const h = host.toLowerCase();
+    if (h === "localhost" || h.endsWith(".local")) return true;
+    if (!h.includes(".")) return true; // bare hostname, e.g. "ubserver"
+    const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/);
+    if (m) {
+      const a = Number(m[1]);
+      const b = Number(m[2]);
+      if (a === 127 || a === 10) return true;
+      if (a === 192 && b === 168) return true;
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      if (a === 100 && b >= 64 && b <= 127) return true; // Tailscale CGNAT
+    }
+    return false;
   }
 
   async function testConnection() {
@@ -111,7 +135,7 @@
       <Input
         label={$_("server.address_label")}
         bind:value={url}
-        placeholder="https://hoard.example.com:8080"
+        placeholder="192.168.1.20:12421"
         hint={$_("server.address_hint")}
         icon={Server}
         autocomplete="url"

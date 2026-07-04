@@ -123,7 +123,7 @@ service itself, so an in-flight sync isn't killed).
 ## Headless CLI
 
 ```sh
-hoard config init --server http://YOUR_SERVER:8080
+hoard config init --server http://YOUR_SERVER:12421
 hoard login --token hoard_v1_...
 hoard save create --game stardew-valley --label main
 hoard backup <SAVE_ID> --from ~/.config/StardewValley/Saves --remember

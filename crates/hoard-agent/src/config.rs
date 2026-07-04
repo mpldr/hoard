@@ -18,7 +18,7 @@ pub struct ServerSection {
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            url: "http://localhost:8080".to_string(),
+            url: "http://localhost:12421".to_string(),
         }
     }
 }

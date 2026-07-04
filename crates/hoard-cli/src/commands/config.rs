@@ -8,7 +8,7 @@ pub enum ConfigCommand {
     /// Create a default config file at the standard location
     Init {
         /// Server URL to write into the new config
-        #[arg(long, default_value = "http://localhost:8080")]
+        #[arg(long, default_value = "http://localhost:12421")]
         server: String,
         /// Overwrite an existing config without asking
         #[arg(long)]

@@ -32,7 +32,7 @@ The token is printed to stdout — copy it now, it cannot be recovered.
 
 ## Notes
 
-- The image listens on `8080` internally; map a different host port via
+- The image listens on `12421` internally; map a different host port via
   `HOARD_PORT=9000 docker compose up -d`.
 - Data lives in a named volume `hoard-data`. Back it up like any other volume.
 - For production, terminate TLS at a reverse proxy (Caddy / nginx / Traefik)

@@ -19,10 +19,10 @@ services:
     container_name: hoard-server
     restart: unless-stopped
     ports:
-      - "${HOARD_PORT:-8080}:8080"
+      - "${HOARD_PORT:-12421}:12421"
     environment:
       # Override TOML keys without rebuilding/remounting:
-      # HOARD__SERVER__PORT must stay 8080 inside the container — change the
+      # HOARD__SERVER__PORT must stay 12421 inside the container — change the
       # host-side mapping above instead.
       HOARD__LOGGING__LEVEL: ${HOARD_LOG_LEVEL:-info}
       HOARD__LOGGING__FORMAT: ${HOARD_LOG_FORMAT:-json}
@@ -35,7 +35,7 @@ services:
       # Compose-side healthcheck (the Dockerfile one is intentionally shallow).
       # Uses wget which we install via a tiny addition below; if you'd rather
       # not, comment this out and rely on Docker's TCP-restart fallback.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/v1/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:12421/v1/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

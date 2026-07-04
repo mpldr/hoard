@@ -516,11 +516,12 @@ export type Prefs = {
    *  `<state_dir>/conflicts/<save_id>/<rfc3339>/`. Defaults to 14;
    *  validated on the Rust side to 1..=30. */
   conflict_retention_days: number;
-  /** Global "modo ahorro" — when `true`, every new cloud upload defaults
-   *  to `backup_only`: the save still uploads and is version-able from
-   *  this device, but the server hides it from *other* devices'
-   *  manifest pull so nothing auto-restores it elsewhere. Pairs with
-   *  the per-save toggle on the Library card. Off by default. */
+  /** DEAD CODE — reserved for possible future use (2026-07-04).
+   *  Was the global "Modo ahorro (solo subida)" toggle: `true` would default
+   *  every new cloud upload to `backup_only` (uploads but hidden from other
+   *  devices' manifest pull). The toggle was removed from the UI because it
+   *  confused users, and the flag was never actually consumed by the agent.
+   *  Kept in the struct so the pref file stays stable; do not surface it. */
   cloud_savings_mode: boolean;
   /** Seconds between manifest polls on the live cloud-pull loop.
    *  Range 5..=300; default 10. Independent from

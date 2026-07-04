@@ -5,10 +5,6 @@
   import { _ } from "svelte-i18n";
   import WizardShell from "../lib/components/WizardShell.svelte";
   import { saveStep } from "../lib/stores/onboarding";
-  import { startCloudLogin } from "../lib/stores/cloud";
-  import { toastError } from "../lib/stores/toasts";
-
-  let cloudLoading = $state(false);
 
   async function chooseSelfHost() {
     await saveStep("server");
@@ -16,19 +12,13 @@
   }
 
   async function chooseCloud() {
-    cloudLoading = true;
-    try {
-      await startCloudLogin();
-    } catch (e) {
-      const msg = typeof e === "string" ? e : (e as Error).message;
-      toastError(msg);
-    } finally {
-      cloudLoading = false;
-    }
+    // Cloud now routes through the terms step, which owns the actual sign-in.
+    await saveStep("terms");
+    push("/onboarding/terms");
   }
 
   function back() {
-    push("/welcome");
+    push("/onboarding/language");
   }
 </script>
 
@@ -65,8 +55,7 @@
       <button
         type="button"
         onclick={chooseCloud}
-        disabled={cloudLoading}
-        class="flex flex-col items-start gap-3 rounded-xl border border-emerald-500/40 bg-emerald-600 p-5 text-left transition hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/50 disabled:opacity-60"
+        class="flex flex-col items-start gap-3 rounded-xl border border-emerald-500/40 bg-emerald-600 p-5 text-left transition hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/50"
       >
         <span
           class="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-700/60 text-emerald-50"

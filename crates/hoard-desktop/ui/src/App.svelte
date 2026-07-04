@@ -6,7 +6,6 @@
     Library,
     Home,
     Settings as SettingsIcon,
-    Map as MapIcon,
     Sparkles,
     AlertCircle,
     HardDrive,
@@ -22,8 +21,9 @@
   import { _ } from "svelte-i18n";
   import { formatBytes } from "./lib/utils/format";
 
-  import Welcome from "./routes/Welcome.svelte";
+  import Language from "./routes/Language.svelte";
   import ChooseMode from "./routes/ChooseMode.svelte";
+  import Terms from "./routes/Terms.svelte";
   import ServerSetup from "./routes/ServerSetup.svelte";
   import TokenSetup from "./routes/TokenSetup.svelte";
   import OnboardingDone from "./routes/OnboardingDone.svelte";
@@ -31,7 +31,6 @@
   import LibraryRoute from "./routes/Library.svelte";
   import SettingsRoute from "./routes/Settings.svelte";
   import HistoryRoute from "./routes/History.svelte";
-  import MapRoute from "./routes/Map.svelte";
   import LogsRoute from "./routes/Logs.svelte";
   import DiagnosticsRoute from "./routes/Diagnostics.svelte";
   import AccountRoute from "./routes/Account.svelte";
@@ -39,6 +38,9 @@
   import HoardWrappedRoute from "./routes/HoardWrapped.svelte";
 
   import Toaster from "./lib/components/Toaster.svelte";
+  import TourOverlay from "./lib/components/TourOverlay.svelte";
+  import AccountDeletedModal from "./lib/components/AccountDeletedModal.svelte";
+  import { loadTourDone, markTourDone } from "./lib/stores/onboarding";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
   import ErrorDialog from "./lib/components/ErrorDialog.svelte";
   import QuotaMini from "./lib/components/QuotaMini.svelte";
@@ -85,7 +87,7 @@
   /**
    * Routing layout
    * --------------
-   * The wizard routes (`/welcome`, `/onboarding/*`) render full-screen and
+   * The wizard routes (`/onboarding/*`) render full-screen and
    * own the entire viewport. The app routes (`/dashboard`, …) render inside
    * the persistent sidebar shell. We pick which to show based on the current
    * URL — auth state decides which URL we land on at boot.
@@ -94,8 +96,9 @@
   // hydrate auth, then `replace()` to the appropriate destination, so we
   // don't need a `*` route here.
   const routes = {
-    "/welcome": Welcome,
+    "/onboarding/language": Language,
     "/onboarding/choose": ChooseMode,
+    "/onboarding/terms": Terms,
     "/onboarding/server": ServerSetup,
     "/onboarding/token": TokenSetup,
     "/onboarding/done": OnboardingDone,
@@ -106,7 +109,6 @@
     // dropped from the nav. The per-save timeline still lives here and is
     // reached by clicking a save in the Dashboard / Library.
     "/history/:saveId": HistoryRoute,
-    "/map": MapRoute,
     "/logs": LogsRoute,
     "/diagnostics": DiagnosticsRoute,
     "/account": AccountRoute,
@@ -118,6 +120,25 @@
 
   let booted = $state(false);
   let updateModalOpen = $state(false);
+
+  // Guided app tour (T2). Opens once, the first time a session is present
+  // after boot — i.e. right after the user finishes onboarding. The persisted
+  // `tour_done` flag (onboarding store) makes it a one-shot; `tourChecked`
+  // guards against re-running the async check on every reactive tick.
+  let showTour = $state(false);
+  let tourChecked = false;
+  $effect(() => {
+    const hasSession = !!($auth.user || $cloud.account);
+    if (!booted || !hasSession || tourChecked) return;
+    tourChecked = true;
+    void loadTourDone().then((done) => {
+      if (!done) showTour = true;
+    });
+  });
+  async function finishTour() {
+    showTour = false;
+    await markTourDone();
+  }
   let automaticMode = $state(false);
   let automaticBusy = $state(false);
   let globalSync = $state(false);
@@ -160,7 +181,7 @@
     try {
       await signOut();
       serverUnreachable = false;
-      replace("/welcome");
+      replace("/onboarding/language");
     } catch (e) {
       showError(e);
     } finally {
@@ -235,7 +256,7 @@
       // the user straight on "Connect to your server" instead of showing the
       // welcome / chooser. The wizard re-hydrates the saved URL anyway, so
       // restarting from welcome loses nothing.
-      replace("/welcome");
+      replace("/onboarding/language");
     }
     booted = true;
 
@@ -276,7 +297,7 @@
     initCloudSessionWatch(() => {
       resetCloudLoop();
       toastInfo($_("account.session_expired"));
-      if (!$auth.user) replace("/welcome");
+      if (!$auth.user) replace("/onboarding/language");
     });
 
     // Register the Tauri listeners exactly once for the lifetime of this
@@ -523,7 +544,6 @@
       children: [
         { kind: "link", labelKey: "nav.library", icon: Library, route: "/library" },
         { kind: "link", labelKey: "nav.dashboard", icon: Archive, route: "/dashboard" },
-        { kind: "link", labelKey: "nav.map", icon: MapIcon, route: "/map" },
       ],
     },
     { kind: "feature", labelKey: "nav.hoard_screen", icon: MonitorPlay, route: "/hoard-screen", feature: "screen" },
@@ -539,7 +559,6 @@
     "/library",
     "/settings",
     "/history",
-    "/map",
     "/logs",
     "/diagnostics",
     "/account",
@@ -866,7 +885,7 @@
       </div>
     </aside>
 
-    <main class="flex-1 overflow-y-auto">
+    <main class="min-w-0 flex-1 overflow-y-auto">
       {#if serverUnreachable && $auth.user}
         <div
           class="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-amber-500/40 bg-amber-500/10 px-6 py-3"
@@ -929,3 +948,12 @@
 {/if}
 
 <Toaster />
+
+<!-- Account scheduled for deletion: a blocking screen over everything (incl. the
+     tour). The account is frozen server-side, so the app behind is dead until
+     the user reactivates or signs out. -->
+{#if $cloud.hydrated && $cloud.account?.deleted_at}
+  <AccountDeletedModal />
+{:else if showTour}
+  <TourOverlay onClose={finishTour} />
+{/if}

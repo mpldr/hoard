@@ -250,7 +250,7 @@
           <Cover
             slug={save.game_slug}
             name={save.game_slug}
-            class="h-11 w-11 rounded-xl"
+            class="h-11 w-11 shrink-0 rounded-xl"
             initialClass="text-lg"
           />
           <div class="min-w-0 flex-1">
@@ -291,7 +291,7 @@
               aria-label={$_("dashboard.history")}
             >
               <History size={14} />
-              {$_("dashboard.history")}
+              <span class="hidden lg:inline">{$_("dashboard.history")}</span>
             </Button>
             <Button
               variant="secondary"
@@ -305,7 +305,7 @@
                   : $_("dashboard.tooltip_force")}
             >
               <UploadCloud size={14} />
-              {$_("dashboard.back_up")}
+              <span class="hidden lg:inline">{$_("dashboard.back_up")}</span>
             </Button>
           </div>
         </div>

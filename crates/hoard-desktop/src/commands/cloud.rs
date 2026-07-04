@@ -114,6 +114,17 @@ pub struct CloudAccount {
     /// uploads rejected). `#[serde(default)]` → `"ok"` on older servers.
     #[serde(default = "default_storage_status")]
     pub storage_status: String,
+    /// RFC3339 instant the account was soft-deleted, or `None` for a live
+    /// account. When set, the account is frozen (every data route 403s) during
+    /// its 30-day grace and the desktop shows a reactivation screen instead of
+    /// the app. `#[serde(default)]` so older servers (no field) parse to
+    /// `None`.
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    /// RFC3339 instant the account is hard-purged if not reactivated
+    /// (`deleted_at` + 30 days). `None` for a live account.
+    #[serde(default)]
+    pub purges_at: Option<String>,
 }
 
 fn default_forever() -> bool {
@@ -664,9 +675,9 @@ pub fn handle_session_expired(app: &AppHandle) {
     );
 }
 
-/// Kick off a server-side export job. Returns the job id; the frontend can
-/// poll a future `/v1/me/export/:id` endpoint or just trust the email that
-/// the server sends when it's done.
+/// Kick off a server-side export job. Returns the job id; the background
+/// worker builds the ZIP, and the client polls `cloud_export_status` for the
+/// download link (the server also emails it when email is configured).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportJob {
     pub job_id: String,
@@ -695,9 +706,47 @@ pub async fn cloud_export_all() -> Result<ExportJob, String> {
         .map_err(|e| format!("Couldn't parse server response: {e}"))
 }
 
-/// Permanently delete the cloud account. The server soft-deletes for 30
-/// days, after which a background job purges R2 + DB. The desktop clears
-/// the session locally either way.
+/// Latest export job's state, with a presigned `download_url` once the ZIP is
+/// ready. Mirrors the server's `ExportStatusOut`. All fields are `None` when
+/// the user has never requested an export.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExportStatus {
+    pub job_id: Option<String>,
+    pub status: Option<String>,
+    pub requested_at: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub expires_at: Option<String>,
+    pub download_url: Option<String>,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn cloud_export_status() -> Result<ExportStatus, String> {
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        return Err("Not signed in to Hoard Cloud.".into());
+    };
+    let url = format!("{}/v1/me/export", creds.server_url);
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format_http_error(status, &body));
+    }
+    serde_json::from_str::<ExportStatus>(&body)
+        .map_err(|e| format!("Couldn't parse server response: {e}"))
+}
+
+/// Delete the cloud account. The server soft-deletes and *freezes* it: every
+/// data route 403s immediately (no longer a silent logout), and a background
+/// job hard-purges R2 + DB after a 30-day grace. During that window the user
+/// can sign back in and reactivate (see [`cloud_reactivate_account`]). The
+/// desktop clears the local session either way.
 #[tauri::command]
 pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
@@ -720,6 +769,47 @@ pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), Stri
     clear_creds().map_err(|e| format!("Couldn't clear local session: {e}"))?;
     *state.cloud_account.lock().unwrap() = None;
     Ok(())
+}
+
+/// Cancel a pending soft-delete. Calls `POST /v1/me/reactivate` (which clears
+/// `deleted_at` server-side and lifts the freeze), then re-fetches `/v1/me` so
+/// the returned account no longer carries `deleted_at` and the desktop can drop
+/// the reactivation screen. Requires an active session — the user re-logs in
+/// during the grace window, sees they're scheduled for deletion, and taps
+/// "Reactivar".
+#[tauri::command]
+pub async fn cloud_reactivate_account(
+    state: State<'_, AppState>,
+) -> Result<CloudAccount, String> {
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        return Err("Not signed in to Hoard Cloud.".into());
+    };
+    let url = format!("{}/v1/me/reactivate", creds.server_url);
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format_http_error(status, &body));
+    }
+    // Re-fetch so the in-memory + on-disk snapshot reflect the now-live account.
+    let me = fetch_me(&creds.server_url, &creds.access_token)
+        .await
+        .map_err(prettify)?;
+    save_creds(
+        &creds.access_token,
+        &creds.refresh_token,
+        &creds.server_url,
+        &me,
+    )
+    .map_err(|e| format!("Couldn't update session: {e}"))?;
+    *state.cloud_account.lock().unwrap() = Some(me.clone());
+    Ok(me)
 }
 
 // ---- Pro entitlements -------------------------------------------------

@@ -7,7 +7,8 @@
 //! tracked-save metadata.
 //!
 //! Defaults are picked to be safe and unsurprising for first-run users:
-//! notifications on, close-to-tray on, autostart off (the user has to opt in).
+//! native notifications off (the in-app feed carries the news), close-to-tray
+//! on, autostart off (the user has to opt in).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,15 +24,16 @@ pub struct Prefs {
     pub close_to_tray: bool,
 
     /// When `true`, show a desktop notification after every successful backup.
-    /// Many users want this off once they trust the agent — keep it on by
-    /// default so the first few backups feel concrete.
-    #[serde(default = "default_true")]
+    /// Off by default (1.0.0): the activity feed already narrates uploads,
+    /// so the native banner is opt-in for users who want the extra nudge.
+    #[serde(default)]
     pub notify_on_success: bool,
 
-    /// When `true`, show a desktop notification after a failed backup. We
-    /// don't let the user disable this entirely without making them tick a
-    /// box — silent failures are a footgun.
-    #[serde(default = "default_true")]
+    /// When `true`, show a desktop notification after a failed backup. Off by
+    /// default (1.0.0), same rationale: failures already surface in-app as a
+    /// long-lived toast plus the red state on the Library row, so the native
+    /// banner is an opt-in extra channel, not the only alarm.
+    #[serde(default)]
     pub notify_on_failure: bool,
 
     /// When `true`, the launcher integration registers Hoard to start on
@@ -51,15 +53,17 @@ pub struct Prefs {
     #[serde(default)]
     pub seen_tray_hint: bool,
 
-    /// When `true`, the desktop app may send anonymous usage pings to the
-    /// project's telemetry endpoint (currently: an aggregate counter for
-    /// "successful backup" + "restore" + "first-run completed" — never the
-    /// game name, save path, file content, or token).
+    /// Opt-in for sharing diagnostic logs with the connected server. When
+    /// `true`, the `tracing` log shipper (`logship.rs`) forwards events to
+    /// `/v1/cloud/logs` (cloud) or `/v1/logs` (self-hosted) at the server's
+    /// advertised level, tagged with hostname, OS, app version, and a
+    /// `SHA256(machine-id|hostname)` fingerprint. When `false` (the default)
+    /// nothing is shipped — the flag is read fresh on every ship cycle, so
+    /// turning it off stops the stream within seconds, no restart needed.
     ///
-    /// Defaults to `false`. We only ever look at this flag if the user
-    /// explicitly turned it on. The actual sender is not implemented yet
-    /// (v0.2 ships with the toggle as a no-op so we can roll it out without
-    /// a settings migration); see `docs/privacy.md`.
+    /// Note: the payload is diagnostic logs, not an anonymous aggregate
+    /// counter, and it carries a device fingerprint — the UI label should make
+    /// that clear rather than implying fully anonymous pings.
     #[serde(default)]
     pub anonymous_telemetry: bool,
 
@@ -149,12 +153,13 @@ pub struct Prefs {
     #[serde(default = "default_conflict_retention_days")]
     pub conflict_retention_days: u32,
 
-    /// Global "modo ahorro" — when `true`, every new cloud upload is
-    /// flagged `backup_only` so the save uploads (and stays version-able
-    /// from this device) but no *other* device pulls it in via the
-    /// manifest. Pairs with the per-save toggle on the Library card; the
-    /// global setting just changes the default for new uploads. Defaults
-    /// to `false` so the multi-device flow keeps working out of the box.
+    /// DEAD CODE — reserved for possible future use (2026-07-04).
+    /// Was the global "Modo ahorro (solo subida)" toggle: `true` would flag
+    /// every new cloud upload `backup_only` (uploads but hidden from other
+    /// devices' manifest pull). The toggle was removed from the desktop UI
+    /// (confusing) and the flag was never actually read by the backup path,
+    /// so it has no effect today. Kept + `#[serde(default)]` so existing
+    /// prefs files keep deserializing; do not resurface without wiring it up.
     #[serde(default)]
     pub cloud_savings_mode: bool,
 
@@ -217,8 +222,8 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             close_to_tray: true,
-            notify_on_success: true,
-            notify_on_failure: true,
+            notify_on_success: false,
+            notify_on_failure: false,
             autostart: false,
             start_minimised: false,
             seen_tray_hint: false,
@@ -370,8 +375,10 @@ mod tests {
         // Existing defaults stay stable — guards against an accidental flip
         // of a `default_true` when somebody adds a new field.
         assert!(p.close_to_tray);
-        assert!(p.notify_on_success);
-        assert!(p.notify_on_failure);
+        // 1.0.0: native notifications flipped to opt-in — the in-app feed and
+        // toasts are the default channel.
+        assert!(!p.notify_on_success);
+        assert!(!p.notify_on_failure);
         assert!(!p.autostart);
         assert!(!p.auto_restore);
         // 1.5.3: toggle off by default. 1.9.14: the single 6h interval was

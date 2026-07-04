@@ -191,6 +191,23 @@ pub struct CloudConfig {
     /// change. Defaults to 14. Cloud-only — self-hosted has no quotas.
     #[serde(default = "default_storage_downgrade_grace_days")]
     pub storage_downgrade_grace_days: u64,
+    /// Transactional email (account-export "your download is ready"). Optional:
+    /// with no API key the export worker still runs and produces a downloadable
+    /// ZIP surfaced in-app — it just skips the email leg.
+    #[serde(default)]
+    pub email: EmailConfig,
+}
+
+/// Resend transactional-email settings. Fields usually come from
+/// `HOARD__CLOUD__EMAIL__*`. Empty `api_key` disables email delivery.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EmailConfig {
+    /// Resend API key (`re_...`). Empty = email delivery disabled.
+    #[serde(default)]
+    pub api_key: String,
+    /// From header, e.g. `Hoard <noreply@hoard.services>`. Required for sends.
+    #[serde(default)]
+    pub from: String,
 }
 
 fn default_aud() -> String {

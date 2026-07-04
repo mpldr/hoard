@@ -15,8 +15,11 @@
 //!   button. Returns [`CatalogUpdateResult`] on success.
 //! - `catalog_status()` — read-only metadata for the Settings page so we
 //!   can show "20,731 games · updated 3 days ago".
-//! - `auto_update_catalog_in_background()` — fire-and-forget called from
-//!   `setup()` if the cached catalog is older than [`AUTO_UPDATE_AFTER`].
+//! - `auto_update_catalog_in_background()` — background loop spawned from
+//!   `setup()`; re-checks hourly and refreshes once the cached catalog is
+//!   older than [`AUTO_UPDATE_AFTER`]. The loop (vs. the old launch-time
+//!   one-shot) matters because the app lives in the tray for weeks — a
+//!   check only at startup meant the catalog could silently go stale.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -24,10 +27,14 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-/// How stale the cached catalog must be before the startup auto-refresh
-/// kicks in. One week — Ludusavi pushes ~daily but most users don't need
-/// that fresh; we trade staleness for fewer GitHub round-trips.
-const AUTO_UPDATE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How stale the cached catalog must be before the background auto-refresh
+/// kicks in. One day, matching Ludusavi's ~daily upstream pushes; the
+/// Settings copy promises the same cadence.
+const AUTO_UPDATE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the background loop re-checks staleness. Checking is a local
+/// metadata read — the 17 MB download only happens past [`AUTO_UPDATE_AFTER`].
+const RECHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Sidecar metadata file written next to the catalog JSON. Tells the UI
 /// when the user last refreshed and how big the result was, without
@@ -175,35 +182,41 @@ pub fn catalog_status() -> CatalogStatus {
     }
 }
 
-/// Background auto-update: spawned from `setup()` at app launch. Runs the
-/// refresh only if the cached catalog is missing or older than
-/// [`AUTO_UPDATE_AFTER`]; never blocks startup, and silently swallows
-/// errors (the user's already running on the embedded catalog, so a
-/// failed refresh is degradation, not breakage).
+/// Background auto-update loop: spawned from `setup()` at app launch. Checks
+/// immediately, then every [`RECHECK_EVERY`], refreshing whenever the cached
+/// catalog is missing or older than [`AUTO_UPDATE_AFTER`]. Never blocks
+/// startup, and silently swallows errors (the user's already running on the
+/// embedded catalog, so a failed refresh is degradation, not breakage — the
+/// next tick retries).
 pub fn auto_update_catalog_in_background(app: AppHandle) {
     // `tauri::async_runtime::spawn` rather than `tokio::spawn`: this is
     // called from `setup()` which runs *before* Tauri enters its event
     // loop, so there is no ambient Tokio runtime yet. Tauri provides its
     // own multi-thread runtime that's always available.
     tauri::async_runtime::spawn(async move {
-        let needs_refresh = match meta_path().and_then(|mp| std::fs::read(&mp).ok()) {
-            None => true,
-            Some(bytes) => match serde_json::from_slice::<CatalogMeta>(&bytes) {
-                Ok(meta) => {
-                    let age = now_secs().saturating_sub(meta.updated_at);
-                    age >= AUTO_UPDATE_AFTER.as_secs()
+        loop {
+            let needs_refresh = match meta_path().and_then(|mp| std::fs::read(&mp).ok()) {
+                None => true,
+                Some(bytes) => match serde_json::from_slice::<CatalogMeta>(&bytes) {
+                    Ok(meta) => {
+                        let age = now_secs().saturating_sub(meta.updated_at);
+                        age >= AUTO_UPDATE_AFTER.as_secs()
+                    }
+                    Err(_) => true,
+                },
+            };
+            if needs_refresh {
+                tracing::info!("Ludusavi catalog stale; running background refresh");
+                match do_update(Some(app.clone())).await {
+                    Ok(result) => tracing::info!(games = result.games, "auto-refresh complete"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-refresh failed; using embedded catalog")
+                    }
                 }
-                Err(_) => true,
-            },
-        };
-        if !needs_refresh {
-            tracing::debug!("Ludusavi catalog is fresh; skipping auto-update");
-            return;
-        }
-        tracing::info!("Ludusavi catalog stale; running background refresh");
-        match do_update(Some(app)).await {
-            Ok(result) => tracing::info!(games = result.games, "auto-refresh complete"),
-            Err(e) => tracing::warn!(error = %e, "auto-refresh failed; using embedded catalog"),
+            } else {
+                tracing::debug!("Ludusavi catalog is fresh; skipping auto-update");
+            }
+            tokio::time::sleep(RECHECK_EVERY).await;
         }
     });
 }

@@ -21,17 +21,39 @@
 
   let { step, onBack, children }: Props = $props();
 
-  const ORDER: OnboardingStep[] = ["welcome", "choose", "server", "token", "done"];
-  const currentIndex = $derived(ORDER.indexOf(step));
+  // The wizard forks at `choose`. Until the user picks a branch we show the
+  // shorter (Cloud) 3-dot track; the self-hosted branch expands to 5 dots
+  // only once the user is inside its server/token/done steps. This kills the
+  // old bug where 5 dots always showed and jumped from step 2 straight home.
+  const CLOUD_ORDER: OnboardingStep[] = ["language", "choose", "terms"];
+  const SELFHOST_ORDER: OnboardingStep[] = [
+    "language",
+    "choose",
+    "server",
+    "token",
+    "done",
+  ];
+  const order = $derived(
+    step === "server" || step === "token" || step === "done"
+      ? SELFHOST_ORDER
+      : CLOUD_ORDER,
+  );
+  const currentIndex = $derived(order.indexOf(step));
 </script>
 
 <div
   class="flex min-h-full flex-col items-center justify-center bg-zinc-950 px-6 py-10"
 >
   <div class="w-full max-w-md">
-    <!-- Logo header -->
-    <div class="mb-8 flex justify-center text-emerald-500">
-      <Logo size={48} />
+    <!-- Logo header: logo sits just left of the welcome wordmark so the two
+         read as one unit (replaces the old standalone welcome screen). -->
+    <div class="mb-8 flex items-center justify-center gap-3">
+      <span class="text-emerald-500">
+        <Logo size={40} />
+      </span>
+      <span class="text-xl font-semibold tracking-tight text-zinc-50">
+        {$_("welcome.title")}
+      </span>
     </div>
 
     <!-- Card -->
@@ -54,9 +76,9 @@
     <!-- Progress dots -->
     <div
       class="mt-6 flex items-center justify-center gap-2"
-      aria-label={$_("wizard.step_aria", { values: { current: currentIndex + 1, total: ORDER.length } })}
+      aria-label={$_("wizard.step_aria", { values: { current: currentIndex + 1, total: order.length } })}
     >
-      {#each ORDER as s, i (s)}
+      {#each order as s, i (s)}
         <span
           class="h-1.5 rounded-full transition-all duration-300 {i ===
           currentIndex

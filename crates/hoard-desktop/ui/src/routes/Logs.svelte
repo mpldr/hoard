@@ -98,8 +98,8 @@
     <ArrowLeft size={14} /> {$_("logs.back_to_settings")}
   </button>
 
-  <header class="mb-4 flex items-start justify-between gap-4">
-    <div>
+  <header class="mb-4 flex flex-wrap items-start justify-between gap-4">
+    <div class="min-w-0">
       <h1 class="text-2xl font-semibold tracking-tight">{$_("logs.title")}</h1>
       <p class="mt-1 text-sm text-zinc-400">{$_("logs.subtitle")}</p>
       {#if path}

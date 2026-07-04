@@ -93,3 +93,8 @@ notify-debouncer-mini = "0.4"
 
 # Test-only — used by per-crate `[dev-dependencies]` blocks.
 tempfile = "3"
+
+# ZIP writer for cloud account exports (server, `cloud` feature). No default
+# features: game saves are already compressed, so export entries are `Stored`
+# (no re-deflate) — we only need the archive container, not compression.
+zip = { version = "2", default-features = false }

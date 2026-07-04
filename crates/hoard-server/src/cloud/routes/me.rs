@@ -66,6 +66,16 @@ pub struct Me {
     /// RFC3339 instant the pending downgrade takes effect (end of the grace
     /// window). `null` when nothing is pending.
     pub storage_limit_change_at: Option<String>,
+    /// Set when the account is soft-deleted and inside its 30-day grace: the
+    /// RFC3339 instant deletion was requested. The desktop uses its presence to
+    /// swap the whole app for a "scheduled for deletion — reactivate?" screen,
+    /// since every data route is frozen (403 `account_scheduled_deletion`)
+    /// until the user reactivates or the grace elapses. `null` for live
+    /// accounts.
+    pub deleted_at: Option<String>,
+    /// RFC3339 instant the account is hard-purged if not reactivated
+    /// (`deleted_at` + 30 days). `null` for live accounts.
+    pub purges_at: Option<String>,
 }
 
 /// Derive the storage gauge state from the deduped footprint vs. the plan's
@@ -114,8 +124,9 @@ pub async fn get_me(
         Option<i64>,
         Option<i64>,
         Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
     ) = sqlx::query_as(
-        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at
+        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at, deleted_at
            FROM profiles WHERE user_id = $1",
     )
     .bind(user.user_id)
@@ -156,6 +167,8 @@ pub async fn get_me(
     let pending_change_at = row.10;
     let pending_limit = pending_change_at
         .map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
+    let deleted_at = row.11;
+    let purges_at = deleted_at.map(|d| d + time::Duration::days(GRACE_DAYS as i64));
     Ok(Json(Me {
         user_id: user.user_id,
         email: row.0,
@@ -180,6 +193,8 @@ pub async fn get_me(
         bandwidth_quota_bytes: bytes_or_unlimited(limits.bandwidth_quota_bytes),
         pending_storage_limit_bytes: pending_limit,
         storage_limit_change_at: pending_change_at.map(format_dt),
+        deleted_at: deleted_at.map(format_dt),
+        purges_at: purges_at.map(format_dt),
     }))
 }
 
@@ -475,6 +490,20 @@ pub async fn create_export_job(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
 ) -> Result<Json<ExportJobOut>, CloudError> {
+    // Reuse an in-flight job instead of stacking duplicates: tapping "export"
+    // twice — or a status poll racing a click — must not spawn N ZIP builds.
+    let existing: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, status FROM export_jobs
+           WHERE user_id = $1 AND status IN ('pending','running')
+           ORDER BY requested_at DESC LIMIT 1",
+    )
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if let Some((job_id, status)) = existing {
+        return Ok(Json(ExportJobOut { job_id, status }));
+    }
+
     let row: (Uuid, String) = sqlx::query_as(
         "INSERT INTO export_jobs (user_id, status) VALUES ($1, 'pending')
          RETURNING id, status",
@@ -488,6 +517,89 @@ pub async fn create_export_job(
     }))
 }
 
+/// Wire shape for `GET /v1/me/export` — the latest export job's state, so the
+/// account page can show a spinner then a download button without email. All
+/// fields are `null` when the user has never requested an export.
+#[derive(Debug, Serialize)]
+pub struct ExportStatusOut {
+    pub job_id: Option<Uuid>,
+    /// `pending` | `running` | `done` | `failed` | `expired`, or `null` if none.
+    pub status: Option<String>,
+    pub requested_at: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub expires_at: Option<String>,
+    /// Presigned R2 GET, only present when the job is `done` and unexpired.
+    pub download_url: Option<String>,
+    pub error: Option<String>,
+}
+
+/// GET /v1/me/export — status of the most recent export, with a fresh
+/// presigned download link when one is ready. Polled by the client after it
+/// enqueues an export.
+pub async fn get_export_status(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+) -> Result<Json<ExportStatusOut>, CloudError> {
+    let row: Option<(
+        Uuid,
+        String,
+        OffsetDateTime,
+        Option<i64>,
+        Option<OffsetDateTime>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, status, requested_at, size_bytes, expires_at, r2_key, error
+           FROM export_jobs WHERE user_id = $1
+          ORDER BY requested_at DESC LIMIT 1",
+    )
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some((job_id, status, requested_at, size_bytes, expires_at, r2_key, error)) = row else {
+        return Ok(Json(ExportStatusOut {
+            job_id: None,
+            status: None,
+            requested_at: None,
+            size_bytes: None,
+            expires_at: None,
+            download_url: None,
+            error: None,
+        }));
+    };
+
+    // Presign a short-lived link only for a ready, unexpired object.
+    let download_url = if status == "done" {
+        match (r2_key.filter(|k| !k.is_empty()), expires_at) {
+            (Some(key), Some(exp)) if exp > OffsetDateTime::now_utc() => state
+                .r2
+                .presign_get(&key, Some(std::time::Duration::from_secs(3600)))
+                .await
+                .ok()
+                .map(|u| u.url),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(ExportStatusOut {
+        job_id: Some(job_id),
+        status: Some(status),
+        requested_at: Some(format_dt(requested_at)),
+        size_bytes,
+        expires_at: expires_at.map(format_dt),
+        download_url,
+        error,
+    }))
+}
+
+/// Days a soft-deleted account is kept, frozen, before the purge cron
+/// hard-deletes it. Single-sourced here so `delete_me`, the `Me` payload's
+/// `purges_at`, and `account_purge`'s cutoff can't drift apart.
+pub const GRACE_DAYS: u32 = 30;
+
 #[derive(Debug, Serialize)]
 pub struct DeleteAccountOut {
     pub deleted_at: String,
@@ -495,16 +607,23 @@ pub struct DeleteAccountOut {
     pub grace_days: u32,
 }
 
-/// DELETE /v1/me — soft-delete the account. Hard-purge happens via the
-/// daily cron 30 days later, giving the user a window to reactivate.
+/// DELETE /v1/me — soft-delete the account. The account is *frozen* immediately
+/// (every data route 403s via `require_active_account`), so unlike before this
+/// no longer behaves like a plain logout. `account_purge`'s daily cron
+/// hard-deletes it `GRACE_DAYS` later; `POST /v1/me/reactivate` cancels it in
+/// the meantime. Mounted on the auth-only router so the freeze doesn't block
+/// the user from un-deleting.
 pub async fn delete_me(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
 ) -> Result<Json<DeleteAccountOut>, CloudError> {
     let now = OffsetDateTime::now_utc();
-    let purge_at = now + time::Duration::days(30);
+    let purge_at = now + time::Duration::days(GRACE_DAYS as i64);
+    // Idempotent: re-deleting an already-deleted account keeps the *original*
+    // `deleted_at` (COALESCE), so tapping delete twice can't quietly extend the
+    // grace window and postpone the purge.
     sqlx::query(
-        "UPDATE profiles SET deleted_at = now(), updated_at = now()
+        "UPDATE profiles SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
              WHERE user_id = $1",
     )
     .bind(user.user_id)
@@ -520,8 +639,44 @@ pub async fn delete_me(
     Ok(Json(DeleteAccountOut {
         deleted_at: format_dt(now),
         purges_after: format_dt(purge_at),
-        grace_days: 30,
+        grace_days: GRACE_DAYS,
     }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReactivateOut {
+    pub reactivated: bool,
+}
+
+/// POST /v1/me/reactivate — cancel a pending soft-delete. Clears `deleted_at`
+/// (the purge cron only ever touches rows where it's non-NULL, so this is what
+/// actually saves the account) and lifts the freeze. Explicit on purpose: a
+/// mere re-login must NOT silently un-delete — that was the old bug that made
+/// "delete" indistinguishable from a logout. `reactivated` is `false` when the
+/// account wasn't scheduled for deletion (nothing to do), so the client can
+/// tell an idempotent no-op from a real reactivation.
+pub async fn reactivate_me(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+) -> Result<Json<ReactivateOut>, CloudError> {
+    let res = sqlx::query(
+        "UPDATE profiles SET deleted_at = NULL, updated_at = now()
+             WHERE user_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(user.user_id)
+    .execute(&state.pool)
+    .await?;
+    let reactivated = res.rows_affected() > 0;
+    if reactivated {
+        sqlx::query(
+            "INSERT INTO audit_log (user_id, actor, event_type, metadata)
+                 VALUES ($1, 'user', 'account.reactivated', NULL)",
+        )
+        .bind(user.user_id)
+        .execute(&state.pool)
+        .await?;
+    }
+    Ok(Json(ReactivateOut { reactivated }))
 }
 
 /// Used by tests on the `quota::QuotaInfo` shape. Keeps the symbol in

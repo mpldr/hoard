@@ -10,10 +10,12 @@
 //! - **ok** (emerald): a backup just succeeded; reverts to idle after a beat.
 //! - **error** (red): the last backup failed.
 //!
-//! The icon image is drawn programmatically into a Vec<u8> RGBA buffer so we
-//! don't have to ship four bitmap variants — and so a future re-skin only
-//! requires editing this file. The base mark is a stylised "H"; the status
-//! dot lives in the bottom-right quarter and overlays it.
+//! The base image is the bundled app icon (embedded at compile time), so the
+//! tray always matches the current branding. The status dot is composited
+//! onto it at runtime in the bottom-right quarter. On macOS the icon is
+//! registered as a *template* (the OS renders its alpha as a monochrome
+//! silhouette that adapts to light/dark menu bars), so the dot is skipped
+//! there — state lives in the tooltip instead.
 //!
 //! The tray menu carries: Show Hoard, Back up everything now, Open Settings,
 //! Sign out, Quit. Left-click the icon to toggle the main window.
@@ -88,16 +90,21 @@ impl TrayController {
             // the next `set_state` will reflect the latest value.
             return;
         };
-        match render_icon(state) {
-            Ok(img) => {
-                if let Err(e) = tray.set_icon(Some(img)) {
-                    tracing::warn!(error = %e, "couldn't update tray icon");
+        // macOS renders the icon as a fixed template silhouette, so pushing a
+        // re-rendered bitmap is pointless (and resets the template flag on
+        // some Tauri versions) — only the tooltip changes there.
+        if !cfg!(target_os = "macos") {
+            match render_icon(state) {
+                Ok(img) => {
+                    if let Err(e) = tray.set_icon(Some(img)) {
+                        tracing::warn!(error = %e, "couldn't update tray icon");
+                    }
                 }
-                if let Err(e) = tray.set_tooltip(Some(state.tooltip())) {
-                    tracing::warn!(error = %e, "couldn't update tray tooltip");
-                }
+                Err(e) => tracing::warn!(error = %e, "tray icon render failed"),
             }
-            Err(e) => tracing::warn!(error = %e, "tray icon render failed"),
+        }
+        if let Err(e) = tray.set_tooltip(Some(state.tooltip())) {
+            tracing::warn!(error = %e, "couldn't update tray tooltip");
         }
     }
 }
@@ -135,14 +142,22 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     )?;
 
     let icon = render_icon(TrayState::Offline)?;
-    let tray = TrayIconBuilder::with_id("hoard-tray")
+    #[allow(unused_mut)]
+    let mut builder = TrayIconBuilder::with_id("hoard-tray")
         .icon(icon)
         .tooltip(TrayState::Offline.tooltip())
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(handle_menu_event)
-        .on_tray_icon_event(handle_icon_event)
-        .build(app)?;
+        .on_tray_icon_event(handle_icon_event);
+    // macOS: register as a template so the menu bar renders the icon's alpha
+    // as a monochrome silhouette matching light/dark mode (Apple HIG); the
+    // status dot is skipped there (see `render_icon`).
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(true);
+    }
+    let tray = builder.build(app)?;
 
     // Stash the handle so other modules can recolour later.
     let controller = app.state::<TrayController>();
@@ -228,75 +243,53 @@ fn toggle_main_window(app: &AppHandle) {
     }
 }
 
-/// Paint the tray icon at 32×32 RGBA. We draw a simple amber square (matching
-/// the in-app brand) with a small status-coloured dot in the lower-right.
-/// Full PNG decode is deliberately avoided — generating bytes ourselves means
-/// we don't have to ship N icon variants, and a recolour is a one-line change
-/// to `TrayState::dot_rgba`.
+/// The bundled app icon, embedded at compile time. 64×64 (not 32) so HiDPI
+/// trays don't upscale a soft bitmap; low-DPI trays downscale it cleanly.
+/// Same asset family the window/taskbar uses, so a rebrand of `icons/`
+/// updates the tray with no code change.
+const ICON_PNG: &[u8] = include_bytes!("../icons/64x64.png");
+
+/// Compose the tray icon: the app icon with a status-coloured dot in the
+/// lower-right (except on macOS — see module docs; the template silhouette
+/// would flatten any colour, so the base icon is returned untouched and the
+/// tooltip carries the state).
 fn render_icon(state: TrayState) -> tauri::Result<Image<'static>> {
-    const SIZE: u32 = 32;
-    let mut buf = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let base = Image::from_bytes(ICON_PNG)?;
+    let (w, h) = (base.width(), base.height());
+    let mut buf = base.rgba().to_vec();
 
-    // Brand square in amber-500, slightly inset so the icon doesn't look
-    // crammed against the menu-bar edges on macOS.
-    let brand = [245u8, 158, 11, 255];
-    let inset = 3i32;
-    for y in inset..(SIZE as i32 - inset) {
-        for x in inset..(SIZE as i32 - inset) {
-            put_pixel(&mut buf, SIZE, x as u32, y as u32, brand);
-        }
-    }
-
-    // White "H" mark — two verticals plus a crossbar. Tiny and unmistakable
-    // even at 16×16 (which is what Linux trays end up scaling us to).
-    let mark = [250u8, 250, 250, 255];
-    let mark_inset_x = 10;
-    let mark_inset_y = 8;
-    let mark_right = SIZE - mark_inset_x;
-    let mark_bottom = SIZE - mark_inset_y;
-    let mark_left = mark_inset_x;
-    let mark_top = mark_inset_y;
-    let crossbar_y = (mark_top + mark_bottom) / 2;
-    for y in mark_top..mark_bottom {
-        // Left and right strokes (2 px wide each).
-        for dx in 0..2 {
-            put_pixel(&mut buf, SIZE, mark_left + dx, y, mark);
-            put_pixel(&mut buf, SIZE, mark_right - 1 - dx, y, mark);
-        }
-    }
-    for x in mark_left..mark_right {
-        for dy in 0..2 {
-            put_pixel(&mut buf, SIZE, x, crossbar_y + dy, mark);
-        }
-    }
-
-    // Status dot in the bottom-right corner, with a thin dark ring so it
-    // reads on top of the amber mark.
-    let dot = state.dot_rgba();
-    let ring = [24u8, 24, 27, 255];
-    let cx = (SIZE - 8) as i32;
-    let cy = (SIZE - 8) as i32;
-    for y in 0..SIZE as i32 {
-        for x in 0..SIZE as i32 {
-            let dx = x - cx;
-            let dy = y - cy;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= 16 {
-                put_pixel(&mut buf, SIZE, x as u32, y as u32, dot);
-            } else if d2 <= 25 {
-                put_pixel(&mut buf, SIZE, x as u32, y as u32, ring);
+    if !cfg!(target_os = "macos") {
+        // Geometry scales off the icon size, keeping the proportions of the
+        // old 32px design: dot radius = w/8, centred 2r from the right/bottom
+        // edges, with a 1-ish px dark ring so it reads on any artwork.
+        let dot = state.dot_rgba();
+        let ring_rgba = [24u8, 24, 27, 255];
+        let r = (w / 8) as i32;
+        let ring = r + (w / 32).max(1) as i32;
+        let cx = w as i32 - 2 * r;
+        let cy = h as i32 - 2 * r;
+        for y in (cy - ring)..=(cy + ring) {
+            for x in (cx - ring)..=(cx + ring) {
+                let dx = x - cx;
+                let dy = y - cy;
+                let d2 = dx * dx + dy * dy;
+                if d2 <= r * r {
+                    put_pixel(&mut buf, w, h, x, y, dot);
+                } else if d2 <= ring * ring {
+                    put_pixel(&mut buf, w, h, x, y, ring_rgba);
+                }
             }
         }
     }
 
-    Ok(Image::new_owned(buf, SIZE, SIZE))
+    Ok(Image::new_owned(buf, w, h))
 }
 
 #[inline]
-fn put_pixel(buf: &mut [u8], size: u32, x: u32, y: u32, rgba: [u8; 4]) {
-    if x >= size || y >= size {
+fn put_pixel(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, rgba: [u8; 4]) {
+    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
         return;
     }
-    let i = ((y * size + x) * 4) as usize;
+    let i = ((y as u32 * w + x as u32) * 4) as usize;
     buf[i..i + 4].copy_from_slice(&rgba);
 }

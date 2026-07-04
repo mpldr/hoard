@@ -39,11 +39,17 @@ function armTimer(id: number, duration: number): void {
   }
 }
 
+// Floor for auto-dismiss: the user wants every toast readable without
+// rushing, errors included ("en Free solo puedes…"). Callers may pass a
+// LONGER duration (or 0 for sticky), never a shorter one.
+const MIN_DURATION = 10_000;
+
 export function pushToast(
   kind: ToastKind,
   message: string,
-  duration = 4000,
+  duration = MIN_DURATION,
 ): number {
+  if (duration > 0) duration = Math.max(duration, MIN_DURATION);
   // Coalesce: if an identical (kind, message) toast is already showing, bump
   // its counter and refresh its timer rather than queuing a duplicate. This
   // keeps a misbehaving background loop from burying the UI in toasts.
@@ -83,4 +89,4 @@ export const toastInfo = (msg: string, ms?: number) =>
 export const toastSuccess = (msg: string, ms?: number) =>
   pushToast("success", msg, ms);
 export const toastError = (msg: string, ms?: number) =>
-  pushToast("error", msg, ms ?? 6000);
+  pushToast("error", msg, ms);

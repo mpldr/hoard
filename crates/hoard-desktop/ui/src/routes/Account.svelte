@@ -27,12 +27,15 @@
     startCloudLogin,
     logoutCloud,
     exportAllCloudData,
+    exportStatusCloud,
+    downloadCloudExport,
     deleteCloudAccount,
     openBillingPortal,
     openUpgradePage,
     planLabel,
+    type CloudExportStatus,
   } from "../lib/stores/cloud";
-  import { toastError, toastInfo, toastSuccess } from "../lib/stores/toasts";
+  import { toastError, toastInfo } from "../lib/stores/toasts";
   import { clearOnboarding } from "../lib/stores/onboarding";
   import { formatBytes } from "../lib/utils/format";
 
@@ -43,11 +46,66 @@
   let deleteConfirmation = $state("");
   let compareOpen = $state(false);
 
+  // Latest export job + a poll while it's building. The worker is async, so the
+  // download link appears here (and by email) once the ZIP is ready.
+  let exportState = $state<CloudExportStatus | null>(null);
+  let exportPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  const exportBusy = $derived(
+    exportState?.status === "pending" || exportState?.status === "running",
+  );
+
   onMount(async () => {
     if (!$cloud.hydrated) {
       await hydrateCloud();
     }
+    if ($cloud.account) {
+      await loadExportStatus();
+    }
   });
+
+  onDestroy(stopExportPoll);
+
+  async function loadExportStatus() {
+    try {
+      exportState = await exportStatusCloud();
+      if (exportState.status === "pending" || exportState.status === "running") {
+        startExportPoll();
+      }
+    } catch {
+      // Non-fatal: the export card just won't show prior state.
+    }
+  }
+
+  function startExportPoll() {
+    if (exportPollTimer) return;
+    exportPollTimer = setInterval(async () => {
+      try {
+        exportState = await exportStatusCloud();
+        const s = exportState.status;
+        if (s !== "pending" && s !== "running") stopExportPoll();
+      } catch {
+        stopExportPoll();
+      }
+    }, 4000);
+  }
+
+  function stopExportPoll() {
+    if (exportPollTimer) {
+      clearInterval(exportPollTimer);
+      exportPollTimer = null;
+    }
+  }
+
+  async function handleDownloadExport() {
+    const url = exportState?.download_url;
+    if (!url) return;
+    try {
+      await downloadCloudExport(url);
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    }
+  }
 
   async function handleSignIn() {
     if (busyAction) return;
@@ -73,7 +131,7 @@
       // made it look like the session "came back".
       await clearOnboarding();
       toastInfo($_("account.signed_out"));
-      push("/welcome");
+      push("/onboarding/language");
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
@@ -94,13 +152,21 @@
   }
 
   async function handleExport() {
-    if (busyAction) return;
+    if (busyAction || exportBusy) return;
     busyAction = "export";
     try {
       const job = await exportAllCloudData();
-      toastSuccess(
-        $_("account.export_queued", { values: { id: job.job_id } }),
-      );
+      toastInfo($_("account.export_started"));
+      exportState = {
+        job_id: job.job_id,
+        status: job.status as CloudExportStatus["status"],
+        requested_at: null,
+        size_bytes: null,
+        expires_at: null,
+        download_url: null,
+        error: null,
+      };
+      startExportPoll();
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
@@ -447,8 +513,8 @@
               <div class="mt-2">
                 <Button
                   variant="secondary"
-                  loading={busyAction === "export"}
-                  disabled={busyAction !== null}
+                  loading={busyAction === "export" || exportBusy}
+                  disabled={busyAction !== null || exportBusy}
                   onclick={handleExport}
                 >
                   <Download size={14} />
@@ -470,8 +536,8 @@
               <div class="mt-2">
                 <Button
                   variant="secondary"
-                  loading={busyAction === "export"}
-                  disabled={busyAction !== null}
+                  loading={busyAction === "export" || exportBusy}
+                  disabled={busyAction !== null || exportBusy}
                   onclick={handleExport}
                 >
                   <Download size={14} />
@@ -555,14 +621,31 @@
       <div class="mt-3 flex flex-wrap gap-2">
         <Button
           variant="secondary"
-          loading={busyAction === "export"}
-          disabled={busyAction !== null}
+          loading={busyAction === "export" || exportBusy}
+          disabled={busyAction !== null || exportBusy}
           onclick={handleExport}
         >
           <Download size={14} />
           {$_("account.export_all")}
         </Button>
+        {#if exportState?.status === "done" && exportState.download_url}
+          <Button variant="primary" onclick={handleDownloadExport}>
+            <Download size={14} />
+            {$_("account.export_download")}
+          </Button>
+        {/if}
       </div>
+      {#if exportBusy}
+        <p class="mt-2 text-xs text-zinc-400">{$_("account.export_building")}</p>
+      {:else if exportState?.status === "done" && exportState.download_url}
+        <p class="mt-2 text-xs text-emerald-300/90">
+          {$_("account.export_ready")}
+        </p>
+      {:else if exportState?.status === "expired" || (exportState?.status === "done" && !exportState.download_url)}
+        <p class="mt-2 text-xs text-zinc-400">{$_("account.export_expired")}</p>
+      {:else if exportState?.status === "failed"}
+        <p class="mt-2 text-xs text-rose-400">{$_("account.export_failed")}</p>
+      {/if}
     </Card>
 
     <Card class="mb-4 border-rose-900/50 bg-rose-950/20">

@@ -30,7 +30,6 @@
     HardDrive,
     Server,
     ServerCog,
-    CloudOff,
   } from "lucide-svelte";
 
   import Card from "../lib/components/Card.svelte";
@@ -426,16 +425,12 @@
     },
   ]);
 
-  // Cloud-only toggle: "Modo ahorro" defaults every new cloud upload to
-  // `backup_only` so it stays a one-way push from this device. Per-save
-  // overrides live on the Library card.
+  // Cloud-only toggles. The old "Modo ahorro (solo subida)"
+  // (`cloud_savings_mode`) toggle was removed from the UI (2026-07-04): it
+  // confused more than it helped and the pref was never actually consumed by
+  // the agent. The pref field is kept as dead code for possible future use —
+  // see `Prefs.cloud_savings_mode`.
   const cloudRows: Row[] = $derived([
-    {
-      field: "cloud_savings_mode",
-      label: $_("settings.cloud_savings_mode_label"),
-      description: $_("settings.cloud_savings_mode_desc"),
-      icon: CloudOff,
-    },
     {
       field: "live_activity_visible",
       label: $_("settings.live_activity_label"),
@@ -647,11 +642,9 @@
       </section>
 
       <!--
-        Cloud "modo ahorro": single toggle that flips the default for new
-        cloud uploads to `backup_only`. Visible only when the user is signed
-        in to Hoard Cloud — for self-hosted users the field is still in
-        prefs.json but has no observable effect, so we hide the row to keep
-        the page focused.
+        Cloud-only settings section. Shown only when signed in to Hoard Cloud.
+        (The former "Modo ahorro (solo subida)" toggle was removed on
+        2026-07-04 — it was confusing and never wired to the agent.)
       -->
       {#if $cloud.account}
         <section>

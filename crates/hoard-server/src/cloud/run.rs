@@ -2,8 +2,9 @@
 //! `database.backend = "postgres"`.
 
 use crate::cloud::{
-    auth::{require_cloud_auth, JwksCache},
-    bandwidth, db, polar, r2,
+    account_purge,
+    auth::{require_active_account, require_cloud_auth, JwksCache},
+    bandwidth, db, export, polar, r2,
     routes::{
         checkout, entitlements as ent_routes, logs as log_routes, me,
         playtime as playtime_routes, saves, sync as sync_routes,
@@ -114,10 +115,35 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
+    // 4d. Hard-purge of soft-deleted accounts past their 30-day grace. Daily
+    //     cadence; deletes R2 objects then cascades the DB rows. Detached like
+    //     the sweepers above.
+    account_purge::spawn(state.clone());
+
+    // Fulfils `export_jobs` rows: builds the ZIP, uploads to R2, emails the
+    // link, and expires old exports.
+    export::spawn(state.clone());
+
     // 5. Build routers.
-    let authed = Router::new()
+    //
+    // `authed_always` needs only a valid token: these routes must work even
+    // while the account is frozen (soft-deleted) so the user can see the
+    // countdown and reactivate. Everything else is on `authed`, which layers
+    // `require_active_account` on top of auth so a scheduled-for-deletion
+    // account can't read or write its data during the 30-day grace.
+    let authed_always = Router::new()
         .route("/v1/me", get(me::get_me).delete(me::delete_me))
-        .route("/v1/me/export", post(me::create_export_job))
+        .route("/v1/me/reactivate", post(me::reactivate_me))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_cloud_auth,
+        ));
+
+    let authed = Router::new()
+        .route(
+            "/v1/me/export",
+            get(me::get_export_status).post(me::create_export_job),
+        )
         .route("/v1/devices", get(me::list_devices))
         .route("/v1/devices/:id", axum::routing::delete(me::delete_device))
         .route("/v1/cloud/checkout", post(checkout::create_checkout))
@@ -172,6 +198,13 @@ pub async fn run(cfg: Config) -> Result<()> {
                 crate::routes::logs::MAX_BATCH_BYTES,
             )),
         )
+        // Bottom-up: `require_cloud_auth` (outer) runs first and inserts the
+        // `CloudUser`, then `require_active_account` (inner) reads it and 403s
+        // frozen accounts.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_active_account,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_cloud_auth,
@@ -198,6 +231,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut app = Router::new()
         .merge(public)
+        .merge(authed_always)
         .merge(authed)
         .with_state(state.clone())
         .layer(cors);

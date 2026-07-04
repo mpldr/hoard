@@ -79,6 +79,24 @@ impl R2Store {
         Ok(())
     }
 
+    /// Streaming PUT from a file on disk. Used for account-export ZIPs, which
+    /// can be hundreds of MB — streaming keeps the archive off the heap
+    /// (unlike `put_object`, which buffers the whole body in a `Vec<u8>`).
+    pub async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
+            .await
+            .with_context(|| format!("r2 put_file open {}", path.display()))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("r2 put_file {key}"))?;
+        Ok(())
+    }
+
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         let out = self
             .client

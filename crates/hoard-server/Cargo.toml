@@ -28,6 +28,8 @@ cloud = [
     "dep:jsonwebtoken",
     "dep:hmac",
     "dep:base64",
+    "dep:zip",
+    "dep:tempfile",
 ]
 
 [dependencies]
@@ -77,6 +79,12 @@ hmac = { version = "0.12", optional = true }
 # Polar webhooks use Standard Webhooks: base64-encoded HMAC-SHA256 over
 # `id.timestamp.body`, unlike Lemon Squeezy's hex signature.
 base64 = { version = "0.22", optional = true }
+# Account-export ZIP writer. Entries are `Stored` (game saves are already
+# compressed) so this is just the container format.
+zip = { workspace = true, optional = true }
+# Export worker builds the ZIP on a temp file (streamed to R2) to keep the
+# whole archive off the heap.
+tempfile = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
 # Enabled (under `--features cloud`) to pull the matching aws-smithy

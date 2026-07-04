@@ -22,5 +22,7 @@
     stroke="var(--color-pine-line, #28332b)"
     stroke-width="2"
   />
-  <path d="M12 8 h9 v16 h22 v-16 h9 v48 h-9 v-16 h-22 v16 h-9 z" fill="#34d399" />
+  <rect x="9" y="9" width="14" height="46" rx="6" fill="#34d399" />
+  <rect x="41" y="9" width="14" height="46" rx="6" fill="#34d399" />
+  <rect x="9" y="25" width="46" height="14" rx="5" fill="#34d399" />
 </svg>

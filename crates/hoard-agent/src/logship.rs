@@ -7,11 +7,13 @@
 //!
 //! A dedicated background thread (own current-thread Tokio runtime, so it
 //! works regardless of the host's runtime) drains the channel in batches and
-//! POSTs them to the server. It only ships when a valid session exists
-//! (`credentials::load`) and the server advertises a log-ingest level via
-//! `/v1/health`; otherwise events are discarded. The server dictates the
-//! minimum level (self-hosted: DEBUG, cloud: INFO), so the client filters at
-//! source and never sends below it.
+//! POSTs them to the server. It only ships when the user has opted in
+//! (`prefs.anonymous_telemetry`), a valid session exists (`credentials::load`),
+//! and the server advertises a log-ingest level via `/v1/health`; otherwise
+//! events are discarded. The opt-in is read fresh each cycle, so toggling it
+//! off stops shipping within a few seconds without a restart. The server
+//! dictates the minimum level (self-hosted: DEBUG, cloud: INFO), so the client
+//! filters at source and never sends below it.
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
@@ -231,9 +233,10 @@ fn drain_loop(rx: Receiver<WireEntry>) {
                 }
             }
 
-            // Re-validate the session roughly every loop; if it vanished or the
-            // token rotated, drop back to the outer loop to re-resolve.
-            if !session_matches(&policy) {
+            // Re-validate roughly every loop; if the session vanished, the
+            // token rotated, or the user opted out mid-run, drop back to the
+            // outer loop to re-resolve (which then backs off).
+            if !session_matches(&policy) || !telemetry_enabled() {
                 break;
             }
         }
@@ -285,6 +288,10 @@ fn discard_available(rx: &Receiver<WireEntry>) {
 /// minimum level. Returns `None` when there's no session or the server can't
 /// receive logs.
 async fn resolve_policy(client: &reqwest::Client) -> Option<Policy> {
+    // Respect the user's opt-out first: no session probe, no shipping.
+    if !telemetry_enabled() {
+        return None;
+    }
     let creds = credentials::load().ok().flatten()?;
     let base = creds.url.trim_end_matches('/').to_string();
 
@@ -312,6 +319,16 @@ async fn resolve_policy(client: &reqwest::Client) -> Option<Policy> {
         token: creds.token,
         min_rank,
     })
+}
+
+/// Whether the user has opted in to sharing diagnostic logs. Read fresh from
+/// `prefs.json` each call so toggling the setting takes effect without a
+/// restart. Any error (missing or corrupt prefs) is treated as opted-out — we
+/// never ship without an affirmative flag.
+fn telemetry_enabled() -> bool {
+    crate::prefs::Prefs::load_default()
+        .map(|(p, _)| p.anonymous_telemetry)
+        .unwrap_or(false)
 }
 
 /// Cheap re-check: is there still a session whose token matches the policy we

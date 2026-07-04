@@ -18,11 +18,14 @@
 //!   `database.backend = "postgres"`.
 
 pub mod abuse;
+pub mod account_purge;
 pub mod auth;
 pub mod bandwidth;
 pub mod db;
+pub mod email;
 pub mod entitlements;
 pub mod errors;
+pub mod export;
 pub mod plans;
 pub mod polar;
 pub mod purge;

@@ -63,6 +63,13 @@ export type CloudAccount = {
   /** RFC3339 — when the pending downgrade takes effect (end of grace window).
    *  `null`/absent = no pending change. */
   storage_limit_change_at?: string | null;
+  /** RFC3339 — set while the account is soft-deleted and inside its 30-day
+   *  grace. When present the app is frozen server-side and the desktop shows the
+   *  reactivation screen instead of the normal UI. `null`/absent = live. */
+  deleted_at?: string | null;
+  /** RFC3339 — when the account is hard-purged if not reactivated
+   *  (`deleted_at` + 30 days). `null`/absent = live. */
+  purges_at?: string | null;
 };
 
 type CloudState = {
@@ -191,17 +198,53 @@ export type CloudExportJob = {
   status: string;
 };
 
-/** Kick off a server-side export. The server emails the user when the
- *  archive is ready (24h presigned R2 URL). */
+/** Latest export job's state. `download_url` is a fresh presigned R2 link,
+ *  present only when `status === "done"` and the object hasn't expired. All
+ *  fields are `null` when the user has never requested an export. */
+export type CloudExportStatus = {
+  job_id: string | null;
+  status: "pending" | "running" | "done" | "failed" | "expired" | null;
+  requested_at: string | null;
+  size_bytes: number | null;
+  expires_at: string | null;
+  download_url: string | null;
+  error: string | null;
+};
+
+/** Kick off a server-side export. A background worker builds the ZIP; poll
+ *  {@link exportStatusCloud} for the download link (the server also emails it
+ *  when email delivery is configured). */
 export async function exportAllCloudData(): Promise<CloudExportJob> {
   return await invoke<CloudExportJob>("cloud_export_all");
 }
 
-/** Soft-delete the cloud account. The server keeps the data for 30 days
- *  in case the user changes their mind. Local session is wiped here. */
+/** Poll the latest export job's status + download link. */
+export async function exportStatusCloud(): Promise<CloudExportStatus> {
+  return await invoke<CloudExportStatus>("cloud_export_status");
+}
+
+/** Open a ready export's presigned download URL in the system browser, which
+ *  saves the ZIP. */
+export async function downloadCloudExport(url: string): Promise<void> {
+  await openExternal(url);
+}
+
+/** Soft-delete the cloud account. The server freezes it and keeps the data for
+ *  a 30-day grace in case the user changes their mind (they can sign back in and
+ *  reactivate). Local session is wiped here. */
 export async function deleteCloudAccount(): Promise<void> {
   await invoke<void>("cloud_delete_account");
   internal.set({ account: null, hydrated: true, loading: false });
+}
+
+/** Cancel a pending soft-delete for the signed-in account. Returns the fresh,
+ *  live account (no `deleted_at`) and updates the store so the reactivation
+ *  screen dismisses. */
+export async function reactivateCloudAccount(): Promise<CloudAccount> {
+  const account = await invoke<CloudAccount>("cloud_reactivate_account");
+  internal.set({ account, hydrated: true, loading: false });
+  noteStorageStatus(account.storage_status);
+  return account;
 }
 
 /** Open the public pricing page in the browser, where the checkout buttons

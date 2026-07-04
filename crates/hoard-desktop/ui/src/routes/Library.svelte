@@ -739,8 +739,8 @@
 </script>
 
 <div class="mx-auto max-w-6xl px-8 py-8">
-  <header class="mb-6 flex items-start justify-between gap-4">
-    <div>
+  <header class="mb-6 flex flex-wrap items-start justify-between gap-4">
+    <div class="min-w-0">
       <h1 class="font-display text-[28px] leading-tight font-semibold tracking-[-0.02em] text-zinc-50">{$_("library.title")}</h1>
       <p class="mt-2 text-sm text-zinc-400">
         {#if report}
@@ -905,7 +905,7 @@
               appId={appIdBySlug.get(save.game_slug) ?? null}
               slug={save.game_slug}
               name={save.game_slug}
-              class="h-9 w-9 rounded-md"
+              class="h-9 w-9 shrink-0 rounded-md"
               initialClass="text-sm"
             />
             <div class="min-w-0 flex-1">
@@ -979,7 +979,7 @@
               appId={appIdBySlug.get(game.slug) ?? null}
               slug={game.slug}
               name={game.display_name}
-              class="h-9 w-9 rounded-md"
+              class="h-9 w-9 shrink-0 rounded-md"
               initialClass="text-sm"
             />
             <div class="min-w-0 flex-1">
@@ -1126,7 +1126,7 @@
                   appId={game.steam_app_id}
                   slug={game.slug}
                   name={game.display_name}
-                  class="h-10 w-10 rounded-md"
+                  class="h-10 w-10 shrink-0 rounded-md"
                   initialClass="text-base"
                 />
                 <div class="min-w-0">

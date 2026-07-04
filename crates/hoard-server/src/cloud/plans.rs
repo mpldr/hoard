@@ -55,7 +55,12 @@ impl Plan {
                 version_history_forever: true,
                 max_save_size_bytes: 200 * MB,
                 bandwidth_window_secs: 15 * 60,
-                bandwidth_quota_bytes: 1 * GB,
+                // Doubled 1→2 GB (2026-07-04): a single large monolithic save
+                // (e.g. a ~144 MB Factorio `.zip` that barely dedups) rewritten
+                // by the game's autosave a handful of times inside the 15-min
+                // window was legitimately saturating the old 1 GB and tripping a
+                // confusing 429 on what the user saw as "one save".
+                bandwidth_quota_bytes: 2 * GB,
             },
             Plan::Pro => PlanLimits {
                 plan: self,
@@ -73,7 +78,8 @@ impl Plan {
                 // save (whose `requested_bytes` ≈ its full size) can't be
                 // permanently wedged behind the window, and roomy enough that
                 // onboarding several games at once doesn't trip a 429.
-                bandwidth_quota_bytes: 5 * GB,
+                // Doubled 5→10 GB (2026-07-04) alongside the Free bump.
+                bandwidth_quota_bytes: 10 * GB,
             },
         }
     }
@@ -139,7 +145,7 @@ mod tests {
         assert!(l.version_history_forever);
         assert_eq!(l.max_save_size_bytes, 200 * MB);
         assert_eq!(l.bandwidth_window_secs, 15 * 60);
-        assert_eq!(l.bandwidth_quota_bytes, 1 * GB);
+        assert_eq!(l.bandwidth_quota_bytes, 2 * GB);
     }
 
     #[test]
@@ -151,7 +157,7 @@ mod tests {
         assert!(l.version_history_forever);
         assert_eq!(l.max_save_size_bytes, 2 * GB);
         assert_eq!(l.bandwidth_window_secs, 15 * 60);
-        assert_eq!(l.bandwidth_quota_bytes, 5 * GB);
+        assert_eq!(l.bandwidth_quota_bytes, 10 * GB);
     }
 
     #[test]

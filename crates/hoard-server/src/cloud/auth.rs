@@ -234,6 +234,49 @@ fn extract_bearer(req: &Request) -> Option<String> {
     val.strip_prefix("Bearer ").map(|s| s.trim().to_string())
 }
 
+/// Axum middleware, layered *inside* `require_cloud_auth` (so it runs second and
+/// can read the `CloudUser` it inserted): freeze accounts that are scheduled for
+/// deletion.
+///
+/// Soft-delete used to be invisible — `require_cloud_auth` never looked at
+/// `deleted_at`, so a "deleted" account kept reading and writing exactly like a
+/// plain logout (all data + devices still live), and nothing ever purged it.
+/// This gate makes the 30-day grace real: the account's data stays put but is
+/// frozen — every data route 403s with a machine-readable code — until either
+/// the user reactivates (see `POST /v1/me/reactivate`) or the purge cron
+/// hard-deletes it. `GET/DELETE /v1/me` and `/v1/me/reactivate` are deliberately
+/// mounted on the auth-only router so a frozen user can still see the countdown
+/// and undo the deletion.
+pub async fn require_active_account(
+    State(state): State<CloudState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // `require_cloud_auth` runs first and inserts this. Its absence is a wiring
+    // bug; fail closed rather than panic.
+    let Some(user) = req.extensions().get::<CloudUser>().cloned() else {
+        return CloudError::Unauthorized("missing auth context").into_response();
+    };
+    let is_deleted: Result<Option<bool>, _> =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM profiles WHERE user_id = $1")
+            .bind(user.user_id)
+            .fetch_optional(&state.pool)
+            .await;
+    match is_deleted {
+        Ok(Some(true)) => CloudError::ForbiddenCode {
+            code: "account_scheduled_deletion",
+            message: "This account is scheduled for deletion. Reactivate it from \
+                      the account page to keep using Hoard Cloud.",
+        }
+        .into_response(),
+        // No profile row yet (first GET /v1/me hasn't provisioned it), not
+        // deleted, or a transient DB error: let it through. The freeze is a
+        // policy gate, not a security boundary, so a DB hiccup must never lock
+        // an active user out of their own data.
+        _ => next.run(req).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

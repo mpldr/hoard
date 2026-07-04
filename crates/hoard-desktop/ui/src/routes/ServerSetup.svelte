@@ -135,7 +135,7 @@
       <Input
         label={$_("server.address_label")}
         bind:value={url}
-        placeholder="192.168.1.20:12421"
+        placeholder="http://192.168.1.20:12421"
         hint={$_("server.address_hint")}
         icon={Server}
         autocomplete="url"

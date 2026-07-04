@@ -58,7 +58,7 @@
   "server.title": "Connect to your server",
   "server.subtitle": "Paste the address of the Hoard server you (or your admin) set up.",
   "server.address_label": "Server address",
-  "server.address_hint": "The same URL you would open in a web browser.",
+  "server.address_hint": "Recommended format: http://IP:12421 — e.g. http://192.168.1.20:12421",
   "server.test_connection": "Test connection",
   "server.unreachable_title": "Can't reach your server",
   "server.unreachable_body": "Hoard couldn't connect to {url}. If this server is gone for good, forget it so Hoard stops trying to reconnect.",

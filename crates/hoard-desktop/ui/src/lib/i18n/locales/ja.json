@@ -58,7 +58,7 @@
   "server.title": "サーバーに接続",
   "server.subtitle": "あなた（または管理者）が用意した Hoard サーバーのアドレスを貼り付けてください。",
   "server.address_label": "サーバーアドレス",
-  "server.address_hint": "ブラウザで開くのと同じ URL です。",
+  "server.address_hint": "推奨形式: http://IP:12421 — 例: http://192.168.1.20:12421",
   "server.test_connection": "接続テスト",
   "server.unreachable_title": "サーバーに接続できません",
   "server.unreachable_body": "Hoard は {url} に接続できませんでした。このサーバーが完全になくなった場合は、削除すると Hoard が再接続を試みなくなります。",

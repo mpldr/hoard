@@ -58,7 +58,7 @@
   "server.title": "连接到你的服务器",
   "server.subtitle": "粘贴你（或管理员）搭建的 Hoard 服务器地址。",
   "server.address_label": "服务器地址",
-  "server.address_hint": "与你在浏览器中打开的 URL 相同。",
+  "server.address_hint": "推荐格式：http://IP:12421 — 例如 http://192.168.1.20:12421",
   "server.test_connection": "测试连接",
   "server.unreachable_title": "无法连接到你的服务器",
   "server.unreachable_body": "Hoard 无法连接到 {url}。如果此服务器已永久消失，请将其忘记，让 Hoard 不再尝试重新连接。",

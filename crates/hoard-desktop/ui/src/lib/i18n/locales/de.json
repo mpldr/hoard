@@ -58,7 +58,7 @@
   "server.title": "Mit deinem Server verbinden",
   "server.subtitle": "Füge die Adresse des Hoard-Servers ein, den du (oder dein Admin) eingerichtet hast.",
   "server.address_label": "Serveradresse",
-  "server.address_hint": "Dieselbe URL, die du im Browser öffnen würdest.",
+  "server.address_hint": "Empfohlenes Format: http://IP:12421 — z. B. http://192.168.1.20:12421",
   "server.test_connection": "Verbindung testen",
   "server.unreachable_title": "Server nicht erreichbar",
   "server.unreachable_body": "Hoard konnte {url} nicht erreichen. Wenn dieser Server endgültig weg ist, vergiss ihn, damit Hoard nicht weiter versucht, sich zu verbinden.",

@@ -104,8 +104,12 @@ pub struct AgentConfig {
     /// upload gets a 409 non-fast-forward and the reconcile path merges the
     /// remote head in before retrying. So outdated-while-playing now defers
     /// to the reconciliation sweep, which catches up as soon as the session
-    /// settles. The only guarded-path exception is the pre-launch barrier
-    /// (see `process_poll`), which is launch-scoped by construction.
+    /// settles — and a deferred `ForceRestore` that finds un-flushed local
+    /// changes flushes them immediately (bypassing the min-interval queue),
+    /// so live progress becomes a cloud version within seconds instead of
+    /// waiting out the debounce window. The only guarded-path exception is
+    /// the pre-launch barrier (see `process_poll`), which is launch-scoped
+    /// by construction.
     pub global_sync: bool,
 }
 
@@ -912,24 +916,53 @@ async fn run_agent(
                         // flushed yet — on a single device, the poller's echo
                         // of our own upload could erase a live session. Never
                         // pull into a folder the user is actively playing in;
-                        // drop the command instead. Nothing is lost: the
-                        // reconciliation sweep runs every tick with these same
-                        // guards and version-gates against the poller's cache,
-                        // so the delta is picked up as soon as the session
-                        // settles (and a genuinely newer remote head is also
-                        // reconciled by the 409 non-fast-forward path if we
-                        // upload first).
+                        // drop the command instead. Nothing is lost: un-flushed
+                        // local changes are uploaded immediately (below), and
+                        // the reconciliation sweep runs every tick with these
+                        // same guards and version-gates against the poller's
+                        // cache, so a remaining delta is picked up as soon as
+                        // the session settles (a genuinely newer remote head is
+                        // also reconciled by the 409 non-fast-forward path when
+                        // we upload first).
                         let mid_session = if eligible {
                             slots.get(&id).and_then(mid_session_reason)
                         } else {
                             None
                         };
                         if let Some(reason) = mid_session {
-                            tracing::info!(
-                                save_id = %id,
-                                reason,
-                                "agent: force-restore deferred — user is mid-session; the sweep will pull once the save settles"
-                            );
+                            // Deferring the pull must not leave the session's
+                            // progress sitting un-versioned in the debounce /
+                            // min-interval queue while the remote moves: flush
+                            // it now. The upload either commits cleanly (this
+                            // device becomes head and the dropped pull turns
+                            // into a no-op) or hits the 409 non-fast-forward
+                            // reconcile, which merges the newer remote head and
+                            // versions both sides — either way the progress
+                            // exists as a cloud version within seconds, even if
+                            // it never ends up being the version the user keeps.
+                            // 2s mirrors the GameStopped final flush; skipping
+                            // the ADR 0018 min-interval floor here is deliberate
+                            // (correctness beats data saving under contention).
+                            let flush_pending =
+                                slots.get(&id).is_some_and(|s| s.has_pending);
+                            if flush_pending {
+                                tracing::info!(
+                                    save_id = %id,
+                                    reason,
+                                    "agent: force-restore deferred — flushing pending local changes so they're versioned first"
+                                );
+                                schedule_backup(
+                                    &mut slots, &id, BackupReason::FilesystemSettled,
+                                    Duration::from_secs(2),
+                                    &api, &events_tx, &config, &done_tx, &cmd_tx,
+                                );
+                            } else {
+                                tracing::info!(
+                                    save_id = %id,
+                                    reason,
+                                    "agent: force-restore deferred — user is mid-session; the sweep will pull once the save settles"
+                                );
+                            }
                         } else if eligible {
                             let known_version =
                                 slots.get(&id).and_then(|s| s.known_version);

@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   el juego y el guardado se asiente; el caso multi-dispositivo legítimo sigue
   igual (un equipo en reposo baja la versión nueva al momento, y si dos
   equipos divergen lo resuelve la reconciliación por conflicto de subida).
+- **El progreso en curso se versiona al instante en vez de quedarse en cola.**
+  Cuando una bajada se pospone por sesión viva y hay cambios locales sin
+  subir, el agente los sube inmediatamente (saltándose el intervalo de ahorro
+  de datos) en lugar de dejarlos esperando en la cola de copia. Así lo jugado
+  existe como versión en la nube en segundos, aunque luego no sea la versión
+  que acabes usando; si la nube iba por delante, la reconciliación por
+  conflicto de subida versiona ambos lados.
 
 ## [1.0.0] — 2026-07-05 (beta)
 

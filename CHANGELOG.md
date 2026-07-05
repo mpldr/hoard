@@ -7,27 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-- **El recap (Wrapple) era el mismo en todas las cuentas.** Las horas jugadas
-  vivían en un único fichero global de la máquina, así que cada cuenta que abría
-  el recap veía —y subía al servidor— el histórico de toda la máquina. Ahora el
-  playtime se particiona por cuenta igual que los saves: el histórico legacy se
-  adopta una sola vez en la cuenta activa (tu principal) y cualquier otra cuenta
-  parte de cero. Además, la subida al servidor pasa a ser un reemplazo por
-  dispositivo, así que una cuenta que ya no tiene horas que aportar limpia sus
-  filas contaminadas la próxima vez que abre el recap.
-- **Cuadrado negro al pasar el ratón dentro de Wrapple (solo Linux).** Artefacto
-  de compositing de WebKitGTK: el `backdrop-filter` de la barra lateral, sobre
-  los glows difuminados del recap, pintaba un rectángulo negro al iluminarse un
-  botón. Los glows decorativos pasan a radial-gradients (sin `filter`) y en Linux
-  se quita el desenfoque de la barra lateral.
-
-## [1.0.0] — beta
+## [1.0.0] — 2026-07-05 (beta)
 
 > **Renumeración.** Hoard pasa a **1.0** como primera beta pública. Toda la
 > numeración anterior (0.x, 1.x dev, 2.x) era de desarrollo: sus tags y
 > releases se han retirado de GitHub y queda una única 1.0. Los bloques de
 > abajo se conservan como histórico interno.
+
+### Added
+- **Tour guiado la primera vez que entras.** Recorre la app real, no un modal:
+  cada paso navega a su sección, un foco se desliza por la barra lateral y las
+  secciones Pro se enseñan en vista previa sin arrancar la prueba de 7 días. Se
+  repite por cuenta/servidor (no una sola vez por máquina) y puede saltarse.
+- **Cuentas: congelar, purgar y exportar.** Borrar la cuenta la congela y exige
+  reactivación explícita; a los 30 días una purga real la elimina del todo. La
+  exportación empaqueta tus datos en un zip y te lo manda por email (o descarga
+  in-app si el email no está disponible).
+- **Prueba Pro de 7 días** que arranca al abrir la sección por primera vez, con
+  contador de días visible.
+- **Panel de actividad con fallos por partida y presión de almacenamiento.**
+  Los errores de copia (demasiado grande, recortada, auto-restauración fallida)
+  dejan de ser ráfagas de popups: van al feed con cuadro rojo/ámbar, y el feed
+  avisa en ámbar al purgar versiones antiguas y en rojo al llenarse el plan.
+- **Métricas del escaneo de detección.** Cada escaneo registra su duración y
+  cuántos juegos aporta cada etapa del pipeline; queda en el informe de
+  detección y en los diagnósticos ocultos.
 
 ### Changed
 - **Partidas grandes en Hoard Cloud: la copia funciona aunque tu plan no llegue.**
@@ -41,6 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **El estado se particiona por contexto (cuenta cloud / self-hosted).** Cada
   cuenta y cada servidor self-hosted guarda sus saves en su propio fichero, sin
   residuos al cambiar de una a otra; migración automática del estado antiguo.
+- **Puerto por defecto del servidor self-hosted: 12421.** El asistente
+  recomienda `http://IP:12421` y el cliente deduce http/https según el host.
+- **Ancho de banda duplicado en Hoard Cloud** (Free 1→2 GB, Pro 5→10 GB por
+  ventana) para absorber ráfagas de un save monolítico reescrito por autosaves.
+- **Barra lateral: almacenamiento compacto.** La línea de estado en vivo del pie
+  se sustituye por una barra de cuota unificada (cloud y self-hosted) que
+  colorea por consecuencia real: ámbar si purga versiones, rojo si está llena.
+- **Las notificaciones de fallo de copia vienen activadas por defecto** (un
+  fallo silencioso no debería pasar desapercibido); las de éxito siguen opt-in.
+- **El toggle de telemetría manda de verdad.** Con «telemetría anónima»
+  desactivada no se envía ningún log al servidor; se relee en cada ciclo sin
+  reiniciar.
+- **El calendario del recap escala con tu día más jugado.** Los tonos del
+  heatmap pasan de cortes fijos de horas (donde un día de 1h y otro de 57h se
+  pintaban igual) a intensidad relativa estilo GitHub: el día más alto siempre
+  es el más oscuro y los cortos quedan claros.
 
 ### Fixed
 - **Errores 413 crípticos al superar el tope por partida.** El cliente
@@ -54,6 +74,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Al iniciar sesión no arrancaba la vigilancia.** Tras entrar con la cuenta
   cloud, los juegos se escaneaban pero no se monitorizaba ninguno hasta reiniciar
   la app; ahora el agente y los schedulers arrancan en el propio login.
+- **Restaurar respetaba el contenido pero no las fechas.** Los ficheros
+  restaurados salían con mtime «ahora», así que la comparación local-vs-remoto
+  posterior podía pisar progreso local más nuevo. Ahora se reaplica el mtime
+  original del snapshot al restaurar.
+- **Falso «Limitada» recurrente en Hoard Cloud.** El rate limiter del servidor
+  reponía 1 token cada 50 segundos en lugar de 50 por segundo, así que un
+  arranque con muchos juegos agotaba la cuota y la sesión quedaba marcada como
+  limitada sin motivo.
+- **La detección por nombre ya no confunde secuelas.** El emparejado difuso
+  Steam/launcher→catálogo descarta candidatos cuyos numerales no coinciden
+  («Dark Souls II» nunca enlaza con *dark-souls-iii*), tratando árabes y romanos
+  como equivalentes («Hitman 2» sí casa con *hitman-ii*).
+- **El recap (Wrapple) era el mismo en todas las cuentas.** Las horas jugadas
+  vivían en un único fichero global de la máquina, así que cada cuenta que abría
+  el recap veía —y subía al servidor— el histórico de toda la máquina. Ahora el
+  playtime se particiona por cuenta igual que los saves: el histórico legacy se
+  adopta una sola vez en la cuenta activa (tu principal) y cualquier otra cuenta
+  parte de cero. Además, la subida al servidor pasa a ser un reemplazo por
+  dispositivo, así que una cuenta que ya no tiene horas que aportar limpia sus
+  filas contaminadas la próxima vez que abre el recap.
+- **Cuadrado negro al pasar el ratón dentro de Wrapple (solo Linux).** Artefacto
+  de compositing de WebKitGTK: el `backdrop-filter` de la barra lateral, sobre
+  los glows difuminados del recap, pintaba un rectángulo negro al iluminarse un
+  botón. Los glows decorativos pasan a radial-gradients (sin `filter`) y en Linux
+  se quita el desenfoque de la barra lateral.
 
 ### Screen
 - **Hoard Screen: mucho menos CPU y vídeo más fluido en modo compatibilidad.**

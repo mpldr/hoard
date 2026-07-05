@@ -413,7 +413,7 @@
   "sync.on": "开启",
   "sync.off": "关闭",
   "sync.aria_toggle": "切换同步",
-  "sync.help_tooltip": "开启后，一旦设备落后，Hoard 会立即从云端下载更新版本，即使你正在游戏中。",
+  "sync.help_tooltip": "开启后，一旦设备落后，Hoard 会立即从云端下载更新版本。游戏运行期间会等到你停止游戏后再下载，避免覆盖尚未备份的进度。",
   "sync.toggled_on": "已启用同步",
   "sync.toggled_off": "已禁用同步",
   "updates.client_short": "有客户端更新",

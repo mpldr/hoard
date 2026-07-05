@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Sync global ya no puede pisar una partida en curso.** Con "Sync" activado,
+  la bajada instantánea (avisada por el poller/SSE), el barrido de
+  reconciliación y la barrera de pre-lanzamiento se saltaban las protecciones
+  de sesión viva: en un solo PC, la bajada podía re-aplicar la última versión
+  ya subida encima de progreso que la copia automática aún no había capturado,
+  y esas partidas intermedias nunca llegaban a versionarse (pérdida real de
+  datos con R.E.P.O.). Ahora cualquier bajada automática espera a que cierres
+  el juego y el guardado se asiente; el caso multi-dispositivo legítimo sigue
+  igual (un equipo en reposo baja la versión nueva al momento, y si dos
+  equipos divergen lo resuelve la reconciliación por conflicto de subida).
+
 ## [1.0.0] — 2026-07-05 (beta)
 
 > **Renumeración.** Hoard pasa a **1.0** como primera beta pública. Toda la

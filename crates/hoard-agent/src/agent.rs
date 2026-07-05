@@ -85,15 +85,27 @@ pub struct AgentConfig {
     /// from `Prefs::data_saving` via `lerp(k, 5s, 600s)`.
     pub min_snapshot_interval_secs: u64,
     /// Mirror of `Prefs::global_sync`. Distinct from [`Self::auto_restore`]:
-    /// when `true` the reconciliation sweep restores a newer cloud version
-    /// **the moment it's detected outdated, regardless of whether the game is
-    /// running or the save was touched recently**. It bypasses the
-    /// "user is mid-session" guards (`is_running`, `has_pending`,
-    /// recent-fs-event, recent-mtime) that `auto_restore` alone respects.
-    /// The version-gate inside `run_auto_restore` (`known >= latest`) still
-    /// holds, so this never re-downloads a save the device is already current
-    /// on — it only ever pulls a genuinely newer cloud version. Backup-only
-    /// presets (`policy.auto_restore == Some(false)`) still opt out.
+    /// it opts every save into restore (same effect as `auto_restore` on the
+    /// eligibility floor) *and* unlocks the low-latency pull paths — the
+    /// poller/SSE `ForceRestore` push and the pre-launch sync barrier on
+    /// `GameStarted`. The version-gate inside `run_auto_restore`
+    /// (`known >= latest`) still holds, so it never re-downloads a save the
+    /// device is already current on. Backup-only presets
+    /// (`policy.auto_restore == Some(false)`) still opt out.
+    ///
+    /// It does **not** bypass the "user is mid-session" guards (`is_running`,
+    /// `has_pending`, recent-fs-event, recent-mtime). It used to — "pull the
+    /// moment it's outdated, even while playing" — and on a single device
+    /// that raced the user's own backup: the pull re-applied the last
+    /// *uploaded* version over progress the debounced backup hadn't flushed
+    /// yet, so intermediate sessions never got versioned (REPO data-loss
+    /// incident, 2026-07-05). A mid-session pull is never needed for
+    /// correctness: if another device genuinely advanced the save, our next
+    /// upload gets a 409 non-fast-forward and the reconcile path merges the
+    /// remote head in before retrying. So outdated-while-playing now defers
+    /// to the reconciliation sweep, which catches up as soon as the session
+    /// settles. The only guarded-path exception is the pre-launch barrier
+    /// (see `process_poll`), which is launch-scoped by construction.
     pub global_sync: bool,
 }
 
@@ -428,14 +440,17 @@ enum AgentCommand {
     SetAutoRestore(bool),
     /// Live-toggle `config.global_sync` (sync global). Distinct from
     /// `SetAutoRestore`: when flipped `false → true` the agent kicks an
-    /// immediate sweep that pulls any outdated save **even mid-session**,
-    /// bypassing the user-is-here guards. See [`AgentConfig::global_sync`].
+    /// immediate sweep so every outdated-but-idle save catches up right away.
+    /// See [`AgentConfig::global_sync`].
     SetGlobalSync(bool),
-    /// Sync global, ruta de baja latencia: el poller `cloud_pull` detectó que
-    /// un save concreto avanzó de versión en la nube y pide bajarlo **ya**,
-    /// saltándose el cooldown del sweep. Respeta el flag `restoring` (no
-    /// solapa restores) y el opt-out backup-only por preset. El version-gate
-    /// dentro de `run_auto_restore` evita la descarga si ya estamos al día.
+    /// Sync global, ruta de baja latencia: el poller `cloud_pull` (o el SSE
+    /// self-hosted) detectó que un save concreto avanzó de versión y pide
+    /// bajarlo ya, saltándose el cooldown del sweep. Respeta el flag
+    /// `restoring` (no solapa restores), el opt-out backup-only por preset y
+    /// los guards de sesión viva (`is_running`/`has_pending`/actividad
+    /// reciente): con la partida abierta se difiere y el sweep lo recoge en
+    /// cuanto el save se asienta. El version-gate dentro de
+    /// `run_auto_restore` evita la descarga si ya estamos al día.
     ForceRestore(String),
     /// DETECCIÓN (fase 3, ADR 0020): lista de carpetas candidatas detectadas
     /// pero AÚN NO rastreadas, que el escaneo del desktop quiere "sondear".
@@ -523,8 +538,9 @@ impl AgentHandle {
 
     /// Push a new `global_sync` preference into the running agent. On a
     /// `false → true` flip the agent immediately sweeps every slot, pulling
-    /// any outdated save even mid-session (the version-gate keeps it free
-    /// when the device is already current). See [`AgentConfig::global_sync`].
+    /// any outdated save that isn't mid-session (the version-gate keeps it
+    /// free when the device is already current). See
+    /// [`AgentConfig::global_sync`].
     pub async fn set_global_sync(&self, enabled: bool) -> Result<()> {
         self.tx.send(AgentCommand::SetGlobalSync(enabled)).await?;
         Ok(())
@@ -535,7 +551,8 @@ impl AgentHandle {
     /// global is on and it spots a save that advanced server-side, so the
     /// download starts within the poll interval instead of up to a cooldown
     /// later. No-op on the agent side if the save is unknown or already
-    /// restoring. See [`AgentCommand::ForceRestore`].
+    /// restoring; deferred to the sweep if the save is mid-session.
+    /// See [`AgentCommand::ForceRestore`].
     pub async fn force_restore(&self, save_id: String) -> Result<()> {
         self.tx.send(AgentCommand::ForceRestore(save_id)).await?;
         Ok(())
@@ -858,9 +875,10 @@ async fn run_agent(
                             global_sync = enabled,
                             "agent: global_sync preference updated"
                         );
-                        // Flipping on means "catch me up now, even if I'm
-                        // playing". Kick an immediate sweep; the version-gate
-                        // keeps it free when already current.
+                        // Flipping on means "catch me up now". Kick an
+                        // immediate sweep; the version-gate keeps it free when
+                        // already current, and the mid-session guards defer
+                        // any save with a live game until it settles.
                         if !was && enabled {
                             sweep_for_auto_restore(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &latest_versions,
@@ -868,18 +886,46 @@ async fn run_agent(
                         }
                     }
                     Some(AgentCommand::ForceRestore(id)) => {
-                        // Low-latency pull requested by the cloud_pull poller.
-                        // Honour the backup-only opt-out and the in-flight
-                        // guard, but ignore the cooldown — the poller already
-                        // confirmed a version bump, so this is never spurious.
+                        // Low-latency pull requested by the cloud_pull poller
+                        // (or the self-hosted SSE stream). Honour the
+                        // backup-only opt-out and the in-flight guard, but
+                        // ignore the cooldown — the poller already confirmed a
+                        // version bump, so this is never spurious.
                         let eligible = slots.get(&id).is_some_and(|slot| {
-                            slot.save
-                                .policy
-                                .auto_restore
-                                .unwrap_or(config.auto_restore || config.global_sync)
+                            !slot.save.track_only
+                                && slot
+                                    .save
+                                    .policy
+                                    .auto_restore
+                                    .unwrap_or(config.auto_restore || config.global_sync)
                                 && !slot.restoring
                         });
-                        if eligible {
+                        // Mid-session veto (REPO data-loss, 2026-07-05): a
+                        // push-triggered pull used to land between the game's
+                        // save write and the debounced backup, re-applying the
+                        // last uploaded version over progress that hadn't been
+                        // flushed yet — on a single device, the poller's echo
+                        // of our own upload could erase a live session. Never
+                        // pull into a folder the user is actively playing in;
+                        // drop the command instead. Nothing is lost: the
+                        // reconciliation sweep runs every tick with these same
+                        // guards and version-gates against the poller's cache,
+                        // so the delta is picked up as soon as the session
+                        // settles (and a genuinely newer remote head is also
+                        // reconciled by the 409 non-fast-forward path if we
+                        // upload first).
+                        let mid_session = if eligible {
+                            slots.get(&id).and_then(mid_session_reason)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = mid_session {
+                            tracing::info!(
+                                save_id = %id,
+                                reason,
+                                "agent: force-restore deferred — user is mid-session; the sweep will pull once the save settles"
+                            );
+                        } else if eligible {
                             let known_version =
                                 slots.get(&id).and_then(|s| s.known_version);
                             let save = slots.get(&id).map(|s| s.save.clone());
@@ -1217,11 +1263,17 @@ fn handle_add(
     // check is the reliable "user is playing" signal regardless of process
     // detection.
     if config.auto_restore || config.global_sync {
-        // Sync global ignores the recent-touch defer: catch up to the cloud
-        // immediately even if the folder was just written. The version-gate
-        // still spares the download when the device is already current.
-        let recently_touched = !config.global_sync
-            && is_path_recently_touched(&save_for_restore.local_path, RECENT_SAVE_GRACE);
+        // The recent-touch defer applies to sync global too. It used to be
+        // skipped there ("catch up immediately even if the folder was just
+        // written"), but AddSave fires for every save at app start — before
+        // the first process poll, so `is_running` can't veto yet — and this
+        // pull is un-gated (`known_version = None`, it always downloads to
+        // diff). Starting the app mid-game could therefore merge the last
+        // uploaded version into a live folder. A just-written folder means
+        // the user is (or was seconds ago) here; let the sweep catch up once
+        // mtime stabilises.
+        let recently_touched =
+            is_path_recently_touched(&save_for_restore.local_path, RECENT_SAVE_GRACE);
         if recently_touched {
             tracing::debug!(
                 save_id = %save_id,
@@ -1573,7 +1625,9 @@ fn spawn_auto_restore(
 /// bump the *directory* mtime — so the sweep auto-restored mid-session,
 /// re-downloading autosaves the game had already rotated away and failing
 /// uploads as the restore mutated the folder under them. The agent's own
-/// inotify stream catches both.
+/// inotify stream catches both. The guards are unconditional: `global_sync`
+/// no longer bypasses them (see [`AgentConfig::global_sync`] for the
+/// data-loss incident that ended that).
 ///
 /// Cheap: per-slot work here is just a `restoring` flag check and a
 /// timer compare. The network/disk cost happens inside the spawned task,
@@ -1617,58 +1671,15 @@ fn sweep_for_auto_restore(
                     return false;
                 }
             }
-            // Sync global: when enabled, pull the newer cloud version "en el
-            // momento", even mid-session. We deliberately skip the
-            // user-is-here guards below; the version-gate in
-            // `run_auto_restore` keeps this bandwidth-safe (it never
-            // downloads unless the cloud is genuinely ahead), and any
-            // local-newer files are parked under `conflict_root` rather than
-            // clobbered, so a folder the user is writing to stays recoverable.
-            if config.global_sync {
-                return true;
-            }
-            if slot.is_running {
-                tracing::debug!(
-                    save_id = %id,
-                    "sweep: skipping — game process is running"
-                );
-                return false;
-            }
-            // The agent's own watcher is a far more reliable "user is here"
-            // signal than disk mtime: inotify catches in-place file rewrites
-            // that DON'T bump the directory's mtime (OpenTTD and other
-            // autosavers truncate-and-overwrite the same .sav). If there are
-            // un-flushed changes queued, or we observed an fs event within
-            // the grace window, the user is mid-session — never auto-restore
-            // into a folder they're actively writing, or the restore and the
-            // backup fight over the same files (re-adding rotated autosaves,
-            // failing uploads mid-mutation).
-            if slot.has_pending {
-                tracing::debug!(
-                    save_id = %id,
-                    "sweep: skipping — un-flushed local changes pending"
-                );
-                return false;
-            }
-            if let Some(last) = slot.last_fs_event_at {
-                if (OffsetDateTime::now_utc() - last).whole_seconds()
-                    < RECENT_SAVE_GRACE.as_secs() as i64
-                {
-                    tracing::debug!(
-                        save_id = %id,
-                        "sweep: skipping — fs event observed recently"
-                    );
-                    return false;
-                }
-            }
-            // Disk-mtime fallback: covers the window right after the agent
-            // starts, before it has any fs history of its own.
-            if is_path_recently_touched(&slot.save.local_path, RECENT_SAVE_GRACE) {
-                tracing::debug!(
-                    save_id = %id,
-                    path = %slot.save.local_path.display(),
-                    "sweep: skipping — save folder touched recently"
-                );
+            // Mid-session guards. These apply to sync global too: it used to
+            // bypass them ("pull en el momento, even mid-session"), which on
+            // a single device let the pull race the user's own debounced
+            // backup and re-apply the last uploaded version over un-flushed
+            // progress (REPO data-loss, 2026-07-05). Deferring costs nothing:
+            // this sweep re-runs every tick, so the pull lands as soon as the
+            // session settles, and the version-gate keeps every retry free.
+            if let Some(reason) = mid_session_reason(slot) {
+                tracing::debug!(save_id = %id, reason, "sweep: skipping — user is mid-session");
                 return false;
             }
             true
@@ -1705,6 +1716,38 @@ fn sweep_for_auto_restore(
 /// process poll will normally mark the slot `is_running`; this catches the
 /// case where the slot has no process match in the catalog.
 const RECENT_SAVE_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// The "user is mid-session" test shared by the reconciliation sweep and the
+/// push-triggered `ForceRestore` path: the game's process is running, there
+/// are un-flushed local changes queued for backup, the watcher saw a write
+/// within [`RECENT_SAVE_GRACE`], or (fallback for the startup window before
+/// the agent has fs history) the folder's disk mtime is that recent. Any of
+/// these means a pull could overwrite progress the backup hasn't captured
+/// yet, so restores must wait until the save settles. Returns the first
+/// tripped guard for logging, `None` when the slot is quiet.
+///
+/// The watcher signals matter because inotify catches in-place file rewrites
+/// that don't bump the directory's mtime (OpenTTD and other autosavers
+/// truncate-and-overwrite the same .sav): never auto-restore into a folder
+/// the user is actively writing, or the restore and the backup fight over
+/// the same files.
+fn mid_session_reason(slot: &SaveSlot) -> Option<&'static str> {
+    if slot.is_running {
+        return Some("game process is running");
+    }
+    if slot.has_pending {
+        return Some("un-flushed local changes pending");
+    }
+    if let Some(last) = slot.last_fs_event_at {
+        if (OffsetDateTime::now_utc() - last).whole_seconds() < RECENT_SAVE_GRACE.as_secs() as i64 {
+            return Some("fs event observed recently");
+        }
+    }
+    if is_path_recently_touched(&slot.save.local_path, RECENT_SAVE_GRACE) {
+        return Some("save folder touched recently");
+    }
+    None
+}
 
 /// True if `path` exists and has been modified within `grace`. Conservative
 /// on errors: an unreadable path returns `false` so we don't deadlock the
@@ -3199,16 +3242,6 @@ async fn run_backup_with_retry(
     }
 }
 
-/// One sweep of the process table. Emits transitions + schedules a
-/// post-game backup when a watched game stops running.
-///
-/// Since 1.4 this no longer touches the fs watcher — the watcher is armed
-/// in `handle_add` and lives for the slot's lifetime. `process_poll` is
-/// pure UI signal (Dashboard pill, "the game just closed → flush" hint).
-///
-/// Returns whether any tracked game is currently running, so the caller can
-/// throttle the poll cadence (fast while a game is up, slow when idle).
-#[allow(clippy::too_many_arguments)]
 /// Filtra las señales de correlación carpeta→proceso para que sólo cuenten
 /// PLAYTIME las fiables, eliminando las horas-fantasma. `candidates` son tuplas
 /// `(proc_name_lower, save_id, game_slug)` de saves SIN manifest cuya carpeta
@@ -3249,6 +3282,16 @@ fn accept_correlation_signals<'a>(
     out
 }
 
+/// One sweep of the process table. Emits transitions + schedules a
+/// post-game backup when a watched game stops running.
+///
+/// Since 1.4 this no longer touches the fs watcher — the watcher is armed
+/// in `handle_add` and lives for the slot's lifetime. `process_poll` is
+/// pure UI signal (Dashboard pill, "the game just closed → flush" hint).
+///
+/// Returns whether any tracked game is currently running, so the caller can
+/// throttle the poll cadence (fast while a game is up, slow when idle).
+#[allow(clippy::too_many_arguments)]
 fn process_poll(
     sys: &mut System,
     slots: &mut HashMap<String, SaveSlot>,
@@ -3472,23 +3515,17 @@ fn process_poll(
                             return None;
                         }
                     }
-                    // Sync global: pull at launch even if the folder was just
-                    // written — skip the user-is-here guards. Version-gated, so
-                    // it's free when already current.
-                    if config.global_sync {
-                        return Some(slot.save.clone());
-                    }
-                    if slot.has_pending {
-                        return None;
-                    }
-                    if let Some(last) = slot.last_fs_event_at {
-                        if (OffsetDateTime::now_utc() - last).whole_seconds()
-                            < RECENT_SAVE_GRACE.as_secs() as i64
-                        {
-                            return None;
-                        }
-                    }
-                    if is_path_recently_touched(&slot.save.local_path, RECENT_SAVE_GRACE) {
+                    // The user-is-here guards apply under sync global too. The
+                    // old bypass ("pull at launch even if the folder was just
+                    // written") meant a quick relaunch — or a process-poll flap
+                    // re-firing GameStarted mid-session — could merge the cloud
+                    // head over changes the backup hadn't flushed yet. A
+                    // genuine cross-device hand-off passes these guards anyway
+                    // (this device wasn't the one just writing the folder), so
+                    // the barrier still fires exactly when it's wanted.
+                    // `is_running` is still false here — it flips after the
+                    // barrier decision — so the launch itself never vetoes.
+                    if mid_session_reason(slot).is_some() {
                         return None;
                     }
                     Some(slot.save.clone())
@@ -3731,6 +3768,82 @@ mod tests {
             match_save_for_path(&slots, Path::new("/tmp/saves/other")),
             None
         );
+    }
+
+    /// Quiet slot over `path`: no process, nothing pending, no fs history.
+    /// Whether it reads as mid-session then depends only on the disk-mtime
+    /// fallback (i.e. on `path`'s own mtime).
+    fn quiet_slot(path: &Path) -> SaveSlot {
+        SaveSlot {
+            save: WatchedSave {
+                save_id: "mid-session-test".into(),
+                game_slug: "r-e-p-o".into(),
+                display_name: "R.E.P.O.".into(),
+                label: "main".into(),
+                local_path: path.to_path_buf(),
+                steam_install_dir: None,
+                processes: vec![],
+                policy: Default::default(),
+                known_version: None,
+                set_hash: None,
+                track_only: false,
+            },
+            watcher: None,
+            pending: None,
+            is_running: false,
+            has_pending: false,
+            last_fs_event_at: None,
+            next_scheduled_backup_at: None,
+            first_pending_event_at: None,
+            last_backup_at: None,
+            restoring: false,
+            next_auto_restore_at: None,
+            last_set_hash: None,
+            known_version: None,
+        }
+    }
+
+    /// The guard shared by the sweep, the push force-restore and the launch
+    /// barrier (REPO data-loss regression, 2026-07-05): any live-session
+    /// signal must veto a pull; a genuinely quiet slot must not.
+    #[test]
+    fn mid_session_reason_flags_live_session_signals() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Age the folder so the disk-mtime fallback doesn't trip by itself.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        filetime::set_file_mtime(tmp.path(), filetime::FileTime::from_system_time(old)).unwrap();
+
+        let mut slot = quiet_slot(tmp.path());
+        assert_eq!(mid_session_reason(&slot), None, "quiet slot must be pullable");
+
+        slot.is_running = true;
+        assert!(mid_session_reason(&slot).is_some(), "running game must veto");
+        slot.is_running = false;
+
+        slot.has_pending = true;
+        assert!(
+            mid_session_reason(&slot).is_some(),
+            "un-flushed changes must veto"
+        );
+        slot.has_pending = false;
+
+        slot.last_fs_event_at = Some(OffsetDateTime::now_utc());
+        assert!(mid_session_reason(&slot).is_some(), "recent fs event must veto");
+        slot.last_fs_event_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+        assert_eq!(
+            mid_session_reason(&slot),
+            None,
+            "an hour-old fs event is outside the grace window"
+        );
+    }
+
+    #[test]
+    fn mid_session_reason_falls_back_to_disk_mtime() {
+        // Fresh tempdir → dir mtime = now → the startup-window fallback trips
+        // even with no fs history of our own.
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = quiet_slot(tmp.path());
+        assert!(mid_session_reason(&slot).is_some());
     }
 
     /// Regression for the "watcher only arms on GameStarted" bug.

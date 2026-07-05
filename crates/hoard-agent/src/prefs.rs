@@ -86,12 +86,15 @@ pub struct Prefs {
 
     /// "Sync global" — distinct from both [`Self::auto_restore`] and
     /// [`Self::automatic_mode`]. When `true`, the agent downloads a newer
-    /// cloud version the moment it detects the device is outdated, **even
-    /// while a game is running or the save was just written**: the sweep
-    /// bypasses the "user is mid-session" guards. Stays bandwidth-safe via
-    /// the version-gate (never re-pulls a version the device already has) and
-    /// non-destructive via conflict backups under `<state_dir>/conflicts/`.
-    /// Backup-only saves (per-save preset) still opt out. Defaults to `false`.
+    /// cloud version as soon as it detects the device is outdated — unless a
+    /// game session is live (`is_running`, un-flushed changes, recent write):
+    /// then the pull defers until the save settles, so it can never overwrite
+    /// progress the backup hasn't captured yet (that race erased a live
+    /// session once; see `AgentConfig::global_sync` for the incident).
+    /// Stays bandwidth-safe via the version-gate (never re-pulls a version
+    /// the device already has) and non-destructive via conflict backups under
+    /// `<state_dir>/conflicts/`. Backup-only saves (per-save preset) still
+    /// opt out. Defaults to `false`.
     #[serde(default)]
     pub global_sync: bool,
 

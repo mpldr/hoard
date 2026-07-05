@@ -75,6 +75,9 @@ pub struct UploadOutcome {
 }
 
 /// Outcome of a skip-aware backup ([`upload_directory_checked`]).
+// One value per backup run, moved straight to the caller — never stored in
+// bulk, so the size gap between variants costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum BackupResult {
     /// The cheap set signature matched the cached one — nothing was read or
@@ -410,7 +413,7 @@ where
     // whole. `trimmed` records what was left out for the UI's "your plan isn't
     // big enough" nudge.
     let mut working: Vec<&UploadFile> = files.iter().collect();
-    working.sort_by(|a, b| b.modified.cmp(&a.modified));
+    working.sort_by_key(|f| std::cmp::Reverse(f.modified));
     let mut trimmed: Option<TrimInfo> = None;
 
     // 2/3/4. Declare manifest → upload missing blobs → commit. Wrapped in a

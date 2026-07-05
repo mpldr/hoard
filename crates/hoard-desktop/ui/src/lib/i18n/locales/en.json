@@ -430,7 +430,7 @@
   "sync.on": "ON",
   "sync.off": "OFF",
   "sync.aria_toggle": "Toggle sync",
-  "sync.help_tooltip": "When on, Hoard downloads a newer cloud version the moment your device is outdated — even while you're playing.",
+  "sync.help_tooltip": "When on, Hoard downloads a newer cloud version as soon as your device is outdated. While a game is running, the download waits until you stop playing so it never overwrites unsaved progress.",
   "sync.toggled_on": "Sync enabled",
   "sync.toggled_off": "Sync disabled",
   "updates.client_short": "Client update available",

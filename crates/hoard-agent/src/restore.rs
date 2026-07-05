@@ -52,8 +52,7 @@ fn restore_byte_cap(declared_expanded: Option<u64>) -> u64 {
     match declared_expanded {
         Some(n) if n > 0 => n
             .saturating_mul(RESTORE_SIZE_SLACK)
-            .max(FLOOR)
-            .min(MAX_RESTORE_BYTES),
+            .clamp(FLOOR, MAX_RESTORE_BYTES),
         _ => MAX_RESTORE_BYTES,
     }
 }

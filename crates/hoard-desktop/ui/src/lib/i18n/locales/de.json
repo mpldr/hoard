@@ -413,7 +413,7 @@
   "sync.on": "AN",
   "sync.off": "AUS",
   "sync.aria_toggle": "Synchronisierung umschalten",
-  "sync.help_tooltip": "Wenn aktiviert, lädt Hoard die neuere Cloud-Version, sobald dein Gerät veraltet ist – sogar während du spielst.",
+  "sync.help_tooltip": "Wenn aktiviert, lädt Hoard die neuere Cloud-Version, sobald dein Gerät veraltet ist. Läuft gerade ein Spiel, wartet der Download, bis du aufhörst zu spielen, damit noch nicht gesicherter Fortschritt nie überschrieben wird.",
   "sync.toggled_on": "Synchronisierung aktiviert",
   "sync.toggled_off": "Synchronisierung deaktiviert",
   "updates.client_short": "Client-Update verfügbar",

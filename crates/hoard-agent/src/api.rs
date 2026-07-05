@@ -17,7 +17,7 @@ pub enum ApiError {
     Forbidden,
     #[error("not found (404)")]
     NotFound,
-    /// 413. On Hoard Cloud the body carries the structured per-save cap
+    /// HTTP 413. On Hoard Cloud the body carries the structured per-save cap
     /// (`code:"save_too_large"` with `plan` / `limit_bytes` / `actual_bytes`),
     /// so we can tell the user exactly which limit they hit and how big the
     /// save was. Self-hosted 413s (raw quota) leave `0` and fall back to the

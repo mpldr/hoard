@@ -170,7 +170,7 @@ pub fn list_playtime_games() -> Result<Vec<PlaytimeGameInfo>, String> {
         }
     }
 
-    out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    out.sort_by_key(|e| e.display_name.to_lowercase());
     Ok(out)
 }
 

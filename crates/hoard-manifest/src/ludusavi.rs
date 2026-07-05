@@ -243,9 +243,13 @@ pub fn find_by_slug(slug: &str) -> Option<&'static LudusaviEntry> {
 /// `name` (so casing/punctuation differences don't count as edits), then scans
 /// every catalog slug and keeps the entry with the lowest normalised distance —
 /// `levenshtein / max(len_a, len_b)` — provided it stays strictly below
-/// `threshold`. The recommended default is `0.15` (≈ one edit per 7 characters),
-/// conservative enough that "Civilization V" vs "Civilization VI" (≈ 0.07) gets
-/// flagged but pulled in only as a `Confidence::Low` fallback by callers.
+/// `threshold`. The recommended default is `0.15` (≈ one edit per 7 characters).
+///
+/// The threshold alone can't tell sequels apart: "civilization-v" vs
+/// "civilization-vi" is ≈ 0.07, comfortably inside 0.15. A numeral veto
+/// closes that hole — candidates whose numeric/roman tokens differ from the
+/// query's are rejected outright (see [`numeral_signature`]), no matter how
+/// small the edit distance.
 ///
 /// Tie-break: when two entries share the lowest distance, the one with a
 /// populated `steam_app_id` wins (the appid is a strictly stronger structural
@@ -269,6 +273,7 @@ pub(crate) fn fuzzy_match_in<'a>(
     if query.is_empty() {
         return None;
     }
+    let query_numerals = numeral_signature(&query);
     let mut best: Option<(&'a LudusaviEntry, f32)> = None;
     for entry in catalog {
         let max_len = query.len().max(entry.slug.len());
@@ -277,6 +282,12 @@ pub(crate) fn fuzzy_match_in<'a>(
         }
         let distance = strsim::levenshtein(&query, &entry.slug) as f32 / max_len as f32;
         if distance >= threshold {
+            continue;
+        }
+        // Sequel veto: "dark-souls-ii" and "dark-souls-iii" are one edit
+        // apart — far inside any useful threshold — but never the same game.
+        // A numeral mismatch disqualifies the candidate outright.
+        if numeral_signature(&entry.slug) != query_numerals {
             continue;
         }
         match best {
@@ -295,6 +306,48 @@ pub(crate) fn fuzzy_match_in<'a>(
         }
     }
     best.map(|(entry, _)| entry)
+}
+
+/// Ordered sequence of numeric tokens in a slug, arabic and roman unified:
+/// `"final-fantasy-x-2"` → `[10, 2]`, `"hitman-2"` == `"hitman-ii"` → `[2]`.
+/// Roman numerals come from a fixed i–xx table — game sequels don't go
+/// higher, and a full parser would happily read words like "mix" as numbers.
+/// Single-letter tokens ("i", "v", "x") can also be genuine words; the veto
+/// only fires when the *signatures* differ, and a same-game pair almost
+/// always carries the same token on both sides, so the false-veto risk stays
+/// negligible next to the cross-sequel mismatch it prevents.
+fn numeral_signature(slug: &str) -> Vec<u64> {
+    const ROMAN: &[(&str, u64)] = &[
+        ("i", 1),
+        ("ii", 2),
+        ("iii", 3),
+        ("iv", 4),
+        ("v", 5),
+        ("vi", 6),
+        ("vii", 7),
+        ("viii", 8),
+        ("ix", 9),
+        ("x", 10),
+        ("xi", 11),
+        ("xii", 12),
+        ("xiii", 13),
+        ("xiv", 14),
+        ("xv", 15),
+        ("xvi", 16),
+        ("xvii", 17),
+        ("xviii", 18),
+        ("xix", 19),
+        ("xx", 20),
+    ];
+    slug.split('-')
+        .filter_map(|tok| {
+            if !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()) {
+                tok.parse().ok()
+            } else {
+                ROMAN.iter().find(|(r, _)| *r == tok).map(|(_, n)| *n)
+            }
+        })
+        .collect()
 }
 
 // ----- YAML → catalog conversion ----------------------------------------
@@ -577,12 +630,16 @@ mod tests {
 
     #[test]
     fn catalog_entries_have_at_least_one_path() {
+        // Mirror of the converter's skip rule: an entry earns its slot with
+        // a save path on some OS **or** a registry key (registry-only
+        // entries feed detection's registry-expand stage on Windows).
         for entry in catalog() {
             assert!(
                 !entry.paths.windows.is_empty()
                     || !entry.paths.linux.is_empty()
-                    || !entry.paths.mac.is_empty(),
-                "{} has no paths on any OS",
+                    || !entry.paths.mac.is_empty()
+                    || !entry.registry.is_empty(),
+                "{} has no paths on any OS and no registry keys",
                 entry.slug
             );
         }
@@ -685,8 +742,10 @@ Game X:
             entry("civilization-v", Some(8930)),
             entry("destiny-2", Some(1085660)),
         ];
-        // "destiny" vs "civilization-v": distance well above 0.15.
-        assert!(fuzzy_match_in(&cat, "civilization", 0.15).is_some());
+        // "civilization" sits within edit distance of "civilization-v"
+        // (0.14 < 0.15) but carries no numeral — the sequel veto rejects it
+        // instead of guessing which entry in the series was meant.
+        assert!(fuzzy_match_in(&cat, "civilization", 0.15).is_none());
         // And "destiny" must not match the unrelated "civilization-v".
         let hit = fuzzy_match_in(&cat, "destiny", 0.15);
         assert!(
@@ -713,6 +772,27 @@ Game X:
         let cat = vec![entry("portal-2", Some(620))];
         // "minecraft" vs "portal-2": normalised distance ≈ 1.0, far above 0.15.
         assert!(fuzzy_match_in(&cat, "minecraft", 0.15).is_none());
+    }
+
+    #[test]
+    fn fuzzy_vetoes_sequel_numeral_mismatch() {
+        // "dark-souls-ii" vs "dark-souls-iii" is one edit over 14 chars
+        // (≈ 0.071 < 0.15) — inside the threshold, but a different game.
+        let cat = vec![entry("dark-souls-iii", Some(374320))];
+        assert!(fuzzy_match_in(&cat, "Dark Souls II", 0.15).is_none());
+        // Extra numeral token: "final-fantasy-x-2" vs "final-fantasy-x"
+        // (≈ 0.118 < 0.15) must also be vetoed.
+        let cat = vec![entry("final-fantasy-x", Some(359870))];
+        assert!(fuzzy_match_in(&cat, "Final Fantasy X-2", 0.15).is_none());
+    }
+
+    #[test]
+    fn fuzzy_accepts_equivalent_numeral_spellings() {
+        // Arabic vs roman spellings of the same number are the same
+        // signature — the veto must not fire, only the distance decides.
+        let cat = vec![entry("hitman-2", Some(863550))];
+        let hit = fuzzy_match_in(&cat, "Hitman II", 0.5).expect("fuzzy hit");
+        assert_eq!(hit.slug, "hitman-2");
     }
 
     #[test]

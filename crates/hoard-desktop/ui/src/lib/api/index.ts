@@ -114,6 +114,12 @@ export type DetectionReport = {
   catalog_size: number;
   steam_apps_found: number;
   scanned_at_ms: number;
+  /**
+   * Per-stage counters + wall time for the pass (what each pipeline stage
+   * contributed). Not rendered anywhere yet — carried for the scan cache
+   * and diagnostics. Optional: cached reports from older builds lack it.
+   */
+  stats?: Record<string, number>;
 };
 
 export type ScanProgress = {

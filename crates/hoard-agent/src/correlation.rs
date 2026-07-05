@@ -311,6 +311,13 @@ impl CorrelationStore {
         })
     }
 
+    /// Itera las observaciones crudas (dir → observación). Lo usa la traza
+    /// de diagnóstico de detección para enseñar qué dirs vigilados atribuye
+    /// el store a un slug (la señal de fase 4).
+    pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &WriteObservation)> {
+        self.observations.iter()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.observations.is_empty()
     }

@@ -270,10 +270,19 @@ fn fs_heuristic_finds_native_linux_save() {
             "found_paths should contain {save_dir:?}; got {:?}",
             game.found_paths,
         );
+        // Desde bd9173f el pipeline rellena el appid desde el catálogo por
+        // slug exacto aunque no haya Steam instalado — es cosmético (la UI
+        // resuelve la cápsula de portada con él), no una señal de detección:
+        // source sigue siendo FilesystemHeuristic y no hay install_dir.
+        assert_eq!(
+            game.steam_app_id,
+            Some(413150),
+            "steam_app_id should be backfilled from the catalog entry"
+        );
         assert!(
-            game.steam_app_id.is_none(),
-            "no Steam install in this fixture, steam_app_id should be None; got {:?}",
-            game.steam_app_id
+            game.install_dir.is_none(),
+            "no Steam install in this fixture, install_dir must stay None; got {:?}",
+            game.install_dir
         );
     });
 }

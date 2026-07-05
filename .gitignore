@@ -69,5 +69,8 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # Backlog de trabajo local (futuros cambios), nunca al repo.
 /TODO.local.md
 
+# Revisión + recolección de datos del pipeline de detección. Local.
+/DETECTION.local.md
+
 # Lista de tareas del usuario (solo la escribe él). Nunca al repo.
 /rleeon.md

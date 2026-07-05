@@ -117,6 +117,35 @@ pub struct DetectionReport {
     pub catalog_size: usize,
     pub steam_apps_found: usize,
     pub scanned_at_ms: u64,
+    /// Per-stage counters + wall time for this pass. `default` keeps cached
+    /// reports from older builds loading without migration.
+    #[serde(default)]
+    pub stats: DetectionStats,
+}
+
+/// What each pipeline stage contributed to one detection pass, plus the wall
+/// time of the whole pass. Serialized with the report — so it lands in the
+/// scan cache and in the `Detection complete` log line — to make scan cost
+/// and per-stage yield measurable across machines instead of guessed.
+/// Counters are "slugs this stage merged/added", not raw path candidates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionStats {
+    pub duration_ms: u64,
+    pub steam_appid_matches: usize,
+    pub steam_name_exact: usize,
+    pub steam_name_fuzzy: usize,
+    pub launcher_exact: usize,
+    pub launcher_fuzzy: usize,
+    pub fs_template_slugs: usize,
+    pub registry_slugs: usize,
+    pub proton_slugs: usize,
+    pub generic_prefix_slugs: usize,
+    pub steam_cloud_slugs: usize,
+    pub walker_slugs: usize,
+    pub phase4_new_games: usize,
+    pub phase4_merged_paths: usize,
+    pub manual_applied: usize,
+    pub manual_orphaned: usize,
 }
 
 /// Cap on how many filesystem stats we run concurrently. 32 is well below
@@ -207,6 +236,8 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let wall = Instant::now();
+    let mut stats = DetectionStats::default();
 
     // Correlation store (ADR 0020, fase 3): the agent records which game
     // process was alive when a watched save was rewritten. Loaded best-effort
@@ -273,6 +304,7 @@ where
             },
         );
     }
+    stats.steam_appid_matches = by_slug.len();
     tracing::info!(
         steam_matches = by_slug.len(),
         "Steam → catalog cross-reference complete"
@@ -283,7 +315,8 @@ where
     // `steam_app_id`. Try a slug match against the game's display name.
     // This catches the long tail of Ludusavi entries scraped from
     // PCGamingWiki without a Steam appid attached.
-    apply_steam_name_fallback(catalog, &steam_apps, &mut by_slug);
+    (stats.steam_name_exact, stats.steam_name_fuzzy) =
+        apply_steam_name_fallback(catalog, &steam_apps, &mut by_slug);
 
     // Non-Steam launchers (1.5.2): Epic Games / GOG Galaxy / Microsoft Store.
     // Same shape as the Steam name fallback above — slugify the display
@@ -293,9 +326,15 @@ where
     let epic_apps = launchers::list_installed_epic_games(os);
     let gog_apps = launchers::list_installed_gog_games(os);
     let ms_apps = launchers::list_installed_msstore_games(os);
-    apply_launcher_name_fallback(catalog, &epic_apps, "epic", &mut by_slug);
-    apply_launcher_name_fallback(catalog, &gog_apps, "gog", &mut by_slug);
-    apply_launcher_name_fallback(catalog, &ms_apps, "msstore", &mut by_slug);
+    for (apps, tag) in [
+        (&epic_apps, "epic"),
+        (&gog_apps, "gog"),
+        (&ms_apps, "msstore"),
+    ] {
+        let (exact, fuzzy) = apply_launcher_name_fallback(catalog, apps, tag, &mut by_slug);
+        stats.launcher_exact += exact;
+        stats.launcher_fuzzy += fuzzy;
+    }
 
     // Filesystem heuristic: spawn one blocking task per game, gated by the
     // semaphore. Each task expands every Windows/Linux/Mac template that
@@ -364,6 +403,7 @@ where
     for t in tasks {
         match t.await {
             Ok(Some((slug, display_name, hits))) => {
+                stats.fs_template_slugs += 1;
                 merge_fs_hit_graded(&mut by_slug, slug, display_name, hits, &corr_store);
             }
             Ok(None) => {}
@@ -422,6 +462,7 @@ where
             refined,
         );
     }
+    stats.registry_slugs = registry_hits;
     if registry_hits > 0 {
         tracing::info!(slugs = registry_hits, "registry expand merged hits");
     }
@@ -456,6 +497,7 @@ where
             // Same merge semantics as a native-fs hit: if the slug already
             // exists from the Steam cross-reference, promote to Both/High;
             // otherwise create a fresh entry.
+            stats.proton_slugs += 1;
             merge_fs_hit(
                 &mut by_slug,
                 entry.slug.clone(),
@@ -548,6 +590,7 @@ where
                 Err(e) => tracing::warn!(error = %e, "generic-prefix scan task panicked"),
             }
         }
+        stats.generic_prefix_slugs = generic_hits;
         if generic_hits > 0 {
             tracing::info!(slugs = generic_hits, "generic Wine prefix saves merged");
         }
@@ -588,6 +631,7 @@ where
                     hits,
                 );
             }
+            stats.steam_cloud_slugs = cloud_hits;
             if cloud_hits > 0 {
                 tracing::info!(slugs = cloud_hits, "Steam Cloud remote dirs merged");
             }
@@ -651,6 +695,7 @@ where
             .max_by_key(|c| confidence_rank(*c))
             .unwrap_or(Confidence::Low);
         let hits: Vec<PathBuf> = discoveries.into_iter().map(|d| d.path).collect();
+        stats.walker_slugs += 1;
         merge_fs_hit(&mut by_slug, slug.clone(), display_name, hits);
         if let Some(entry) = by_slug.get_mut(&slug) {
             // `merge_fs_hit` over a pre-existing Steam entry stamps
@@ -706,6 +751,8 @@ where
                 }
             }
         }
+        stats.phase4_new_games = new_games;
+        stats.phase4_merged_paths = merged;
         if new_games > 0 || merged > 0 {
             tracing::info!(
                 new_games,
@@ -717,7 +764,8 @@ where
 
     // Apply user overrides last so they always win, regardless of how strong
     // a heuristic signal the upstream pipeline produced.
-    apply_manual_overrides(&state.manual_paths, &mut by_slug);
+    (stats.manual_applied, stats.manual_orphaned) =
+        apply_manual_overrides(&state.manual_paths, &mut by_slug);
 
     // Backfill Steam app ids from the catalog by exact slug. A game found
     // purely by filesystem heuristic (a Wine prefix, a native Linux path, a
@@ -753,10 +801,13 @@ where
     let mut games: Vec<DetectedGame> = by_slug.into_values().collect();
     games.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
+    stats.duration_ms = wall.elapsed().as_millis() as u64;
     tracing::info!(
         detected = games.len(),
         catalog_size,
         steam_apps = steam_apps.len(),
+        duration_ms = stats.duration_ms,
+        stats = ?stats,
         "Detection complete"
     );
 
@@ -765,6 +816,7 @@ where
         catalog_size,
         steam_apps_found: steam_apps.len(),
         scanned_at_ms: started,
+        stats,
     })
 }
 
@@ -789,13 +841,15 @@ fn paths_for_os(entry: &LudusaviEntry, os: Os) -> Vec<String> {
 /// Skips Steam apps already linked above (their `app_id` is present as
 /// `steam_app_id` somewhere in `by_slug`) and slugs already in the dedupe
 /// map (the appid pass owns the entry; never demote High → Low).
+///
+/// Returns `(exact_added, fuzzy_added)` for the scan stats.
 fn apply_steam_name_fallback(
     catalog: &[LudusaviEntry],
     steam_apps: &[SteamApp],
     by_slug: &mut HashMap<String, DetectedGame>,
-) {
+) -> (usize, usize) {
     if steam_apps.is_empty() {
-        return;
+        return (0, 0);
     }
     let matched_appids: HashSet<u64> = by_slug.values().filter_map(|g| g.steam_app_id).collect();
     let catalog_by_slug: HashMap<&str, &LudusaviEntry> =
@@ -861,13 +915,14 @@ fn apply_steam_name_fallback(
             "Steam → catalog fuzzy-name fallback added entries with Confidence::Low"
         );
     }
+    (added, fuzzy_added)
 }
 
 /// Threshold for `find_by_fuzzy_name` in [`apply_steam_name_fallback`].
-/// 0.15 ≈ one edit per ~7 characters. Conservative enough that
-/// "Civilization V" vs "Civilization VI" (≈ 0.07) wouldn't trip the
-/// fuzzy match for an unrelated query; restrictive enough that
-/// random typos still resolve.
+/// 0.15 ≈ one edit per ~7 characters — enough slack for typos and minor
+/// suffix noise. Note the threshold alone would NOT stop cross-sequel
+/// matches ("civilization-v" vs "civilization-vi" ≈ 0.07 sits well inside
+/// it); the numeral veto in `fuzzy_match_in` is what rejects those.
 const FUZZY_NAME_THRESHOLD: f32 = 0.15;
 
 /// Cross-reference non-Steam launcher apps (Epic / GOG / Microsoft Store)
@@ -887,14 +942,16 @@ const FUZZY_NAME_THRESHOLD: f32 = 0.15;
 /// inserted — surfacing every random launcher app would surface launcher
 /// tooling and non-game executables. The walker still benefits from the
 /// install_dir attached to matched rows.
+///
+/// Returns `(exact_added, fuzzy_added)` for the scan stats.
 fn apply_launcher_name_fallback(
     catalog: &[LudusaviEntry],
     apps: &[LauncherApp],
     launcher_tag: &str,
     by_slug: &mut HashMap<String, DetectedGame>,
-) {
+) -> (usize, usize) {
     if apps.is_empty() {
-        return;
+        return (0, 0);
     }
     let catalog_by_slug: HashMap<&str, &LudusaviEntry> =
         catalog.iter().map(|e| (e.slug.as_str(), e)).collect();
@@ -966,6 +1023,7 @@ fn apply_launcher_name_fallback(
             "launcher cross-reference complete"
         );
     }
+    (exact_added, fuzzy_added)
 }
 
 /// Build the slug → prefix_root map the aggressive walker consumes.
@@ -1182,14 +1240,14 @@ fn name_matches_save_pattern(name: &str) -> bool {
 /// * Slug not in the catalog: log WARN and leave the override on disk. The
 ///   override stays in `state.json` so the user can clean it up; we don't
 ///   silently drop it because the catalog can grow back into the slug
-///   (Ludusavi refreshes weekly) and we don't want the user's manual work
-///   discarded between sessions.
+///   (the desktop refreshes it daily in the background, see `catalog.rs`)
+///   and we don't want the user's manual work discarded between sessions.
 fn apply_manual_overrides(
     manual_paths: &HashMap<String, PathBuf>,
     by_slug: &mut HashMap<String, DetectedGame>,
-) {
+) -> (usize, usize) {
     if manual_paths.is_empty() {
-        return;
+        return (0, 0);
     }
     let catalog = ludusavi::catalog();
     let mut applied = 0usize;
@@ -1230,12 +1288,15 @@ fn apply_manual_overrides(
     if applied > 0 || orphaned > 0 {
         tracing::info!(applied, orphaned, "manual_paths overrides applied");
     }
+    (applied, orphaned)
 }
 
 /// One leg of a [`DetectionTrace`]: the result of a single pipeline step
 /// for the slug being diagnosed. `kind` names the step
 /// (`"manual_override"`, `"steam_appid"`, `"name_fallback"`,
-/// `"filesystem"`, `"proton_prefix"`, `"refine"`).
+/// `"launcher_fallback"`, `"filesystem"`, `"registry"`, `"proton_prefix"`,
+/// `"generic_prefix"`, `"steam_cloud"`, `"refine"`, `"aggressive_walk"`,
+/// `"correlation"`).
 ///
 /// `template` is the input the step worked from (a Ludusavi save-path
 /// template, a Steam appid, a slugified name, …). `expanded` is what the
@@ -1282,10 +1343,15 @@ pub struct DetectionTrace {
 ///
 /// The real [`detect_all`] is untouched: this is a parallel implementation
 /// that hits the same primitives ([`expand_path`],
-/// [`expand_path_in_prefix`], [`refine_save_dir`]) but writes traces.
-/// Drift between the two will surface as silent disagreements — the
-/// integration tests in `tests/detection_integration.rs` (P-DET-7) are the
-/// guard against that.
+/// [`expand_path_in_prefix_as_user`], [`refine_save_dir`],
+/// [`aggressive_discover_with`]) but writes traces. Every stage of the real
+/// pipeline has a step here; the only structural difference is phase 4
+/// (catalog-free discovery), which is global rather than per-slug — the
+/// `correlation` step covers its per-slug signal by listing which observed
+/// dirs the store attributes to this slug. If you add a stage to
+/// [`detect_all_inner`], add its step here in the same order; the
+/// integration tests in `tests/detection_integration.rs` (P-DET-7) guard
+/// against behavioural drift in the shared primitives.
 pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
     let mut attempts: Vec<TraceStep> = Vec::new();
 
@@ -1335,6 +1401,16 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
     };
 
     let steam_apps = steam::list_installed_steam_games(os).unwrap_or_default();
+    // Same store the real pipeline loads: feeds the walk step's grading and
+    // the final `correlation` step.
+    let corr_store = CorrelationStore::default_path()
+        .ok()
+        .map(|p| CorrelationStore::load(&p))
+        .unwrap_or_default();
+    // Install dir recovered from whichever launcher signal matches; the
+    // aggressive-walk step needs it, exactly like the real pipeline reads it
+    // off the merged row.
+    let mut install_dir_hint: Option<PathBuf> = None;
     let mut steam_step = TraceStep {
         kind: "steam_appid".into(),
         template: entry.steam_app_id.map(|id| format!("steam_app_id={id}")),
@@ -1347,6 +1423,7 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
         steam_step.expanded.push(format!("appid={appid}"));
         if let Some(app) = steam_apps.iter().find(|a| a.app_id == appid) {
             steam_step.kept.push(app.install_dir.display().to_string());
+            install_dir_hint = Some(app.install_dir.clone());
             steam_appid_matched = true;
         } else {
             steam_step.dropped.push(DroppedPath {
@@ -1380,6 +1457,9 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
                 fallback_step
                     .kept
                     .push(app.install_dir.display().to_string());
+                if install_dir_hint.is_none() {
+                    install_dir_hint = Some(app.install_dir.clone());
+                }
             }
         }
         if fallback_step.kept.is_empty() {
@@ -1391,7 +1471,48 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
     }
     attempts.push(fallback_step);
 
-    // ---- Step 4: filesystem -----------------------------------------
+    // ---- Step 4: launcher_fallback ----------------------------------
+    // Epic / GOG / Microsoft Store cross-reference. Exact slug match only —
+    // the real pipeline also fuzzy-matches, but the exact miss is already
+    // the answer the user needs ("your launcher spells the name differently").
+    let mut launcher_step = TraceStep {
+        kind: "launcher_fallback".into(),
+        template: None,
+        expanded: Vec::new(),
+        kept: Vec::new(),
+        dropped: Vec::new(),
+    };
+    let launcher_apps = [
+        ("epic", launchers::list_installed_epic_games(os)),
+        ("gog", launchers::list_installed_gog_games(os)),
+        ("msstore", launchers::list_installed_msstore_games(os)),
+    ];
+    let mut any_launcher_app = false;
+    for (tag, apps) in &launcher_apps {
+        for app in apps {
+            any_launcher_app = true;
+            let slugified = ludusavi::slugify(&app.name);
+            launcher_step.expanded.push(format!("{tag}: {slugified}"));
+            if slugified == slug {
+                launcher_step.template = Some(format!("slugify({:?}) [{tag}]", app.name));
+                launcher_step
+                    .kept
+                    .push(app.install_dir.display().to_string());
+                if install_dir_hint.is_none() {
+                    install_dir_hint = Some(app.install_dir.clone());
+                }
+            }
+        }
+    }
+    if any_launcher_app && launcher_step.kept.is_empty() {
+        launcher_step.dropped.push(DroppedPath {
+            path: slug.into(),
+            reason: "no Epic/GOG/MS Store app name slugifies to this slug".into(),
+        });
+    }
+    attempts.push(launcher_step);
+
+    // ---- Step 5: filesystem -----------------------------------------
     // One step per save-path template that applies to the current OS.
     // Collects raw hits to feed into the refinement step below.
     let templates = paths_for_os(entry, os);
@@ -1430,7 +1551,45 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
         attempts.push(step);
     }
 
-    // ---- Step 5: proton_prefix (Linux only) -------------------------
+    // ---- Step 6: registry -------------------------------------------
+    // Catalog `registry` keys point at HKEY_* values holding the save dir.
+    // Hits feed the same refinement as template hits, mirroring the real
+    // pipeline. On non-Windows `expand_registry_path` returns nothing.
+    for reg in &entry.registry {
+        let mut step = TraceStep {
+            kind: "registry".into(),
+            template: Some(reg.key.clone()),
+            expanded: Vec::new(),
+            kept: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let candidates = expand_registry_path(reg);
+        if candidates.is_empty() {
+            step.dropped.push(DroppedPath {
+                path: reg.key.clone(),
+                reason: "expand_registry_path produced no candidates \
+                         (non-Windows host, or key/value missing)"
+                    .into(),
+            });
+        }
+        for c in candidates {
+            step.expanded.push(c.display().to_string());
+            if c.exists() {
+                step.kept.push(c.display().to_string());
+                if seen.insert(c.clone()) {
+                    raw_hits.push(c);
+                }
+            } else {
+                step.dropped.push(DroppedPath {
+                    path: c.display().to_string(),
+                    reason: "registry value points at a path that doesn't exist".into(),
+                });
+            }
+        }
+        attempts.push(step);
+    }
+
+    // ---- Step 7: proton_prefix (Linux only) -------------------------
     // For each compatdata prefix whose appid matches the catalog entry,
     // try every Windows save-path template against the prefix root.
     if os == Os::Linux {
@@ -1480,7 +1639,97 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
         }
     }
 
-    // ---- Step 6: refine ---------------------------------------------
+    // Paths that the real pipeline merges directly, without refinement
+    // (generic-prefix and Steam Cloud hits). Tracked so the walk step below
+    // can honour the same "only walk when nothing found a path" gate.
+    let mut merged_direct: Vec<PathBuf> = Vec::new();
+
+    // ---- Step 8: generic_prefix (Linux only) ------------------------
+    // Wine prefixes not owned by a catalog-resolvable Proton appid: expand
+    // this entry's Windows templates against every real Windows user inside
+    // each prefix, exactly like the whole-catalog cross-reference does.
+    if os == Os::Linux && !entry.paths.windows.is_empty() {
+        for prefix in wine_prefixes::list_wine_prefixes(os) {
+            let qualifies = match prefix.kind {
+                PrefixKind::Generic => true,
+                PrefixKind::Proton => prefix
+                    .identifier
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(ludusavi::find_by_steam_app_id)
+                    .is_none(),
+                PrefixKind::Lutris | PrefixKind::Bottles => false,
+            };
+            if !qualifies {
+                continue;
+            }
+            for user in roots::prefix_windows_users(&prefix.prefix_root) {
+                let mut step = TraceStep {
+                    kind: "generic_prefix".into(),
+                    template: Some(format!(
+                        "windows templates under {} as user {:?}",
+                        prefix.prefix_root.display(),
+                        user
+                    )),
+                    expanded: Vec::new(),
+                    kept: Vec::new(),
+                    dropped: Vec::new(),
+                };
+                for tmpl in entry.paths.windows.iter().map(|p| &p.path) {
+                    for c in expand_path_in_prefix_as_user(tmpl, &prefix.prefix_root, &user) {
+                        step.expanded.push(c.display().to_string());
+                        if c.exists() {
+                            step.kept.push(c.display().to_string());
+                            merged_direct.push(c);
+                        } else {
+                            step.dropped.push(DroppedPath {
+                                path: c.display().to_string(),
+                                reason: "path doesn't exist under the Wine prefix".into(),
+                            });
+                        }
+                    }
+                }
+                attempts.push(step);
+            }
+        }
+    }
+
+    // ---- Step 9: steam_cloud ----------------------------------------
+    // `userdata/<storeUserId>/<appid>/remote/` — some titles write their
+    // only save there. Merged directly (no refinement) like the pipeline.
+    if let Some(appid) = entry.steam_app_id {
+        let mut step = TraceStep {
+            kind: "steam_cloud".into(),
+            template: Some(format!("userdata/<user>/{appid}/remote")),
+            expanded: Vec::new(),
+            kept: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let libraries = steam::detect_steam_libraries(os);
+        let user_dirs = steam::steam_user_dirs(&libraries).unwrap_or_default();
+        if user_dirs.is_empty() {
+            step.dropped.push(DroppedPath {
+                path: format!("appid={appid}"),
+                reason: "no Steam userdata dirs found on this machine".into(),
+            });
+        }
+        for ud in &user_dirs {
+            let remote = ud.join(appid.to_string()).join("remote");
+            step.expanded.push(remote.display().to_string());
+            if remote.is_dir() {
+                step.kept.push(remote.display().to_string());
+                merged_direct.push(remote);
+            } else {
+                step.dropped.push(DroppedPath {
+                    path: remote.display().to_string(),
+                    reason: "no remote/ dir for this appid under this Steam user".into(),
+                });
+            }
+        }
+        attempts.push(step);
+    }
+
+    // ---- Step 10: refine --------------------------------------------
     // Whatever survived the filesystem + proton passes goes through the
     // save-dir refinement. Any hit that lost its place (root replaced
     // by its subdir, or dropped because no save-named subdir exists) is
@@ -1507,6 +1756,87 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
         }
     }
     attempts.push(refine_step);
+
+    // ---- Step 11: aggressive_walk -----------------------------------
+    // Mirrors the pipeline gate: the walker only runs for slugs that ended
+    // the main pipeline without a single save path.
+    let mut walk_step = TraceStep {
+        kind: "aggressive_walk".into(),
+        template: None,
+        expanded: Vec::new(),
+        kept: Vec::new(),
+        dropped: Vec::new(),
+    };
+    if refined.is_empty() && merged_direct.is_empty() {
+        let prefix_root = build_prefix_root_by_slug(os).remove(slug);
+        walk_step.template = Some(format!(
+            "install_dir={install_dir_hint:?}, prefix_root={prefix_root:?}"
+        ));
+        if install_dir_hint.is_none() && prefix_root.is_none() {
+            walk_step.dropped.push(DroppedPath {
+                path: slug.into(),
+                reason: "nothing to walk: no install dir hint and no Wine/Proton prefix \
+                         resolved for this slug"
+                    .into(),
+            });
+        } else {
+            let discoveries = aggressive_discover_with(
+                slug,
+                &entry.display_name,
+                install_dir_hint.as_deref(),
+                prefix_root.as_deref(),
+                AGGRESSIVE_WALK_TIMEOUT,
+                AGGRESSIVE_WALK_MAX_DEPTH,
+                &corr_store,
+            );
+            if discoveries.is_empty() {
+                walk_step.dropped.push(DroppedPath {
+                    path: slug.into(),
+                    reason: "walk found no save-like dirs under the available roots".into(),
+                });
+            }
+            for d in discoveries {
+                walk_step
+                    .kept
+                    .push(format!("{} ({})", d.path.display(), d.reason));
+            }
+        }
+    } else {
+        walk_step.template = Some("skipped — earlier stages already produced save paths".into());
+    }
+    attempts.push(walk_step);
+
+    // ---- Step 12: correlation (phase-4 signal) ------------------------
+    // Phase 4 proper is catalog-free and global, so it can't be replayed for
+    // one slug; what CAN be shown is its per-slug input — every observed
+    // process↔write whose attributed name slugifies to this slug.
+    let mut corr_step = TraceStep {
+        kind: "correlation".into(),
+        template: Some(format!("{} observed dirs in the store", corr_store.len())),
+        expanded: Vec::new(),
+        kept: Vec::new(),
+        dropped: Vec::new(),
+    };
+    for (dir, obs) in corr_store.iter() {
+        let attributed = corr_store.attributed_name(dir).unwrap_or_default();
+        if ludusavi::slugify(&attributed) == slug {
+            corr_step.kept.push(format!(
+                "{} (process {:?}, {} hits)",
+                dir.display(),
+                obs.process_name,
+                obs.hits
+            ));
+        }
+    }
+    if corr_step.kept.is_empty() {
+        corr_step.dropped.push(DroppedPath {
+            path: slug.into(),
+            reason: "no observed write is attributed to this slug (game never seen \
+                     running while a watched dir changed)"
+                .into(),
+        });
+    }
+    attempts.push(corr_step);
 
     DetectionTrace {
         slug: slug.into(),
@@ -1850,7 +2180,7 @@ fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
     if let Some(proc) = store.attributed_name(path) {
         let trimmed = proc.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return prettify_process_name(trimmed);
         }
     }
     let mut cur = Some(path);
@@ -1873,6 +2203,35 @@ fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// Turn a raw process name into a presentable Library display name:
+/// `"plan_b-terraform"` → `"Plan B Terraform"`. Only all-lowercase names are
+/// touched — a name that already carries any uppercase ("NieRAutomata",
+/// "DOOMEternal") is left verbatim, since mangling its casing is worse than
+/// showing it raw. The slug is unaffected either way: `slugify` lowercases
+/// and folds separators, so `slugify(prettified) == slugify(raw)`.
+fn prettify_process_name(name: &str) -> String {
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        return name.to_string();
+    }
+    let pretty = name
+        .split(['_', '-', ' '])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if pretty.is_empty() {
+        name.to_string()
+    } else {
+        pretty
+    }
 }
 
 /// Walk one root, appending up to [`AGGRESSIVE_WALK_MAX_CANDIDATES`]
@@ -2934,7 +3293,9 @@ mod tests {
                 .iter()
                 .find(|a| a.path == guid)
                 .expect("correlated GUID folder should surface in phase 4");
-            assert_eq!(hit.display_name, "mysterygame");
+            // El nombre de proceso se embellece para la Library (title-case);
+            // el slug sale del slugify del display, así que no cambia.
+            assert_eq!(hit.display_name, "Mysterygame");
             assert_eq!(hit.slug, "mysterygame");
 
             // Si ya está reclamada por el catálogo, se omite.

@@ -57,7 +57,9 @@ impl EventBus {
     /// use. The returned receiver keeps the channel alive for as long as the
     /// SSE connection holds it.
     pub fn subscribe(&self, user: Uuid) -> broadcast::Receiver<SaveEvent> {
-        let mut map = self.inner.lock().unwrap();
+        // A poisoned lock only means another thread panicked mid-insert; the
+        // map is still usable, so keep serving instead of panicking the request.
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(user)
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .subscribe()
@@ -68,7 +70,7 @@ impl EventBus {
     /// when there are zero live receivers, so that case doubles as our cue to
     /// drop the channel and keep the map from growing without bound.
     pub fn publish(&self, user: Uuid, ev: SaveEvent) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = map.get(&user) {
             if tx.send(ev).is_err() {
                 map.remove(&user);

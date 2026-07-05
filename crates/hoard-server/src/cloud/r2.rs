@@ -227,7 +227,9 @@ pub fn key_for_blob(user_id: uuid::Uuid, sha256: &str) -> String {
 /// prefix, so this is defense-in-depth — but it keeps malformed or oversized
 /// values out of the keyspace and out of `cloud_blobs`/`save_version_files`.
 pub fn is_valid_sha256(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]

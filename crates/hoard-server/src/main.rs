@@ -209,11 +209,11 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("received ctrl-c, shutting down");
-        })
-        .await?;
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received ctrl-c, shutting down");
+    })
+    .await?;
 
     Ok(())
 }

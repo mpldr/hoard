@@ -464,12 +464,13 @@ where
                 // under the cap and retry once. Only trim on the first hit
                 // (`trimmed.is_none()`) so we can't loop.
                 let cap = if trimmed.is_none() {
-                    e.downcast_ref::<crate::api::ApiError>().and_then(|api_err| {
-                        match api_err {
-                            crate::api::ApiError::TooLarge(d) if d.limit_bytes > 0 => Some(d.clone()),
+                    e.downcast_ref::<crate::api::ApiError>()
+                        .and_then(|api_err| match api_err {
+                            crate::api::ApiError::TooLarge(d) if d.limit_bytes > 0 => {
+                                Some(d.clone())
+                            }
                             _ => None,
-                        }
-                    })
+                        })
                 } else {
                     None
                 };

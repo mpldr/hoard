@@ -222,7 +222,10 @@ pub async fn handle(
     // body. (The signature still covers the timestamp, so this can't be forged
     // to slip a stale event through.)
     if !timestamp_is_fresh(webhook_ts, now_unix()) {
-        warn!(webhook_ts, "polar webhook: stale/invalid timestamp, rejecting");
+        warn!(
+            webhook_ts,
+            "polar webhook: stale/invalid timestamp, rejecting"
+        );
         return (StatusCode::UNAUTHORIZED, "stale timestamp").into_response();
     }
     if !verify_signature(
@@ -336,8 +339,8 @@ pub async fn handle(
             .polar
             .storage_bytes_for_product(product_id)
             .map(|b| b as i64);
-        let plan_enum = crate::cloud::plans::Plan::from_str(plan)
-            .unwrap_or(crate::cloud::plans::Plan::Pro);
+        let plan_enum =
+            crate::cloud::plans::Plan::from_str(plan).unwrap_or(crate::cloud::plans::Plan::Pro);
         if let Err(e) = crate::cloud::quota::settle_storage_on_active(
             &state.pool,
             user_id,

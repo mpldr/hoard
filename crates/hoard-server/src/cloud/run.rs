@@ -6,8 +6,8 @@ use crate::cloud::{
     auth::{require_active_account, require_cloud_auth, JwksCache},
     bandwidth, db, export, polar, r2,
     routes::{
-        checkout, entitlements as ent_routes, logs as log_routes, me,
-        playtime as playtime_routes, saves, sync as sync_routes,
+        checkout, entitlements as ent_routes, logs as log_routes, me, playtime as playtime_routes,
+        saves, sync as sync_routes,
     },
     state::CloudState,
 };
@@ -255,11 +255,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("received ctrl-c, shutting down");
-        })
-        .await?;
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received ctrl-c, shutting down");
+    })
+    .await?;
     Ok(())
 }
 

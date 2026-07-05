@@ -36,7 +36,9 @@ pub fn spawn(state: CloudState) {
             tick.tick().await;
             match purge_due(&state).await {
                 Ok(0) => {}
-                Ok(n) => tracing::info!(accounts = n, "account purge: hard-deleted expired accounts"),
+                Ok(n) => {
+                    tracing::info!(accounts = n, "account purge: hard-deleted expired accounts")
+                }
                 Err(e) => tracing::warn!(error = %e, "account purge: sweep failed"),
             }
         }
@@ -94,11 +96,10 @@ async fn purge_account(state: &CloudState, user_id: Uuid) -> Result<(), sqlx::Er
 async fn r2_keys_for(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
     let mut keys: Vec<String> = Vec::new();
 
-    let blobs: Vec<(String,)> =
-        sqlx::query_as("SELECT r2_key FROM cloud_blobs WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await?;
+    let blobs: Vec<(String,)> = sqlx::query_as("SELECT r2_key FROM cloud_blobs WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
     keys.extend(blobs.into_iter().map(|(k,)| k));
 
     // Legacy (non content-addressed) versions store one opaque archive each.

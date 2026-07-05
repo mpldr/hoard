@@ -558,8 +558,7 @@ async fn verify_installer_signature(
 
     let pubkey = PublicKey::from_base64(MINISIGN_PUBKEY)
         .map_err(|e| format!("embedded minisign key is invalid: {e}"))?;
-    let signature =
-        Signature::decode(&sig_text).map_err(|e| format!("malformed .minisig: {e}"))?;
+    let signature = Signature::decode(&sig_text).map_err(|e| format!("malformed .minisig: {e}"))?;
     pubkey
         .verify(bytes, &signature, false)
         .map_err(|e| format!("signature does NOT match the Hoard release key: {e}"))?;

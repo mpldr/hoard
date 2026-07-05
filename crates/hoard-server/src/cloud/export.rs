@@ -14,8 +14,8 @@
 //! would duplicate the client's restore pipeline for a shrinking set of old
 //! accounts.
 
-use crate::cloud::{email, r2};
 use crate::cloud::state::CloudState;
+use crate::cloud::{email, r2};
 use std::io::Write;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -303,7 +303,13 @@ fn sanitize_rel(rel: &str) -> String {
 fn sanitize_component(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_control() || c == '/' || c == '\\' { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = cleaned.trim_matches(['.', ' ']);
     if trimmed.is_empty() {

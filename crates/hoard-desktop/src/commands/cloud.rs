@@ -495,7 +495,9 @@ pub async fn cloud_complete_login(
     match expected {
         Some(nonce) if !nonce.is_empty() && nonce == echoed => {}
         _ => {
-            tracing::warn!("cloud login: rejected auth callback with missing/mismatched state nonce");
+            tracing::warn!(
+                "cloud login: rejected auth callback with missing/mismatched state nonce"
+            );
             return Err("auth callback state mismatch".into());
         }
     }
@@ -778,9 +780,7 @@ pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), Stri
 /// during the grace window, sees they're scheduled for deletion, and taps
 /// "Reactivar".
 #[tauri::command]
-pub async fn cloud_reactivate_account(
-    state: State<'_, AppState>,
-) -> Result<CloudAccount, String> {
+pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<CloudAccount, String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };

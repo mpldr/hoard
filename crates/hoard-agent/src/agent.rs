@@ -728,9 +728,8 @@ async fn run_agent(
 
     // Process watcher: periodic poll. We refresh only the bits we care
     // about (process names + exe paths) to keep CPU near zero when idle.
-    let mut sys = System::new_with_specifics(
-        RefreshKind::new().with_processes(proc_refresh_kind()),
-    );
+    let mut sys =
+        System::new_with_specifics(RefreshKind::new().with_processes(proc_refresh_kind()));
     let active_poll = Duration::from_secs(config.poll_secs.max(1));
     let idle_poll = active_poll.saturating_mul(IDLE_POLL_MULT);
     let mut poll = tokio::time::interval(active_poll);
@@ -778,6 +777,12 @@ async fn run_agent(
     // one event per process; `process_poll` prunes exited PIDs each tick so a
     // relaunch re-triggers.
     let mut reported_heavy: HashSet<Pid> = HashSet::new();
+
+    // PLAYTIME "solo lo que juegas": índice `carpeta Steam → slug` de la
+    // biblioteca instalada. El poll atribuye horas a cualquier juego de Steam
+    // que se ejecute, esté o no rastreado. Se reconstruye con TTL (ver
+    // `playtime_index`); vacío hasta el primer `refresh_if_stale`.
+    let mut steam_index = crate::playtime_index::SteamPlaytimeIndex::new();
 
     tracing::info!(
         debounce_secs = config.debounce_secs,
@@ -1107,10 +1112,13 @@ async fn run_agent(
 
             // ----- Process poll tick -----
             _ = poll.tick() => {
+                // Refresca el índice de Steam si el TTL expiró (barato en estado
+                // estable) antes de que el poll atribuya horas por carpeta.
+                steam_index.refresh_if_stale();
                 let any_running = process_poll(
                     &mut sys, &mut slots, &events_tx, &api, &config, &done_tx, &cmd_tx,
                     &mut playtime, playtime_path.as_deref(), &mut reported_heavy,
-                    &corr_store,
+                    &corr_store, &steam_index,
                 );
                 // Watcher self-healing: a slot whose folder didn't exist when
                 // the game was tracked (freshly installed, save dir created on
@@ -3304,6 +3312,7 @@ fn process_poll(
     playtime_path: Option<&std::path::Path>,
     reported_heavy: &mut HashSet<Pid>,
     corr_store: &crate::correlation::CorrelationStore,
+    steam_index: &crate::playtime_index::SteamPlaytimeIndex,
 ) -> bool {
     // Refresh every process. The `true` flag asks sysinfo to remove
     // entries for processes that have exited since the last refresh,
@@ -3383,6 +3392,10 @@ fn process_poll(
     }
 
     let mut running: HashSet<String> = HashSet::new();
+    // PLAYTIME "solo lo que juegas": slugs de juegos de Steam que corren pero
+    // no están rastreados por ningún slot (ni save real ni catálogo). Se cuentan
+    // igual para el Wrapped; ver `steam_index` y la atribución más abajo.
+    let mut steam_running: HashSet<String> = HashSet::new();
     for (pid, proc) in sys.processes() {
         let name = proc.name().to_string_lossy().to_lowercase();
         // Name match — works on every storefront on Windows, and on
@@ -3407,6 +3420,26 @@ fn process_poll(
                 for (id, dir) in &dir_slots {
                     if exe.starts_with(dir) {
                         running.insert(id.to_string());
+                    }
+                }
+            }
+        }
+
+        // PLAYTIME "solo lo que juegas": cualquier juego de Steam que corra
+        // desde su carpeta de instalación cuenta horas aunque no esté rastreado
+        // ni en el catálogo curado. Exigimos CPU real, que no sea un hilo y que
+        // tenga pinta de juego para no contar herramientas de fondo (Proton,
+        // runtimes) que viven bajo `steamapps/common`. La atribución a
+        // `steam_running` (por slug) se reconcilia con los slots más abajo para
+        // no contar dos veces un juego que ya tiene su slot.
+        if !steam_index.is_empty()
+            && proc.thread_kind().is_none()
+            && proc.cpu_usage() >= CORRELATION_MIN_CPU_PCT
+        {
+            if let Some(exe) = proc.exe() {
+                if crate::correlation::is_game_like(&name, Some(exe)) {
+                    if let Some(slug) = steam_index.slug_for_exe(exe) {
+                        steam_running.insert(slug.to_string());
                     }
                 }
             }
@@ -3441,7 +3474,7 @@ fn process_poll(
 
     // PLAYTIME: atribuye el intervalo de este tick a los juegos vivos. El cap
     // es 4× el poll (mín. 30 s) para no contar un suspend/resume como juego.
-    let running_games: Vec<(String, String)> = running
+    let mut running_games: Vec<(String, String)> = running
         .iter()
         .filter_map(|id| {
             slots
@@ -3449,6 +3482,18 @@ fn process_poll(
                 .map(|s| (id.clone(), s.save.game_slug.clone()))
         })
         .collect();
+    // Suma los juegos de Steam jugados-pero-no-rastreados que ningún slot ya
+    // cuenta (evita doble conteo por slug). El `save_id` sintético es estable
+    // entre ticks —clave de ancla en `PlaytimeStore::accrue`— y su prefijo lo
+    // hace obvio en logs.
+    if !steam_running.is_empty() {
+        let counted: HashSet<String> = running_games.iter().map(|(_, s)| s.clone()).collect();
+        for slug in &steam_running {
+            if !counted.contains(slug) {
+                running_games.push((format!("playtime:steam:{slug}"), slug.clone()));
+            }
+        }
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -3620,7 +3665,10 @@ fn process_poll(
         playtime.flush_if_due(playtime_path, now_ms);
     }
 
-    !running.is_empty()
+    // Un juego de Steam no rastreado que corre también mantiene la cadencia
+    // rápida: si no, el intervalo idle podría superar el cap de `accrue` y
+    // subcontar sus horas.
+    !running.is_empty() || !steam_running.is_empty()
 }
 
 #[cfg(test)]
@@ -3814,10 +3862,17 @@ mod tests {
         filetime::set_file_mtime(tmp.path(), filetime::FileTime::from_system_time(old)).unwrap();
 
         let mut slot = quiet_slot(tmp.path());
-        assert_eq!(mid_session_reason(&slot), None, "quiet slot must be pullable");
+        assert_eq!(
+            mid_session_reason(&slot),
+            None,
+            "quiet slot must be pullable"
+        );
 
         slot.is_running = true;
-        assert!(mid_session_reason(&slot).is_some(), "running game must veto");
+        assert!(
+            mid_session_reason(&slot).is_some(),
+            "running game must veto"
+        );
         slot.is_running = false;
 
         slot.has_pending = true;
@@ -3828,7 +3883,10 @@ mod tests {
         slot.has_pending = false;
 
         slot.last_fs_event_at = Some(OffsetDateTime::now_utc());
-        assert!(mid_session_reason(&slot).is_some(), "recent fs event must veto");
+        assert!(
+            mid_session_reason(&slot).is_some(),
+            "recent fs event must veto"
+        );
         slot.last_fs_event_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
         assert_eq!(
             mid_session_reason(&slot),
@@ -4214,9 +4272,7 @@ mod tests {
 
         let mtime_of = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
         let close = |a: std::time::SystemTime, b: std::time::SystemTime| {
-            let d = a
-                .duration_since(b)
-                .unwrap_or_else(|e| e.duration());
+            let d = a.duration_since(b).unwrap_or_else(|e| e.duration());
             d < Duration::from_secs(1)
         };
         assert!(

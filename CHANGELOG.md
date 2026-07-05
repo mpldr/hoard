@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **El recap (Wrapped) cuenta cualquier juego de Steam que juegues**, aunque no
+  tenga partida local que copiar ni entrada en el catálogo (juegos online como
+  War Selection, servidores privados, etc.). No enrola nada ni ensucia la lista
+  "Jugados, sin copia": cuando el agente ve un juego corriendo desde su carpeta
+  de Steam, le atribuye el tiempo. Se descartan las herramientas (Proton,
+  runtimes, SteamVR) para que no sumen horas fantasma.
+
 ### Fixed
 - **Sync global ya no puede pisar una partida en curso.** Con "Sync" activado,
   la bajada instantánea (avisada por el poller/SSE), el barrido de

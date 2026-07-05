@@ -79,7 +79,11 @@ async fn appdetails_header_url(app_id: u32) -> Option<String> {
     let id = app_id.to_string();
     let resp = reqwest::Client::new()
         .get("https://store.steampowered.com/api/appdetails")
-        .query(&[("appids", id.as_str()), ("filters", "basic"), ("l", "english")])
+        .query(&[
+            ("appids", id.as_str()),
+            ("filters", "basic"),
+            ("l", "english"),
+        ])
         .send()
         .await
         .ok()?;

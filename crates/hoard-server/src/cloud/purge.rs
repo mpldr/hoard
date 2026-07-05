@@ -301,7 +301,8 @@ mod tests {
                 *e = x.version_num;
             }
         }
-        let head: HashMap<String, i64> = head.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let head: HashMap<String, i64> =
+            head.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         for x in &mut cs {
             x.is_head = head[&x.save_id] == x.version_num;
         }
@@ -347,7 +348,10 @@ mod tests {
         let vic = plan.iter().filter(|(s, _)| s == "victoria").count();
         let fac = plan.iter().filter(|(s, _)| s == "factorio").count();
         assert!(vic > fac, "hoarder (victoria) cedes more: {vic} vs {fac}");
-        assert!(fac <= 1, "factorio barely touched while victoria has surplus");
+        assert!(
+            fac <= 1,
+            "factorio barely touched while victoria has surplus"
+        );
     }
 
     #[test]

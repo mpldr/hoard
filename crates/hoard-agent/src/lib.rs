@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod pathexpand;
 pub mod playtime;
 pub mod playtime_catalog;
+pub mod playtime_index;
 pub mod prefs;
 pub mod presets;
 pub mod proclist;

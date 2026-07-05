@@ -398,8 +398,11 @@ fn hydrate_watched_saves(_state: &State<'_, AppState>) -> anyhow::Result<Vec<Wat
     // Playtime-only games (Fortnite, Rust…): seed before consuming
     // `cli_state.saves`. `tracked_slugs` keeps us from enrolling a
     // playtime-only duplicate for a game already backed up as a real save.
-    let tracked_slugs: std::collections::HashSet<String> =
-        cli_state.saves.values().map(|s| s.game_slug.clone()).collect();
+    let tracked_slugs: std::collections::HashSet<String> = cli_state
+        .saves
+        .values()
+        .map(|s| s.game_slug.clone())
+        .collect();
     let playtime_saves =
         crate::commands::playtime::derive_playtime_saves(&cli_state, &tracked_slugs);
 

@@ -325,11 +325,13 @@ pub async fn commit_upload(
         if let Err(e) = state.r2.delete_object(&r2_key).await {
             tracing::warn!(error = %e, r2_key = %r2_key, "commit_upload: orphan object cleanup after quota reject failed");
         }
-        sqlx::query("DELETE FROM save_versions WHERE save_id = $1 AND version_num = $2 AND sha256 = ''")
-            .bind(&save_id)
-            .bind(version)
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            "DELETE FROM save_versions WHERE save_id = $1 AND version_num = $2 AND sha256 = ''",
+        )
+        .bind(&save_id)
+        .bind(version)
+        .execute(&state.pool)
+        .await?;
         if real > limits.max_save_size_bytes {
             return Ok(SaveTooLargeResponse {
                 error: "save exceeds per-save size limit",
@@ -830,9 +832,8 @@ pub async fn cas_commit(
         }
         let key = r2::key_for_blob(user.user_id, sha);
         let landed = state.r2.head(&key).await.map_err(CloudError::Internal)?;
-        let size = landed.ok_or_else(|| {
-            CloudError::BadRequest(format!("blob {sha} was not uploaded"))
-        })?;
+        let size =
+            landed.ok_or_else(|| CloudError::BadRequest(format!("blob {sha} was not uploaded")))?;
         new_bytes += size.max(0) as u64;
         actual_size.insert(sha.clone(), size);
     }

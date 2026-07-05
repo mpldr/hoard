@@ -60,7 +60,10 @@ const CATALOG: &[EmulatorDef] = &[
             "pcsx2.exe",
             "pcsx2",
         ],
-        save_templates: &["<winDocuments>/PCSX2/memcards", "<xdgConfig>/PCSX2/memcards"],
+        save_templates: &[
+            "<winDocuments>/PCSX2/memcards",
+            "<xdgConfig>/PCSX2/memcards",
+        ],
     },
     EmulatorDef {
         id: "rpcs3",

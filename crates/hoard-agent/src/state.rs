@@ -476,7 +476,10 @@ mod tests {
 
         let loaded = CliState::load_split(&device, &ctx).unwrap();
         assert!(loaded.saves.contains_key("s1"));
-        assert_eq!(loaded.manual_paths.get("ck3"), Some(&PathBuf::from("/data/ck3")));
+        assert_eq!(
+            loaded.manual_paths.get("ck3"),
+            Some(&PathBuf::from("/data/ck3"))
+        );
         assert!(loaded.is_ignored("dwarf-fortress"));
     }
 

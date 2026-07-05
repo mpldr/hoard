@@ -165,8 +165,8 @@ pub async fn get_me(
     // A pending downgrade exists iff a change instant is set; its target limit
     // resolves the override the same way (NULL pending = the plan base).
     let pending_change_at = row.10;
-    let pending_limit = pending_change_at
-        .map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
+    let pending_limit =
+        pending_change_at.map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
     let deleted_at = row.11;
     let purges_at = deleted_at.map(|d| d + time::Duration::days(GRACE_DAYS as i64));
     Ok(Json(Me {

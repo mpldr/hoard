@@ -98,7 +98,9 @@ pub async fn screen_send(proc: State<'_, ScreenProc>, line: String) -> Result<()
     };
     let mut bytes = line.into_bytes();
     bytes.push(b'\n');
-    child.write(&bytes).map_err(|e| format!("write overlay stdin: {e}"))
+    child
+        .write(&bytes)
+        .map_err(|e| format!("write overlay stdin: {e}"))
 }
 
 /// Ask the overlay to quit and drop the handle.

@@ -89,7 +89,10 @@ fn installed_catalog_games(os: Os) -> Vec<(&'static str, Option<PathBuf>)> {
 /// catalog game that isn't already tracked as a real save and that the user
 /// hasn't excluded. Shared by [`crate::commands::agent::hydrate_watched_saves`]
 /// and the live attach path.
-pub fn derive_playtime_saves(cli_state: &CliState, tracked_slugs: &HashSet<String>) -> Vec<WatchedSave> {
+pub fn derive_playtime_saves(
+    cli_state: &CliState,
+    tracked_slugs: &HashSet<String>,
+) -> Vec<WatchedSave> {
     installed_catalog_games(Os::current())
         .into_iter()
         .filter_map(|(slug, dir)| {
@@ -104,7 +107,9 @@ pub fn derive_playtime_saves(cli_state: &CliState, tracked_slugs: &HashSet<Strin
 /// Construct the `track_only` slot for one catalog slug.
 fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSave {
     let game = playtime_catalog::by_slug(slug);
-    let display_name = game.map(|g| g.display_name.to_string()).unwrap_or_else(|| slug.to_string());
+    let display_name = game
+        .map(|g| g.display_name.to_string())
+        .unwrap_or_else(|| slug.to_string());
     let processes = game
         .map(|g| g.processes.iter().map(|p| p.to_string()).collect())
         .unwrap_or_default();
@@ -128,7 +133,11 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
 /// Slugs already tracked as real saves on this machine (their playtime is
 /// counted via the save slot, so we never enrol a playtime-only duplicate).
 fn tracked_slugs(cli_state: &CliState) -> HashSet<String> {
-    cli_state.saves.values().map(|s| s.game_slug.clone()).collect()
+    cli_state
+        .saves
+        .values()
+        .map(|s| s.game_slug.clone())
+        .collect()
 }
 
 /// The amber "Jugados, sin copia" list: installed catalog games not tracked as

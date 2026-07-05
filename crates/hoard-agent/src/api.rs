@@ -70,7 +70,11 @@ impl SaveTooLarge {
         format!(
             "save too large: {} exceeds the {} plan limit of {} per save",
             fmt_bytes(self.actual_bytes),
-            if self.plan.is_empty() { "current" } else { &self.plan },
+            if self.plan.is_empty() {
+                "current"
+            } else {
+                &self.plan
+            },
             fmt_bytes(self.limit_bytes),
         )
     }

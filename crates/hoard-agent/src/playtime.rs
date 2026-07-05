@@ -371,10 +371,7 @@ mod tests {
         s.days.insert("2020-01-01".into(), 100);
         let rows = s.upload_rows();
         // La fila real "g".
-        let g = rows
-            .iter()
-            .find(|r| r.game_slug == "g")
-            .expect("row for g");
+        let g = rows.iter().find(|r| r.game_slug == "g").expect("row for g");
         assert_eq!(g.secs, 12);
         // El día histórico se vuelca entero como remanente.
         let other = rows

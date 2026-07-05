@@ -1032,7 +1032,10 @@ pub async fn download(
     // Sanitize to a header-safe filename and fall back rather than `unwrap`.
     let filename = sanitize_filename(&format!("{}-{}-v{}.tar.zst", game_slug, label, version));
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/zstd"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zstd"),
+    );
     let disposition = format!("attachment; filename=\"{}\"", filename);
     headers.insert(
         header::CONTENT_DISPOSITION,
@@ -1199,7 +1202,10 @@ mod filename_tests {
             "elden_ring-v3.tar.zst"
         );
         assert_eq!(sanitize_filename("zelda—save"), "zelda_save");
-        assert_eq!(sanitize_filename("ok-name_v1.tar.zst"), "ok-name_v1.tar.zst");
+        assert_eq!(
+            sanitize_filename("ok-name_v1.tar.zst"),
+            "ok-name_v1.tar.zst"
+        );
         // A quote would break the quoted filename; it must be neutralized.
         assert_eq!(sanitize_filename("a\"b"), "a_b");
     }

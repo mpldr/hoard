@@ -13,9 +13,11 @@
   // clean, and everything else falls back to `ProGate` (lock / expired).
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { _ } from "svelte-i18n";
   import ProGate from "./ProGate.svelte";
   import { openUpgradePage } from "../stores/cloud";
+  import { tourActive } from "../stores/tour";
   import {
     entitlements,
     refreshEntitlements,
@@ -47,8 +49,11 @@
   let deciding = $state(true);
 
   onMount(async () => {
+    // Preview mode (guided tour): show the feature's promo/gate view without
+    // spending the one-week trial the tour is only walking past.
+    const preview = get(tourActive);
     const ent = await refreshEntitlements();
-    if (ent?.features[feature]?.state === "trial_available") {
+    if (!preview && ent?.features[feature]?.state === "trial_available") {
       await activateFeature(feature);
     }
     deciding = false;

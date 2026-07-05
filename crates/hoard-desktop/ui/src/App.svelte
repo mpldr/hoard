@@ -39,6 +39,7 @@
   import TourOverlay from "./lib/components/TourOverlay.svelte";
   import AccountDeletedModal from "./lib/components/AccountDeletedModal.svelte";
   import { loadTourSeen, markTourSeen } from "./lib/stores/onboarding";
+  import { tourActive } from "./lib/stores/tour";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
   import ErrorDialog from "./lib/components/ErrorDialog.svelte";
   import QuotaMini from "./lib/components/QuotaMini.svelte";
@@ -145,6 +146,48 @@
     showTour = false;
     if (tourSig) await markTourSeen(tourSig);
   }
+
+  // --- Guided tour choreography ------------------------------------------
+  // The tour drives the real app shell: each step navigates the content area
+  // to its section (`tourNavigate`) and the sidebar spotlight glides to the
+  // matching rail item (measured by `TourOverlay` from the `data-tour*`
+  // markers). Keeping this in `App` — the owner of `<main>` and the nav — lets
+  // the overlay stay purely presentational while still moving the app behind
+  // it. The Pro sections navigate too — `tourActive` puts ProFeature in preview
+  // mode so opening `/hoard-screen` or `/hoard-wrapped` shows the feature
+  // without burning the one-week trial. Only concept steps pass `null`.
+  let mainViewport = $state<HTMLElement | null>(null);
+
+  // While the tour runs, keep the Hoard-Saves group expanded so its Library /
+  // Dashboard children exist for the spotlight to land on, and flag the tour so
+  // the Pro sections render in preview mode (no trial spent on the walkthrough).
+  $effect(() => {
+    tourActive.set(showTour);
+    if (showTour) savesOpen = true;
+  });
+
+  function tourNavigate(route: string | null) {
+    savesOpen = true;
+    if (!route) return;
+    push(route);
+    // Zoom-settle the content into view so the section change reads as
+    // "flying into" the area, not a hard cut. Runs after the route swap has
+    // painted; skipped under reduced-motion.
+    const reduce = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    if (reduce) return;
+    requestAnimationFrame(() => {
+      mainViewport?.animate(
+        [
+          { transform: "scale(1.05) translateY(6px)", opacity: 0.5 },
+          { transform: "scale(1) translateY(0)", opacity: 1 },
+        ],
+        { duration: 480, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+      );
+    });
+  }
+
   let automaticMode = $state(false);
   let automaticBusy = $state(false);
   let globalSync = $state(false);
@@ -641,6 +684,7 @@
         {@const active = $location === item.route}
         <button
           type="button"
+          data-tour-route={item.route}
           aria-label={$_(item.labelKey)}
           aria-current={active ? "page" : undefined}
           onclick={() => push(item.route)}
@@ -670,6 +714,7 @@
             {#if PRO_DEV_UNLOCK || featureUnlocked(fs) || fs?.state === "trial_available"}
               <button
                 type="button"
+                data-tour-route={entry.route}
                 aria-label={$_(entry.labelKey)}
                 aria-current={active ? "page" : undefined}
                 onclick={() => push(entry.route)}
@@ -691,6 +736,7 @@
                    routes to upgrade/sign-in instead of the gated view. -->
               <button
                 type="button"
+                data-tour-route={entry.route}
                 aria-label={$_(entry.labelKey)}
                 title={$cloud.account
                   ? $_("nav.locked_pro")
@@ -712,6 +758,7 @@
             {@const open = savesOpen || childActive}
             <button
               type="button"
+              data-tour="saves"
               aria-expanded={open}
               aria-label={$_(entry.labelKey)}
               onclick={toggleSaves}
@@ -812,6 +859,7 @@
         </button>
         <button
           type="button"
+          data-tour="automatic"
           onclick={toggleAutomatic}
           disabled={automaticBusy}
           class="flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors {automaticMode
@@ -841,7 +889,7 @@
       </div>
     </aside>
 
-    <main class="min-w-0 flex-1 overflow-y-auto">
+    <main class="min-w-0 flex-1 overflow-y-auto" data-tour="content">
       {#if serverUnreachable && $auth.user}
         <div
           class="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-amber-500/40 bg-amber-500/10 px-6 py-3"
@@ -881,7 +929,12 @@
           </div>
         </div>
       {/if}
-      <Router {routes} />
+      <!-- Zoom-settle target for the guided tour (see `tourNavigate`). The
+           wrapper persists across route swaps so the WAAPI animation can play
+           on it without remounting the routed component. -->
+      <div bind:this={mainViewport} class="h-full">
+        <Router {routes} />
+      </div>
     </main>
   </div>
 {:else}
@@ -911,5 +964,5 @@
 {#if $cloud.hydrated && $cloud.account?.deleted_at}
   <AccountDeletedModal />
 {:else if showTour}
-  <TourOverlay onClose={finishTour} />
+  <TourOverlay onClose={finishTour} navigate={tourNavigate} />
 {/if}

@@ -117,6 +117,16 @@
     }
   }
 
+  // Supabase's own OTP rate limit (distinct from our client-side resend
+  // cooldown) surfaces as AuthApiError with this code — show a message that
+  // explains it's temporary rather than the raw "email rate limit exceeded".
+  function describeAuthError(err: unknown): string {
+    if ((err as { code?: string })?.code === 'over_email_send_rate_limit') {
+      return $_('login.error_rate_limit');
+    }
+    return (err as Error).message;
+  }
+
   async function withEmail(e: SubmitEvent) {
     e.preventDefault();
     if (!email) return;
@@ -127,7 +137,7 @@
       sent = true;
       startCooldown();
     } catch (err) {
-      error = (err as Error).message;
+      error = describeAuthError(err);
     } finally {
       busy = false;
     }
@@ -142,7 +152,7 @@
       await auth.signInWithEmail(email, redirectTo);
       startCooldown();
     } catch (err) {
-      error = (err as Error).message;
+      error = describeAuthError(err);
     } finally {
       busy = false;
     }

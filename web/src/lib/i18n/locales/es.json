@@ -202,6 +202,7 @@
   "login.email_sent_desktop_note": "Abre el enlace en este mismo ordenador, el que tiene Hoard abierto. No funcionará desde el móvil ni otro dispositivo.",
   "login.email_resend": "Reenviar correo",
   "login.email_resend_wait": "Reenviar en {secs}s",
+  "login.error_rate_limit": "El acceso por email tiene un límite de peticiones en el servidor y ahora mismo está al tope. Prueba con \"Continuar con Google\", o espera unos minutos e inténtalo de nuevo con el email.",
   "login.use_another_email": "Usar otro correo",
   "login.signed_in_as": "Sesión iniciada como",
   "login.connect_app": "Conectar esta cuenta",

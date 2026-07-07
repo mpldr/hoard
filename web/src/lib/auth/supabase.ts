@@ -69,17 +69,19 @@ export const supabaseAuth: AuthProvider = {
   },
 
   async signInWithGoogle(redirectTo) {
-    await supabase.auth.signInWithOAuth({
+    const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: { redirectTo }
     });
+    if (error) throw error;
   },
 
   async signInWithEmail(email, redirectTo) {
-    await supabase.auth.signInWithOtp({
+    const { error } = await supabase.auth.signInWithOtp({
       email,
       options: { emailRedirectTo: redirectTo }
     });
+    if (error) throw error;
   },
 
   async signOut() {

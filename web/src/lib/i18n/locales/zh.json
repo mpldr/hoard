@@ -202,6 +202,7 @@
   "login.email_sent_desktop_note": "请在运行 Hoard 的这同一台电脑上打开链接。在手机或其他设备上无法使用。",
   "login.email_resend": "重新发送邮件",
   "login.email_resend_wait": "{secs}秒后可重发",
+  "login.error_rate_limit": "邮箱登录在服务器端有请求限制，目前已达到上限。请改用\"用 Google 继续\"，或等待几分钟后再用邮箱重试。",
   "login.use_another_email": "使用其他邮箱",
   "login.signed_in_as": "已登录为",
   "login.connect_app": "连接此账户",

@@ -202,6 +202,7 @@
   "login.email_sent_desktop_note": "Apri il link su questo stesso computer — quello che esegue Hoard. Non funzionerà dal telefono o da un altro dispositivo.",
   "login.email_resend": "Reinvia l’email",
   "login.email_resend_wait": "Reinvia tra {secs}s",
+  "login.error_rate_limit": "L'accesso via email è limitato lato server e ha appena raggiunto il limite. Prova invece \"Continua con Google\", oppure attendi qualche minuto e riprova con l'email.",
   "login.use_another_email": "Usa un’altra email",
   "login.signed_in_as": "Connesso come",
   "login.connect_app": "Collega questo account",

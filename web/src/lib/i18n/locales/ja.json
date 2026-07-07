@@ -202,6 +202,7 @@
   "login.email_sent_desktop_note": "このリンクはHoardを動かしているこのコンピューターで開いてください。スマートフォンや別のデバイスでは機能しません。",
   "login.email_resend": "メールを再送",
   "login.email_resend_wait": "再送まで{secs}秒",
+  "login.error_rate_limit": "メールでのサインインはサーバー側で制限されており、現在上限に達しています。代わりに「Googleで続行」をお試しいただくか、数分待ってからメールで再度お試しください。",
   "login.use_another_email": "別のメールを使う",
   "login.signed_in_as": "ログイン中",
   "login.connect_app": "このアカウントを接続",

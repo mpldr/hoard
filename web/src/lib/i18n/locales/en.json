@@ -202,6 +202,7 @@
   "login.email_sent_desktop_note": "Open the link on this same computer — the one running Hoard. It won't work from your phone or another device.",
   "login.email_resend": "Resend email",
   "login.email_resend_wait": "Resend in {secs}s",
+  "login.error_rate_limit": "Our email sign-in is rate-limited server-side and has hit its limit right now. Try \"Continue with Google\" instead, or wait a few minutes and try email again.",
   "login.use_another_email": "Use a different email",
   "login.signed_in_as": "Signed in as",
   "login.connect_app": "Connect this account",

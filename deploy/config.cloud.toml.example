@@ -102,8 +102,8 @@ interval = "year"
 # Grace window (days) a user keeps their old, larger storage limit after
 # downgrading to a tier below their current usage. Nothing is purged during the
 # window and /v1/me advertises the pending change so the app can warn first.
-# Default 14. Cloud-only; self-hosted has no quotas.
-# storage_downgrade_grace_days = 14
+# Cloud-only; self-hosted has no quotas.
+storage_downgrade_grace_days = 7
 
 [cloud.polar]
 access_token = ""

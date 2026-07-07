@@ -161,6 +161,7 @@ pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, Strin
     let creds = credentials::load()
         .map_err(|e| format!("Couldn't load credentials: {e}"))?
         .ok_or_else(|| "Not logged in.".to_string())?;
+    let url = creds.url.clone();
     let client = ApiClient::new(creds.url, creds.token).map_err(pretty_error)?;
     let who = match client.whoami().await {
         Ok(who) => who,
@@ -185,6 +186,9 @@ pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, Strin
     let updated = UserInfo {
         storage_used_bytes: who.storage_used_bytes,
         storage_quota_bytes: who.storage_quota_bytes,
+        // Reclassify each poll so a heuristic change — or a server that moved
+        // onto a LAN/Tailscale name — takes effect without forcing a re-login.
+        is_local_server: classify_server(&url),
         ..current
     };
     *state.user.lock().unwrap() = Some(updated.clone());
@@ -209,14 +213,24 @@ pub(crate) fn classify_server(url: &str) -> bool {
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".local") {
         return true;
     }
-    // RFC1918 IPv4 private ranges. We accept v4 only; an IPv6 ULA
-    // (`fc00::/7`) check could go here later if needed.
+    // RFC1918 IPv4 private ranges + the Tailscale CGNAT block (100.64.0.0/10),
+    // which is a private overlay network, not public SaaS. We accept v4 only; an
+    // IPv6 ULA (`fc00::/7`) check could go here later if needed.
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let octs = ip.octets();
         let private = octs[0] == 10
             || (octs[0] == 172 && (16..=31).contains(&octs[1]))
-            || (octs[0] == 192 && octs[1] == 168);
+            || (octs[0] == 192 && octs[1] == 168)
+            || (octs[0] == 100 && (64..=127).contains(&octs[1]));
         return private;
+    }
+    // Single-label host (no dot, not an IP/IPv6 literal): a LAN box or a
+    // Tailscale MagicDNS name like `ubserver` / `nas`. A public SaaS always has
+    // a fully-qualified name with a TLD, so treat the bare hostname as local —
+    // otherwise a self-hoster sees a bogus quota bar against the 100 GiB schema
+    // default instead of the plain "X used" line they own the disk for.
+    if !host.contains('.') && !host.contains(':') {
+        return true;
     }
     false
 }
@@ -343,4 +357,44 @@ fn network_message(err: &reqwest::Error) -> String {
         return format!("Couldn't send the request: {err}");
     }
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_server;
+
+    #[test]
+    fn localhost_and_loopback_are_local() {
+        assert!(classify_server("http://localhost:8082"));
+        assert!(classify_server("http://127.0.0.1:8082"));
+        assert!(classify_server("http://[::1]:8082"));
+        assert!(classify_server("http://nas.local"));
+    }
+
+    #[test]
+    fn rfc1918_and_tailscale_cgnat_are_local() {
+        assert!(classify_server("http://10.0.0.5:12421"));
+        assert!(classify_server("http://172.16.4.4"));
+        assert!(classify_server("http://192.168.1.10"));
+        // Tailscale CGNAT 100.64.0.0/10.
+        assert!(classify_server("http://100.100.1.1:12421"));
+        assert!(classify_server("http://100.127.255.254"));
+    }
+
+    #[test]
+    fn single_label_lan_hostnames_are_local() {
+        // The `ubserver` case: a bare hostname is a LAN / Tailscale MagicDNS
+        // box, never a public SaaS, so it shouldn't get a bogus quota bar.
+        assert!(classify_server("http://ubserver:12421"));
+        assert!(classify_server("http://homelab"));
+    }
+
+    #[test]
+    fn public_hosts_are_external() {
+        assert!(!classify_server("https://saves.example.com"));
+        assert!(!classify_server("https://hoard.services"));
+        // 100.63.x is just outside the CGNAT block; 8.8.8.8 is public.
+        assert!(!classify_server("http://100.63.0.1"));
+        assert!(!classify_server("http://8.8.8.8"));
+    }
 }

@@ -358,7 +358,7 @@ pub async fn handle(
         // (belt-and-suspenders; the Free branch of effective_storage_limit
         // already ignores it).
         if let Err(e) = sqlx::query(
-            "UPDATE profiles SET storage_limit_bytes = NULL, \
+            "UPDATE profiles SET plan = 'free', storage_limit_bytes = NULL, \
              pending_storage_limit_bytes = NULL, storage_limit_change_at = NULL, \
              updated_at = now() WHERE user_id = $1",
         )
@@ -366,7 +366,7 @@ pub async fn handle(
         .execute(&state.pool)
         .await
         {
-            warn!(error = %e, "polar webhook: clearing storage override failed");
+            warn!(error = %e, "polar webhook: clearing storage override / plan reset failed");
         }
     }
 

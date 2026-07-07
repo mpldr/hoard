@@ -136,7 +136,13 @@
   );
   $effect(() => {
     const sig = tourSig;
+    const loc = $location;
     if (!booted || !sig || sig === lastSigChecked) return;
+    // El tour es "post-onboarding": no lo arranques mientras el wizard sigue en
+    // pantalla (la sesión ya existe desde el paso `token`, pero aún falta elegir
+    // el modo en `done`). Espera a que `finish()` navegue a una ruta de app; al
+    // depender de `$location`, este efecto vuelve a evaluarse tras esa navegación.
+    if (loc.startsWith("/onboarding")) return;
     lastSigChecked = sig;
     void loadTourSeen().then((seen) => {
       if (seen !== sig) showTour = true;

@@ -195,6 +195,7 @@
   "login.title": "登录 Hoard",
   "login.subtitle": "每台设备上的同一个账户。",
   "login.google": "用 Google 继续",
+  "login.github": "用 GitHub 继续",
   "login.email_label": "或用邮箱",
   "login.email_placeholder": "you@example.com",
   "login.email_cta": "发送魔法链接",

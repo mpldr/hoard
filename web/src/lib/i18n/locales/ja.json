@@ -195,6 +195,7 @@
   "login.title": "Hoardにログイン",
   "login.subtitle": "すべてのデバイスで同じアカウント。",
   "login.google": "Googleで続行",
+  "login.github": "GitHubで続行",
   "login.email_label": "またはメールで",
   "login.email_placeholder": "you@example.com",
   "login.email_cta": "マジックリンクを送信",

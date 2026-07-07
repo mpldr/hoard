@@ -76,6 +76,14 @@ export const supabaseAuth: AuthProvider = {
     if (error) throw error;
   },
 
+  async signInWithGithub(redirectTo) {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'github',
+      options: { redirectTo }
+    });
+    if (error) throw error;
+  },
+
   async signInWithEmail(email, redirectTo) {
     const { error } = await supabase.auth.signInWithOtp({
       email,

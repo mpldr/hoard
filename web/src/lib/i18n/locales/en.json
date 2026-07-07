@@ -195,6 +195,7 @@
   "login.title": "Sign in to Hoard",
   "login.subtitle": "The same account on every device.",
   "login.google": "Continue with Google",
+  "login.github": "Continue with GitHub",
   "login.email_label": "or with email",
   "login.email_placeholder": "you@example.com",
   "login.email_cta": "Send magic link",

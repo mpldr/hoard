@@ -103,7 +103,7 @@ interval = "year"
 # downgrading to a tier below their current usage. Nothing is purged during the
 # window and /v1/me advertises the pending change so the app can warn first.
 # Cloud-only; self-hosted has no quotas.
-storage_downgrade_grace_days = 7
+storage_downgrade_grace_days = 0
 
 [cloud.polar]
 access_token = ""

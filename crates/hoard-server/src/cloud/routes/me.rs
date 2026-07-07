@@ -138,7 +138,7 @@ pub async fn get_me(
     let expired_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM subscriptions
          WHERE user_id = $1 AND status IN ('active','grace')
-         AND renews_at IS NOT NULL AND renews_at <= datetime('now')",
+         AND renews_at IS NOT NULL AND renews_at <= now()",
     )
     .bind(user.user_id)
     .fetch_one(&state.pool)
@@ -147,7 +147,7 @@ pub async fn get_me(
         let _ = sqlx::query(
             "UPDATE subscriptions SET status = 'expired', updated_at = now()
              WHERE user_id = $1 AND status IN ('active','grace')
-             AND renews_at IS NOT NULL AND renews_at <= datetime('now')",
+             AND renews_at IS NOT NULL AND renews_at <= now()",
         )
         .bind(user.user_id)
         .execute(&state.pool)

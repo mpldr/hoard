@@ -111,6 +111,8 @@ pub async fn get_me(
     // Promote any downgrade whose grace window elapsed, so the limit + status
     // we report are the live ones.
     quota::apply_due_downgrade(&state.pool, user.user_id).await?;
+    // Purge snapshots if new limit is below current usage (e.g., downgrade from Pro to Free).
+    let _ = crate::cloud::purge::maybe_purge(&state, user.user_id).await;
 
     let row: (
         String,

@@ -164,8 +164,9 @@ fn timestamp_is_fresh(webhook_ts: &str, now: i64) -> bool {
 ///
 /// - `*.created` / `*.active` / `*.updated` / `*.uncanceled` defer to the
 ///   embedded status field.
-/// - `*.canceled` → 'grace': the user cancelled but keeps access until the
-///   period ends (Polar leaves status 'active' with cancel_at_period_end).
+/// - `*.canceled` → 'expired': user cancelled. With grace_period > 0, storage
+///   downgrade is scheduled for later; with grace_period = 0, user converts to Free
+///   immediately (useful for testing).
 /// - `*.past_due` → 'grace'.
 /// - `*.revoked` → 'expired': access pulled, period over.
 pub fn status_for_event(event_type: &str, data_status: Option<&str>) -> Option<&'static str> {
@@ -178,8 +179,8 @@ pub fn status_for_event(event_type: &str, data_status: Option<&str>) -> Option<&
             Some("canceled") | Some("revoked") => "expired",
             _ => "active",
         }),
-        "subscription.canceled" | "subscription.past_due" => Some("grace"),
-        "subscription.revoked" => Some("expired"),
+        "subscription.canceled" | "subscription.revoked" => Some("expired"),
+        "subscription.past_due" => Some("grace"),
         _ => None,
     }
 }

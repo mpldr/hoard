@@ -212,6 +212,12 @@ pub async fn get_me(
         pending_change_at.map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
     let deleted_at = row.11;
     let purges_at = deleted_at.map(|d| d + time::Duration::days(GRACE_DAYS as i64));
+
+    // Auto-purge if storage usage exceeds 80% of limit.
+    let threshold = (limits.storage_bytes as f64 * 0.80) as i64;
+    if row.4 > threshold {
+        let _ = crate::cloud::purge::maybe_purge(&state, user.user_id).await;
+    }
     Ok(Json(Me {
         user_id: user.user_id,
         email: row.0,

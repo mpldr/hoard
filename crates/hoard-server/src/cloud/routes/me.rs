@@ -215,8 +215,12 @@ pub async fn get_me(
 
     // Auto-purge if storage usage exceeds 80% of limit.
     let threshold = (limits.storage_bytes as f64 * 0.80) as i64;
+    tracing::info!(used = row.4, threshold, limit = limits.storage_bytes, "storage check");
     if row.4 > threshold {
-        let _ = crate::cloud::purge::maybe_purge(&state, user.user_id).await;
+        match crate::cloud::purge::maybe_purge(&state, user.user_id).await {
+            Ok(deleted) => tracing::info!(deleted, "auto-purge executed"),
+            Err(e) => tracing::warn!(error = %e, "auto-purge failed"),
+        }
     }
     Ok(Json(Me {
         user_id: user.user_id,

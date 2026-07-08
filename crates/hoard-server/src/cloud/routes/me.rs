@@ -135,10 +135,12 @@ pub async fn get_me(
 
     // Sync any subscriptions that actually expired but status wasn't updated
     // (retroactive fix for webhooks that didn't fire or were delayed).
+    // Check both renews_at (renewal date) and cancel_at (cancellation scheduled date).
     let expired_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM subscriptions
          WHERE user_id = $1 AND status IN ('active','grace')
-         AND renews_at IS NOT NULL AND renews_at <= now()",
+         AND ((renews_at IS NOT NULL AND renews_at <= now())
+              OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
     )
     .bind(user.user_id)
     .fetch_one(&state.pool)
@@ -147,7 +149,8 @@ pub async fn get_me(
         let _ = sqlx::query(
             "UPDATE subscriptions SET status = 'expired', updated_at = now()
              WHERE user_id = $1 AND status IN ('active','grace')
-             AND renews_at IS NOT NULL AND renews_at <= now()",
+             AND ((renews_at IS NOT NULL AND renews_at <= now())
+                  OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
         )
         .bind(user.user_id)
         .execute(&state.pool)

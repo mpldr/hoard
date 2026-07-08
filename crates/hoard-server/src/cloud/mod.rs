@@ -19,6 +19,7 @@
 
 pub mod abuse;
 pub mod account_purge;
+pub mod archive;
 pub mod auth;
 pub mod bandwidth;
 pub mod db;

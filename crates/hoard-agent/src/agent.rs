@@ -3164,6 +3164,32 @@ async fn run_backup_with_retry(
                         .await;
                     return;
                 }
+                // Archived game (403 `save_archived`): the user parked this save
+                // in the server-side "caja negra". Re-uploading would revive its
+                // frozen blobs and undo the quota it freed, so never retry —
+                // settle quietly (clear has_pending, no red "falló"). The local
+                // save stays put; the desktop learns the archived state from
+                // `/v1/cloud/storage/games` and surfaces it there.
+                let is_archived = e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<crate::api::ApiError>(),
+                        Some(crate::api::ApiError::Archived)
+                    )
+                });
+                if is_archived {
+                    tracing::info!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        "agent: backup skipped — game is archived on the server (caja negra)"
+                    );
+                    let _ = done_tx.try_send(BackupDone {
+                        save_id: save.save_id.clone(),
+                        new_set_hash: None,
+                        committed: false,
+                        version_num: None,
+                    });
+                    return;
+                }
                 // Per-save size cap (413 `save_too_large`): the upload can never
                 // succeed as-is, so retrying just burns the budget and spams the
                 // feed. Emit a dedicated, actionable event and settle (clear

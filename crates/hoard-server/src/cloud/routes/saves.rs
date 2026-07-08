@@ -260,6 +260,7 @@ pub async fn commit_upload(
     if owner != user.user_id {
         return Err(CloudError::Forbidden("save belongs to a different user"));
     }
+    crate::cloud::archive::ensure_not_archived(&state, user.user_id, &save_id).await?;
 
     // The committed hash is persisted (and, for CAS, addresses R2 objects).
     // Reject anything that isn't a canonical sha256.
@@ -480,6 +481,10 @@ pub async fn cas_init(
             bad.sha256
         )));
     }
+
+    // Don't accept uploads for a game the user archived — it would revive the
+    // frozen blobs and re-inflate the quota. The client stops retrying on this.
+    crate::cloud::archive::ensure_not_archived(&state, user.user_id, &body.save_id).await?;
 
     let plan = match plan_for_user(&state, user.user_id).await? {
         Some(p) => p,
@@ -743,6 +748,7 @@ pub async fn cas_commit(
     if owner != user.user_id {
         return Err(CloudError::Forbidden("save belongs to a different user"));
     }
+    crate::cloud::archive::ensure_not_archived(&state, user.user_id, &save_id).await?;
 
     // The version must exist and be a content-addressed row.
     let vrow: Option<(String, bool)> = sqlx::query_as(
@@ -881,6 +887,9 @@ pub async fn cas_commit(
     // cloud_blobs trigger) with the size R2 actually reported — never the
     // client's declared size; existing ones just increment (the bound size is
     // ignored by the ON CONFLICT path, so their already-charged size stands).
+    // `purge_after = NULL` un-trashes a blob that archiving had frozen: if the
+    // user re-uploads a file whose blob is sitting in the 7-day archive grace
+    // window, this revives it and the expiry cron must no longer sweep it.
     for (sha, declared) in &unique {
         let key = r2::key_for_blob(user.user_id, sha);
         let size = actual_size.get(sha).copied().unwrap_or(*declared);
@@ -889,7 +898,7 @@ pub async fn cas_commit(
             INSERT INTO cloud_blobs (user_id, sha256, size_bytes, r2_key, refcount)
             VALUES ($1, $2, $3, $4, 1)
             ON CONFLICT (user_id, sha256)
-            DO UPDATE SET refcount = cloud_blobs.refcount + 1
+            DO UPDATE SET refcount = cloud_blobs.refcount + 1, purge_after = NULL
             "#,
         )
         .bind(user.user_id)

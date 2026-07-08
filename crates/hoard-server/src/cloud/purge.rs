@@ -208,7 +208,7 @@ async fn load_candidates(
         ),
         freeable AS (
             SELECT vb.save_id, vb.version_num,
-                   COALESCE(SUM(CASE WHEN b.refcount = 1 THEN b.size_bytes ELSE 0 END), 0) AS bytes
+                   COALESCE(SUM(CASE WHEN b.refcount = 1 THEN b.size_bytes ELSE 0 END), 0)::bigint AS bytes
             FROM ver_blobs vb
             JOIN cloud_blobs b ON b.user_id = $1 AND b.sha256 = vb.sha256
             GROUP BY vb.save_id, vb.version_num
@@ -266,11 +266,19 @@ async fn purge_one(
     .fetch_all(&state.pool)
     .await?;
 
-    sqlx::query("DELETE FROM save_versions WHERE save_id = $1 AND version_num = $2")
+    let res = sqlx::query("DELETE FROM save_versions WHERE save_id = $1 AND version_num = $2")
         .bind(save_id)
         .bind(version)
         .execute(&state.pool)
         .await?;
+
+    // Concurrency guard: if another purge/delete path already removed this
+    // version, our DELETE affects 0 rows and that other path already released
+    // these blob references. Releasing them again would double-decrement the
+    // refcount and could evict blobs a live version still points at. Bail.
+    if res.rows_affected() == 0 {
+        return Ok(());
+    }
 
     release_blobs(state, user_id, shas.into_iter().map(|(s,)| (s, 1))).await;
     Ok(())

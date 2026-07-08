@@ -2,7 +2,7 @@
 //! `database.backend = "postgres"`.
 
 use crate::cloud::{
-    account_purge,
+    account_purge, archive,
     auth::{require_active_account, require_cloud_auth, JwksCache},
     bandwidth, db, export, polar, r2,
     routes::{
@@ -124,6 +124,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // link, and expires old exports.
     export::spawn(state.clone());
 
+    // 4e. Hard-purge of archived games ("caja negra") past their 7-day grace:
+    //     deletes the save rows and GCs the frozen R2 blobs whose window
+    //     elapsed. Daily cadence, detached like the sweepers above.
+    archive::spawn(state.clone());
+
     // 5. Build routers.
     //
     // `authed_always` needs only a valid token: these routes must work even
@@ -161,6 +166,20 @@ pub async fn run(cfg: Config) -> Result<()> {
             "/v1/cloud/saves/:save_id",
             axum::routing::delete(saves::delete_save),
         )
+        // "Caja negra": archive a game to free quota immediately (frozen,
+        // downloadable for 7 days, then purged), and reactivate it (re-upload
+        // from local) after upgrading.
+        .route(
+            "/v1/cloud/saves/:save_id/archive",
+            post(archive::archive_handler),
+        )
+        .route(
+            "/v1/cloud/saves/:save_id/reactivate",
+            post(archive::reactivate_handler),
+        )
+        // Per-game freeable footprint + quota figures, for the "free space"
+        // dialog.
+        .route("/v1/cloud/storage/games", get(archive::storage_games))
         .route(
             "/v1/cloud/saves/:save_id/versions",
             get(saves::list_versions),

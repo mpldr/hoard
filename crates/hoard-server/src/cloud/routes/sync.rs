@@ -58,6 +58,7 @@ pub async fn manifest(
          LEFT JOIN save_versions sv
                 ON sv.save_id = s.id AND sv.version_num = s.latest_version_num
              WHERE s.user_id = $1 AND s.backup_only = false
+               AND s.archived_at IS NULL
           ORDER BY s.updated_at DESC
             "#,
     )

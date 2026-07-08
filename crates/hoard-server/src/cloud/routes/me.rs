@@ -219,7 +219,7 @@ pub async fn get_me(
     if row.4 > threshold {
         match crate::cloud::purge::maybe_purge(&state, user.user_id).await {
             Ok(deleted) => tracing::info!(deleted, "auto-purge executed"),
-            Err(e) => tracing::warn!(error = %e, "auto-purge failed"),
+            Err(e) => tracing::warn!(error = ?e, "auto-purge failed"),
         }
     }
     Ok(Json(Me {

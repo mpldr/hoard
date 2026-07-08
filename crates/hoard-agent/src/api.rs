@@ -24,6 +24,14 @@ pub enum ApiError {
     /// generic message.
     #[error("{}", .0.human())]
     TooLarge(SaveTooLarge),
+    /// HTTP 403 with `code:"save_archived"` — the game is parked in the
+    /// server-side archive ("caja negra"). Uploading it would revive its frozen
+    /// blobs and re-inflate the quota, so the client must stop trying and treat
+    /// the local save as frozen, not errored. Distinct from the generic
+    /// `Forbidden` so the backup path can settle it silently instead of painting
+    /// a red "falló".
+    #[error("game is archived on the server")]
+    Archived,
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -110,7 +118,13 @@ impl ApiError {
         let body = resp.text().await.unwrap_or_default();
         match status {
             StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
-            StatusCode::FORBIDDEN => ApiError::Forbidden,
+            StatusCode::FORBIDDEN => {
+                if extract_code(&body).as_deref() == Some("save_archived") {
+                    ApiError::Archived
+                } else {
+                    ApiError::Forbidden
+                }
+            }
             StatusCode::NOT_FOUND => ApiError::NotFound,
             StatusCode::PAYLOAD_TOO_LARGE => {
                 ApiError::TooLarge(serde_json::from_str::<SaveTooLarge>(&body).unwrap_or_default())
@@ -152,6 +166,13 @@ fn extract_message(body: &str) -> String {
         }
     }
     body.to_string()
+}
+
+/// Pull the stable machine-readable `code` out of a cloud error body, if any.
+fn extract_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|x| x.as_str()).map(String::from))
 }
 
 #[derive(Debug, Clone)]

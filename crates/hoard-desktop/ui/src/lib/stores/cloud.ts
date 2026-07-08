@@ -229,6 +229,55 @@ export async function downloadCloudExport(url: string): Promise<void> {
   await openExternal(url);
 }
 
+// ---- Caja negra: archived games ----
+
+/** One game's freeable footprint, mirrors the server's `GameFootprint`. */
+export type StorageGame = {
+  save_id: string;
+  game_slug: string;
+  label: string;
+  /** Bytes the quota drops by if this game is archived (deduped exclusive
+   *  blobs). The dialog ranks the heaviest by this. */
+  freeable_bytes: number;
+  archived: boolean;
+  /** RFC3339 hard-delete instant, present only while archived. */
+  purge_after: string | null;
+};
+
+/** Per-game freeable footprint + quota figures for the "free space" dialog. */
+export type StorageGames = {
+  plan: string;
+  used_bytes: number;
+  limit_bytes: number;
+  /** Bytes the live footprint is over the limit (0 if within). */
+  over_bytes: number;
+  games: StorageGame[];
+};
+
+export type ArchiveResult = {
+  save_id: string;
+  archived: boolean;
+  /** RFC3339 — when the frozen copy is hard-deleted (archive instant + 7d). */
+  purge_after: string;
+  freed_bytes: number;
+};
+
+/** Per-game freeable footprint + quota, to drive the archive dialog. */
+export async function storageGamesCloud(): Promise<StorageGames> {
+  return await invoke<StorageGames>("cloud_storage_games");
+}
+
+/** Archive a game into the black box: frees quota now, keeps it downloadable
+ *  for 7 days, then it's purged. The local save is never touched. */
+export async function archiveSaveCloud(saveId: string): Promise<ArchiveResult> {
+  return await invoke<ArchiveResult>("cloud_archive_save", { saveId });
+}
+
+/** Bring an archived game back (after upgrading / freeing space). */
+export async function reactivateSaveCloud(saveId: string): Promise<void> {
+  await invoke<void>("cloud_reactivate_save", { saveId });
+}
+
 /** Soft-delete the cloud account. The server freezes it and keeps the data for
  *  a 30-day grace in case the user changes their mind (they can sign back in and
  *  reactivate). Local session is wiped here. */

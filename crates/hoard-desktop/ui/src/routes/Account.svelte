@@ -20,6 +20,7 @@
   import Button from "../lib/components/Button.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import UpgradePlanModal from "../lib/components/UpgradePlanModal.svelte";
+  import LiberateStorageModal from "../lib/components/LiberateStorageModal.svelte";
   import {
     cloud,
     hydrateCloud,
@@ -45,6 +46,7 @@
   let confirmDeleteOpen = $state(false);
   let deleteConfirmation = $state("");
   let compareOpen = $state(false);
+  let liberateOpen = $state(false);
 
   // Latest export job + a poll while it's building. The worker is async, so the
   // download link appears here (and by email) once the ZIP is ready.
@@ -535,6 +537,12 @@
             <p class="mt-1.5 text-xs text-amber-400">{$_("account.storage_purging")}</p>
           {:else if storageView.status === "full"}
             <p class="mt-1.5 text-xs text-rose-400">{$_("account.storage_full")}</p>
+            <div class="mt-2">
+              <Button onclick={() => (liberateOpen = true)}>
+                <HardDrive size={14} />
+                {$_("liberate.cta")}
+              </Button>
+            </div>
           {/if}
           {#if storageView.status === "purging" || storageView.status === "full"}
             <div
@@ -741,4 +749,13 @@
 <UpgradePlanModal
   open={compareOpen}
   onClose={() => (compareOpen = false)}
+/>
+
+<LiberateStorageModal
+  open={liberateOpen}
+  onClose={() => (liberateOpen = false)}
+  onDownload={handleExport}
+  onDone={() => {
+    void refreshCloud();
+  }}
 />

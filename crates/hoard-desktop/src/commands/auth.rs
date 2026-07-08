@@ -295,6 +295,9 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
             ApiError::Forbidden => {
                 "Your access key is valid but the server isn't letting it do that.".into()
             }
+            ApiError::Archived => {
+                "This game is archived — reactivate it (upgrade to Pro) to sync it again.".into()
+            }
             ApiError::NotFound => {
                 // A 404 on a data fetch (history, library, a single save) means
                 // the resource is gone server-side — typically a save that was

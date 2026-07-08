@@ -744,6 +744,117 @@ pub async fn cloud_export_status() -> Result<ExportStatus, String> {
         .map_err(|e| format!("Couldn't parse server response: {e}"))
 }
 
+// ---- Caja negra: archived games ----
+
+/// One game's freeable footprint. Mirrors the server's `GameFootprint`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageGame {
+    pub save_id: String,
+    pub game_slug: String,
+    pub label: String,
+    /// Bytes the quota drops by if this game is archived (deduped exclusive
+    /// blobs). What the dialog ranks "los que más pesan" by.
+    pub freeable_bytes: i64,
+    #[serde(default)]
+    pub archived: bool,
+    /// RFC3339 hard-delete instant, present only while archived.
+    #[serde(default)]
+    pub purge_after: Option<String>,
+}
+
+/// `GET /v1/cloud/storage/games` — per-game freeable footprint + the quota
+/// figures. Drives the "free space" dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageGames {
+    pub plan: String,
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    /// Bytes the live footprint is over the limit (0 if within).
+    pub over_bytes: u64,
+    pub games: Vec<StorageGame>,
+}
+
+#[tauri::command]
+pub async fn cloud_storage_games() -> Result<StorageGames, String> {
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        return Err("Not signed in to Hoard Cloud.".into());
+    };
+    let url = format!("{}/v1/cloud/storage/games", creds.server_url);
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format_http_error(status, &body));
+    }
+    serde_json::from_str::<StorageGames>(&body)
+        .map_err(|e| format!("Couldn't parse server response: {e}"))
+}
+
+/// Result of archiving. Mirrors the server's `ArchiveOut`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveResult {
+    pub save_id: String,
+    pub archived: bool,
+    /// RFC3339 — when the frozen copy is hard-deleted (archive instant + 7d).
+    pub purge_after: String,
+    pub freed_bytes: i64,
+}
+
+/// `POST /v1/cloud/saves/:id/archive` — park a game in the black box: frees the
+/// quota now, keeps it downloadable for 7 days, then a cron purges it. The local
+/// save on disk is never touched.
+#[tauri::command]
+pub async fn cloud_archive_save(save_id: String) -> Result<ArchiveResult, String> {
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        return Err("Not signed in to Hoard Cloud.".into());
+    };
+    let url = format!("{}/v1/cloud/saves/{save_id}/archive", creds.server_url);
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format_http_error(status, &body));
+    }
+    serde_json::from_str::<ArchiveResult>(&body)
+        .map_err(|e| format!("Couldn't parse server response: {e}"))
+}
+
+/// `POST /v1/cloud/saves/:id/reactivate` — bring an archived game back (after
+/// upgrading to Pro / freeing space). Re-references its blobs; errors if it no
+/// longer fits the plan or the 7-day window already elapsed.
+#[tauri::command]
+pub async fn cloud_reactivate_save(save_id: String) -> Result<(), String> {
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        return Err("Not signed in to Hoard Cloud.".into());
+    };
+    let url = format!("{}/v1/cloud/saves/{save_id}/reactivate", creds.server_url);
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format_http_error(status, &body));
+    }
+    Ok(())
+}
+
 /// Delete the cloud account. The server soft-deletes and *freezes* it: every
 /// data route 403s immediately (no longer a silent logout), and a background
 /// job hard-purges R2 + DB after a 30-day grace. During that window the user

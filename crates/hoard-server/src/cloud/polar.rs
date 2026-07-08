@@ -512,7 +512,7 @@ mod tests {
         );
         assert_eq!(
             status_for_event("subscription.canceled", Some("active")),
-            Some("grace")
+            Some("expired")
         );
         assert_eq!(
             status_for_event("subscription.revoked", Some("revoked")),

@@ -7,7 +7,9 @@
 //!   Windows, Keychain on macOS — all surfaced by the `keyring` crate).
 //! * The server URL and a cached copy of the last-seen user info, which are
 //!   not sensitive and live in a TOML file at `<config>/desktop/session.toml`
-//!   so we can show the username without hitting the network on startup.
+//!   so we can show the username without hitting the network on startup. These
+//!   are also mirrored into the keychain blob, so a lost or unreadable cache
+//!   file no longer signs the user out.
 //!
 //! When the OS keychain is unavailable (e.g. headless Linux without
 //! libsecret) the token falls back into the same TOML file, which is created
@@ -75,6 +77,20 @@ struct AuthSection {
     token: String,
 }
 
+/// What we stash in the OS keychain. Historically this was the bare token
+/// string; it's now a small TOML document so the keychain alone can restore a
+/// session (token + server URL + cached user) even when the on-disk cache is
+/// missing or unreadable. Reads tolerate the legacy bare-token form.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KeyringBlob {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    user: Option<UserSection>,
+}
+
 impl From<Whoami> for UserSection {
     fn from(w: Whoami) -> Self {
         Self {
@@ -103,7 +119,7 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
     };
     write_session(&session)?;
 
-    match try_keyring_set(&creds.token) {
+    match try_keyring_set(creds) {
         Ok(()) => {
             // Belt and braces: if the file had a stale token from a previous
             // fallback run, scrub it now that the keyring took over.
@@ -124,28 +140,55 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
 /// Load credentials if any are stored. Returns `Ok(None)` when no session is
 /// present yet (e.g. fresh install) — that is not an error.
 pub fn load() -> Result<Option<Credentials>> {
-    let Some(session) = read_session()? else {
-        return Ok(None);
-    };
-    if session.server.url.is_empty() {
-        return Ok(None);
+    match read_session() {
+        // Normal path: the on-disk cache is readable and has a server URL. The
+        // token comes from the keychain, falling back to the file copy.
+        Ok(Some(session)) if !session.server.url.is_empty() => {
+            let token = match try_keyring_get() {
+                Ok(Some(blob)) if !blob.token.is_empty() => Some(blob.token),
+                _ => session.auth.as_ref().map(|a| a.token.clone()),
+            };
+            match token.filter(|t| !t.is_empty()) {
+                Some(token) => Ok(Some(Credentials {
+                    url: session.server.url,
+                    token,
+                    user: session.user,
+                })),
+                None => Ok(None),
+            }
+        }
+        // Cache absent, empty, or unreadable (e.g. an ACL a previous Windows
+        // build clamped down and `read_session` couldn't repair). Don't drop
+        // the session over a disk hiccup: the keychain now carries the URL too,
+        // so it can restore everything on its own.
+        read => {
+            if let Ok(Some(blob)) = try_keyring_get() {
+                if !blob.token.is_empty() && !blob.url.is_empty() {
+                    let creds = Credentials {
+                        url: blob.url,
+                        token: blob.token,
+                        user: blob.user,
+                    };
+                    // Best-effort: rewrite the cache so it's healthy again, with
+                    // sane inherited permissions.
+                    let _ = write_session(&Session {
+                        server: ServerSection {
+                            url: creds.url.clone(),
+                        },
+                        user: creds.user.clone(),
+                        auth: None,
+                    });
+                    return Ok(Some(creds));
+                }
+            }
+            // Nothing recoverable from the keychain. Surface a real read error;
+            // treat "absent/empty" as simply not-logged-in.
+            match read {
+                Err(e) => Err(e),
+                _ => Ok(None),
+            }
+        }
     }
-
-    // Prefer the keyring; if it has nothing, fall back to the file.
-    let token = match try_keyring_get() {
-        Ok(Some(t)) => Some(t),
-        _ => session.auth.as_ref().map(|a| a.token.clone()),
-    };
-
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return Ok(None);
-    };
-
-    Ok(Some(Credentials {
-        url: session.server.url,
-        token,
-        user: session.user,
-    }))
 }
 
 /// Wipe stored credentials. Idempotent — clearing twice is fine.
@@ -182,8 +225,18 @@ fn read_session() -> Result<Option<Session>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // A session file written by an older build can carry a broken ACL
+        // (icacls /inheritance:r granted to a principal that doesn't resolve to
+        // this process's identity) → the file exists but reads back "access
+        // denied". The owner can always rewrite the DACL, so reset inherited
+        // permissions and retry once before giving up.
+        #[cfg(windows)]
+        Err(_) if reset_acl_windows(&path) => std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {} after ACL reset", path.display()))?,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let s: Session =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(s))
@@ -217,49 +270,42 @@ fn write_session(s: &Session) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
 
-    // Windows: harden ACL on the now-current session file.
-    #[cfg(windows)]
-    restrict_acl_windows(&path);
-
     Ok(())
 }
 
-/// Lock the fallback session file down to the current user on Windows.
+/// Repair a session file a previous build's ACL-hardening left unreadable.
 ///
-/// Unlike Unix there's no `mode(0o600)`; a fresh file inherits the parent
-/// directory's ACL, which under a roaming/shared profile can be broader than we
-/// want for a token-bearing file. `icacls` is the documented, dependency-free
-/// way to fix this: strip inherited ACEs (`/inheritance:r`) and grant full
-/// control to just this user. Best-effort — the file already sits under the
-/// per-user profile, so a failure only forgoes the extra hardening; we warn and
-/// carry on rather than block login.
+/// Older versions ran `icacls /inheritance:r /grant:r %USERNAME%:F` on the
+/// file. When `%USERNAME%` didn't resolve to the process's actual identity
+/// (Microsoft accounts, a same-named local account, roaming/redirected
+/// profiles) the file ended up owned by the user but granting access to the
+/// wrong principal, so a later launch reads it back as "access denied". The
+/// owner keeps the implicit right to rewrite the DACL, so `icacls /reset`
+/// restores the inherited, per-user permissions and the retry read then
+/// succeeds. Best-effort — returns whether the reset ran cleanly so the caller
+/// only retries the read when it's worth it.
 #[cfg(windows)]
-fn restrict_acl_windows(path: &std::path::Path) {
-    let user = match std::env::var("USERNAME") {
-        Ok(u) if !u.is_empty() => u,
-        _ => {
-            tracing::warn!("credentials: USERNAME unset; skipping ACL hardening");
-            return;
-        }
-    };
-    let grant = format!("{user}:F");
+fn reset_acl_windows(path: &std::path::Path) -> bool {
     match std::process::Command::new("icacls")
         .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(&grant)
+        .arg("/reset")
         .output()
     {
-        Ok(out) if out.status.success() => {}
+        Ok(out) if out.status.success() => {
+            tracing::info!(path = %path.display(), "credentials: reset stale ACL on session file");
+            true
+        }
         Ok(out) => {
             tracing::warn!(
                 status = ?out.status.code(),
                 stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "credentials: icacls did not harden the session file",
+                "credentials: icacls /reset did not repair the session file",
             );
+            false
         }
         Err(e) => {
-            tracing::warn!(error = %e, "credentials: failed to run icacls");
+            tracing::warn!(error = %e, "credentials: failed to run icacls /reset");
+            false
         }
     }
 }
@@ -275,18 +321,39 @@ fn scrub_file_token() -> Result<()> {
     Ok(())
 }
 
-fn try_keyring_set(token: &str) -> Result<()> {
+fn try_keyring_set(creds: &Credentials) -> Result<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    entry.set_password(token)?;
+    // Store the whole session (token + URL + cached user) as TOML so the
+    // keychain can restore it without the on-disk cache. See `KeyringBlob`.
+    let blob = toml::to_string(&KeyringBlob {
+        token: creds.token.clone(),
+        url: creds.url.clone(),
+        user: creds.user.clone(),
+    })
+    .context("serializing keychain blob")?;
+    entry.set_password(&blob)?;
     Ok(())
 }
 
-fn try_keyring_get() -> Result<Option<String>> {
+fn try_keyring_get() -> Result<Option<KeyringBlob>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     match entry.get_password() {
-        Ok(t) => Ok(Some(t)),
+        Ok(raw) => Ok(Some(parse_keyring_blob(&raw))),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Parse a keychain payload, tolerating the legacy format where the entry was
+/// just the bare token string (no TOML wrapper).
+fn parse_keyring_blob(raw: &str) -> KeyringBlob {
+    match toml::from_str::<KeyringBlob>(raw) {
+        Ok(blob) if !blob.token.is_empty() => blob,
+        _ => KeyringBlob {
+            token: raw.trim().to_string(),
+            url: String::new(),
+            user: None,
+        },
     }
 }
 

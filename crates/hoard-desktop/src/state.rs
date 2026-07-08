@@ -62,7 +62,9 @@ impl AppState {
             }
             Ok(None) => None,
             Err(e) => {
-                tracing::warn!(error = %e, "couldn't load saved credentials; starting fresh");
+                // `{:#}` so the anyhow cause chain (e.g. the underlying OS
+                // error) shows up instead of just the top-level context.
+                tracing::warn!(error = %format!("{e:#}"), "couldn't load saved credentials; starting fresh");
                 None
             }
         };

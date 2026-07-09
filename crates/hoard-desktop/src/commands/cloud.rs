@@ -1283,10 +1283,12 @@ pub async fn cloud_sync_playtime(
     // para que el store que subimos sea el de esta cuenta y no el global.
     let _ = PlaytimeStore::migrate_legacy_into_current_context();
 
-    let local = || -> Result<PlaytimeSummary, String> {
-        let path = PlaytimeStore::default_path().map_err(|e| e.to_string())?;
-        Ok(PlaytimeStore::load(&path).summary())
-    };
+    // The recap reads ONLY from the server (the device-merged aggregate is the
+    // source of truth); the local store is just the upload source, never a read
+    // fallback. When no server is reachable — no session, or the server is down
+    // — we return an empty summary rather than the single-device local store,
+    // so the recap is always the account's real cross-device history or nothing.
+    let empty = || Ok(PlaytimeSummary::default());
 
     // Build the upload body from the local store (shared by both modes).
     let path = PlaytimeStore::default_path().map_err(|e| e.to_string())?;
@@ -1298,14 +1300,15 @@ pub async fn cloud_sync_playtime(
     };
 
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        // No cloud session. In self-hosted mode the recap must read the user's
-        // OWN server (device-merged across their machines), not just this
-        // device's local store. Fall back to `local()` only when there's no
-        // self-hosted session either, or its server is unreachable.
+        // No cloud session. In self-hosted mode the recap reads the user's OWN
+        // hoard-server, scoped to that server's user — one machine is one user,
+        // so the recap is that user's history on their server. Empty summary
+        // when there's no self-hosted session either, or its server is
+        // unreachable — never this machine's local store.
         return sync_playtime_selfhosted(&body)
             .await
             .map(Ok)
-            .unwrap_or_else(local);
+            .unwrap_or_else(empty);
     };
 
     // Push (best-effort): a failed push still lets us read the existing
@@ -1324,35 +1327,38 @@ pub async fn cloud_sync_playtime(
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
                 }
-                return local();
+                return empty();
             }
         },
         Err(_other) => {}
     }
 
-    // Read the device-merged aggregate.
+    // Read the device-merged aggregate (server only; empty on failure).
     match fetch_playtime_raw(&base, &token).await {
         Ok(sum) => Ok(sum),
         Err(MeError::Unauthorized) => match refresh_active_session().await {
             Ok(fresh) => fetch_playtime_raw(&fresh.server_url, &fresh.access_token)
                 .await
-                .or_else(|_| local()),
+                .or_else(|_| empty()),
             Err(e) => {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
                 }
-                local()
+                empty()
             }
         },
-        Err(_other) => local(),
+        Err(_other) => empty(),
     }
 }
 
-/// Self-hosted playtime sync: push this device's rows to the user's OWN server
-/// (`/v1/playtime`, bearer auth) and read back its device-merged aggregate.
+/// Self-hosted playtime sync: push this machine's rows to the user's OWN
+/// hoard-server (`/v1/playtime`, bearer auth) and read back the aggregate the
+/// server keeps for that user. In self-hosted one machine is one server user,
+/// so this is that user's own history (the server scopes it by the bearer's
+/// user_id), not a cross-machine merge.
 /// Returns `None` when there's no self-hosted session, when the session points
 /// at a cloud server (handled by the cloud path, not here), or when the server
-/// is unreachable — the caller then shows the single-device local summary.
+/// is unreachable — the caller then shows an empty recap, never the local store.
 async fn sync_playtime_selfhosted(
     body: &PlaytimeUploadBody,
 ) -> Option<hoard_agent::playtime::PlaytimeSummary> {

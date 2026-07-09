@@ -1,7 +1,13 @@
 //! `/v1/playtime` — self-hosted mirror of the agent's real-hours-played
-//! tracker, attributed per local day and per game, per device. SQLite/bearer
-//! counterpart of the cloud route (`cloud::routes::playtime`); same wire shape
-//! so the recap (hoard-wrapple) reads either source identically.
+//! tracker, attributed per local day and per game. SQLite/bearer counterpart of
+//! the cloud route (`cloud::routes::playtime`); same wire shape so the recap
+//! (hoard-wrapple) reads either source identically.
+//!
+//! Self-hosted model: one machine is one server user. Rows are scoped by the
+//! bearer's `user_id`, so a user's recap is their OWN machine's history — not a
+//! cross-machine merge (that's the cloud model, where many devices hang off one
+//! account). `device_fp` is still recorded (and the aggregate sums over it), but
+//! for a 1:1 machine↔user server that's just the single device.
 //!
 //! - `POST` replaces a device's full breakdown of `(day, game, secs)` rows: the
 //!   client's local playtime is monotonic (only accrues), so each device is the

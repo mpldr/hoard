@@ -93,7 +93,9 @@ pub async fn require_feature(
     plan: Plan,
     feature: Feature,
 ) -> Result<(), CloudError> {
-    if plan == Plan::Pro {
+    // Wrapple (hoard-wrapple) is free for everyone, in every app and on every
+    // plan — the server never gates it. Only Screen is a paid/trial feature.
+    if feature == Feature::Wrapple || plan == Plan::Pro {
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
@@ -134,7 +136,8 @@ pub async fn feature_state(
     plan: Plan,
     feature: Feature,
 ) -> Result<FeatureState, CloudError> {
-    if plan == Plan::Pro {
+    // Wrapple is always free (never gated); Pro unlocks everything.
+    if feature == Feature::Wrapple || plan == Plan::Pro {
         return Ok(FeatureState::Entitled);
     }
     let row: Option<(OffsetDateTime,)> =

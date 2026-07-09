@@ -540,13 +540,18 @@
   // Keep the per-feature entitlement snapshot (nav gating + tooltips for
   // Hoard-Screen / Hoard-Wrapped) in step with the cloud session: boot
   // hydrate, sign-in, sign-out and account switches all change the account
-  // identity, so key the refresh on `user_id`. The store caches `null` when
-  // signed out, which renders both items locked.
-  let lastEntitlementsUser: string | null | undefined = undefined;
+  // identity. Key the refresh on `user_id` AND `plan` so an in-session upgrade
+  // (Free → Pro, when the `/v1/me` poller flips `plan`) re-pulls entitlements
+  // and unlocks the feature immediately, instead of keeping the pre-upgrade
+  // snapshot (which shows Pro as still locked) until the app is restarted. The
+  // store caches `null` when signed out, which renders both items locked.
+  let lastEntitlementsKey: string | null | undefined = undefined;
   $effect(() => {
-    const key = $cloud.account?.user_id ?? null;
-    if (key === lastEntitlementsUser) return;
-    lastEntitlementsUser = key;
+    const key = $cloud.account
+      ? `${$cloud.account.user_id}:${$cloud.account.plan}`
+      : null;
+    if (key === lastEntitlementsKey) return;
+    lastEntitlementsKey = key;
     void refreshEntitlements();
   });
 

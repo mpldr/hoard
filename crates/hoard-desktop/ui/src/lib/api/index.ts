@@ -886,10 +886,11 @@ export function includePlaytimeGame(slug: string): Promise<void> {
   return invoke<void>("include_playtime_game", { slug });
 }
 
-/** Push this device's playtime to Hoard Cloud and read back the device-merged
- *  aggregate (the recap's "multi-equipo" source of truth). Same shape as
- *  {@link listPlaytime}; the command falls back to the local summary when
- *  signed out or offline, so this never throws on a missing session. */
+/** Push this device's playtime to the server (Hoard Cloud, or the user's own
+ *  server when self-hosted) and read back the device-merged aggregate — the
+ *  recap's "multi-equipo" source of truth, read from the server ONLY. Same
+ *  shape as {@link listPlaytime}; returns an empty summary (never the local
+ *  store) when there's no session or the server is unreachable. */
 export function syncPlaytime(): Promise<PlaytimeSummary> {
   return invoke<PlaytimeSummary>("cloud_sync_playtime");
 }

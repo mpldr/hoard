@@ -91,7 +91,7 @@ pub struct PlaytimeStore {
 }
 
 /// Forma serializable que el comando `list_playtime` devuelve a la UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlaytimeSummary {
     pub days: BTreeMap<String, u64>,
     pub by_game: BTreeMap<String, u64>,

@@ -310,8 +310,10 @@
     // when the lifetime counter isn't available (see `hoardedBytes`).
     totalBytes = saves.reduce((a, s) => a + (s.total_size_bytes || 0), 0);
 
-    // Real per-day playtime, merged across every device from the cloud
-    // (falls back to this machine's local data when signed out / offline).
+    // Real per-day playtime, read from the server only: the device-merged
+    // aggregate for this account (cloud, or the user's own server when
+    // self-hosted). No local fallback — an unreachable server shows an empty
+    // recap, never this single machine's local store.
     let days: Record<string, number> = {};
     let byGame: Record<string, number> = {};
     try {

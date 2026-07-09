@@ -16,7 +16,8 @@ use hoard_server::auth::require_auth;
 use hoard_server::cleanup;
 use hoard_server::routes::{
     admin as admin_routes, auth as auth_routes, events as event_routes, games as game_routes,
-    health, logs as log_routes, saves as save_routes, snapshots as snap_routes,
+    health, logs as log_routes, playtime as playtime_routes, saves as save_routes,
+    snapshots as snap_routes,
 };
 
 #[derive(Parser)]
@@ -127,6 +128,11 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         .route("/v1/games/:slug", get(game_routes::get_one))
         .route("/v1/games/:slug/known-paths", get(game_routes::known_paths))
         .route("/v1/manifest/version", get(game_routes::manifest_version))
+        // Playtime mirror (hoard-wrapple recap source in self-hosted mode).
+        .route(
+            "/v1/playtime",
+            get(playtime_routes::aggregate).post(playtime_routes::upload),
+        )
         // Saves
         .route(
             "/v1/saves",

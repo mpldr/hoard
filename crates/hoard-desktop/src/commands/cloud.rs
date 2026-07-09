@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::commands::auth::classify_cloud;
 use crate::commands::cloud_pull;
 use crate::state::AppState;
 
@@ -1287,17 +1288,24 @@ pub async fn cloud_sync_playtime(
         Ok(PlaytimeStore::load(&path).summary())
     };
 
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return local();
-    };
-
-    // Build the upload body from the local store.
+    // Build the upload body from the local store (shared by both modes).
     let path = PlaytimeStore::default_path().map_err(|e| e.to_string())?;
     let store = PlaytimeStore::load(&path);
     let dev = hoard_agent::logship::device_identity();
     let body = PlaytimeUploadBody {
         device_fp: dev.fingerprint,
         rows: store.upload_rows(),
+    };
+
+    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+        // No cloud session. In self-hosted mode the recap must read the user's
+        // OWN server (device-merged across their machines), not just this
+        // device's local store. Fall back to `local()` only when there's no
+        // self-hosted session either, or its server is unreachable.
+        return sync_playtime_selfhosted(&body)
+            .await
+            .map(Ok)
+            .unwrap_or_else(local);
     };
 
     // Push (best-effort): a failed push still lets us read the existing
@@ -1340,12 +1348,45 @@ pub async fn cloud_sync_playtime(
     }
 }
 
+/// Self-hosted playtime sync: push this device's rows to the user's OWN server
+/// (`/v1/playtime`, bearer auth) and read back its device-merged aggregate.
+/// Returns `None` when there's no self-hosted session, when the session points
+/// at a cloud server (handled by the cloud path, not here), or when the server
+/// is unreachable — the caller then shows the single-device local summary.
+async fn sync_playtime_selfhosted(
+    body: &PlaytimeUploadBody,
+) -> Option<hoard_agent::playtime::PlaytimeSummary> {
+    let creds = hoard_agent::credentials::load().ok().flatten()?;
+    let base = creds.url.trim_end_matches('/').to_string();
+    if base.is_empty() || creds.token.is_empty() {
+        return None;
+    }
+    // A cloud server is served by the cloud path; never hit `/v1/playtime` there.
+    if classify_cloud(&base) {
+        return None;
+    }
+    // Push is best-effort; even a failed push still lets us read the aggregate.
+    let _ = push_playtime_to(&base, "/v1/playtime", &creds.token, body).await;
+    fetch_playtime_from(&base, "/v1/playtime", &creds.token)
+        .await
+        .ok()
+}
+
 async fn push_playtime_raw(
     base: &str,
     token: &str,
     body: &PlaytimeUploadBody,
 ) -> Result<(), MeError> {
-    let url = format!("{base}/v1/cloud/playtime");
+    push_playtime_to(base, "/v1/cloud/playtime", token, body).await
+}
+
+async fn push_playtime_to(
+    base: &str,
+    path: &str,
+    token: &str,
+    body: &PlaytimeUploadBody,
+) -> Result<(), MeError> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
     let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
     let resp = client
         .post(&url)
@@ -1369,7 +1410,15 @@ async fn fetch_playtime_raw(
     base: &str,
     token: &str,
 ) -> Result<hoard_agent::playtime::PlaytimeSummary, MeError> {
-    let url = format!("{base}/v1/cloud/playtime");
+    fetch_playtime_from(base, "/v1/cloud/playtime", token).await
+}
+
+async fn fetch_playtime_from(
+    base: &str,
+    path: &str,
+    token: &str,
+) -> Result<hoard_agent::playtime::PlaytimeSummary, MeError> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
     let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
     let resp = client
         .get(&url)

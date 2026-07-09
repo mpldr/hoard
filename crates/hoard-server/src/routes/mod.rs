@@ -4,5 +4,6 @@ pub mod events;
 pub mod games;
 pub mod health;
 pub mod logs;
+pub mod playtime;
 pub mod saves;
 pub mod snapshots;

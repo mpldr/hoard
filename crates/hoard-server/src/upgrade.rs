@@ -46,6 +46,14 @@ struct Asset {
     browser_download_url: String,
 }
 
+/// Best-effort "are we inside a container?" check. Docker writes `/.dockerenv`
+/// at the image root; Podman writes `/run/.containerenv`. Either marker is a
+/// reliable signal without needing to parse cgroups.
+fn in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+}
+
 /// Entry point used by `main`. Prints progress to stdout so a user running
 /// this interactively can see what's happening; no tracing init is needed.
 pub async fn run(target: Option<PathBuf>) -> Result<()> {
@@ -53,6 +61,24 @@ pub async fn run(target: Option<PathBuf>) -> Result<()> {
 
     println!("hoard-server upgrade");
     println!("  current version: {current}");
+
+    // 0. Refuse inside a container. Swapping the binary in a running container
+    //    is pointless: it's a read-only-ish, ephemeral layer that a
+    //    `docker compose up` recreate throws away, and the systemd restart this
+    //    command tells you to run doesn't exist there. Docker/Podman deploys
+    //    update by rebuilding the image, so bail with that instruction instead
+    //    of downloading a binary that will vanish. Escape hatch for odd setups:
+    //    `HOARD_UPGRADE_ALLOW_CONTAINER=1`.
+    if in_container() && std::env::var_os("HOARD_UPGRADE_ALLOW_CONTAINER").is_none() {
+        println!(
+            "\nThis server is running in a container — `hoard-server upgrade` doesn't apply here.\n\
+             The binary swap wouldn't survive a container recreate. Update the image instead:\n\n\
+             \x20 docker compose pull   # or: docker compose build --pull\n\
+             \x20 docker compose up -d\n\n\
+             (Set HOARD_UPGRADE_ALLOW_CONTAINER=1 to override.)"
+        );
+        return Ok(());
+    }
 
     // 1. Ask GitHub what the latest release is.
     let client = reqwest::Client::builder()

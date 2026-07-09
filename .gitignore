@@ -39,16 +39,11 @@ crates/hoard-desktop/ui/node_modules/
 crates/hoard-desktop/ui/dist/
 crates/hoard-desktop/ui/.vite/
 
-# Closed-source Pro UI, copied in from the private hoard-pro repo at build
-# time. The public build resolves `$pro` to the inert pro-stub instead — Pro
-# code must never land in this repo.
-crates/hoard-desktop/ui/src/lib/pro/
-
-# Compiled Pro sidecar (`hoard-screen-<triple>`), dropped here by the Pro build
-# / `hoard-pro/scripts/local-link.sh`. It's the closed-source Pro artifact — it
-# must never land in this repo. Lives next to tauri.conf.json (src-tauri root)
-# so the bundler flattens it adjacent to the app exe and the runtime sidecar
-# resolver finds it; the old `binaries/` subdir broke runtime resolution.
+# Compiled Pro sidecar (`hoard-screen-<triple>`), built from the in-repo
+# `crates/hoard-screen` crate and dropped here by the build so the bundler
+# flattens it adjacent to the app exe (the runtime sidecar resolver finds it
+# there; the old `binaries/` subdir broke runtime resolution). The compiled
+# artifact is never committed — the source lives in `crates/hoard-screen`.
 crates/hoard-desktop/binaries/
 crates/hoard-desktop/hoard-screen-*
 

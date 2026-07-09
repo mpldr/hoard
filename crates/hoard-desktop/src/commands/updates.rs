@@ -480,9 +480,19 @@ fn sanitize_exe_path(exe: std::path::PathBuf) -> std::path::PathBuf {
 fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
     #[cfg(target_os = "linux")]
     {
-        // Prefer .deb (Ubuntu/Debian, what we test against). Fall back to
-        // .AppImage if no .deb is in the release.
-        if let Some(a) = assets.iter().find(|a| a.name.ends_with(".deb")) {
+        // Pick the package format that matches the running distro. On an
+        // rpm-based system (Fedora/RHEL/openSUSE) prefer .rpm; everywhere else
+        // prefer .deb (Ubuntu/Debian, what we test against). Fall back to the
+        // other package format, then to the portable .AppImage.
+        let (primary, secondary): (&str, &str) = if linux_prefers_rpm() {
+            (".rpm", ".deb")
+        } else {
+            (".deb", ".rpm")
+        };
+        if let Some(a) = assets.iter().find(|a| a.name.ends_with(primary)) {
+            return Some(a);
+        }
+        if let Some(a) = assets.iter().find(|a| a.name.ends_with(secondary)) {
             return Some(a);
         }
         assets.iter().find(|a| a.name.ends_with(".AppImage"))
@@ -565,19 +575,64 @@ async fn verify_installer_signature(
     Ok(SigCheck::Verified)
 }
 
+/// True on rpm-based distros (Fedora/RHEL/openSUSE). We check for the `rpm`
+/// binary while `dpkg` is absent, plus `/etc/os-release` ID hints, so a Debian
+/// box that happens to have `rpm` installed still gets `.deb`.
+#[cfg(target_os = "linux")]
+fn linux_prefers_rpm() -> bool {
+    fn on_path(bin: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
+            })
+            .unwrap_or(false)
+    }
+    if on_path("dpkg") {
+        return false;
+    }
+    if let Ok(os) = std::fs::read_to_string("/etc/os-release") {
+        let rpm_ids = ["fedora", "rhel", "centos", "opensuse", "suse", "rocky", "almalinux"];
+        for line in os.lines() {
+            if let Some(v) = line.strip_prefix("ID=").or_else(|| line.strip_prefix("ID_LIKE=")) {
+                let v = v.trim_matches('"');
+                if rpm_ids.iter().any(|id| v.split_whitespace().any(|w| w == *id)) {
+                    return true;
+                }
+            }
+        }
+    }
+    on_path("rpm")
+}
+
 #[cfg(target_os = "linux")]
 async fn launch_installer(path: &std::path::Path) -> Result<(), String> {
-    // pkexec pops the polkit auth dialog and runs dpkg as root. If the user
-    // cancels, dpkg never runs and we get a non-zero exit; we treat that as
-    // an error so the UI can fall back to "Downloaded".
+    // pkexec pops the polkit auth dialog and runs the package manager as root.
+    // If the user cancels, it never runs and we get a non-zero exit; we treat
+    // that as an error so the UI can fall back to "Downloaded".
     let p = path.to_string_lossy().to_string();
+    let is_rpm = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpm"));
+
+    // For .rpm prefer dnf (resolves deps) and fall back to plain rpm -U; for
+    // .deb use dpkg -i (deps already vendored in the Tauri bundle).
+    let args: Vec<&str> = if is_rpm {
+        if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|d| d.join("dnf").is_file())
+        {
+            vec!["dnf", "install", "-y", &p]
+        } else {
+            vec!["rpm", "-U", "--force", &p]
+        }
+    } else {
+        vec!["dpkg", "-i", &p]
+    };
+
     let status = tokio::process::Command::new("pkexec")
-        .args(["dpkg", "-i", &p])
+        .args(&args)
         .status()
         .await
         .map_err(|e| format!("spawning pkexec: {e}"))?;
     if !status.success() {
-        return Err(format!("dpkg -i exited with status {status}"));
+        return Err(format!("{} exited with status {status}", args.join(" ")));
     }
     Ok(())
 }

@@ -580,8 +580,15 @@
         { kind: "link", labelKey: "nav.dashboard", icon: Archive, route: "/dashboard" },
       ],
     },
-    { kind: "feature", labelKey: "nav.hoard_screen", icon: MonitorPlay, route: "/hoard-screen", feature: "screen" },
-    { kind: "feature", labelKey: "nav.hoard_wrapped", icon: Sparkles, route: "/hoard-wrapped", feature: "wrapple" },
+    // Hoard-Screen (overlay) is a Cloud-only paid feature: shown (and server
+    // gated) only when signed in to Hoard Cloud. Self-hosted never sees it —
+    // the overlay unlocks against a Cloud entitlement it can't obtain.
+    ...($cloud.account
+      ? [{ kind: "feature", labelKey: "nav.hoard_screen", icon: MonitorPlay, route: "/hoard-screen", feature: "screen" } as NavEntry]
+      : []),
+    // Hoard-Wrapped is free for everyone (Cloud and self-hosted): a plain link,
+    // no entitlement gate.
+    { kind: "link", labelKey: "nav.hoard_wrapped", icon: Sparkles, route: "/hoard-wrapped" },
     { kind: "link", labelKey: "nav.settings", icon: SettingsIcon, route: "/settings" },
   ]);
 

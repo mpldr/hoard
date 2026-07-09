@@ -11,12 +11,14 @@ name: Release (desktop)
 # repository secrets and the Tauri Action will pick them up automatically.
 
 on:
-  # Desktop installers ship from the private `hoard-build` (Pro) pipeline,
-  # which uploads the Pro-capable bundles straight onto the public release.
-  # A plain build here produces the Pro-less STUB; if it ran on the same tag
-  # it would overwrite those Pro installers (identical filenames). So this
-  # workflow no longer runs on tags — desktop releases go through
-  # `hoard-build`. Kept as `workflow_dispatch` for a one-off STUB build.
+  # Canonical desktop release path. The Pro layer (overlay + Wrapped) now lives
+  # in-repo, so this single workflow builds the full bundles — no private
+  # `hoard-build`/`hoard-pro` overlay any more. Runs on `v*` tags alongside
+  # `release.yml` (which attaches the headless server tarball; different
+  # filenames, no clash) and can be dispatched manually for a one-off build.
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
 
 env:
@@ -95,7 +97,15 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libpipewire-0.3-dev \
+            clang
+
+      - name: Build overlay sidecar (hoard-screen)
+        shell: bash
+        run: bash scripts/build-sidecar.sh
 
       - name: Install frontend deps
         run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
@@ -184,10 +194,6 @@ jobs:
       # loudly: unsigned installers make the client fall back to a *manual*
       # download instead of auto-installing, so updates degrade rather than run
       # an unverified binary.
-      #
-      # NOTE: the production desktop installers ship from the private
-      # `hoard-build` pipeline, which MUST run an equivalent signing step or
-      # those releases won't auto-update. Keep the two in lockstep.
       - name: Sign bundles (minisign)
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}

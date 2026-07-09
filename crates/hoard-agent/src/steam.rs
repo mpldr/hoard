@@ -38,8 +38,9 @@ pub struct ProtonPrefix {
 /// Probe the host for Steam libraries. Returns the directories that contain
 /// a `steamapps` subfolder; later passes scan those.
 ///
-/// On Linux the lookup considers the native install (`~/.steam/steam`) and
-/// the Flatpak path (`~/.var/app/com.valvesoftware.Steam/.local/share/Steam`).
+/// On Linux the lookup considers the native install (`~/.steam/steam`), the
+/// Flatpak path (`~/.var/app/com.valvesoftware.Steam/.local/share/Steam`) and
+/// the Snap path (`~/snap/steam/common/.local/share/Steam`).
 /// On Windows we look at `%PROGRAMFILES(X86)%/Steam` and `%PROGRAMFILES%/Steam`.
 /// On macOS we check `~/Library/Application Support/Steam`.
 pub fn detect_steam_libraries(os: Os) -> Vec<PathBuf> {
@@ -199,6 +200,9 @@ fn linux_roots() -> Vec<PathBuf> {
         v.push(h.join(".steam/steam"));
         v.push(h.join(".local/share/Steam"));
         v.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
+        // Snap package (canonical/steam) keeps its own HOME under ~/snap.
+        v.push(h.join("snap/steam/common/.local/share/Steam"));
+        v.push(h.join("snap/steam/common/.steam/steam"));
     }
     v
 }

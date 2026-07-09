@@ -651,6 +651,14 @@ struct SaveSlot {
     /// Currently-running guess from the last process poll. Drives
     /// GameStarted/Stopped transitions.
     is_running: bool,
+    /// Last poll at which this slot's process was seen running. Powers the
+    /// stop-debounce (`RUNNING_STICKY_SECS`): a correlation match is CPU-gated,
+    /// so a Paradox game idling in a menu or on a loading screen can dip below
+    /// the threshold for a tick and drop out of the running set. Without a
+    /// grace window that flaps GameStarted/Stopped (and its final-flush backup)
+    /// every few seconds. We keep the slot "running" until this is older than
+    /// the grace. `None` until first seen running.
+    last_running_seen: Option<TokioInstant>,
     /// Has the save folder changed since the last successful backup?
     /// Drives the v0.3 "final-flush-only-if-pending" rule on `GameStopped`
     /// — no point re-uploading an unchanged save just because the user
@@ -1268,6 +1276,7 @@ fn handle_add(
         watcher: None,
         pending: None,
         is_running: false,
+        last_running_seen: None,
         has_pending: false,
         last_fs_event_at: None,
         next_scheduled_backup_at: None,
@@ -1438,6 +1447,16 @@ const HEAVY_PROCESS_CPU_PCT: f32 = 25.0;
 /// un helper en reposo. Por debajo de `HEAVY_PROCESS_CPU_PCT` para que un juego
 /// moderadamente activo siga contando.
 const CORRELATION_MIN_CPU_PCT: f32 = 5.0;
+
+/// Grace window (in *poll ticks*) before a slot that dropped out of the running
+/// set is declared stopped. A correlation match is CPU-gated
+/// (`CORRELATION_MIN_CPU_PCT`), so a game idling in a menu or grinding a loading
+/// screen can dip under the floor for a tick and momentarily look stopped;
+/// without this it flaps GameStarted/Stopped (and a final-flush backup) every
+/// few seconds. We keep the slot "running" for this many consecutive
+/// not-seen polls (converted to seconds via `poll_secs`, floored at 90 s) before
+/// firing GameStopped. A genuine quit still resolves within the grace.
+const RUNNING_STICKY_POLLS: u64 = 3;
 
 /// Backoff applied when an auto-restore fails with a 404: the save is tracked
 /// locally but has no record/snapshot on the backend we're talking to (e.g.
@@ -3531,6 +3550,33 @@ fn process_poll(
     // Forget PIDs that have exited so a relaunch of the same game re-triggers.
     reported_heavy.retain(|pid| sys.processes().contains_key(pid));
 
+    // Stop-debounce. Refresh the "last seen running" stamp for every slot alive
+    // this tick, then re-add any slot that was running last tick but dropped out
+    // *and* is still inside the grace window. This absorbs one-tick CPU dips on
+    // a correlation match (Paradox menus, loading screens) that would otherwise
+    // flap GameStarted/Stopped — and its final-flush backup — every few seconds.
+    // A real quit stays out for the whole window and stops as normal.
+    let now_inst = TokioInstant::now();
+    for id in &running {
+        if let Some(slot) = slots.get_mut(id) {
+            slot.last_running_seen = Some(now_inst);
+        }
+    }
+    let sticky =
+        Duration::from_secs(config.poll_secs.saturating_mul(RUNNING_STICKY_POLLS).max(90));
+    let readd: Vec<String> = slots
+        .iter()
+        .filter(|(id, slot)| {
+            slot.is_running
+                && !running.contains(id.as_str())
+                && slot
+                    .last_running_seen
+                    .is_some_and(|seen| now_inst.duration_since(seen) < sticky)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    running.extend(readd);
+
     // PLAYTIME: atribuye el intervalo de este tick a los juegos vivos. El cap
     // es 4× el poll (mín. 30 s) para no contar un suspend/resume como juego.
     let mut running_games: Vec<(String, String)> = running
@@ -3851,6 +3897,7 @@ mod tests {
                 watcher: None,
                 pending: None,
                 is_running: false,
+                last_running_seen: None,
                 has_pending: false,
                 last_fs_event_at: None,
                 next_scheduled_backup_at: None,
@@ -3898,6 +3945,7 @@ mod tests {
             watcher: None,
             pending: None,
             is_running: false,
+            last_running_seen: None,
             has_pending: false,
             last_fs_event_at: None,
             next_scheduled_backup_at: None,

@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-07-09
+
 ### Added
+- **Libera espacio sin perder partidas.** Si tus guardados vivos superan el
+  límite del plan, un nuevo diálogo lista los juegos que más ocupan y te deja
+  archivar los más pesados: liberan la cuota al instante y la copia en la nube
+  queda congelada y descargable 7 días antes de borrarse. El guardado local
+  nunca se toca y es reversible al pasar a Pro.
 - **El recap (Wrapped) cuenta cualquier juego de Steam que juegues**, aunque no
   tenga partida local que copiar ni entrada en el catálogo (juegos online como
   War Selection, servidores privados, etc.). No enrola nada ni ensucia la lista
@@ -15,7 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   de Steam, le atribuye el tiempo. Se descartan las herramientas (Proton,
   runtimes, SteamVR) para que no sumen horas fantasma.
 
+### Changed
+- **Más espacio y límites más altos en Hoard Cloud.** El almacenamiento sube
+  (Free 1→2 GB, Pro 25→100 GB), igual que el tope por partida (Free
+  200 MB→1 GB, Pro 2→10 GB) y el ancho de banda por ventana de 15 min
+  (Free →3 GB, Pro →15 GB).
+- **Cuenta: se retira el botón «Comparar planes».**
+
 ### Fixed
+- **«Exportar todos los datos» ya no se queda cargando para siempre.** Un
+  trabajo de exportación que quedó a medias bloqueaba los siguientes; ahora se
+  detecta y se marca como fallido para poder reintentar, y el botón responde
+  aunque el email no llegue.
+- **El diálogo de liberar espacio muestra los juegos por su nombre** (antes
+  salían todos como «main») y, si la carga falla, un mensaje claro con botón de
+  reintento en vez de un error crudo.
 - **Sync global ya no puede pisar una partida en curso.** Con "Sync" activado,
   la bajada instantánea (avisada por el poller/SSE), el barrido de
   reconciliación y la barrera de pre-lanzamiento se saltaban las protecciones

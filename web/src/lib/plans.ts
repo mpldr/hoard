@@ -12,12 +12,12 @@ const MB = 1024 * 1024;
 export const PLANS: Record<PlanId, PlanLimits> = {
   free: {
     id: 'free',
-    storageBytes: 1 * GB,
+    storageBytes: 2 * GB,
     devices: 3,
     saves: null,
     versionHistoryForever: true,
-    maxSaveSizeBytes: 200 * MB,
-    bandwidthQuotaBytes: 1 * GB,
+    maxSaveSizeBytes: 1 * GB,
+    bandwidthQuotaBytes: 3 * GB,
     bandwidthWindowSecs: 15 * 60,
     priceMonthly: 0,
     priceYearly: 0
@@ -26,16 +26,16 @@ export const PLANS: Record<PlanId, PlanLimits> = {
     id: 'pro',
     // Pro x1 base tier. Higher tiers (+25 GB steps) only change storageBytes,
     // never the plan; sold via storage stepper -> server resolves the product.
-    storageBytes: 25 * GB,
+    storageBytes: 100 * GB,
     devices: null,
     saves: null,
     versionHistoryForever: true,
-    maxSaveSizeBytes: 2 * GB,
-    bandwidthQuotaBytes: 5 * GB,
+    maxSaveSizeBytes: 10 * GB,
+    bandwidthQuotaBytes: 15 * GB,
     bandwidthWindowSecs: 15 * 60,
-    priceMonthly: 1.49,
+    priceMonthly: 1.99,
     // Yearly = monthly × 10 (two months free).
-    priceYearly: 14.9
+    priceYearly: 19.99
   }
 };
 
@@ -54,14 +54,14 @@ export function formatPlanQuota(plan: PlanId): string {
   return `${Math.round(limit / MB)} MB`;
 }
 
-/** "200 MB" / "2 GB" — used in plan-card feature list. */
+/** "1 GB" / "10 GB" — used in plan-card feature list. */
 export function formatMaxSaveSize(plan: PlanId): string {
   const limit = PLANS[plan].maxSaveSizeBytes;
   if (limit >= GB) return `${Math.round(limit / GB)} GB`;
   return `${Math.round(limit / MB)} MB`;
 }
 
-/** "1 GB" / "5 GB" — used in plan-card feature list. */
+/** "3 GB" / "15 GB" — used in plan-card feature list. */
 export function formatBandwidthQuota(plan: PlanId): string {
   const limit = PLANS[plan].bandwidthQuotaBytes;
   if (limit >= GB) return `${Math.round(limit / GB)} GB`;

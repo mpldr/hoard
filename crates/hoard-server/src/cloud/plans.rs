@@ -49,37 +49,38 @@ impl Plan {
         match self {
             Plan::Free => PlanLimits {
                 plan: self,
-                storage_bytes: 1 * GB,
+                storage_bytes: 2 * GB,
                 devices: 3,
                 saves_tracked: None,
                 version_history_forever: true,
-                max_save_size_bytes: 200 * MB,
+                max_save_size_bytes: 1 * GB,
                 bandwidth_window_secs: 15 * 60,
-                // Doubled 1→2 GB (2026-07-04): a single large monolithic save
-                // (e.g. a ~144 MB Factorio `.zip` that barely dedups) rewritten
-                // by the game's autosave a handful of times inside the 15-min
-                // window was legitimately saturating the old 1 GB and tripping a
-                // confusing 429 on what the user saw as "one save".
-                bandwidth_quota_bytes: 2 * GB,
+                // Per-save cap raised 200 MB→1 GB and the 15-min window quota
+                // 2→3 GB (2026-07-09). A single large monolithic save (e.g. a
+                // ~144 MB Factorio `.zip` that barely dedups) rewritten by the
+                // game's autosave a handful of times inside the window was
+                // saturating the old quota and tripping a confusing 429 on what
+                // the user saw as "one save".
+                bandwidth_quota_bytes: 3 * GB,
             },
             Plan::Pro => PlanLimits {
                 plan: self,
                 // Base tier (Pro x1). The effective limit can be larger when
                 // the user bought a higher storage tier — see
                 // `effective_storage_limit` and `STORAGE_STEP_BYTES`.
-                storage_bytes: 25 * GB,
+                storage_bytes: 100 * GB,
                 devices: u32::MAX,
                 saves_tracked: None,
                 version_history_forever: true,
-                max_save_size_bytes: 2 * GB,
+                max_save_size_bytes: 10 * GB,
                 bandwidth_window_secs: 15 * 60,
-                // Single 15-min rolling window. Kept well above the 2 GB
-                // max single-save size so a first-time upload of a large
-                // save (whose `requested_bytes` ≈ its full size) can't be
+                // Single 15-min rolling window. Kept above the 10 GB max
+                // single-save size so a first-time upload of a large save
+                // (whose `requested_bytes` ≈ its full size) can't be
                 // permanently wedged behind the window, and roomy enough that
                 // onboarding several games at once doesn't trip a 429.
-                // Doubled 5→10 GB (2026-07-04) alongside the Free bump.
-                bandwidth_quota_bytes: 10 * GB,
+                // Raised to 15 GB (2026-07-09) alongside the Free bump.
+                bandwidth_quota_bytes: 15 * GB,
             },
         }
     }
@@ -121,7 +122,7 @@ pub const STORAGE_STEP_BYTES: u64 = 25 * GB;
 /// Free always gets the plan default regardless of any override left behind —
 /// a guard so a stale value from a lapsed Pro tier can never grant a free
 /// account extra room. Pro honours a positive override (the bought tier) and
-/// falls back to the 25 GB base when it's NULL/0.
+/// falls back to the 100 GB base when it's NULL/0.
 pub fn effective_storage_limit(plan: Plan, override_bytes: Option<i64>) -> u64 {
     match plan {
         Plan::Free => Plan::Free.limits().storage_bytes,
@@ -139,25 +140,25 @@ mod tests {
     #[test]
     fn free_limits_match_spec() {
         let l = Plan::Free.limits();
-        assert_eq!(l.storage_bytes, 1 * GB);
+        assert_eq!(l.storage_bytes, 2 * GB);
         assert_eq!(l.devices, 3);
         assert_eq!(l.saves_tracked, None);
         assert!(l.version_history_forever);
-        assert_eq!(l.max_save_size_bytes, 200 * MB);
+        assert_eq!(l.max_save_size_bytes, 1 * GB);
         assert_eq!(l.bandwidth_window_secs, 15 * 60);
-        assert_eq!(l.bandwidth_quota_bytes, 2 * GB);
+        assert_eq!(l.bandwidth_quota_bytes, 3 * GB);
     }
 
     #[test]
     fn pro_limits_match_spec() {
         let l = Plan::Pro.limits();
-        assert_eq!(l.storage_bytes, 25 * GB);
+        assert_eq!(l.storage_bytes, 100 * GB);
         assert_eq!(l.devices, u32::MAX);
         assert_eq!(l.saves_tracked, None);
         assert!(l.version_history_forever);
-        assert_eq!(l.max_save_size_bytes, 2 * GB);
+        assert_eq!(l.max_save_size_bytes, 10 * GB);
         assert_eq!(l.bandwidth_window_secs, 15 * 60);
-        assert_eq!(l.bandwidth_quota_bytes, 10 * GB);
+        assert_eq!(l.bandwidth_quota_bytes, 15 * GB);
     }
 
     #[test]
@@ -177,17 +178,17 @@ mod tests {
         // Free ignores any override.
         assert_eq!(
             effective_storage_limit(Plan::Free, Some(200 * GB as i64)),
-            1 * GB
+            2 * GB
         );
-        assert_eq!(effective_storage_limit(Plan::Free, None), 1 * GB);
-        // Pro falls back to the 25 GB base when NULL/0/negative.
-        assert_eq!(effective_storage_limit(Plan::Pro, None), 25 * GB);
-        assert_eq!(effective_storage_limit(Plan::Pro, Some(0)), 25 * GB);
-        assert_eq!(effective_storage_limit(Plan::Pro, Some(-5)), 25 * GB);
-        // Pro honours a bought tier (e.g. x4 = 100 GB).
+        assert_eq!(effective_storage_limit(Plan::Free, None), 2 * GB);
+        // Pro falls back to the 100 GB base when NULL/0/negative.
+        assert_eq!(effective_storage_limit(Plan::Pro, None), 100 * GB);
+        assert_eq!(effective_storage_limit(Plan::Pro, Some(0)), 100 * GB);
+        assert_eq!(effective_storage_limit(Plan::Pro, Some(-5)), 100 * GB);
+        // Pro honours a bought tier override above the base.
         assert_eq!(
-            effective_storage_limit(Plan::Pro, Some(100 * GB as i64)),
-            100 * GB
+            effective_storage_limit(Plan::Pro, Some(150 * GB as i64)),
+            150 * GB
         );
         assert_eq!(STORAGE_STEP_BYTES, 25 * GB);
     }

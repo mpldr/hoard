@@ -94,7 +94,7 @@ interval = "year"
 # server how much that product grants (written to profiles.storage_limit_bytes
 # by the webhook). One entry per (tier, interval). Add x3/x4/… by creating the
 # products in Polar and appending entries here. Omitting `storage_gb` means the
-# plan default (25 GB), which keeps an old single-tier config working.
+# plan default (100 GB), which is what the base Pro products do.
 #
 # IMPORTANT: replace the placeholder UUIDs with the real product IDs from your
 # Polar dashboard. Downgrades must be issued with proration_behavior=next_period
@@ -109,18 +109,16 @@ storage_downgrade_grace_days = 0
 access_token = ""
 webhook_secret = ""
 
-# --- Pro x1 (25 GB) — base ---
+# --- Pro (base) — no `storage_gb` → falls to the 100 GB plan default ---
 [[cloud.polar.products]]
 product_id = "4404a328-9289-4077-b25b-162ecd1d6ed3"
 plan = "pro"
 interval = "month"
-storage_gb = 25
 
 [[cloud.polar.products]]
 product_id = "77d81015-7c9d-4009-b2a6-e0c0a0901899"
 plan = "pro"
 interval = "year"
-storage_gb = 25
 
 # --- Pro x2 (50 GB) ---
 # [[cloud.polar.products]]

@@ -156,12 +156,10 @@
         <Button variant="secondary" size="sm" onclick={gotoUpgrade}>
           {$_('account.change_plan')}
         </Button>
-        {#if p.plan !== 'free'}
-          <Button variant="ghost" size="sm" onclick={gotoBilling}>
-            {$_('account.manage_billing')}
-            <ExternalLink class="h-3.5 w-3.5" />
-          </Button>
-        {/if}
+        <Button variant="ghost" size="sm" onclick={gotoBilling}>
+          {$_('account.manage_billing')}
+          <ExternalLink class="h-3.5 w-3.5" />
+        </Button>
       {/snippet}
 
       <div class="flex flex-wrap items-baseline gap-3">

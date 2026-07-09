@@ -77,7 +77,28 @@
     return sel;
   });
 
-  const gameName = (g: StorageGame) => g.label || g.game_slug;
+  // The list is one row per save; `game_slug` is the game and `label` is the
+  // save slot (almost always the default "main"). Show the game name — turn the
+  // slug into a title — and only surface the label when it disambiguates.
+  const ROMAN = new Set([
+    "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix",
+    "x", "xi", "xii", "xiii", "xiv", "xv",
+  ]);
+  function prettifyGame(slug: string): string {
+    return slug
+      .split("-")
+      .map((w) =>
+        !w
+          ? w
+          : ROMAN.has(w)
+            ? w.toUpperCase()
+            : w[0].toUpperCase() + w.slice(1),
+      )
+      .join(" ");
+  }
+  const gameName = (g: StorageGame) => prettifyGame(g.game_slug);
+  const saveLabel = (g: StorageGame) =>
+    g.label && g.label.toLowerCase() !== "main" ? g.label : null;
 
   async function handleContinue() {
     const ids = games
@@ -135,7 +156,16 @@
       {#if loading}
         <p class="text-sm text-zinc-500">{$_("liberate.loading")}</p>
       {:else if loadError}
-        <p class="text-sm text-rose-400">{loadError}</p>
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-sm text-rose-400">{$_("liberate.load_error")}</p>
+          <button
+            type="button"
+            onclick={() => void load()}
+            class="shrink-0 rounded-lg border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-800"
+          >
+            {$_("liberate.retry")}
+          </button>
+        </div>
       {:else if games.length === 0}
         <p class="text-sm text-zinc-500">{$_("liberate.nothing")}</p>
       {:else}
@@ -147,7 +177,12 @@
                 ? 'border-rose-500/40 bg-rose-500/10'
                 : 'border-white/[0.06] bg-zinc-950/40'}"
             >
-              <span class="truncate text-zinc-200">{gameName(g)}</span>
+              <span class="flex min-w-0 flex-col">
+                <span class="truncate text-zinc-200">{gameName(g)}</span>
+                {#if saveLabel(g)}
+                  <span class="truncate text-xs text-zinc-500">{saveLabel(g)}</span>
+                {/if}
+              </span>
               <span class="flex shrink-0 items-center gap-2">
                 {#if willArchive}
                   <span

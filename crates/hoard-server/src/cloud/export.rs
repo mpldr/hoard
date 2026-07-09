@@ -27,6 +27,14 @@ use uuid::Uuid;
 /// hammering the DB.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A job stuck in `running` past this is treated as dead and failed. The worker
+/// runs inside the API process, which Fly stops when the app scales to zero
+/// (`min_machines_running = 0`); a machine killed mid-build leaves its row
+/// `running` forever. Without recovery that row also wedges the feature, because
+/// `create_export_job` dedupes on any pending/running job — so every retry just
+/// re-polls the corpse. Reaping it to `failed` unblocks a fresh request.
+const STALE_RUNNING_AFTER: Duration = Duration::from_secs(60 * 60);
+
 /// How long a finished export ZIP lives in R2 before the sweep expires it.
 /// 7 is also the SigV4 presign ceiling, so the emailed link (presigned for one
 /// day less) is always valid for the object's whole life.
@@ -42,6 +50,12 @@ pub fn spawn(state: CloudState) {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         loop {
             ticker.tick().await;
+            // Recover jobs orphaned in `running` by a machine that stopped
+            // mid-build, before claiming new work — otherwise the dedup in
+            // `create_export_job` keeps every retry pinned to the dead row.
+            if let Err(e) = reap_stale(&state).await {
+                tracing::warn!(error = %e, "export stale-job reap failed");
+            }
             // Drain every pending job this tick, one at a time (exports are
             // heavy; serialising keeps peak memory to a single blob).
             loop {
@@ -82,6 +96,28 @@ async fn claim_next(state: &CloudState) -> Result<Option<(Uuid, Uuid)>, sqlx::Er
     )
     .fetch_optional(&state.pool)
     .await
+}
+
+/// Fail any job wedged in `running` past `STALE_RUNNING_AFTER`. Returns the
+/// number reaped. Uses `started_at` (set by `claim_next`); a NULL guards the
+/// rare row claimed before this column existed.
+async fn reap_stale(state: &CloudState) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE export_jobs
+            SET status = 'failed', finished_at = now(),
+                error = 'export interrupted (worker stopped mid-build); retry'
+          WHERE status = 'running'
+            AND started_at IS NOT NULL
+            AND started_at < now() - $1::interval",
+    )
+    .bind(format!("{} seconds", STALE_RUNNING_AFTER.as_secs()))
+    .execute(&state.pool)
+    .await?;
+    let n = res.rows_affected();
+    if n > 0 {
+        tracing::warn!(reaped = n, "reclaimed stale running export jobs");
+    }
+    Ok(n)
 }
 
 async fn run_job(state: &CloudState, job_id: Uuid, user_id: Uuid) -> anyhow::Result<()> {

@@ -17,6 +17,9 @@ primary_region = "cdg"
 kill_signal = "SIGINT"
 kill_timeout = "10s"
 
+[build]
+  dockerfile = "Dockerfile"
+
 [env]
   HOARD__SERVER__HOST = "0.0.0.0"
   HOARD__SERVER__PORT = "8082"

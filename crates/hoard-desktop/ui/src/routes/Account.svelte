@@ -19,7 +19,6 @@
   import Card from "../lib/components/Card.svelte";
   import Button from "../lib/components/Button.svelte";
   import Modal from "../lib/components/Modal.svelte";
-  import UpgradePlanModal from "../lib/components/UpgradePlanModal.svelte";
   import LiberateStorageModal from "../lib/components/LiberateStorageModal.svelte";
   import {
     cloud,
@@ -45,7 +44,6 @@
   >(null);
   let confirmDeleteOpen = $state(false);
   let deleteConfirmation = $state("");
-  let compareOpen = $state(false);
   let liberateOpen = $state(false);
 
   // Latest export job + a poll while it's building. The worker is async, so the
@@ -478,13 +476,6 @@
               {$_("account.manage_billing")}
             </Button>
           {/if}
-          <button
-            type="button"
-            class="text-xs text-zinc-400 underline-offset-2 hover:text-zinc-200 hover:underline"
-            onclick={() => (compareOpen = true)}
-          >
-            {$_("account.compare_plans")}
-          </button>
         </div>
       </div>
 
@@ -745,11 +736,6 @@
     </Button>
   {/snippet}
 </Modal>
-
-<UpgradePlanModal
-  open={compareOpen}
-  onClose={() => (compareOpen = false)}
-/>
 
 <LiberateStorageModal
   open={liberateOpen}

@@ -25,8 +25,10 @@
     FolderOpen,
     Pencil,
     RotateCcw,
+    RotateCw,
     Link,
     Clock,
+    Snowflake,
     X,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
@@ -50,6 +52,11 @@
   } from "../lib/api";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
   import { showError } from "../lib/stores/error_dialog";
+  import {
+    archivedSaves,
+    refreshArchivedSaves,
+    reactivateAndRefresh,
+  } from "../lib/stores/cloud";
 
   let report = $state<DetectionReport | null>(null);
   let tracked = $state<TrackedSave[]>([]);
@@ -167,7 +174,41 @@
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     }
+    // Which tracked saves are frozen in the black box (drives the badge +
+    // Reactivar button). Cloud-only; a no-op when self-hosted.
+    void refreshArchivedSaves();
   });
+
+  // Reactivate an archived save: recovers quota + resumes sync (within the
+  // 7-day window). Per-save busy set so only the pressed row spins.
+  let reactivating = $state<Set<string>>(new Set());
+
+  /** Localised purge date for an archived save, or null when it isn't
+   *  archived. Reads `$archivedSaves` so it re-derives when the map changes. */
+  function purgeDate(saveId: string): string | null {
+    const iso = $archivedSaves[saveId];
+    return iso ? new Date(iso).toLocaleDateString() : null;
+  }
+
+  async function reactivate(save: TrackedSave) {
+    if (reactivating.has(save.save_id)) return;
+    reactivating = new Set(reactivating).add(save.save_id);
+    try {
+      await reactivateAndRefresh(save.save_id);
+      toastSuccess(
+        $_("archived.reactivated_toast", {
+          values: { name: displayName(save.game_slug) },
+        }),
+      );
+      tracked = await api.listTrackedSaves();
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      const next = new Set(reactivating);
+      next.delete(save.save_id);
+      reactivating = next;
+    }
+  }
 
   // Opt a playtime-only game out of (or back into) the recap. Optimistic: we
   // flip `excluded` locally and reconcile from the backend, so the amber card
@@ -816,18 +857,34 @@
                 <FolderOpen size={11} class="shrink-0" />
                 <span class="truncate">{save.local_path}</span>
               </p>
-              <p class="mt-0.5 flex items-center gap-1.5 text-[11px]">
-                <span
-                  class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
-                    ? 'bg-amber-400'
-                    : 'bg-emerald-400'}"
-                ></span>
-                <span class={save.paused ? "text-amber-400" : "text-emerald-400/90"}>
-                  {save.paused
-                    ? $_("library.paused_badge")
-                    : $_("library.monitored_badge")}
-                </span>
-              </p>
+              {#if purgeDate(save.save_id)}
+                <p
+                  class="mt-0.5 flex items-center gap-1 text-[11px] text-sky-300"
+                  title={$_("archived.banner_body", {
+                    values: { date: purgeDate(save.save_id) },
+                  })}
+                >
+                  <Snowflake size={11} class="shrink-0" />
+                  <span class="truncate"
+                    >{$_("archived.frozen_note", {
+                      values: { date: purgeDate(save.save_id) },
+                    })}</span
+                  >
+                </p>
+              {:else}
+                <p class="mt-0.5 flex items-center gap-1.5 text-[11px]">
+                  <span
+                    class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
+                      ? 'bg-amber-400'
+                      : 'bg-emerald-400'}"
+                  ></span>
+                  <span class={save.paused ? "text-amber-400" : "text-emerald-400/90"}>
+                    {save.paused
+                      ? $_("library.paused_badge")
+                      : $_("library.monitored_badge")}
+                  </span>
+                </p>
+              {/if}
             </div>
             <span
               class="shrink-0 rounded bg-zinc-800 px-2 py-0.5 text-xs font-medium tabular-nums text-zinc-300"
@@ -837,6 +894,23 @@
                 ? fmtBytes(save.local_size_bytes)
                 : "—"}
             </span>
+            {#if purgeDate(save.save_id)}
+              <button
+                type="button"
+                onclick={() => reactivate(save)}
+                disabled={reactivating.has(save.save_id)}
+                title={$_("archived.reactivate")}
+                class="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-500/15 px-2 py-1 text-[11px] font-medium text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
+              >
+                <RotateCw
+                  size={12}
+                  class={reactivating.has(save.save_id) ? "animate-spin" : ""}
+                />
+                {reactivating.has(save.save_id)
+                  ? $_("archived.reactivating")
+                  : $_("archived.reactivate")}
+              </button>
+            {/if}
             <button
               type="button"
               onclick={() => askRename(save)}

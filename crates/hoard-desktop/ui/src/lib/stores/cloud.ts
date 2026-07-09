@@ -278,6 +278,39 @@ export async function reactivateSaveCloud(saveId: string): Promise<void> {
   await invoke<void>("cloud_reactivate_save", { saveId });
 }
 
+// ---- archived-save lookup (drives badges + the reactivate button) ----
+
+/** `save_id → RFC3339` hard-delete instant, for every archived game. Lets the
+ *  Library and History views badge a frozen game and offer "Reactivar" without
+ *  each re-deriving the archive state. Empty when signed out / self-hosted
+ *  (there's no black box there). Refresh via {@link refreshArchivedSaves}. */
+export const archivedSaves = writable<Record<string, string>>({});
+
+/** Repopulate {@link archivedSaves} from the server. No-op that clears the map
+ *  when the user isn't signed in to cloud. */
+export async function refreshArchivedSaves(): Promise<void> {
+  if (!get(internal).account) {
+    archivedSaves.set({});
+    return;
+  }
+  try {
+    const data = await storageGamesCloud();
+    const map: Record<string, string> = {};
+    for (const g of data.games) {
+      if (g.archived && g.purge_after) map[g.save_id] = g.purge_after;
+    }
+    archivedSaves.set(map);
+  } catch (e) {
+    console.warn("refreshArchivedSaves failed:", e);
+  }
+}
+
+/** Reactivate an archived game and refresh the map so its badge clears. */
+export async function reactivateAndRefresh(saveId: string): Promise<void> {
+  await reactivateSaveCloud(saveId);
+  await refreshArchivedSaves();
+}
+
 /** Soft-delete the cloud account. The server freezes it and keeps the data for
  *  a 30-day grace in case the user changes their mind (they can sign back in and
  *  reactivate). Local session is wiped here. */

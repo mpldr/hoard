@@ -35,6 +35,8 @@
     History as HistoryIcon,
     Folder,
     FolderOpen,
+    Snowflake,
+    RotateCw,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
@@ -51,7 +53,12 @@
     RestoreProgress,
   } from "../lib/api";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
-  import { isCloudLoggedIn } from "../lib/stores/cloud";
+  import {
+    isCloudLoggedIn,
+    archivedSaves,
+    refreshArchivedSaves,
+    reactivateAndRefresh,
+  } from "../lib/stores/cloud";
 
   type Props = { params?: { saveId?: string } };
   let { params }: Props = $props();
@@ -83,6 +90,14 @@
 
   let togglingPause = $state(false);
   let backingUp = $state(false);
+  let reactivating = $state(false);
+
+  // Localised hard-delete date if this save is frozen in the black box, else
+  // null. Reads `$archivedSaves` so it re-derives when the map refreshes.
+  const purgeDate = $derived.by(() => {
+    const iso = $archivedSaves[saveId];
+    return iso ? new Date(iso).toLocaleDateString() : null;
+  });
 
   // Sync presets — the catalog comes from the backend; `savingPreset` gates
   // the selector while a change is in flight.
@@ -99,6 +114,7 @@
       .listSavePresets()
       .then((p) => (presets = p))
       .catch(() => (presets = []));
+    void refreshArchivedSaves();
     await hydrate();
   });
 
@@ -298,6 +314,24 @@
     }
   }
 
+  async function reactivate() {
+    if (!save || reactivating) return;
+    reactivating = true;
+    try {
+      await reactivateAndRefresh(saveId);
+      toastSuccess(
+        $_("archived.reactivated_toast", {
+          values: { name: save.game_slug },
+        }),
+      );
+      await hydrate();
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      reactivating = false;
+    }
+  }
+
   async function togglePause() {
     if (!save) return;
     togglingPause = true;
@@ -462,6 +496,13 @@
                 <PauseCircle size={11} /> {$_("history.paused")}
               </span>
             {/if}
+            {#if purgeDate}
+              <span
+                class="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-medium text-sky-300 ring-1 ring-inset ring-sky-500/30"
+              >
+                <Snowflake size={11} /> {$_("archived.badge")}
+              </span>
+            {/if}
           </div>
           <p class="mt-2 flex items-center gap-2 text-sm text-zinc-400">
             <Folder size={14} class="text-zinc-500" />
@@ -519,6 +560,35 @@
         <p class="mt-2 text-xs text-zinc-500">
           {$_(`presets.${save.preset}.desc`)}
         </p>
+      {/if}
+
+      {#if purgeDate}
+        <div
+          class="mt-4 flex flex-col gap-3 rounded-lg border border-sky-500/30 bg-sky-500/[0.07] p-3 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div class="flex items-start gap-2">
+            <Snowflake size={16} class="mt-0.5 shrink-0 text-sky-300" />
+            <div>
+              <p class="text-sm font-medium text-sky-200">
+                {$_("archived.banner_title")}
+              </p>
+              <p class="mt-0.5 text-xs text-sky-200/80">
+                {$_("archived.banner_body", { values: { date: purgeDate } })}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onclick={reactivate}
+            disabled={reactivating}
+            class="inline-flex shrink-0 items-center justify-center gap-1.5 self-start rounded-lg bg-sky-500 px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-400 disabled:opacity-50 sm:self-auto"
+          >
+            <RotateCw size={14} class={reactivating ? "animate-spin" : ""} />
+            {reactivating
+              ? $_("archived.reactivating")
+              : $_("archived.reactivate")}
+          </button>
+        </div>
       {/if}
     </header>
 

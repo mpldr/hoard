@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Official self-hosted Docker image on GHCR.** Every release tag now
+  publishes a prebuilt multi-arch image (`ghcr.io/rleeon/hoard`, amd64 +
+  arm64), so operators can `docker compose pull && docker compose up -d` to
+  update instead of building from source on their box — friendlier to NAS
+  setups and tools like Dockge/Watchtower. Building locally still works
+  (uncomment `build:` in the compose file).
+
+### Changed
+- CI now runs only on version tags, pull requests, and manual dispatch —
+  routine branch pushes (including docs-only edits) no longer spend Actions
+  minutes. Validate locally with `cargo check` + `pnpm check` before pushing.
+
 ## [1.0.1] — 2026-07-09
 
 The reliability release. A single-PC data-loss window in Global Sync is closed

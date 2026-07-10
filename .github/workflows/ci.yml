@@ -1,9 +1,16 @@
 name: CI
 
 on:
+  # Full CI runs only on a version tag (the release gate) and on demand — never
+  # on routine branch pushes, so editing a single .md no longer spends Actions
+  # minutes. Validate locally before pushing with `cargo check --workspace` +
+  # `pnpm --dir crates/hoard-desktop/ui check` (see CLAUDE.md). PRs still get
+  # checked if you ever open one.
   push:
-    branches: [master, main]
+    tags:
+      - "v*.*.*"
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

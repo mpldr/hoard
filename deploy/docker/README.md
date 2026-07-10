@@ -2,12 +2,12 @@
 
 This directory contains everything needed to run Hoard in a container.
 
-## Quick start
+## Quick start (prebuilt image)
+
+The compose file pulls a prebuilt multi-arch image from GHCR
+(`ghcr.io/rleeon/hoard`), so no local build is needed:
 
 ```sh
-# from repo root
-docker build -t hoard:latest -f deploy/docker/Dockerfile .
-
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
 $EDITOR deploy/docker/config/config.toml   # set public_url, retention, etc.
@@ -15,6 +15,25 @@ $EDITOR deploy/docker/config/config.toml   # set public_url, retention, etc.
 cd deploy/docker
 docker compose up -d
 docker compose logs -f
+```
+
+Updating later is just:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+Pin a version tag (`ghcr.io/rleeon/hoard:1.0`) instead of `:latest` in
+`docker-compose.yml` for reproducible upgrades.
+
+## Building from source instead
+
+Uncomment the `build:` block in `docker-compose.yml` (it overrides the pull),
+or build the image by hand:
+
+```sh
+# from repo root
+docker build -t hoard:latest -f deploy/docker/Dockerfile .
 ```
 
 ## Creating an admin user

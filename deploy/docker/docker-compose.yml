@@ -11,11 +11,16 @@
 
 services:
   server:
-    image: hoard:latest
-    build:
-      # Build context is the repo root so the Cargo workspace is visible.
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
+    # Prebuilt multi-arch image (amd64/arm64) published to GHCR on every
+    # release tag — `docker compose pull && docker compose up -d` to update.
+    # Pin a version (…/hoard:1.0) instead of :latest for reproducible upgrades.
+    image: ghcr.io/rleeon/hoard:latest
+    # To build from source instead of pulling, uncomment `build:` below (it
+    # overrides the pull) — the context is the repo root so the workspace
+    # resolves.
+    # build:
+    #   context: ../..
+    #   dockerfile: deploy/docker/Dockerfile
     container_name: hoard-server
     restart: unless-stopped
     ports:

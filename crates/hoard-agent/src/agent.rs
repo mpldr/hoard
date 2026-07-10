@@ -167,11 +167,12 @@ pub struct WatchedSave {
     pub steam_install_dir: Option<PathBuf>,
     /// Process executable file names (case-insensitive, with extension on
     /// Windows). The agent's process poll matches against these to fire
-    /// `GameStarted` / `GameStopped` transitions. Empty list = match by
-    /// `steam_install_dir` only. Today the desktop never populates this
-    /// — the curated TOML catalog that fed it was removed in 1.5.0 — so
-    /// every save falls back to install-dir matching. The field stays
-    /// in case a future catalog ships process names again.
+    /// `GameStarted` / `GameStopped` transitions. Rarely populated (only the
+    /// curated `builtin_processes_for` list — Minecraft, emuladores…); the
+    /// TOML catalog that fed it se quitó en 1.5.0. Con la lista vacía el match
+    /// NO se queda en `steam_install_dir`: el poll también casa por identidad
+    /// genérica (nombre/carpeta del proceso vs slug del juego, list-free y
+    /// multiplataforma — ver `game_identity_tokens` / `process_identity_candidates`).
     #[serde(default)]
     pub processes: Vec<String>,
     /// Resolved per-save sync overrides (from the save's preset). Empty by
@@ -3371,6 +3372,118 @@ fn accept_correlation_signals<'a>(
 /// One sweep of the process table. Emits transitions + schedules a
 /// post-game backup when a watched game stops running.
 ///
+/// Longitud mínima de un token de identidad para que cuente en el match
+/// genérico. Por debajo (`gta`, `ori`, `ff`) es demasiado corto y colisiona
+/// con carpetas o nombres de proceso cualesquiera.
+const MIN_IDENTITY_TOKEN_LEN: usize = 4;
+
+/// Token canónico de identidad de un juego/proceso: solo alfanuméricos ASCII en
+/// minúscula, sin separadores ni extensión. Unifica las tres formas en las que
+/// el mismo juego aparece — slug (`victoria-3`), nombre visible (`Victoria 3`) y
+/// ejecutable (`victoria3.exe` → `victoria3`) — en una sola clave comparable.
+fn canon_token(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Tokens de identidad de un save rastreado, derivados de datos que ya tenemos
+/// (slug + nombre visible) — SIN lista curada. Son las claves contra las que se
+/// compara cada proceso vivo.
+fn game_identity_tokens(slug: &str, display: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(2);
+    for raw in [slug, display] {
+        let t = canon_token(raw);
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !v.contains(&t) {
+            v.push(t);
+        }
+    }
+    v
+}
+
+/// Candidatos de identidad de un proceso vivo, list-free y multiplataforma: el
+/// basename del ejecutable (`.../Stellaris/stellaris` → `stellaris`), el nombre
+/// del proceso, y cada componente de la RUTA del ejecutable — porque la carpeta
+/// de instalación casi siempre lleva el nombre del juego (`steamapps/common/The
+/// Witcher 3 Wild Hunt/...`, `GOG Games/...`, el `.app` de macOS). Con esto un
+/// juego cuyo exe está abreviado (`witcher3.exe`) casa igual por su carpeta. La
+/// comparación es igualdad exacta de tokens canónicos, así que un componente
+/// genérico (`common`, `bin`, `x64`) no colisiona con un slug real.
+fn process_identity_candidates(name: &str, exe: Option<&Path>) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    let push = |s: &str, v: &mut Vec<String>| {
+        let t = canon_token(s);
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !v.contains(&t) {
+            v.push(t);
+        }
+    };
+    push(name, &mut v);
+    if let Some(exe) = exe {
+        if let Some(base) = exe.file_stem().and_then(|s| s.to_str()) {
+            push(base, &mut v);
+        }
+        for comp in exe.components() {
+            if let std::path::Component::Normal(c) = comp {
+                if let Some(s) = c.to_str() {
+                    push(s, &mut v);
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Rutas abiertas (fd + cwd) por el proceso `pid` que caen DENTRO de alguna de
+/// `folders`. Señal de arranque agnóstica del instalador y del nombre del exe:
+/// si un proceso de juego tiene abierto un fichero de la carpeta de save (o su
+/// cwd está ahí), ese proceso es el juego de ese save — sin catálogo, sin Steam
+/// y sin esperar a que escriba (basta con que lo tenga abierto, p. ej. al listar
+/// partidas en el menú de carga o al mapear el save en memoria). Devuelve los
+/// `save_id` casados.
+///
+/// Hoy solo Linux/SteamOS (vía `/proc/<pid>/fd` y `/proc/<pid>/cwd`, que no
+/// requieren privilegios para procesos propios). Windows/macOS devuelven vacío
+/// por ahora — su equivalente (enumerar handles / `proc_pidfdinfo`) queda
+/// pendiente; ahí la detección se apoya en nombre/carpeta y correlación.
+#[cfg(target_os = "linux")]
+fn open_paths_matching(pid: Pid, folders: &[(&str, &Path)]) -> Vec<String> {
+    let mut hits: Vec<String> = Vec::new();
+    if folders.is_empty() {
+        return hits;
+    }
+    let check = |p: &Path, hits: &mut Vec<String>| {
+        for (id, folder) in folders {
+            if p.starts_with(folder) && !hits.iter().any(|h| h == id) {
+                hits.push((*id).to_string());
+            }
+        }
+    };
+    let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+    if let Ok(cwd) = std::fs::read_link(base.join("cwd")) {
+        check(&cwd, &mut hits);
+    }
+    if let Ok(entries) = std::fs::read_dir(base.join("fd")) {
+        for entry in entries.flatten() {
+            if hits.len() == folders.len() {
+                break; // ya casaron todos; no sigas leyendo fds
+            }
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                check(&target, &mut hits);
+            }
+        }
+    }
+    hits
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_paths_matching(_pid: Pid, _folders: &[(&str, &Path)]) -> Vec<String> {
+    Vec::new()
+}
+
 /// Since 1.4 this no longer touches the fs watcher — the watcher is armed
 /// in `handle_add` and lives for the slot's lifetime. `process_poll` is
 /// pure UI signal (Dashboard pill, "the game just closed → flush" hint).
@@ -3408,12 +3521,37 @@ fn process_poll(
     // rebuilt a HashSet per slot per tick, which got worse now that playtime-
     // only games add up to ~16 extra slots.
     let mut name_index: HashMap<String, Vec<&str>> = HashMap::new();
+    // Índice genérico de identidad (slug/nombre → save_ids), list-free y
+    // multiplataforma. Es la vía que arregla los juegos sin procesos
+    // configurados (Stellaris, Victoria…): antes solo casaban por correlación
+    // fría o por `steam_install_dir`, así que la primera sesión no disparaba
+    // "arrancó" ni auto-restore aunque el save sí se detectara. Ahora casan por
+    // su propio nombre/carpeta sin depender de Steam ni de una lista curada.
+    let mut token_index: HashMap<String, Vec<&str>> = HashMap::new();
+    // Carpetas de save rastreadas `(save_id, local_path)`. Las usa la detección
+    // por HANDLES ABIERTOS: un proceso de juego que tiene un fichero abierto
+    // dentro de una de estas carpetas ES el juego de ese save — agnóstico del
+    // instalador y del nombre del exe (resuelve exes en clave como EU5 sin
+    // catálogo ni Steam). Se saltan los `track_only` (no tienen save real).
+    let mut save_folders: Vec<(&str, &Path)> = Vec::new();
     let mut dir_slots: Vec<(&str, &Path)> = Vec::new();
     // Señales de correlación candidatas `(proc_name_lower, save_id, game_slug)`,
     // recogidas aparte para vetar las ambiguas ANTES de que cuenten horas (ver
     // `accept_correlation_signals`).
     let mut corr_candidates: Vec<(String, &str, &str)> = Vec::new();
     for slot in slots.values() {
+        // Identidad genérica: vale para TODOS los slots (con o sin procesos
+        // configurados, `track_only` incluido). Es aditivo sobre un HashSet, así
+        // que solaparse con `name_index` es inocuo.
+        for tok in game_identity_tokens(&slot.save.game_slug, &slot.save.display_name) {
+            token_index
+                .entry(tok)
+                .or_default()
+                .push(slot.save.save_id.as_str());
+        }
+        if !slot.save.track_only {
+            save_folders.push((slot.save.save_id.as_str(), slot.save.local_path.as_path()));
+        }
         if slot.save.processes.is_empty() {
             // Correlation-learned launch signal (ADR 0020, storefront- y
             // juego-agnóstico): si Hoard ya observó algún proceso de JUEGO
@@ -3483,6 +3621,29 @@ fn process_poll(
                 running.extend(ids.iter().map(|id| id.to_string()));
             }
         }
+        // Match genérico por identidad (list-free): el proceso lleva el nombre
+        // del juego o corre desde su carpeta de instalación. Sin gate de CPU —
+        // igualdad exacta con el slug/nombre del juego es señal fuerte por sí
+        // sola, y así un juego pausado (menús de Paradox, a 0% de CPU) sigue
+        // contando como "corriendo". `is_game_like` descarta sistema/launchers.
+        if !token_index.is_empty() && crate::correlation::is_game_like(&name, proc.exe()) {
+            for cand in process_identity_candidates(&name, proc.exe()) {
+                if let Some(ids) = token_index.get(&cand) {
+                    running.extend(ids.iter().map(|id| id.to_string()));
+                }
+            }
+        }
+        // Match por HANDLES ABIERTOS (agnóstico del instalador y del nombre del
+        // exe): si un proceso de juego tiene abierto un fichero de la carpeta de
+        // save, es el juego de ese save. Resuelve los exes en clave/abreviados
+        // (EU5 → `eu5.exe`) que ni el nombre ni la carpeta delatan, sin catálogo
+        // ni Steam. Sólo para procesos con pinta de juego, para acotar el coste
+        // de leer `/proc/<pid>/fd`.
+        if !save_folders.is_empty() && crate::correlation::is_game_like(&name, proc.exe()) {
+            for id in open_paths_matching(*pid, &save_folders) {
+                running.insert(id);
+            }
+        }
         // Match por correlación: sólo cuenta si el proceso está realmente
         // activo este tick. Un util de fondo mal correlacionado con una carpeta
         // de save vive a ~0% y no debe parecer un juego corriendo (ni disparar
@@ -3503,13 +3664,12 @@ fn process_poll(
             }
         }
 
-        // PLAYTIME "solo lo que juegas": cualquier juego de Steam que corra
-        // desde su carpeta de instalación cuenta horas aunque no esté rastreado
-        // ni en el catálogo curado. Exigimos CPU real, que no sea un hilo y que
-        // tenga pinta de juego para no contar herramientas de fondo (Proton,
-        // runtimes) que viven bajo `steamapps/common`. La atribución a
-        // `steam_running` (por slug) se reconcilia con los slots más abajo para
-        // no contar dos veces un juego que ya tiene su slot.
+        // PLAYTIME "solo lo que juegas" (recap, Steam): cuenta horas de juegos
+        // de Steam aunque no estén rastreados. Es SOLO para el Wrapped, no para
+        // detectar arranque — la detección de "corriendo" es agnóstica del
+        // instalador (nombre/carpeta + handles abiertos + correlación), sin
+        // tocar Steam. Exigimos CPU real, no-hilo y pinta de juego para no
+        // sumar herramientas de fondo bajo `steamapps/common`.
         if !steam_index.is_empty()
             && proc.thread_kind().is_none()
             && proc.cpu_usage() >= CORRELATION_MIN_CPU_PCT
@@ -3780,6 +3940,75 @@ fn process_poll(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn canon_token_unifies_slug_name_and_exe() {
+        // Las tres formas del mismo juego colapsan a un token.
+        assert_eq!(canon_token("victoria-3"), "victoria3");
+        assert_eq!(canon_token("Victoria 3"), "victoria3");
+        assert_eq!(canon_token("victoria3.exe"), "victoria3exe");
+        assert_eq!(canon_token("stellaris"), "stellaris");
+    }
+
+    #[test]
+    fn game_tokens_drop_short_and_dedup() {
+        // Slug y nombre visible que colapsan al mismo token → uno solo.
+        assert_eq!(game_identity_tokens("stellaris", "Stellaris"), ["stellaris"]);
+        // Token demasiado corto se descarta (colisiona con cualquier carpeta).
+        assert!(game_identity_tokens("gta", "GTA").is_empty());
+    }
+
+    #[test]
+    fn process_matches_game_by_exe_basename() {
+        // Caso Stellaris/Victoria: el exe lleva el nombre del juego.
+        let cands = process_identity_candidates(
+            "victoria3",
+            Some(Path::new("/home/u/.steam/steamapps/common/Victoria 3/binaries/victoria3")),
+        );
+        assert!(cands.contains(&"victoria3".to_string()));
+    }
+
+    #[test]
+    fn process_matches_game_by_install_folder() {
+        // Exe abreviado (`witcher3`) pero la CARPETA lleva el nombre completo:
+        // el slug casa por el componente de ruta, no por el basename.
+        let cands = process_identity_candidates(
+            "witcher3",
+            Some(Path::new(
+                "/games/GOG Games/The Witcher 3 Wild Hunt/bin/x64/witcher3.exe",
+            )),
+        );
+        assert!(cands.contains(&canon_token("the-witcher-3-wild-hunt")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_handle_detects_process_holding_a_save_file() {
+        // Un fichero abierto dentro de la carpeta de save delata al proceso
+        // dueño, sin depender del nombre del exe (caso EU5).
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("Save Games");
+        std::fs::create_dir_all(&save).unwrap();
+        let f = std::fs::File::create(save.join("autosave.sav")).unwrap();
+        let pid = Pid::from_u32(std::process::id());
+        let folders: Vec<(&str, &Path)> = vec![("save-eu5", save.as_path())];
+        let hits = open_paths_matching(pid, &folders);
+        assert!(hits.contains(&"save-eu5".to_string()));
+        drop(f);
+        // Cerrado el fichero, ya no casa.
+        let hits2 = open_paths_matching(pid, &folders);
+        assert!(!hits2.contains(&"save-eu5".to_string()));
+    }
+
+    #[test]
+    fn generic_identity_ignores_unrelated_process() {
+        // Un proceso sin relación no produce el token del juego.
+        let cands = process_identity_candidates(
+            "firefox",
+            Some(Path::new("/usr/lib/firefox/firefox")),
+        );
+        assert!(!cands.contains(&"stellaris".to_string()));
+    }
 
     #[test]
     fn config_defaults_are_sane() {

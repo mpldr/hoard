@@ -117,6 +117,13 @@ const NON_GAME_PROCESS: &[&str] = &[
     "rivatuner",
     "radeonsoftware",
     "windhawk",
+    // Overlays / helpers de vendor de GPU en Windows: viven en Program Files, así
+    // que la regla de ruta de sistema NO los alcanza y (a diferencia de los de
+    // System32) hay que nombrarlos. Idlean a ~0% CPU, o sea que el orden por CPU
+    // de `sample_game_processes` ya los relega — esto es solo red de seguridad
+    // para el caso raro de juego pausado. "NVIDIA Overlay.exe", "nvcontainer.exe".
+    "nvidia",
+    "nvcontainer",
     // El propio Hoard.
     "hoard",
 ];
@@ -134,7 +141,19 @@ pub struct GameProcess {
 /// o en `/opt/<juego>` — nunca en `/usr` ni `/lib`. Filtra el grueso de la
 /// basura observada (hilos de Brave en `/opt/brave.com`, Electron en
 /// `/usr/lib/...`, `gsd-*` en `/usr/libexec`).
-const SYSTEM_EXE_PREFIXES: &[&str] = &["/usr/", "/lib", "/lib64", "/bin", "/sbin", "/run/"];
+/// Vale para Linux/SteamOS y macOS (`/System/` = daemons del sistema; los juegos
+/// de mac viven en `/Applications/*.app`, no aquí).
+const SYSTEM_EXE_PREFIXES: &[&str] =
+    &["/usr/", "/lib", "/lib64", "/bin", "/sbin", "/run/", "/System/"];
+
+/// Igual pero para Windows: un exe bajo el directorio de Windows (`C:\Windows\`,
+/// System32, SysWOW64, WinSxS…) es del sistema, nunca un juego. Match por
+/// substring `:\windows\` para cubrir cualquier letra de unidad. Esto filtra
+/// `RuntimeBroker.exe`, `ssh.exe`, `conhost.exe`, etc. que en Windows envenenaban
+/// la correlación porque `SYSTEM_EXE_PREFIXES` solo tenía rutas Linux.
+fn is_windows_system_exe(exe_str: &str) -> bool {
+    exe_str.contains(":\\windows\\")
+}
 
 /// `true` si el proceso parece un juego (no sistema/launcher/navegador).
 /// Usa el nombre y, cuando está, la ruta del ejecutable: un nombre de hilo
@@ -150,6 +169,9 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
     if let Some(exe) = exe {
         let exe_str = exe.to_string_lossy().to_lowercase();
         if SYSTEM_EXE_PREFIXES.iter().any(|p| exe_str.starts_with(p)) {
+            return false;
+        }
+        if is_windows_system_exe(&exe_str) {
             return false;
         }
         // El nombre del proceso puede ser un hilo genérico; mira también el
@@ -178,7 +200,7 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
 ///   correlación alimenta el playtime, y atribuir un save a un worker de
 ///   kernel —que vive 24/7— acumularía horas para siempre.
 pub fn sample_game_processes(sys: &System) -> Vec<GameProcess> {
-    let mut out = Vec::new();
+    let mut scored: Vec<(f32, GameProcess)> = Vec::new();
     for proc in sys.processes().values() {
         if proc.thread_kind().is_some() {
             continue;
@@ -188,13 +210,21 @@ pub fn sample_game_processes(sys: &System) -> Vec<GameProcess> {
         };
         let name = proc.name().to_string_lossy().to_string();
         if is_game_like(&name, Some(&exe)) {
-            out.push(GameProcess {
-                name,
-                exe: Some(exe),
-            });
+            scored.push((
+                proc.cpu_usage(),
+                GameProcess {
+                    name,
+                    exe: Some(exe),
+                },
+            ));
         }
     }
-    out
+    // Orden por CPU descendente: el juego real quema CPU mientras los helpers de
+    // fondo (overlays, brokers, Steam Cloud) están casi a cero. `record()` atribuye
+    // por `.first()`, así que este orden hace que la correlación apunte al juego
+    // y no al primer proceso arbitrario del mapa. Empate ⇒ orden estable.
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Una escritura observada en un dir, atribuida a un proceso de juego.
@@ -443,6 +473,39 @@ mod tests {
             "factorio.exe",
             Some(Path::new(
                 "/home/u/.wine64/drive_c/Factorio/bin/factorio.exe"
+            ))
+        ));
+    }
+
+    #[test]
+    fn is_game_like_rejects_windows_system_and_overlays() {
+        // Procesos de fondo de Windows que envenenaban la correlación real:
+        // ssh.exe / RuntimeBroker.exe bajo C:\Windows\ (ruta de sistema)…
+        assert!(!is_game_like(
+            "ssh.exe",
+            Some(Path::new("C:\\Windows\\System32\\OpenSSH\\ssh.exe"))
+        ));
+        assert!(!is_game_like(
+            "RuntimeBroker.exe",
+            Some(Path::new("C:\\Windows\\System32\\RuntimeBroker.exe"))
+        ));
+        // …y overlay de NVIDIA en Program Files (no lo pilla la ruta, sí el nombre).
+        assert!(!is_game_like(
+            "NVIDIA Overlay.exe",
+            Some(Path::new(
+                "C:\\Program Files\\NVIDIA Corporation\\NVIDIA app\\NVIDIA Overlay.exe"
+            ))
+        ));
+        // Otra unidad distinta de C: también cuenta como sistema.
+        assert!(!is_game_like(
+            "conhost.exe",
+            Some(Path::new("D:\\Windows\\System32\\conhost.exe"))
+        ));
+        // eu5.exe instalado en la biblioteca de Steam pasa el filtro.
+        assert!(is_game_like(
+            "eu5.exe",
+            Some(Path::new(
+                "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Europa Universalis V\\eu5.exe"
             ))
         ));
     }

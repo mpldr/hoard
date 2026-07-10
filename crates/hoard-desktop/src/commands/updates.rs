@@ -428,6 +428,9 @@ pub async fn apply_desktop_update(
 /// Failures are logged and swallowed — the worst case is the user has to
 /// reopen the app from their app menu, which is exactly the 1.4.0 status
 /// quo we're trying to improve.
+// `exe_before` solo se consume en la rama Linux (relanzar el binario tras el
+// .deb); en Windows/mac el parámetro no se lee y sería un unused-variable.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn relaunch_then_exit(app: &AppHandle, exe_before: Option<std::path::PathBuf>) {
     #[cfg(target_os = "linux")]
     {

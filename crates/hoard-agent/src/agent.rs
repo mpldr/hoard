@@ -3385,9 +3385,6 @@ fn accept_correlation_signals<'a>(
     out
 }
 
-/// One sweep of the process table. Emits transitions + schedules a
-/// post-game backup when a watched game stops running.
-///
 /// Longitud mínima de un token de identidad para que cuente en el match
 /// genérico. Por debajo (`gta`, `ori`, `ff`) es demasiado corto y colisiona
 /// con carpetas o nombres de proceso cualesquiera.
@@ -3500,6 +3497,9 @@ fn open_paths_matching(_pid: Pid, _folders: &[(&str, &Path)]) -> Vec<String> {
     Vec::new()
 }
 
+/// One sweep of the process table. Emits transitions + schedules a
+/// post-game backup when a watched game stops running.
+///
 /// Since 1.4 this no longer touches the fs watcher — the watcher is armed
 /// in `handle_add` and lives for the slot's lifetime. `process_poll` is
 /// pure UI signal (Dashboard pill, "the game just closed → flush" hint).
@@ -3623,7 +3623,17 @@ fn process_poll(
         corr_index.entry(pname).or_default().push(save_id);
     }
 
+    // Señales FUERTES: el proceso lleva el nombre/identidad del juego, corre
+    // desde su carpeta de instalación o tiene un fichero de su save abierto.
+    // Todas exigen que el ejecutable real del juego EXISTA ahora mismo, así que
+    // no pueden mantener "corriendo" un juego ya cerrado.
     let mut running: HashSet<String> = HashSet::new();
+    // Señales DÉBILES (correlación carpeta→proceso): no exigen el exe real del
+    // juego, solo que "algún proceso de juego" tocara su carpeta alguna vez. Un
+    // proceso de fondo mal atribuido puede mantenerlas vivas indefinidamente
+    // (caso offworld: 35 min sin cerrarse). Se resuelven aparte para poder
+    // aplicarles el guard "un juego a la vez" más abajo.
+    let mut weak_running: HashSet<String> = HashSet::new();
     // PLAYTIME "solo lo que juegas": slugs de juegos de Steam que corren pero
     // no están rastreados por ningún slot (ni save real ni catálogo). Se cuentan
     // igual para el Wrapped; ver `steam_index` y la atribución más abajo.
@@ -3660,13 +3670,14 @@ fn process_poll(
                 running.insert(id);
             }
         }
-        // Match por correlación: sólo cuenta si el proceso está realmente
-        // activo este tick. Un util de fondo mal correlacionado con una carpeta
-        // de save vive a ~0% y no debe parecer un juego corriendo (ni disparar
-        // "arrancó" ni el barrier de auto-restore).
+        // Match por correlación (señal DÉBIL): sólo cuenta si el proceso está
+        // realmente activo este tick. Un util de fondo mal correlacionado con
+        // una carpeta de save vive a ~0% y no debe parecer un juego corriendo.
+        // Va a `weak_running`: el guard "un juego a la vez" la descartará si otro
+        // juego corre por señal fuerte (ver más abajo).
         if !corr_index.is_empty() && proc.cpu_usage() >= CORRELATION_MIN_CPU_PCT {
             if let Some(ids) = corr_index.get(&name) {
-                running.extend(ids.iter().map(|id| id.to_string()));
+                weak_running.extend(ids.iter().map(|id| id.to_string()));
             }
         }
         // Legacy install-dir fallback for slots without process names.
@@ -3727,31 +3738,66 @@ fn process_poll(
     reported_heavy.retain(|pid| sys.processes().contains_key(pid));
 
     // Stop-debounce. Refresh the "last seen running" stamp for every slot alive
-    // this tick, then re-add any slot that was running last tick but dropped out
-    // *and* is still inside the grace window. This absorbs one-tick CPU dips on
-    // a correlation match (Paradox menus, loading screens) that would otherwise
-    // flap GameStarted/Stopped — and its final-flush backup — every few seconds.
-    // A real quit stays out for the whole window and stops as normal.
+    // this tick (fuerte o débil), then re-add any slot that was running last
+    // tick but dropped out *and* is still inside the grace window. This absorbs
+    // one-tick CPU dips on a correlation match (Paradox menus, loading screens)
+    // that would otherwise flap GameStarted/Stopped — and its final-flush backup
+    // — every few seconds. A real quit stays out for the whole window and stops
+    // as normal.
     let now_inst = TokioInstant::now();
-    for id in &running {
+    for id in running.iter().chain(weak_running.iter()) {
         if let Some(slot) = slots.get_mut(id) {
             slot.last_running_seen = Some(now_inst);
         }
     }
+    let live_now: HashSet<&str> = running
+        .iter()
+        .chain(weak_running.iter())
+        .map(|s| s.as_str())
+        .collect();
     let sticky =
         Duration::from_secs(config.poll_secs.saturating_mul(RUNNING_STICKY_POLLS).max(90));
     let readd: Vec<String> = slots
         .iter()
         .filter(|(id, slot)| {
             slot.is_running
-                && !running.contains(id.as_str())
+                && !live_now.contains(id.as_str())
                 && slot
                     .last_running_seen
                     .is_some_and(|seen| now_inst.duration_since(seen) < sticky)
         })
         .map(|(id, _)| id.clone())
         .collect();
-    running.extend(readd);
+
+    // Guard "un juego a la vez": las señales fuertes (`running`) exigen que el
+    // exe real del juego exista, así que sus slugs son juegos que corren de
+    // verdad AHORA. Casi nadie juega a dos a la vez, y una correlación pegada a
+    // un proceso de fondo puede mantener un juego ya cerrado "arrancado" para
+    // siempre (offworld). Por eso, si algún juego corre por señal fuerte,
+    // descartamos las señales DÉBILES (correlación) y las re-añadidas por
+    // sticky de OTROS juegos: al arrancar otro juego, el fantasma se apaga y se
+    // queda apagado mientras juegas. Sin ningún juego fuerte, la correlación y
+    // el sticky siguen valiendo (juegos que SOLO casan así se detectan igual).
+    let strong_slugs: HashSet<String> = running
+        .iter()
+        .filter_map(|id| slots.get(id).map(|s| s.save.game_slug.clone()))
+        .collect();
+    let survives_guard = |id: &str| -> bool {
+        strong_slugs.is_empty()
+            || slots
+                .get(id)
+                .is_some_and(|s| strong_slugs.contains(&s.save.game_slug))
+    };
+    for id in weak_running.into_iter().chain(readd) {
+        if survives_guard(&id) {
+            running.insert(id);
+        } else {
+            tracing::debug!(
+                save_id = %id,
+                "agent: señal débil/sticky descartada — otro juego corre por señal fuerte"
+            );
+        }
+    }
 
     // PLAYTIME: atribuye el intervalo de este tick a los juegos vivos. El cap
     // es 4× el poll (mín. 30 s) para no contar un suspend/resume como juego.

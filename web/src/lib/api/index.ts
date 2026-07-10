@@ -77,6 +77,27 @@ export const api = {
     await authedFetch(`/v1/devices/${id}`, { method: 'DELETE' });
   },
 
+  /**
+   * Approve a headless CLI's device-pairing request. The phone is signed in;
+   * the server mints a fresh session for *this* user and hands it to the
+   * waiting CLI. `code` is the short user_code shown by `hoard login`. Throws
+   * with the server's error `code` ("not_found" for a wrong/expired code) so
+   * the page can localize the message.
+   */
+  async approveDevice(code: string): Promise<{ hostname: string | null }> {
+    const res = await authedFetch('/v1/cloud/device/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_code: code })
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}) as Record<string, unknown>);
+      throw new Error((detail?.code as string) ?? `approve failed: ${res.status}`);
+    }
+    const j = await res.json();
+    return { hostname: (j.hostname as string) ?? null };
+  },
+
   async usageEvents(limit = 20): Promise<UsageEvent[]> {
     const res = await authedFetch(`/v1/usage?limit=${limit}`);
     if (!res.ok) return [];

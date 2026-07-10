@@ -288,5 +288,16 @@
   "guides.back": "All guides",
   "guides.updated": "Updated",
   "guides.cta_title": "Ready to protect your saves?",
-  "guides.cta_text": "Download Hoard and set up automatic, versioned backups in a couple of minutes."
+  "guides.cta_text": "Download Hoard and set up automatic, versioned backups in a couple of minutes.",
+  "link.title": "Link a device",
+  "link.subtitle": "Approve the code shown by the Hoard CLI on your other machine.",
+  "link.need_signin": "Sign in to approve this device.",
+  "link.signed_in_as": "Signed in as",
+  "link.code_label": "Pairing code",
+  "link.approve": "Approve",
+  "link.approve_hint": "Only approve a code you started yourself on a device you own.",
+  "link.approved": "Device approved.",
+  "link.approved_hint": "You can go back to that machine — it's signing in now.",
+  "link.err_not_found": "That code is invalid or has expired. Start again on your device.",
+  "link.err_generic": "Couldn't approve the device. Try again."
 }

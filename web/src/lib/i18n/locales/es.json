@@ -288,5 +288,16 @@
   "guides.back": "Todas las guías",
   "guides.updated": "Actualizado",
   "guides.cta_title": "¿Listo para proteger tus partidas?",
-  "guides.cta_text": "Descarga Hoard y configura copias automáticas y versionadas en un par de minutos."
+  "guides.cta_text": "Descarga Hoard y configura copias automáticas y versionadas en un par de minutos.",
+  "link.title": "Vincular un dispositivo",
+  "link.subtitle": "Aprueba el código que muestra la CLI de Hoard en tu otra máquina.",
+  "link.need_signin": "Inicia sesión para aprobar este dispositivo.",
+  "link.signed_in_as": "Sesión iniciada como",
+  "link.code_label": "Código de vinculación",
+  "link.approve": "Aprobar",
+  "link.approve_hint": "Aprueba solo un código que hayas iniciado tú en un dispositivo tuyo.",
+  "link.approved": "Dispositivo aprobado.",
+  "link.approved_hint": "Vuelve a esa máquina: ya está iniciando sesión.",
+  "link.err_not_found": "Ese código no es válido o ha caducado. Empieza de nuevo en tu dispositivo.",
+  "link.err_generic": "No se pudo aprobar el dispositivo. Inténtalo de nuevo."
 }

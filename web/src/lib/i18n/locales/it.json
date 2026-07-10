@@ -288,5 +288,16 @@
   "guides.back": "Tutte le guide",
   "guides.updated": "Aggiornato",
   "guides.cta_title": "Pronto a proteggere i tuoi salvataggi?",
-  "guides.cta_text": "Scarica Hoard e configura backup automatici e versionati in un paio di minuti."
+  "guides.cta_text": "Scarica Hoard e configura backup automatici e versionati in un paio di minuti.",
+  "link.title": "Collega un dispositivo",
+  "link.subtitle": "Approva il codice mostrato dalla CLI di Hoard sull'altra macchina.",
+  "link.need_signin": "Accedi per approvare questo dispositivo.",
+  "link.signed_in_as": "Accesso come",
+  "link.code_label": "Codice di abbinamento",
+  "link.approve": "Approva",
+  "link.approve_hint": "Approva solo un codice che hai avviato tu su un dispositivo tuo.",
+  "link.approved": "Dispositivo approvato.",
+  "link.approved_hint": "Torna a quella macchina: sta effettuando l'accesso.",
+  "link.err_not_found": "Codice non valido o scaduto. Ricomincia dal tuo dispositivo.",
+  "link.err_generic": "Impossibile approvare il dispositivo. Riprova."
 }

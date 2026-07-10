@@ -184,6 +184,9 @@ pub async fn start_agent(
             game_slug: s.game_slug.clone(),
         })
         .collect();
+    // Capturado antes de mover `config` al agente (lo usa el forwarder para no
+    // marcar como "esperando" el debounce rutinario).
+    let debounce_ms = config.debounce_secs.saturating_mul(1000);
     let (handle, _task) = agent::spawn(client, config, saves, events_tx);
 
     // Fan out the synthetic watcher-armed events. Done after `spawn` so the
@@ -202,6 +205,10 @@ pub async fn start_agent(
     // semantic names ("upload", "throttled") without forcing every legacy
     // listener to rename. The original `agent://backup-*` topics stay live.
     let app_for_emit = app.clone();
+    // `debounce_ms` (capturado arriba, antes de mover `config`) distingue una
+    // espera REAL por throttle —el min-interval aplazó la subida por encima del
+    // debounce— del debounce rutinario de cada autosave. Sin esto, "en cola —
+    // esperando…" salía en cada guardado aunque el suelo por defecto sea 0.
     tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             // The event variant name doubles as the Tauri channel suffix.
@@ -283,8 +290,12 @@ pub async fn start_agent(
                 }
                 AgentEvent::BackupScheduled {
                     reason: hoard_agent::agent::BackupReason::FilesystemSettled,
+                    delay_ms,
                     ..
-                } => {
+                } if *delay_ms > debounce_ms => {
+                    // Solo cuando el min-interval aplazó la subida más allá del
+                    // debounce hay una espera de verdad que mostrar. El debounce
+                    // rutinario (delay == debounce) no es "en cola — esperando".
                     let _ = app_for_emit.emit("agent://throttled", &ev);
                 }
                 _ => {}

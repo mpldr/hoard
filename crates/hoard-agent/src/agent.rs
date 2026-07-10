@@ -81,8 +81,10 @@ pub struct AgentConfig {
     /// intermediate writes coalesce into the next one (the final state is
     /// always uploaded). Kills the "one version per minute" cadence of games
     /// that autosave every few seconds (OpenTTD). `0` disables the floor
-    /// (legacy behaviour — every settle backs up). The desktop derives this
-    /// from `Prefs::data_saving` via `lerp(k, 5s, 600s)`.
+    /// (every settle backs up — sin espera). The desktop derives this from
+    /// `Prefs::data_saving` via `min_snapshot_interval_for`: la franja baja del
+    /// deslizador (incluido el default) da `0`; sólo al empujar hacia "ahorro"
+    /// aparece un suelo, hasta 600 s.
     pub min_snapshot_interval_secs: u64,
     /// Mirror of `Prefs::global_sync`. Distinct from [`Self::auto_restore`]:
     /// it opts every save into restore (same effect as `auto_restore` on the
@@ -128,12 +130,26 @@ impl Default for AgentConfig {
     }
 }
 
-/// Map the user's `data_saving` knob (0..=1) to a minimum snapshot interval
-/// in seconds via `lerp(k, 5, 600)` (ADR 0018, Decisión 4). `k=0` keeps the
-/// eager 5 s floor; `k=1` waits up to 10 min between backups of a save.
+/// Umbral del deslizador "Ahorro de datos" por debajo del cual NO se impone
+/// suelo entre snapshots: el cambio sube en cuanto se asienta el debounce, sin
+/// "en cola — esperando". Cubre el default de fábrica (`data_saving = 0.3`) para
+/// que el usuario nunca vea una subida en espera salvo que pida ahorrar a
+/// propósito.
+const DATA_SAVING_NO_FLOOR_UPTO: f64 = 0.4;
+
+/// Map the user's `data_saving` knob (0..=1) to a minimum snapshot interval in
+/// seconds (ADR 0018, Decisión 4). La franja baja (`k ≤ DATA_SAVING_NO_FLOOR_UPTO`,
+/// incluido el default) devuelve `0`: sin espera, la subida es inmediata tras el
+/// debounce. Por encima del umbral el suelo crece linealmente hasta 600 s
+/// (`k = 1`, "máximo ahorro" ≈ 10 min entre snapshots). Los presets con suelo
+/// explícito (`short_session` 30 s, `data_saver` 600 s) siguen mandando por save.
 pub fn min_snapshot_interval_for(data_saving: f64) -> u64 {
     let k = data_saving.clamp(0.0, 1.0);
-    (5.0 + (600.0 - 5.0) * k).round() as u64
+    if k <= DATA_SAVING_NO_FLOOR_UPTO {
+        return 0;
+    }
+    let t = (k - DATA_SAVING_NO_FLOOR_UPTO) / (1.0 - DATA_SAVING_NO_FLOOR_UPTO);
+    (600.0 * t).round() as u64
 }
 
 /// The *minimal* process-refresh set the agent actually consumes. The process

@@ -692,6 +692,10 @@ async fn launch_installer(path: &std::path::Path) -> Result<(), String> {
 /// "up to date"; on `upgraded` it tells the user to restart manually.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Sólo la impl de Linux construye estas variantes; en Windows/macOS el stub
+// devuelve error y nunca las crea, pero el tipo debe existir cross-platform
+// (es el retorno del comando Tauri y su forma serde).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum ServerUpgradeOutcome {
     /// The new binary is on disk *and* `systemctl restart hoard-server`
     /// returned 0. The user can keep using the app immediately.

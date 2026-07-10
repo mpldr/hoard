@@ -30,6 +30,7 @@ cloud = [
     "dep:base64",
     "dep:zip",
     "dep:tempfile",
+    "dep:rand",
 ]
 
 [dependencies]
@@ -84,6 +85,8 @@ zip = { workspace = true, optional = true }
 # Export worker builds the ZIP on a temp file (streamed to R2) to keep the
 # whole archive off the heap.
 tempfile = { workspace = true, optional = true }
+# Device-pairing codes (CLI browserless login): random device_code + user_code.
+rand = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
 # Enabled (under `--features cloud`) to pull the matching aws-smithy

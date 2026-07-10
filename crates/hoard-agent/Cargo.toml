@@ -58,10 +58,10 @@ keyring = { version = "3", default-features = false, features = [
     "crypto-rust",
 ] }
 
-# Windows-only registry access for `pathexpand::expand_registry_path` and
-# the OneDrive-aware Known Folder lookups (User Shell Folders). Kept under
-# `cfg(windows)` so non-Windows builds don't pull it in. Single consumer,
-# so it stays out of `[workspace.dependencies]`.
+# Windows-only registry access for `pathexpand` (OneDrive-aware Known Folder
+# lookups via User Shell Folders) and `steam` (Steam's install path from
+# `Valve\Steam\SteamPath`, so non-default install drives are found). Kept
+# under `cfg(windows)` so non-Windows builds don't pull it in.
 #
 # `rusqlite` powers the GOG Galaxy enumerator in `launchers.rs`: Galaxy
 # stores its installed-product index in `galaxy-2.0.db`, a sqlite file

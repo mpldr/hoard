@@ -6,7 +6,7 @@
 //! which is conceptually a JSON-ish nested map; we parse it with a
 //! minimal tokenizer rather than pulling in a full VDF crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -41,10 +41,12 @@ pub struct ProtonPrefix {
 /// On Linux the lookup considers the native install (`~/.steam/steam`), the
 /// Flatpak path (`~/.var/app/com.valvesoftware.Steam/.local/share/Steam`) and
 /// the Snap path (`~/snap/steam/common/.local/share/Steam`).
-/// On Windows we look at `%PROGRAMFILES(X86)%/Steam` and `%PROGRAMFILES%/Steam`.
+/// On Windows we read Steam's own install path from the registry (so a
+/// non-default drive is covered) and fall back to `%PROGRAMFILES(X86)%/Steam`
+/// and `%PROGRAMFILES%/Steam`.
 /// On macOS we check `~/Library/Application Support/Steam`.
 pub fn detect_steam_libraries(os: Os) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = match os {
+    let roots: Vec<PathBuf> = match os {
         Os::Linux => linux_roots(),
         Os::Windows => windows_roots(),
         Os::Mac => mac_roots(),
@@ -52,27 +54,70 @@ pub fn detect_steam_libraries(os: Os) -> Vec<PathBuf> {
 
     // The root itself always doubles as a library — Steam ships its own
     // `steamapps` there. Then any extra libraries are listed inside
-    // libraryfolders.vdf.
+    // libraryfolders.vdf. `seen` de-dups by a normalised key so the same
+    // directory reached two ways (e.g. registry root vs `%ProgramFiles%`
+    // guess on Windows) is only counted once.
     let mut libraries: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for root in &roots {
-        if root.join("steamapps").is_dir() {
+        if root.join("steamapps").is_dir() && seen.insert(lib_key(root)) {
             libraries.push(root.clone());
         }
         let vdf = root.join("steamapps/libraryfolders.vdf");
-        if let Ok(text) = std::fs::read_to_string(&vdf) {
-            for extra in parse_library_folders(&text) {
-                if extra.join("steamapps").is_dir() && !libraries.contains(&extra) {
-                    libraries.push(extra);
-                }
+        let text = match std::fs::read_to_string(&vdf) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for extra in parse_library_folders(&text) {
+            if !extra.join("steamapps").is_dir() {
+                // A library that libraryfolders.vdf lists but whose steamapps
+                // dir isn't readable right now: almost always an unmounted
+                // drive, an offline NAS/removable path, or a permissions
+                // issue. This is the usual reason "only the main library
+                // shows up", so log it at info so it's visible in the app.
+                tracing::info!(
+                    library = %extra.display(),
+                    "Steam library listed in libraryfolders.vdf skipped — no readable steamapps dir (drive offline / not mounted / no permission?)"
+                );
+                continue;
+            }
+            if seen.insert(lib_key(&extra)) {
+                libraries.push(extra);
             }
         }
     }
 
     libraries.sort();
     libraries.dedup();
-    // Free the root buffer so callers don't keep a dangling ref.
-    roots.clear();
+    tracing::debug!(
+        ?os,
+        roots = roots.len(),
+        libraries = libraries.len(),
+        detected = %libraries
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "Steam library scan"
+    );
     libraries
+}
+
+/// Normalised key for de-duplicating library paths. On Windows the same
+/// directory can arrive spelled two ways — the registry gives
+/// `c:/program files (x86)/steam` (forward slashes, lower-case) while the
+/// `%ProgramFiles%` guess gives `C:\Program Files (x86)\Steam` — so fold case
+/// and slash direction there. Elsewhere paths are case-sensitive; leave them.
+fn lib_key(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    #[cfg(windows)]
+    {
+        s.replace('\\', "/").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s.into_owned()
+    }
 }
 
 /// List Steam apps installed across all detected libraries.
@@ -209,12 +254,60 @@ fn linux_roots() -> Vec<PathBuf> {
 
 fn windows_roots() -> Vec<PathBuf> {
     let mut v = Vec::new();
+    // Steam's own recorded install path first — this is the only source that
+    // survives a non-default install drive (`D:\Steam`, etc.). The
+    // `%ProgramFiles%` guesses below are the fallback for when the registry
+    // read fails.
+    if let Some(reg) = windows_registry_root() {
+        v.push(reg);
+    }
     for var in ["ProgramFiles(x86)", "ProgramFiles", "PROGRAMFILES"] {
         if let Some(p) = std::env::var_os(var) {
             v.push(PathBuf::from(p).join("Steam"));
         }
     }
     v
+}
+
+/// Steam's install directory as recorded in the registry.
+///
+/// HKCU `Software\Valve\Steam\SteamPath` is the per-user value Steam keeps
+/// current (forward-slashed, e.g. `d:/steam`); HKLM
+/// `…\Valve\Steam\InstallPath` is the machine-wide fallback (back-slashed).
+/// Reading this is what lets `libraryfolders.vdf` be found — and therefore
+/// every extra library be enumerated — even when Steam lives on another drive.
+#[cfg(windows)]
+fn windows_registry_root() -> Option<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(key) = hkcu.open_subkey(r"Software\Valve\Steam") {
+        if let Ok(p) = key.get_value::<String, _>("SteamPath") {
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for subkey in [
+        r"SOFTWARE\Wow6432Node\Valve\Steam",
+        r"SOFTWARE\Valve\Steam",
+    ] {
+        if let Ok(key) = hklm.open_subkey(subkey) {
+            if let Ok(p) = key.get_value::<String, _>("InstallPath") {
+                if !p.is_empty() {
+                    return Some(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn windows_registry_root() -> Option<PathBuf> {
+    None
 }
 
 fn mac_roots() -> Vec<PathBuf> {
@@ -506,6 +599,41 @@ mod tests {
             let ids: Vec<u64> = prefixes.iter().map(|p| p.app_id).collect();
             assert_eq!(ids, vec![413150]);
             assert!(prefixes[0].prefix_root.ends_with("compatdata/413150/pfx"));
+        });
+    }
+
+    #[test]
+    fn detect_libraries_skips_absent_and_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join(".steam/steam");
+        std::fs::create_dir_all(root.join("steamapps")).unwrap();
+        // An extra library that exists on disk.
+        let extra = home.join("games/SteamLibrary");
+        std::fs::create_dir_all(extra.join("steamapps")).unwrap();
+        // A ghost library listed in the vdf but with no steamapps dir
+        // (unmounted drive / offline NAS) — must be skipped.
+        let ghost = home.join("mnt/nas/SteamLibrary");
+
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n  \"0\" {{ \"path\" \"{}\" }}\n  \"1\" {{ \"path\" \"{}\" }}\n  \"2\" {{ \"path\" \"{}\" }}\n}}\n",
+                root.display(),
+                extra.display(),
+                ghost.display(),
+            ),
+        )
+        .unwrap();
+
+        with_home(home, || {
+            let libs = detect_steam_libraries(Os::Linux);
+            assert!(libs.contains(&root), "root library present");
+            assert!(libs.contains(&extra), "extra readable library present");
+            assert!(!libs.contains(&ghost), "ghost library skipped");
+            // The root is listed both as a linux_root and inside the vdf; it
+            // must appear exactly once.
+            assert_eq!(libs.iter().filter(|p| **p == root).count(), 1);
         });
     }
 

@@ -102,8 +102,11 @@ interval = "year"
 # Grace window (days) a user keeps their old, larger storage limit after
 # downgrading to a tier below their current usage. Nothing is purged during the
 # window and /v1/me advertises the pending change so the app can warn first.
-# Cloud-only; self-hosted has no quotas.
-storage_downgrade_grace_days = 0
+# Cloud-only; self-hosted has no quotas. 30 = one month of buffer after the
+# paid period ENDS (subscription.revoked / retroactive expiry), never from the
+# cancel click — the webhook only downgrades to Free on 'expired', not on the
+# 'grace' state a cancellation leaves behind.
+storage_downgrade_grace_days = 30
 
 [cloud.polar]
 access_token = ""

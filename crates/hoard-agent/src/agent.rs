@@ -806,6 +806,14 @@ async fn run_agent(
     // one event per process; `process_poll` prunes exited PIDs each tick so a
     // relaunch re-triggers.
     let mut reported_heavy: HashSet<Pid> = HashSet::new();
+    // Estado cross-tick de la detección por correlación (señal DÉBIL), que ahora
+    // es transición de PID en vez de presencia+CPU: `prev_pids` es la foto de
+    // PIDs vivos del tick anterior (para saber cuáles NACIERON este tick) y
+    // `corr_running` mapea `save_id → (pid, start_time)` del proceso que hoy
+    // mantiene ese slot "corriendo". Un residente (Discord desde el boot) nunca
+    // es nuevo, así que jamás dispara "arrancó"; el slot para cuando su PID muere.
+    let mut prev_pids: HashSet<Pid> = HashSet::new();
+    let mut corr_running: HashMap<String, (Pid, u64)> = HashMap::new();
 
     // PLAYTIME "solo lo que juegas": índice `carpeta Steam → slug` de la
     // biblioteca instalada. El poll atribuye horas a cualquier juego de Steam
@@ -1176,7 +1184,7 @@ async fn run_agent(
                 let any_running = process_poll(
                     &mut sys, &mut slots, &events_tx, &api, &config, &done_tx, &cmd_tx,
                     &mut playtime, playtime_path.as_deref(), &mut reported_heavy,
-                    &corr_store, &steam_index,
+                    &corr_store, &steam_index, &mut prev_pids, &mut corr_running,
                 );
                 // Watcher self-healing: a slot whose folder didn't exist when
                 // the game was tracked (freshly installed, save dir created on
@@ -3520,6 +3528,8 @@ fn process_poll(
     reported_heavy: &mut HashSet<Pid>,
     corr_store: &crate::correlation::CorrelationStore,
     steam_index: &crate::playtime_index::SteamPlaytimeIndex,
+    prev_pids: &mut HashSet<Pid>,
+    corr_running: &mut HashMap<String, (Pid, u64)>,
 ) -> bool {
     // Refresh every process. The `true` flag asks sysinfo to remove
     // entries for processes that have exited since the last refresh,
@@ -3623,6 +3633,14 @@ fn process_poll(
         corr_index.entry(pname).or_default().push(save_id);
     }
 
+    // Señal DÉBIL = transición de PID, no presencia+CPU. `first_tick` (no había
+    // foto previa) marca el arranque del agente: en él NO disparamos "arrancó"
+    // por correlación —adoptamos lo que ya corría como pre-existente— para no
+    // confundir un residente vivo desde el boot con un lanzamiento. `cur_pids`
+    // se convierte en la foto del próximo tick.
+    let first_tick = prev_pids.is_empty();
+    let mut cur_pids: HashSet<Pid> = HashSet::with_capacity(sys.processes().len());
+
     // Señales FUERTES: el proceso lleva el nombre/identidad del juego, corre
     // desde su carpeta de instalación o tiene un fichero de su save abierto.
     // Todas exigen que el ejecutable real del juego EXISTA ahora mismo, así que
@@ -3670,14 +3688,35 @@ fn process_poll(
                 running.insert(id);
             }
         }
-        // Match por correlación (señal DÉBIL): sólo cuenta si el proceso está
-        // realmente activo este tick. Un util de fondo mal correlacionado con
-        // una carpeta de save vive a ~0% y no debe parecer un juego corriendo.
-        // Va a `weak_running`: el guard "un juego a la vez" la descartará si otro
+        cur_pids.insert(*pid);
+        // Match por correlación (señal DÉBIL) por TRANSICIÓN DE PID: el slot
+        // corre mientras viva el PID que lo arrancó, y sólo arranca cuando un PID
+        // que casa su nombre NACE este tick (no estaba el tick anterior). Sin
+        // gate de CPU: un residente correlacionado por error (Discord) nunca
+        // "aparece", así que ningún pico de CPU puede dispararlo. Va a
+        // `weak_running`; el guard "un juego a la vez" aún lo descarta si otro
         // juego corre por señal fuerte (ver más abajo).
-        if !corr_index.is_empty() && proc.cpu_usage() >= CORRELATION_MIN_CPU_PCT {
+        if !corr_index.is_empty() {
             if let Some(ids) = corr_index.get(&name) {
-                weak_running.extend(ids.iter().map(|id| id.to_string()));
+                let st = proc.start_time();
+                for id in ids {
+                    match corr_running.get(*id) {
+                        // Es el PID que ya mantenía vivo este slot y sigue vivo.
+                        Some((rpid, rst)) if *rpid == *pid && *rst == st => {
+                            weak_running.insert(id.to_string());
+                        }
+                        // PID distinto (o slot parado): sólo cuenta si acaba de
+                        // nacer. En el primer tick tras arrancar el agente nada
+                        // es "nuevo" — un juego ya abierto se detecta igual por
+                        // señal fuerte; la correlación lo recupera al relanzar.
+                        _ => {
+                            if !first_tick && !prev_pids.contains(pid) {
+                                weak_running.insert(id.to_string());
+                                corr_running.insert(id.to_string(), (*pid, st));
+                            }
+                        }
+                    }
+                }
             }
         }
         // Legacy install-dir fallback for slots without process names.
@@ -3736,25 +3775,24 @@ fn process_poll(
     }
     // Forget PIDs that have exited so a relaunch of the same game re-triggers.
     reported_heavy.retain(|pid| sys.processes().contains_key(pid));
+    // Suelta la atribución débil de slots cuyo PID ya no vive, y guarda la foto
+    // de PIDs para que el próximo tick sepa cuáles nacieron.
+    corr_running.retain(|_, (pid, _)| cur_pids.contains(pid));
+    *prev_pids = cur_pids;
 
-    // Stop-debounce. Refresh the "last seen running" stamp for every slot alive
-    // this tick (fuerte o débil), then re-add any slot that was running last
-    // tick but dropped out *and* is still inside the grace window. This absorbs
-    // one-tick CPU dips on a correlation match (Paradox menus, loading screens)
-    // that would otherwise flap GameStarted/Stopped — and its final-flush backup
-    // — every few seconds. A real quit stays out for the whole window and stops
-    // as normal.
+    // Stop-debounce SÓLO para señales FUERTES: un match por nombre/handle puede
+    // caerse un tick por una carrera del refresco de procesos. Las señales
+    // DÉBILES ya son exactas (transición de PID: su "parado" es la muerte del
+    // PID), así que NO entran en el sticky — sin ellas aquí desaparece el ciclo
+    // de 90 s y el "35 min sin cerrarse". Refresca el stamp de los slots fuertes
+    // vivos y re-añade los que cayeron dentro de la ventana de gracia.
     let now_inst = TokioInstant::now();
-    for id in running.iter().chain(weak_running.iter()) {
+    for id in running.iter() {
         if let Some(slot) = slots.get_mut(id) {
             slot.last_running_seen = Some(now_inst);
         }
     }
-    let live_now: HashSet<&str> = running
-        .iter()
-        .chain(weak_running.iter())
-        .map(|s| s.as_str())
-        .collect();
+    let live_now: HashSet<&str> = running.iter().map(|s| s.as_str()).collect();
     let sticky =
         Duration::from_secs(config.poll_secs.saturating_mul(RUNNING_STICKY_POLLS).max(90));
     let readd: Vec<String> = slots

@@ -18,17 +18,13 @@
 //! `stop_agent` cleanly shuts the agent down on logout. `backup_now`
 //! exposes the manual-trigger button on the dashboard.
 
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentSlotStatus, WatchedSave};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
-use hoard_agent::manifest::Os;
 use hoard_agent::prefs::Prefs;
-use hoard_agent::presets::{self, SavePolicy};
 use hoard_agent::state::{CliState, SaveState};
-use hoard_agent::steam;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use time::OffsetDateTime;
@@ -398,85 +394,11 @@ pub async fn agent_status(state: State<'_, AppState>) -> Result<Vec<AgentSlotSta
 /// machine. We try to enrich each entry with its Steam install dir so the
 /// process watcher has something to match against.
 fn hydrate_watched_saves(_state: &State<'_, AppState>) -> anyhow::Result<Vec<WatchedSave>> {
+    // Business logic lives in the agent so the CLI daemon builds the exact same
+    // watch list (Steam-enriched saves + playtime-only slots). This wrapper is
+    // just the desktop's entry point.
     let (cli_state, _) = CliState::load_default()?;
-
-    // Cache Steam apps once — if the user has 100 tracked saves we don't
-    // want to scan `appmanifest_*.acf` 100 times. `list_installed_steam_games`
-    // is cheap (sub-second on a normal install) so a single call here is
-    // negligible startup cost.
-    let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
-
-    // Playtime-only games (Fortnite, Rust…): seed before consuming
-    // `cli_state.saves`. `tracked_slugs` keeps us from enrolling a
-    // playtime-only duplicate for a game already backed up as a real save.
-    let tracked_slugs: std::collections::HashSet<String> = cli_state
-        .saves
-        .values()
-        .map(|s| s.game_slug.clone())
-        .collect();
-    let playtime_saves =
-        crate::commands::playtime::derive_playtime_saves(&cli_state, &tracked_slugs);
-
-    let mut out = Vec::with_capacity(cli_state.saves.len() + playtime_saves.len());
-    for (save_id, save_state) in cli_state.saves {
-        if save_state.paused {
-            // The user has explicitly told us to leave this save alone.
-            // Skipping it here keeps the agent unaware of it entirely —
-            // no process matching, no FS watch, no backups.
-            continue;
-        }
-        let steam_install_dir = steam_apps
-            .iter()
-            .find(|a| name_matches(&a.name, &save_state.game_slug))
-            .map(|a| a.install_dir.clone());
-
-        let policy = resolve_policy(&save_state.game_slug, save_state.preset.as_deref());
-        out.push(WatchedSave {
-            save_id,
-            game_slug: save_state.game_slug.clone(),
-            // We don't store the display name in CliState today; reuse the
-            // slug as a stand-in. The UI re-fetches display name from the
-            // server cache anyway.
-            display_name: save_state.game_slug.clone(),
-            label: save_state.label,
-            local_path: save_state.local_path,
-            steam_install_dir,
-            // A manually-pinned process list (emulator saves) wins; otherwise
-            // derive from the slug as before. Persisting it on `SaveState` is
-            // what keeps a manual emulator's play-detection alive across
-            // restarts — its slug isn't in the built-in catalog.
-            processes: if save_state.processes.is_empty() {
-                resolve_processes(&save_state.game_slug)
-            } else {
-                save_state.processes.clone()
-            },
-            policy,
-            known_version: save_state.last_version_num,
-            set_hash: save_state.set_hash.clone(),
-            track_only: false,
-        });
-    }
-    out.extend(playtime_saves);
-    Ok(out)
-}
-
-/// Loose match between a Steam app name and a Hoard slug. Steam stores
-/// "Stardew Valley", we store "stardew-valley"; comparing
-/// kebab-cased-lowercase against lowercase-with-spaces-removed catches
-/// most cases.
-fn name_matches(steam_name: &str, slug: &str) -> bool {
-    let a: String = steam_name
-        .chars()
-        .filter_map(|c| {
-            if c.is_alphanumeric() {
-                Some(c.to_ascii_lowercase())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let b: String = slug.chars().filter(|c| c.is_alphanumeric()).collect();
-    !a.is_empty() && a == b
+    Ok(hoard_agent::library::watched_saves_from_state(&cli_state))
 }
 
 /// Glue used by `add_game_to_tracking` so newly tracked saves auto-attach
@@ -490,6 +412,23 @@ pub(crate) async fn attach_save_if_running(state: &State<'_, AppState>, save: Wa
     }
 }
 
+/// Apply the live-agent side effect that a save-settings change
+/// (`hoard_agent::library::set_paused`/`set_preset`/`set_local_path`) asks for.
+/// Keeps the desktop's attach/detach glue in one place; the CLI ignores the
+/// reseat entirely (a separate daemon picks the change up on restart).
+pub(crate) async fn apply_reseat(state: &State<'_, AppState>, reseat: hoard_agent::library::LiveReseat) {
+    use hoard_agent::library::LiveReseat;
+    match reseat {
+        LiveReseat::Detach(id) => detach_save_if_running(state, id).await,
+        LiveReseat::Attach(w) => attach_save_if_running(state, *w).await,
+        LiveReseat::Reseat(id, w) => {
+            detach_save_if_running(state, id).await;
+            attach_save_if_running(state, *w).await;
+        }
+        LiveReseat::Noop => {}
+    }
+}
+
 /// Glue used by `untrack_save` so removing a save also stops watching it.
 pub(crate) async fn detach_save_if_running(state: &State<'_, AppState>, save_id: String) {
     let handle = state.agent.lock().unwrap().clone();
@@ -500,73 +439,9 @@ pub(crate) async fn detach_save_if_running(state: &State<'_, AppState>, save_id:
     }
 }
 
-/// Resolve a save's effective sync policy: the user-pinned preset wins; with
-/// none pinned, fall back to our built-in catalog for known-quirky games
-/// (R.E.P.O. → short-session). An unknown name yields the empty (inherit-all)
-/// policy.
-pub(crate) fn resolve_policy(game_slug: &str, stored_preset: Option<&str>) -> SavePolicy {
-    let name = stored_preset.or_else(|| presets::builtin_preset_for(game_slug));
-    SavePolicy::from_preset(name)
-}
-
-/// Path-aware helper used by the library command when adding a save and the
-/// agent is running. Builds a `WatchedSave` from minimal inputs, resolving the
-/// save's sync policy from `preset` (or the built-in catalog).
-pub(crate) fn watched_save_from(
-    save_id: String,
-    game_slug: String,
-    display_name: String,
-    label: String,
-    local_path: PathBuf,
-    preset: Option<&str>,
-    processes_override: Vec<String>,
-) -> WatchedSave {
-    let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
-    let steam_install_dir = steam_apps
-        .iter()
-        .find(|a| name_matches(&a.name, &game_slug))
-        .map(|a| a.install_dir.clone());
-    let policy = resolve_policy(&game_slug, preset);
-    // Manual pin (emulator saves) wins; otherwise fall back to the slug-derived
-    // built-in list so normal tracked games behave exactly as before.
-    let processes = if processes_override.is_empty() {
-        resolve_processes(&game_slug)
-    } else {
-        processes_override
-    };
-    WatchedSave {
-        save_id,
-        game_slug,
-        display_name,
-        label,
-        local_path,
-        steam_install_dir,
-        processes,
-        policy,
-        // Freshly tracked or just-added save: nothing committed from here yet,
-        // so leave the gate open. Once the first backup lands, the slot's
-        // `known_version` advances via `BackupDone`.
-        known_version: None,
-        // No persisted signature for a just-added path; the first backup
-        // establishes it.
-        set_hash: None,
-        track_only: false,
-    }
-}
-
-/// Process names that mark a game as "running" for slugs the storefront can't
-/// supply (TLauncher Minecraft, native Factorio). Pulled from the built-in
-/// catalog so "is the game open" works without a Steam install dir.
-pub(crate) fn resolve_processes(game_slug: &str) -> Vec<String> {
-    presets::builtin_processes_for(game_slug)
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use hoard_agent::library::name_matches;
 
     #[test]
     fn name_match_kebab_vs_titlecase() {

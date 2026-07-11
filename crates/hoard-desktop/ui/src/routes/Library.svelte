@@ -19,6 +19,7 @@
     Filter,
     HardDrive,
     Gamepad2,
+    FolderSearch,
     AlertTriangle,
     Trash2,
     Trash,
@@ -39,7 +40,8 @@
   import Cover from "../lib/components/Cover.svelte";
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
-  import AddEmulatorModal from "../lib/components/AddEmulatorModal.svelte";
+  import ManualTrackModal from "../lib/components/ManualTrackModal.svelte";
+  import ScanFolderModal from "../lib/components/ScanFolderModal.svelte";
   import * as api from "../lib/api";
   import type {
     Confidence,
@@ -60,8 +62,10 @@
 
   let report = $state<DetectionReport | null>(null);
   let tracked = $state<TrackedSave[]>([]);
-  // Manual "Add emulator" dialog (independent of the detection flow).
+  // Manual-track dialog (game or emulator by hand) and the folder-scan dialog,
+  // both independent of the auto-detection flow.
   let emulatorModalOpen = $state(false);
+  let scanFolderOpen = $state(false);
 
   // Manually-added emulator saves carry a synthesized slug: `emu-<id>` for a
   // catalog pick or `emu-<slugified name>` for a custom one. The Library shows
@@ -795,9 +799,17 @@
       </p>
     </div>
     <div class="flex shrink-0 items-center gap-2">
+      <Button
+        variant="secondary"
+        onclick={() => (scanFolderOpen = true)}
+        title={$_("scan_folder.title")}
+        aria-label={$_("scan_folder.title")}
+      >
+        <FolderSearch size={16} />
+      </Button>
       <Button variant="secondary" onclick={() => (emulatorModalOpen = true)}>
         <Gamepad2 size={16} />
-        {$_("emulators.add_button")}
+        {$_("manual.add_button")}
       </Button>
       <Button onclick={runScan} loading={scanning}>
         <RefreshCw size={16} />
@@ -1434,9 +1446,17 @@
        button on a Steam-only detection card. Explains why we don't have a
        path and offers an explicit "pick folder" action — no surprise OS
        dialog. -->
-  <AddEmulatorModal
+  <ManualTrackModal
     open={emulatorModalOpen}
     onClose={() => (emulatorModalOpen = false)}
+    onAdded={(saved) => {
+      tracked = [...tracked, saved];
+    }}
+  />
+
+  <ScanFolderModal
+    open={scanFolderOpen}
+    onClose={() => (scanFolderOpen = false)}
     onAdded={(saved) => {
       tracked = [...tracked, saved];
     }}

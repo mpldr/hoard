@@ -6,8 +6,8 @@ use crate::cloud::{
     auth::{require_active_account, require_cloud_auth, JwksCache},
     bandwidth, db, export, polar, r2,
     routes::{
-        checkout, entitlements as ent_routes, logs as log_routes, me, playtime as playtime_routes,
-        saves, sync as sync_routes,
+        checkout, device as device_routes, entitlements as ent_routes, logs as log_routes, me,
+        playtime as playtime_routes, saves, sync as sync_routes,
     },
     state::CloudState,
 };
@@ -129,6 +129,31 @@ pub async fn run(cfg: Config) -> Result<()> {
     //     elapsed. Daily cadence, detached like the sweepers above.
     archive::spawn(state.clone());
 
+    // 4f. Device-pairing sweep. Approved/expired rows are deleted inline on
+    //     poll, but a pairing that's started and never polled (or approved and
+    //     never collected) would linger. Drop anything past its expiry every
+    //     10 minutes. Detached like the sweepers above.
+    {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tick.tick().await;
+                let res = sqlx::query("DELETE FROM device_pairings WHERE expires_at < now()")
+                    .execute(&pool)
+                    .await;
+                match res {
+                    Ok(r) if r.rows_affected() > 0 => {
+                        tracing::debug!(rows = r.rows_affected(), "device pairings: pruned expired");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "device pairings: prune failed"),
+                }
+            }
+        });
+    }
+
     // 5. Build routers.
     //
     // `authed_always` needs only a valid token: these routes must work even
@@ -152,6 +177,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         .route("/v1/devices", get(me::list_devices))
         .route("/v1/devices/:id", axum::routing::delete(me::delete_device))
         .route("/v1/cloud/checkout", post(checkout::create_checkout))
+        // Phone confirms a CLI pairing. Authed: mints a session for *this*
+        // signed-in user and hands it to the waiting headless device.
+        .route("/v1/cloud/device/approve", post(device_routes::approve))
         .route("/v1/cloud/entitlements", get(ent_routes::get_entitlements))
         .route(
             "/v1/cloud/features/:feature/activate",
@@ -231,6 +259,11 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let public = Router::new()
         .route("/v1/webhooks/polar", post(polar::handle))
+        // Device pairing for browserless CLI login. Unauthenticated: the CLI
+        // has no session yet and is keyed by the secret `device_code`. `start`
+        // opens a pairing, `poll` collects the minted session once approved.
+        .route("/v1/cloud/device/start", post(device_routes::start))
+        .route("/v1/cloud/device/poll", post(device_routes::poll))
         // Health is *also* available unauthed in cloud mode so Fly can probe it.
         .route("/v1/health", get(cloud_health));
 

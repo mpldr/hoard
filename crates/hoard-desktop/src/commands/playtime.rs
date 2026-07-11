@@ -85,25 +85,6 @@ fn installed_catalog_games(os: Os) -> Vec<(&'static str, Option<PathBuf>)> {
     out
 }
 
-/// Build the `track_only` WatchedSaves to seed into the agent: every installed
-/// catalog game that isn't already tracked as a real save and that the user
-/// hasn't excluded. Shared by [`crate::commands::agent::hydrate_watched_saves`]
-/// and the live attach path.
-pub fn derive_playtime_saves(
-    cli_state: &CliState,
-    tracked_slugs: &HashSet<String>,
-) -> Vec<WatchedSave> {
-    installed_catalog_games(Os::current())
-        .into_iter()
-        .filter_map(|(slug, dir)| {
-            if tracked_slugs.contains(slug) || cli_state.is_playtime_excluded(slug) {
-                return None;
-            }
-            Some(playtime_watched_save(slug, dir))
-        })
-        .collect()
-}
-
 /// Construct the `track_only` slot for one catalog slug.
 fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSave {
     let game = playtime_catalog::by_slug(slug);

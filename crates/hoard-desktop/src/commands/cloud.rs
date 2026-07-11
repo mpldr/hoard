@@ -678,49 +678,39 @@ pub fn handle_session_expired(app: &AppHandle) {
     );
 }
 
+/// Cuenta Cloud portable: los tipos wire y las llamadas REST viven en
+/// `hoard_agent::cloud_account` (compartidos con la CLI). Aquí solo re-exportamos
+/// los tipos (las bindings JS no cambian) y envolvemos cada llamada con la glue
+/// de sesión Supabase (resolver creds, refrescar el JWT, tocar `AppState`).
+pub use hoard_agent::cloud_account::{
+    ArchiveResult, CloudEntitlements, ExportJob, ExportStatus, FeatureState, StorageGames,
+};
+use hoard_agent::cloud_account::{self, CloudError};
+
+/// Traduce un [`CloudError`] al `String` que la UI ya esperaba, reusando
+/// `format_http_error` para conservar el mapeo `i18n:<key>` intacto.
+fn cloud_err_to_string(e: CloudError) -> String {
+    match e {
+        CloudError::Unauthorized => format_http_error(StatusCode::UNAUTHORIZED, ""),
+        CloudError::Http { status, body } => {
+            let st = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            format_http_error(st, &body)
+        }
+        CloudError::Network(m) | CloudError::Parse(m) => m,
+    }
+}
+
 /// Kick off a server-side export job. Returns the job id; the background
 /// worker builds the ZIP, and the client polls `cloud_export_status` for the
 /// download link (the server also emails it when email is configured).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportJob {
-    pub job_id: String,
-    pub status: String,
-}
-
 #[tauri::command]
 pub async fn cloud_export_all() -> Result<ExportJob, String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/me/export", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::export_all(&creds.server_url, &creds.access_token)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
-    serde_json::from_str::<ExportJob>(&body)
-        .map_err(|e| format!("Couldn't parse server response: {e}"))
-}
-
-/// Latest export job's state, with a presigned `download_url` once the ZIP is
-/// ready. Mirrors the server's `ExportStatusOut`. All fields are `None` when
-/// the user has never requested an export.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExportStatus {
-    pub job_id: Option<String>,
-    pub status: Option<String>,
-    pub requested_at: Option<String>,
-    pub size_bytes: Option<i64>,
-    pub expires_at: Option<String>,
-    pub download_url: Option<String>,
-    pub error: Option<String>,
+        .map_err(cloud_err_to_string)
 }
 
 #[tauri::command]
@@ -728,83 +718,23 @@ pub async fn cloud_export_status() -> Result<ExportStatus, String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/me/export", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::export_status(&creds.server_url, &creds.access_token)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
-    serde_json::from_str::<ExportStatus>(&body)
-        .map_err(|e| format!("Couldn't parse server response: {e}"))
+        .map_err(cloud_err_to_string)
 }
 
 // ---- Caja negra: archived games ----
 
-/// One game's freeable footprint. Mirrors the server's `GameFootprint`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageGame {
-    pub save_id: String,
-    pub game_slug: String,
-    pub label: String,
-    /// Bytes the quota drops by if this game is archived (deduped exclusive
-    /// blobs). What the dialog ranks "los que más pesan" by.
-    pub freeable_bytes: i64,
-    #[serde(default)]
-    pub archived: bool,
-    /// RFC3339 hard-delete instant, present only while archived.
-    #[serde(default)]
-    pub purge_after: Option<String>,
-}
-
 /// `GET /v1/cloud/storage/games` — per-game freeable footprint + the quota
 /// figures. Drives the "free space" dialog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageGames {
-    pub plan: String,
-    pub used_bytes: u64,
-    pub limit_bytes: u64,
-    /// Bytes the live footprint is over the limit (0 if within).
-    pub over_bytes: u64,
-    pub games: Vec<StorageGame>,
-}
-
 #[tauri::command]
 pub async fn cloud_storage_games() -> Result<StorageGames, String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/cloud/storage/games", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::storage_games(&creds.server_url, &creds.access_token)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
-    serde_json::from_str::<StorageGames>(&body)
-        .map_err(|e| format!("Couldn't parse server response: {e}"))
-}
-
-/// Result of archiving. Mirrors the server's `ArchiveOut`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArchiveResult {
-    pub save_id: String,
-    pub archived: bool,
-    /// RFC3339 — when the frozen copy is hard-deleted (archive instant + 7d).
-    pub purge_after: String,
-    pub freed_bytes: i64,
+        .map_err(cloud_err_to_string)
 }
 
 /// `POST /v1/cloud/saves/:id/archive` — park a game in the black box: frees the
@@ -815,21 +745,9 @@ pub async fn cloud_archive_save(save_id: String) -> Result<ArchiveResult, String
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/cloud/saves/{save_id}/archive", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::archive_save(&creds.server_url, &creds.access_token, &save_id)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
-    serde_json::from_str::<ArchiveResult>(&body)
-        .map_err(|e| format!("Couldn't parse server response: {e}"))
+        .map_err(cloud_err_to_string)
 }
 
 /// `POST /v1/cloud/saves/:id/reactivate` — bring an archived game back (after
@@ -840,20 +758,9 @@ pub async fn cloud_reactivate_save(save_id: String) -> Result<(), String> {
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/cloud/saves/{save_id}/reactivate", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::reactivate_save(&creds.server_url, &creds.access_token, &save_id)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format_http_error(status, &body));
-    }
-    Ok(())
+        .map_err(cloud_err_to_string)
 }
 
 /// Delete the cloud account. The server soft-deletes and *freezes* it: every
@@ -866,19 +773,9 @@ pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), Stri
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/me", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .delete(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::delete_account(&creds.server_url, &creds.access_token)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
+        .map_err(cloud_err_to_string)?;
     // Clear local state regardless of body contents.
     clear_creds().map_err(|e| format!("Couldn't clear local session: {e}"))?;
     *state.cloud_account.lock().unwrap() = None;
@@ -896,19 +793,9 @@ pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<Clou
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    let url = format!("{}/v1/me/reactivate", creds.server_url);
-    let client = http_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
+    cloud_account::reactivate_account(&creds.server_url, &creds.access_token)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format_http_error(status, &body));
-    }
+        .map_err(cloud_err_to_string)?;
     // Re-fetch so the in-memory + on-disk snapshot reflect the now-live account.
     let me = fetch_me(&creds.server_url, &creds.access_token)
         .await
@@ -926,33 +813,6 @@ pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<Clou
 
 // ---- Pro entitlements -------------------------------------------------
 
-/// Per-feature Pro access, mirrored from the server's `GET /v1/cloud/entitlements`.
-/// The server is the source of truth: the trial starts on first *use* of a Pro
-/// content endpoint and locks (402) once the one-month window elapses. This
-/// read-only snapshot only paints the badge/lock; it never starts a trial.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudEntitlements {
-    pub plan: String,
-    pub features: CloudFeatures,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudFeatures {
-    pub screen: FeatureState,
-    pub wrapple: FeatureState,
-}
-
-/// Resolved access state for one feature. Tagged with `state` to match the
-/// server enum (`entitled` / `trial_available` / `trial` / `trial_expired`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum FeatureState {
-    Entitled,
-    TrialAvailable { days: i64 },
-    Trial { expires_at: String },
-    TrialExpired,
-}
-
 /// Fetch the per-feature entitlement snapshot. Transparently renews the JWT and
 /// retries once on a 401, mirroring `cloud_refresh_account`.
 #[tauri::command]
@@ -960,42 +820,21 @@ pub async fn cloud_entitlements(app: AppHandle) -> Result<CloudEntitlements, Str
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    match fetch_entitlements_raw(&creds.server_url, &creds.access_token).await {
+    match cloud_account::entitlements(&creds.server_url, &creds.access_token).await {
         Ok(ent) => Ok(ent),
-        Err(MeError::Unauthorized) => {
+        Err(CloudError::Unauthorized) => {
             let fresh = refresh_active_session().await.map_err(|e| {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
                 }
                 prettify(e)
             })?;
-            fetch_entitlements_raw(&fresh.server_url, &fresh.access_token)
+            cloud_account::entitlements(&fresh.server_url, &fresh.access_token)
                 .await
-                .map_err(|e| e.into_message())
+                .map_err(cloud_err_to_string)
         }
-        Err(other) => Err(other.into_message()),
+        Err(other) => Err(cloud_err_to_string(other)),
     }
-}
-
-async fn fetch_entitlements_raw(base: &str, token: &str) -> Result<CloudEntitlements, MeError> {
-    let url = format!("{base}/v1/cloud/entitlements");
-    let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| MeError::Other(format!("Network error: {e}")))?;
-    let status = resp.status();
-    if status == StatusCode::UNAUTHORIZED {
-        return Err(MeError::Unauthorized);
-    }
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(MeError::Other(format_http_error(status, &body)));
-    }
-    serde_json::from_str::<CloudEntitlements>(&body)
-        .map_err(|e| MeError::Other(format!("parsing entitlements response: {e}: {body}")))
 }
 
 /// Open a Pro feature: this is the call that *starts* the one-month trial on a
@@ -1011,50 +850,21 @@ pub async fn cloud_activate_feature(
     let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };
-    match activate_feature_raw(&creds.server_url, &creds.access_token, &feature).await {
+    match cloud_account::activate_feature(&creds.server_url, &creds.access_token, &feature).await {
         Ok(st) => Ok(st),
-        Err(MeError::Unauthorized) => {
+        Err(CloudError::Unauthorized) => {
             let fresh = refresh_active_session().await.map_err(|e| {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
                 }
                 prettify(e)
             })?;
-            activate_feature_raw(&fresh.server_url, &fresh.access_token, &feature)
+            cloud_account::activate_feature(&fresh.server_url, &fresh.access_token, &feature)
                 .await
-                .map_err(|e| e.into_message())
+                .map_err(cloud_err_to_string)
         }
-        Err(other) => Err(other.into_message()),
+        Err(other) => Err(cloud_err_to_string(other)),
     }
-}
-
-async fn activate_feature_raw(
-    base: &str,
-    token: &str,
-    feature: &str,
-) -> Result<FeatureState, MeError> {
-    let url = format!("{base}/v1/cloud/features/{feature}/activate");
-    let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| MeError::Other(format!("Network error: {e}")))?;
-    let status = resp.status();
-    if status == StatusCode::UNAUTHORIZED {
-        return Err(MeError::Unauthorized);
-    }
-    // 402 = locked (no paid Pro, trial elapsed). Keep the UI locked.
-    if status == StatusCode::PAYMENT_REQUIRED {
-        return Ok(FeatureState::TrialExpired);
-    }
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(MeError::Other(format_http_error(status, &body)));
-    }
-    serde_json::from_str::<FeatureState>(&body)
-        .map_err(|e| MeError::Other(format!("parsing activate response: {e}: {body}")))
 }
 
 // ---- HTTP helpers -----------------------------------------------------
@@ -1090,7 +900,8 @@ async fn fetch_me_raw(base: &str, token: &str) -> Result<CloudAccount, MeError> 
         .get(&url)
         .bearer_auth(token)
         .header("x-hoard-device-fp", &dev.fingerprint)
-        .header("x-hoard-device-os", &dev.os);
+        .header("x-hoard-device-os", &dev.os)
+        .header("x-hoard-app-version", env!("CARGO_PKG_VERSION"));
     if let Some(name) = dev.name.as_deref() {
         req = req.header("x-hoard-device-name", name);
     }
@@ -1260,13 +1071,7 @@ fn prettify(err: anyhow::Error) -> String {
 
 // ---- Playtime sync ----------------------------------------------------
 
-/// Upload body: this device's full `(day, game, secs)` breakdown plus its
-/// fingerprint so the server keeps each machine's rows separate.
-#[derive(Debug, Serialize)]
-struct PlaytimeUploadBody {
-    device_fp: String,
-    rows: Vec<hoard_agent::playtime::PlaytimeRow>,
-}
+use hoard_agent::cloud_account::PlaytimeUploadBody;
 
 /// Push this device's local playtime breakdown to Hoard Cloud, then read back
 /// the device-merged aggregate the recap renders ("multi-equipo": the GET sums
@@ -1315,13 +1120,14 @@ pub async fn cloud_sync_playtime(
     // aggregate. Only a 401 triggers a refresh+retry; other errors fall through.
     let mut token = creds.access_token.clone();
     let mut base = creds.server_url.clone();
-    match push_playtime_raw(&base, &token, &body).await {
+    match cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body).await {
         Ok(()) => {}
-        Err(MeError::Unauthorized) => match refresh_active_session().await {
+        Err(CloudError::Unauthorized) => match refresh_active_session().await {
             Ok(fresh) => {
                 token = fresh.access_token.clone();
                 base = fresh.server_url.clone();
-                let _ = push_playtime_raw(&base, &token, &body).await;
+                let _ = cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body)
+                    .await;
             }
             Err(e) => {
                 if is_session_expired(&e) {
@@ -1334,12 +1140,18 @@ pub async fn cloud_sync_playtime(
     }
 
     // Read the device-merged aggregate (server only; empty on failure).
-    match fetch_playtime_raw(&base, &token).await {
+    match cloud_account::fetch_playtime(&base, "/v1/cloud/playtime", &token).await {
         Ok(sum) => Ok(sum),
-        Err(MeError::Unauthorized) => match refresh_active_session().await {
-            Ok(fresh) => fetch_playtime_raw(&fresh.server_url, &fresh.access_token)
+        Err(CloudError::Unauthorized) => match refresh_active_session().await {
+            Ok(fresh) => {
+                cloud_account::fetch_playtime(
+                    &fresh.server_url,
+                    "/v1/cloud/playtime",
+                    &fresh.access_token,
+                )
                 .await
-                .or_else(|_| empty()),
+                .or_else(|_| empty())
+            }
             Err(e) => {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
@@ -1372,76 +1184,10 @@ async fn sync_playtime_selfhosted(
         return None;
     }
     // Push is best-effort; even a failed push still lets us read the aggregate.
-    let _ = push_playtime_to(&base, "/v1/playtime", &creds.token, body).await;
-    fetch_playtime_from(&base, "/v1/playtime", &creds.token)
+    let _ = cloud_account::push_playtime(&base, "/v1/playtime", &creds.token, body).await;
+    cloud_account::fetch_playtime(&base, "/v1/playtime", &creds.token)
         .await
         .ok()
-}
-
-async fn push_playtime_raw(
-    base: &str,
-    token: &str,
-    body: &PlaytimeUploadBody,
-) -> Result<(), MeError> {
-    push_playtime_to(base, "/v1/cloud/playtime", token, body).await
-}
-
-async fn push_playtime_to(
-    base: &str,
-    path: &str,
-    token: &str,
-    body: &PlaytimeUploadBody,
-) -> Result<(), MeError> {
-    let url = format!("{}{path}", base.trim_end_matches('/'));
-    let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| MeError::Other(format!("Network error: {e}")))?;
-    let status = resp.status();
-    if status == StatusCode::UNAUTHORIZED {
-        return Err(MeError::Unauthorized);
-    }
-    if !status.is_success() {
-        let b = resp.text().await.unwrap_or_default();
-        return Err(MeError::Other(format_http_error(status, &b)));
-    }
-    Ok(())
-}
-
-async fn fetch_playtime_raw(
-    base: &str,
-    token: &str,
-) -> Result<hoard_agent::playtime::PlaytimeSummary, MeError> {
-    fetch_playtime_from(base, "/v1/cloud/playtime", token).await
-}
-
-async fn fetch_playtime_from(
-    base: &str,
-    path: &str,
-    token: &str,
-) -> Result<hoard_agent::playtime::PlaytimeSummary, MeError> {
-    let url = format!("{}{path}", base.trim_end_matches('/'));
-    let client = http_client().map_err(|e| MeError::Other(e.to_string()))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| MeError::Other(format!("Network error: {e}")))?;
-    let status = resp.status();
-    if status == StatusCode::UNAUTHORIZED {
-        return Err(MeError::Unauthorized);
-    }
-    let b = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(MeError::Other(format_http_error(status, &b)));
-    }
-    serde_json::from_str::<hoard_agent::playtime::PlaytimeSummary>(&b)
-        .map_err(|e| MeError::Other(format!("parsing playtime response: {e}: {b}")))
 }
 
 /// Restore the in-memory cache at boot. Best-effort; logs and shrugs if

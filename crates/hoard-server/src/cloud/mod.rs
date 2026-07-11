@@ -35,5 +35,6 @@ pub mod r2;
 pub mod routes;
 pub mod run;
 pub mod state;
+pub mod supabase_admin;
 
 pub use run::run;

@@ -2104,9 +2104,6 @@ pub fn discover_unattributed_mode(
     known_paths: &HashSet<PathBuf>,
     deep: bool,
 ) -> Vec<AttributedSave> {
-    let mut out: Vec<AttributedSave> = Vec::new();
-    let mut emitted: HashSet<PathBuf> = HashSet::new();
-
     let mut walk_roots = roots::user_save_roots(os);
     let prefixes = if deep {
         wine_prefixes::list_wine_prefixes_deep(os)
@@ -2119,6 +2116,39 @@ pub fn discover_unattributed_mode(
     if deep {
         walk_roots.extend(roots::deep_save_roots(os));
     }
+
+    discover_in_roots(walk_roots, store, known_paths, deep)
+}
+
+/// Scan ONE user-chosen folder (the Library "add from folder" button) and
+/// attribute every save-like dir inside it to a game name, Ludusavi-style:
+/// the user points Hoard at a folder and gets back "we found <Game> here".
+///
+/// Always uses the relaxed (`deep`) gate and depth: the user explicitly asked
+/// us to look here, so surfacing weak/static-only maybes for them to confirm
+/// is the whole point — unlike the periodic scan, there's no risk of minting
+/// phantom games across the whole disk. `known_paths` still skips folders
+/// already covered by a tracked save so the list only shows new candidates.
+pub fn discover_in_folder(
+    root: &Path,
+    store: &CorrelationStore,
+    known_paths: &HashSet<PathBuf>,
+) -> Vec<AttributedSave> {
+    discover_in_roots(vec![root.to_path_buf()], store, known_paths, true)
+}
+
+/// Shared core of [`discover_unattributed_mode`] and [`discover_in_folder`]:
+/// walk each root, grade every candidate with the correlation store, apply the
+/// precision gate, and attribute survivors to a game name. `deep` relaxes both
+/// the walk budget and the gate (keeps `Low` static-only hits).
+fn discover_in_roots(
+    walk_roots: Vec<PathBuf>,
+    store: &CorrelationStore,
+    known_paths: &HashSet<PathBuf>,
+    deep: bool,
+) -> Vec<AttributedSave> {
+    let mut out: Vec<AttributedSave> = Vec::new();
+    let mut emitted: HashSet<PathBuf> = HashSet::new();
 
     let (max_depth, timeout) = if deep {
         (PHASE4_DEEP_WALK_MAX_DEPTH, PHASE4_DEEP_WALK_TIMEOUT)
@@ -3339,5 +3369,38 @@ mod tests {
                 found.iter().map(|a| &a.path).collect::<Vec<_>>()
             );
         });
+    }
+
+    /// The Library "add from folder" flow: scanning an arbitrary folder (not a
+    /// standard save root) must find a save-like dir inside it and attribute it
+    /// to the game named by the folder above the save-word — no catalog, no
+    /// correlation. A folder already covered by a tracked save is skipped.
+    #[test]
+    fn discover_in_folder_finds_and_attributes_inside_arbitrary_dir() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("hoard-scan-folder-{uniq}"));
+        let saves = base.join("MyGame").join("Saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("slot1.sav"), b"savedata").unwrap();
+
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&base, &store, &HashSet::new());
+        let hit = found
+            .iter()
+            .find(|a| a.path == saves)
+            .expect("save-like dir inside the chosen folder should surface");
+        assert_eq!(hit.display_name, "MyGame");
+        assert_eq!(hit.slug, "mygame");
+
+        // Already tracked ⇒ filtered out.
+        let mut known = HashSet::new();
+        known.insert(saves.clone());
+        let skipped = discover_in_folder(&base, &store, &known);
+        assert!(skipped.iter().all(|a| a.path != saves));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -288,5 +288,16 @@
   "guides.back": "Tous les guides",
   "guides.updated": "Mis à jour",
   "guides.cta_title": "Prêt à protéger vos sauvegardes ?",
-  "guides.cta_text": "Téléchargez Hoard et configurez des sauvegardes automatiques et versionnées en quelques minutes."
+  "guides.cta_text": "Téléchargez Hoard et configurez des sauvegardes automatiques et versionnées en quelques minutes.",
+  "link.title": "Associer un appareil",
+  "link.subtitle": "Approuvez le code affiché par la CLI Hoard sur votre autre machine.",
+  "link.need_signin": "Connectez-vous pour approuver cet appareil.",
+  "link.signed_in_as": "Connecté en tant que",
+  "link.code_label": "Code d'association",
+  "link.approve": "Approuver",
+  "link.approve_hint": "N'approuvez qu'un code que vous avez lancé vous-même sur un appareil vous appartenant.",
+  "link.approved": "Appareil approuvé.",
+  "link.approved_hint": "Vous pouvez revenir à cette machine : elle se connecte maintenant.",
+  "link.err_not_found": "Ce code est invalide ou a expiré. Recommencez sur votre appareil.",
+  "link.err_generic": "Impossible d'approuver l'appareil. Réessayez."
 }

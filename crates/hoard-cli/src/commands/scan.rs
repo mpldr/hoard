@@ -1,6 +1,6 @@
 //! `hoard scan` — benchmark the local game-detection pass.
 //!
-//! This runs exactly the heavy half of what Modo Automático executes on every
+//! This runs exactly the heavy half of what Automatic Mode executes on every
 //! `automatic-tick`: `detection::detect_all`, the disk walk that cross-checks
 //! the Ludusavi catalog + Steam libraries against the filesystem. It needs no
 //! server and writes nothing, so it's a safe, repeatable way to answer "is the

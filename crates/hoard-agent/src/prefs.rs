@@ -8,7 +8,11 @@
 //!
 //! Defaults are picked to be safe and unsurprising for first-run users:
 //! native notifications off (the in-app feed carries the news), close-to-tray
-//! on, autostart off (the user has to opt in).
+//! on, and — since the "arranque silencioso" change — autostart + start-minimised
+//! on, so Hoard runs at login as a background tray app. The desktop only hides
+//! the window when launched via the autostart `--silent` flag, so a manual
+//! first launch still shows the UI. Diagnostic log shipping is on by default
+//! (opt-out in Settings).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -227,10 +231,20 @@ impl Default for Prefs {
             close_to_tray: true,
             notify_on_success: false,
             notify_on_failure: true,
-            autostart: false,
-            start_minimised: false,
+            // Default on: Hoard registers itself at login and boots silently
+            // (only the tray icon). The desktop applies the real OS autostart
+            // entry on first run and only hides the window when launched via
+            // the autostart `--silent` flag, so a manual first launch still
+            // shows the app. See hoard-desktop/src/lib.rs setup().
+            autostart: true,
+            start_minimised: true,
             seen_tray_hint: false,
-            anonymous_telemetry: false,
+            // Default on: diagnostic log shipping is enabled out of the box so
+            // crashes/errors reach the server. Read fresh each ship cycle, so
+            // a user can turn it off in Settings and the stream stops within
+            // seconds. NOTE: payload carries a device fingerprint — the consent
+            // copy must say so (it's diagnostics, not anonymous counters).
+            anonymous_telemetry: true,
             language: None,
             auto_restore: false,
             global_sync: false,
@@ -383,7 +397,12 @@ mod tests {
         // error doesn't slip by unnoticed.
         assert!(!p.notify_on_success);
         assert!(p.notify_on_failure);
-        assert!(!p.autostart);
+        // Default on since the "arranque silencioso" change: autostart at login
+        // + start hidden (only the tray). The desktop gates the actual hide on
+        // the autostart `--silent` flag so a manual launch still shows.
+        assert!(p.autostart);
+        assert!(p.start_minimised);
+        assert!(p.anonymous_telemetry);
         assert!(!p.auto_restore);
         // 1.5.3: toggle off by default. 1.9.14: the single 6h interval was
         // split into a cheap 10-min scan and an expensive 1h hash sweep.

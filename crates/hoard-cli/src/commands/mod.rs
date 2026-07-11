@@ -1,8 +1,16 @@
 pub mod auth;
 pub mod backup;
+pub mod banner;
+pub mod cloud;
 pub mod config;
+pub mod daemon;
 pub mod games;
+pub mod launch;
 pub mod restore;
 pub mod saves;
 pub mod scan;
+pub mod service;
+pub mod session;
 pub mod status;
+pub mod track;
+pub mod tracked;

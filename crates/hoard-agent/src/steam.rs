@@ -46,11 +46,14 @@ pub struct ProtonPrefix {
 /// and `%PROGRAMFILES%/Steam`.
 /// On macOS we check `~/Library/Application Support/Steam`.
 pub fn detect_steam_libraries(os: Os) -> Vec<PathBuf> {
-    let roots: Vec<PathBuf> = match os {
+    let mut roots: Vec<PathBuf> = match os {
         Os::Linux => linux_roots(),
         Os::Windows => windows_roots(),
         Os::Mac => mac_roots(),
     };
+    // Beyond the well-known locations, sweep the disks for second Steam
+    // installs / custom-named libraries the registry and home paths miss.
+    roots.extend(scan_steam_roots(os));
 
     // The root itself always doubles as a library — Steam ships its own
     // `steamapps` there. Then any extra libraries are listed inside
@@ -267,6 +270,167 @@ fn windows_roots() -> Vec<PathBuf> {
         }
     }
     v
+}
+
+/// Max directory depth the library scan descends below each base dir.
+const SCAN_MAX_DEPTH: usize = 3;
+
+/// Hard cap on directories inspected per base, so a pathological tree (a huge
+/// system drive, a deep home) can never turn the scan into a stall. Once hit,
+/// that base stops early — the well-known roots still cover the common case.
+const SCAN_DIR_BUDGET: usize = 6000;
+
+/// Directory names never worth descending into when hunting for Steam
+/// libraries: OS/system trees and known-huge noise. Matched case-insensitively.
+const SCAN_SKIP_DIRS: &[&str] = &[
+    // Windows.
+    "windows",
+    "windows.old",
+    "$recycle.bin",
+    "system volume information",
+    "programdata",
+    "appdata",
+    "msocache",
+    "recovery",
+    "$winreagent",
+    // Unix / macOS system + noise.
+    "proc",
+    "sys",
+    "dev",
+    "run",
+    "boot",
+    "var",
+    "usr",
+    "lib",
+    "lib64",
+    "node_modules",
+    ".git",
+];
+
+/// `true` if a directory name should not be descended into during the scan.
+/// Skips dot-directories (unix hidden) and the explicit system/noise list —
+/// but never `steamapps` itself, which is the thing we're looking for.
+fn is_skippable_scan_dir(name: &str) -> bool {
+    if name == "steamapps" {
+        return false;
+    }
+    if name.starts_with('.') {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    SCAN_SKIP_DIRS.iter().any(|d| *d == lower)
+}
+
+/// Base directories to sweep for Steam libraries the well-known paths miss.
+///
+/// Cross-platform by design — only the set of bases differs:
+/// - **Windows**: every present drive root `C:`–`Z:` (second installs and
+///   custom-named libraries live on other drives).
+/// - **macOS**: `/Volumes` (external/extra disks) plus `$HOME`.
+/// - **Linux/SteamOS**: the usual removable/extra mount points
+///   (`/mnt`, `/media`, `/run/media`) plus `$HOME`.
+///
+/// Only meaningful for the host OS, so it returns empty when `os` isn't the
+/// one we're running on (keeps cross-OS unit tests from touching real disks).
+fn scan_bases(os: Os) -> Vec<PathBuf> {
+    if os != Os::current() {
+        return Vec::new();
+    }
+    #[cfg(windows)]
+    {
+        return (b'C'..=b'Z')
+            .map(|l| PathBuf::from(format!("{}:\\", l as char)))
+            .filter(|p| p.is_dir())
+            .collect();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut v = vec![PathBuf::from("/Volumes")];
+        if let Some(h) = home() {
+            v.push(h);
+        }
+        return v;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut v = vec![
+            PathBuf::from("/mnt"),
+            PathBuf::from("/media"),
+            PathBuf::from("/run/media"),
+        ];
+        if let Some(h) = home() {
+            v.push(h);
+        }
+        return v;
+    }
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+/// Steam libraries found by sweeping the disks — catches second/third Steam
+/// installs and custom-named library folders on other drives/mounts that
+/// neither the registry (Windows) nor the well-known home paths record. A
+/// Steam library is any directory that holds a `steamapps` subfolder; we
+/// breadth-first walk each base up to [`SCAN_MAX_DEPTH`], record matches, and
+/// prune once found (a library never nests inside another). Memoised: the
+/// sweep (and its discovery logs) runs once per process — a disk mounted after
+/// launch is picked up on the next run, the same contract the catalog uses.
+fn scan_steam_roots(os: Os) -> Vec<PathBuf> {
+    use std::sync::OnceLock;
+    static SCAN: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    SCAN.get_or_init(|| {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for base in scan_bases(os) {
+            find_steam_libraries_under(&base, &mut out);
+        }
+        out
+    })
+    .clone()
+}
+
+/// Breadth-first walk `base` up to [`SCAN_MAX_DEPTH`], pushing every directory
+/// that holds a `steamapps` subfolder into `out`. Prunes once a library is
+/// found (they don't nest), skips system/hidden dirs, doesn't follow symlinks
+/// (no cycles), and stops a runaway tree at [`SCAN_DIR_BUDGET`]. Pure w.r.t.
+/// the filesystem it's handed, so it's unit-testable against a temp tree.
+fn find_steam_libraries_under(base: &Path, out: &mut Vec<PathBuf>) {
+    use std::collections::VecDeque;
+    let mut budget = SCAN_DIR_BUDGET;
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((base.to_path_buf(), 0));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if budget == 0 {
+            tracing::debug!("Steam disk scan hit its budget; stopping this base early");
+            break;
+        }
+        budget -= 1;
+        // Is this dir itself a Steam library?
+        if dir.join("steamapps").is_dir() {
+            tracing::info!(root = %dir.display(), "Steam library found by disk scan (outside registry / known paths)");
+            out.push(dir);
+            continue; // libraries don't nest — prune here
+        }
+        if depth >= SCAN_MAX_DEPTH {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            // Only recurse into real directories; `file_type` doesn't follow
+            // symlinks, so we never chase a link into a cycle.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {}
+                _ => continue,
+            }
+            let name = entry.file_name();
+            if is_skippable_scan_dir(&name.to_string_lossy()) {
+                continue;
+            }
+            queue.push_back((entry.path(), depth + 1));
+        }
+    }
 }
 
 /// Steam's install directory as recorded in the registry.
@@ -635,6 +799,47 @@ mod tests {
             // must appear exactly once.
             assert_eq!(libs.iter().filter(|p| **p == root).count(), 1);
         });
+    }
+
+    #[test]
+    fn scan_finds_custom_named_library_deep_and_prunes_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // A second Steam install, custom folder name, two levels down:
+        //   <base>/Juegos/SteamLua/steamapps        (depth 2 -> found)
+        let lua = base.join("Juegos/SteamLua");
+        std::fs::create_dir_all(lua.join("steamapps/common")).unwrap();
+        // A nested library inside the first must be pruned (not reported).
+        std::fs::create_dir_all(lua.join("steamapps/common/inner/steamapps")).unwrap();
+        // A library at depth 3:
+        //   <base>/a/b/Lib3/steamapps
+        let lib3 = base.join("a/b/Lib3");
+        std::fs::create_dir_all(lib3.join("steamapps")).unwrap();
+        // Too deep (depth 4) — must NOT be found.
+        let deep = base.join("a/b/c/TooDeep");
+        std::fs::create_dir_all(deep.join("steamapps")).unwrap();
+        // Hidden + system-named dirs holding a library must be skipped.
+        std::fs::create_dir_all(base.join(".hidden/steamapps")).unwrap();
+        std::fs::create_dir_all(base.join("Windows/steamapps")).unwrap();
+
+        let mut out = Vec::new();
+        find_steam_libraries_under(base, &mut out);
+
+        assert!(out.contains(&lua), "custom-named library at depth 2 found");
+        assert!(out.contains(&lib3), "library at depth 3 found");
+        assert!(!out.contains(&deep), "depth-4 library not reached");
+        assert!(
+            !out.iter().any(|p| p.ends_with("inner")),
+            "nested library inside a found one is pruned"
+        );
+        assert!(
+            !out.iter().any(|p| p.starts_with(base.join(".hidden"))),
+            "hidden dir skipped"
+        );
+        assert!(
+            !out.iter().any(|p| p.starts_with(base.join("Windows"))),
+            "system-named dir skipped"
+        );
     }
 
     #[test]

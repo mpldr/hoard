@@ -138,6 +138,21 @@ const NON_GAME_PROCESS: &[&str] = &[
     "hoard",
 ];
 
+/// Un proceso nacido dentro de esta ventana tras el arranque del SISTEMA es
+/// infraestructura de autostart (Discord, trays, overlays de GPU, daemons de
+/// `node`, el propio Claude), no un juego que el usuario lanzó. Se veta como
+/// FUENTE de correlación — no como juego a secas: `is_game_like` no se toca, así
+/// que un juego auto-lanzado al boot se sigue detectando por nombre/handle; sólo
+/// no se usa para ATRIBUIR una carpeta de save (que es de donde salía el veneno:
+/// Discord vivo desde el boot heredando el save de Offworld).
+const BOOT_AUTOSTART_GRACE_SECS: u64 = 120;
+
+/// Cuántos ticks seguidos debe ganar un proceso distinto del atribuido antes de
+/// robarle la atribución a una correlación ya asentada. Sin esto, `record` hacía
+/// last-writer-wins: un solo tick desafortunado (Discord primario mientras Steam
+/// Cloud reescribe el save) machacaba al exe real del juego.
+const ATTRIBUTION_SWITCH_STREAK: u32 = 3;
+
 /// Un proceso vivo candidato a juego.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameProcess {
@@ -210,6 +225,7 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
 ///   correlación alimenta el playtime, y atribuir un save a un worker de
 ///   kernel —que vive 24/7— acumularía horas para siempre.
 pub fn sample_game_processes(sys: &System) -> Vec<GameProcess> {
+    let boot = System::boot_time();
     let mut scored: Vec<(f32, GameProcess)> = Vec::new();
     for proc in sys.processes().values() {
         if proc.thread_kind().is_some() {
@@ -218,6 +234,12 @@ pub fn sample_game_processes(sys: &System) -> Vec<GameProcess> {
         let Some(exe) = proc.exe().map(|p| p.to_path_buf()) else {
             continue;
         };
+        // Veto de autostart: un residente nacido junto al sistema no es la
+        // fuente de una correlación de save. `start_time`/`boot_time` van en
+        // segundos epoch, así que la resta es la antigüedad tras el boot.
+        if proc.start_time().saturating_sub(boot) < BOOT_AUTOSTART_GRACE_SECS {
+            continue;
+        }
         let name = proc.name().to_string_lossy().to_string();
         if is_game_like(&name, Some(&exe)) {
             scored.push((
@@ -246,6 +268,13 @@ pub struct WriteObservation {
     pub observed_at_ms: u64,
     /// Cuántas veces se ha re-observado (más hits ⇒ más confianza).
     pub hits: u32,
+    /// Proceso candidato distinto del atribuido y su racha de ticks seguidos
+    /// como primario. Evita que un tick suelto robe la atribución; sólo tras
+    /// `ATTRIBUTION_SWITCH_STREAK` gana. `default` para leer stores antiguos.
+    #[serde(default)]
+    challenger: Option<GameProcess>,
+    #[serde(default)]
+    challenger_streak: u32,
 }
 
 /// Store persistido de correlaciones, indexado por dir observado.
@@ -306,6 +335,11 @@ impl CorrelationStore {
     /// guarda nada. Con varios juegos vivos se atribuye al primero (la
     /// atribución fina es best-effort; para la señal "esto es un save" basta
     /// con que CUALQUIER juego estuviera vivo).
+    ///
+    /// La atribución NO es last-writer-wins: una vez asentada, un proceso
+    /// distinto sólo la sustituye si es primario `ATTRIBUTION_SWITCH_STREAK`
+    /// ticks seguidos. Así un hit aislado de un residente (Discord mientras algo
+    /// reescribe el save) no machaca al exe real del juego.
     pub fn record(&mut self, dir: &Path, processes: &[GameProcess]) {
         let Some(primary) = processes.first() else {
             return;
@@ -319,11 +353,36 @@ impl CorrelationStore {
                 exe: primary.exe.clone(),
                 observed_at_ms: 0,
                 hits: 0,
+                challenger: None,
+                challenger_streak: 0,
             });
-        entry.process_name = primary.name.clone();
-        entry.exe = primary.exe.clone();
         entry.observed_at_ms = now_ms();
         entry.hits = entry.hits.saturating_add(1);
+
+        if primary.name == entry.process_name {
+            // Confirma la atribución vigente; refresca el exe y borra retador.
+            entry.exe = primary.exe.clone();
+            entry.challenger = None;
+            entry.challenger_streak = 0;
+            return;
+        }
+        // Proceso distinto: acumula racha en vez de machacar.
+        if entry
+            .challenger
+            .as_ref()
+            .is_some_and(|c| c.name == primary.name)
+        {
+            entry.challenger_streak = entry.challenger_streak.saturating_add(1);
+        } else {
+            entry.challenger = Some(primary.clone());
+            entry.challenger_streak = 1;
+        }
+        if entry.challenger_streak >= ATTRIBUTION_SWITCH_STREAK {
+            entry.process_name = primary.name.clone();
+            entry.exe = primary.exe.clone();
+            entry.challenger = None;
+            entry.challenger_streak = 0;
+        }
     }
 
     /// Devuelve la observación que corrobora `dir`: coincidencia exacta o
@@ -538,6 +597,38 @@ mod tests {
         // Un dir no relacionado, no.
         assert!(store.signal_for(Path::new("/etc")).is_none());
         assert_eq!(store.attributed_name(&save).as_deref(), Some("game"));
+    }
+
+    #[test]
+    fn record_attribution_survives_single_intruder_tick() {
+        // Correlación asentada con el juego real.
+        let mut store = CorrelationStore::default();
+        let dir = PathBuf::from("/home/u/.local/share/Game/Saves");
+        let game = GameProcess {
+            name: "game.exe".into(),
+            exe: Some(PathBuf::from("/games/game.exe")),
+        };
+        let intruder = GameProcess {
+            name: "discord.exe".into(),
+            exe: Some(PathBuf::from("/apps/discord.exe")),
+        };
+        for _ in 0..5 {
+            store.record(&dir, std::slice::from_ref(&game));
+        }
+        assert_eq!(store.attributed_name(&dir).as_deref(), Some("game"));
+        // Un tick suelto de un intruso NO roba la atribución…
+        store.record(&dir, std::slice::from_ref(&intruder));
+        assert_eq!(store.attributed_name(&dir).as_deref(), Some("game"));
+        // …y el juego real, al reaparecer, resetea la racha del intruso.
+        store.record(&dir, std::slice::from_ref(&game));
+        store.record(&dir, std::slice::from_ref(&intruder));
+        store.record(&dir, std::slice::from_ref(&game));
+        assert_eq!(store.attributed_name(&dir).as_deref(), Some("game"));
+        // Sólo tras ATTRIBUTION_SWITCH_STREAK ticks seguidos gana el retador.
+        for _ in 0..ATTRIBUTION_SWITCH_STREAK {
+            store.record(&dir, std::slice::from_ref(&intruder));
+        }
+        assert_eq!(store.attributed_name(&dir).as_deref(), Some("discord"));
     }
 
     #[test]

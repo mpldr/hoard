@@ -3115,6 +3115,7 @@ version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-compression",
+ "base64 0.22.1",
  "directories",
  "filetime",
  "futures",
@@ -3134,10 +3135,12 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tar",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "winreg 0.52.0",
  "zip",
 ]
@@ -3150,9 +3153,13 @@ dependencies = [
  "clap",
  "hoard-agent",
  "indicatif",
+ "rpassword",
+ "time",
  "tokio",
  "toml 0.8.2",
+ "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3260,6 +3267,7 @@ dependencies = [
  "hoard-core",
  "jsonwebtoken",
  "minisign-verify",
+ "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

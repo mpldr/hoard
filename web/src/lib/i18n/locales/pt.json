@@ -288,5 +288,16 @@
   "guides.back": "Todos os guias",
   "guides.updated": "Atualizado",
   "guides.cta_title": "Pronto para proteger os seus saves?",
-  "guides.cta_text": "Baixe o Hoard e configure backups automáticos e versionados em poucos minutos."
+  "guides.cta_text": "Baixe o Hoard e configure backups automáticos e versionados em poucos minutos.",
+  "link.title": "Vincular um dispositivo",
+  "link.subtitle": "Aprove o código mostrado pela CLI do Hoard na sua outra máquina.",
+  "link.need_signin": "Inicie sessão para aprovar este dispositivo.",
+  "link.signed_in_as": "Sessão iniciada como",
+  "link.code_label": "Código de emparelhamento",
+  "link.approve": "Aprovar",
+  "link.approve_hint": "Aprove apenas um código que você mesmo iniciou num dispositivo seu.",
+  "link.approved": "Dispositivo aprovado.",
+  "link.approved_hint": "Volte àquela máquina: já está a iniciar sessão.",
+  "link.err_not_found": "Esse código é inválido ou expirou. Comece de novo no seu dispositivo.",
+  "link.err_generic": "Não foi possível aprovar o dispositivo. Tente novamente."
 }

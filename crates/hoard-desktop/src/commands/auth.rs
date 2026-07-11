@@ -195,79 +195,13 @@ pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, Strin
     Ok(updated)
 }
 
-/// Decide whether `url` points at a server we should treat as
-/// "self-hosted at home" (display sizes in MB) or "external SaaS"
-/// (display as % of quota).
-///
-/// Heuristic: anything on localhost, an RFC1918 private IP, or an
-/// `.local` mDNS hostname is treated as local. Everything else —
-/// including a publicly-routable IP behind a home dynamic-DNS — is
-/// treated as external. Worst case the user sees % when they wanted
-/// MB; both views show the same data.
-pub(crate) fn classify_server(url: &str) -> bool {
-    let host = match host_of(url) {
-        Some(h) => h,
-        None => return false,
-    };
-
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".local") {
-        return true;
-    }
-    // RFC1918 IPv4 private ranges + the Tailscale CGNAT block (100.64.0.0/10),
-    // which is a private overlay network, not public SaaS. We accept v4 only; an
-    // IPv6 ULA (`fc00::/7`) check could go here later if needed.
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        let octs = ip.octets();
-        let private = octs[0] == 10
-            || (octs[0] == 172 && (16..=31).contains(&octs[1]))
-            || (octs[0] == 192 && octs[1] == 168)
-            || (octs[0] == 100 && (64..=127).contains(&octs[1]));
-        return private;
-    }
-    // Single-label host (no dot, not an IP/IPv6 literal): a LAN box or a
-    // Tailscale MagicDNS name like `ubserver` / `nas`. A public SaaS always has
-    // a fully-qualified name with a TLD, so treat the bare hostname as local —
-    // otherwise a self-hoster sees a bogus quota bar against the 100 GiB schema
-    // default instead of the plain "X used" line they own the disk for.
-    if !host.contains('.') && !host.contains(':') {
-        return true;
-    }
-    false
-}
-
-/// Decide whether `url` points at the managed Hoard Cloud backend. Used by
-/// the UI to hide the self-hosted "upgrade server" panel — the cloud has no
-/// `/v1/admin/upgrade` route (POSTing it returns 404; that was the source of
-/// the Windows "HTTP 404 Not Found" the user hit) and is upgraded out of
-/// band. Matches `hoard.services` / any `*.hoard.services` subdomain and the
-/// Fly.io hostnames the backend runs on (`*.fly.dev`).
-pub(crate) fn classify_cloud(url: &str) -> bool {
-    let host = match host_of(url) {
-        Some(h) => h,
-        None => return false,
-    };
-    host == "hoard.services" || host.ends_with(".hoard.services") || host.ends_with(".fly.dev")
-}
+// La heurística "local vs SaaS externo" y "es Hoard Cloud" vive en el agente
+// (`hoard_agent::serverclass`) para que la CLI comparta exactamente el mismo
+// criterio. Mantenemos los nombres históricos como alias finos.
+pub(crate) use hoard_agent::serverclass::is_cloud_host as classify_cloud;
+pub(crate) use hoard_agent::serverclass::is_local_server as classify_server;
 
 // ---- helpers ----------------------------------------------------------
-
-/// Extract the lowercased host from a `http(s)://host[:port][/path]` URL.
-/// Returns `None` when the URL has no recognised scheme.
-fn host_of(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    Some(
-        rest.split('/')
-            .next()
-            .unwrap_or(rest)
-            .split(':')
-            .next()
-            .unwrap_or(rest)
-            .trim_end_matches('.')
-            .to_lowercase(),
-    )
-}
 
 fn validate_url(url: &str) -> Result<(), String> {
     if url.is_empty() {
@@ -362,42 +296,3 @@ fn network_message(err: &reqwest::Error) -> String {
     err.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::classify_server;
-
-    #[test]
-    fn localhost_and_loopback_are_local() {
-        assert!(classify_server("http://localhost:8082"));
-        assert!(classify_server("http://127.0.0.1:8082"));
-        assert!(classify_server("http://[::1]:8082"));
-        assert!(classify_server("http://nas.local"));
-    }
-
-    #[test]
-    fn rfc1918_and_tailscale_cgnat_are_local() {
-        assert!(classify_server("http://10.0.0.5:12421"));
-        assert!(classify_server("http://172.16.4.4"));
-        assert!(classify_server("http://192.168.1.10"));
-        // Tailscale CGNAT 100.64.0.0/10.
-        assert!(classify_server("http://100.100.1.1:12421"));
-        assert!(classify_server("http://100.127.255.254"));
-    }
-
-    #[test]
-    fn single_label_lan_hostnames_are_local() {
-        // The `ubserver` case: a bare hostname is a LAN / Tailscale MagicDNS
-        // box, never a public SaaS, so it shouldn't get a bogus quota bar.
-        assert!(classify_server("http://ubserver:12421"));
-        assert!(classify_server("http://homelab"));
-    }
-
-    #[test]
-    fn public_hosts_are_external() {
-        assert!(!classify_server("https://saves.example.com"));
-        assert!(!classify_server("https://hoard.services"));
-        // 100.63.x is just outside the CGNAT block; 8.8.8.8 is public.
-        assert!(!classify_server("http://100.63.0.1"));
-        assert!(!classify_server("http://8.8.8.8"));
-    }
-}

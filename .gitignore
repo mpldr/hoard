@@ -67,5 +67,11 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # Revisión + recolección de datos del pipeline de detección. Local.
 /DETECTION.local.md
 
+# Notas de cambios por versión + dónde tocar. Local.
+/CAMBIOS-1.0.2.local.md
+
+# Visión del rediseño del CLI. Doc de trabajo local.
+/HOARD-CLI.local.md
+
 # Lista de tareas del usuario (solo la escribe él). Nunca al repo.
 /rleeon.md

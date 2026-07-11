@@ -288,5 +288,16 @@
   "guides.back": "Alle Anleitungen",
   "guides.updated": "Aktualisiert",
   "guides.cta_title": "Bereit, deine Spielstände zu schützen?",
-  "guides.cta_text": "Lade Hoard herunter und richte in wenigen Minuten automatische, versionierte Backups ein."
+  "guides.cta_text": "Lade Hoard herunter und richte in wenigen Minuten automatische, versionierte Backups ein.",
+  "link.title": "Gerät verknüpfen",
+  "link.subtitle": "Bestätige den Code, den die Hoard-CLI auf deinem anderen Gerät anzeigt.",
+  "link.need_signin": "Melde dich an, um dieses Gerät zu bestätigen.",
+  "link.signed_in_as": "Angemeldet als",
+  "link.code_label": "Kopplungscode",
+  "link.approve": "Bestätigen",
+  "link.approve_hint": "Bestätige nur einen Code, den du selbst auf einem eigenen Gerät gestartet hast.",
+  "link.approved": "Gerät bestätigt.",
+  "link.approved_hint": "Du kannst zu diesem Gerät zurückkehren – es meldet sich gerade an.",
+  "link.err_not_found": "Dieser Code ist ungültig oder abgelaufen. Starte auf deinem Gerät neu.",
+  "link.err_generic": "Gerät konnte nicht bestätigt werden. Versuch es erneut."
 }

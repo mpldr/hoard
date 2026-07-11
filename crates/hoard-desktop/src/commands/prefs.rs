@@ -191,7 +191,7 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 /// swallow errors — if we can't create it the subsequent `enable()` will
 /// surface a real error to the caller.
 #[cfg(target_os = "linux")]
-fn ensure_autostart_dir() {
+pub(crate) fn ensure_autostart_dir() {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));

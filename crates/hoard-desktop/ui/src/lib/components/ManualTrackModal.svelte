@@ -1,16 +1,20 @@
 <script lang="ts">
   /**
-   * "Add emulator" dialog (Hoard free).
+   * "Manual track" dialog (Hoard free).
    *
-   * Emulators have no storefront/Steam/manifest entry, so Hoard can't
-   * auto-detect their save folder or guess "is the user playing". This dialog
-   * collects both by hand — folder + the emulator's executable(s) — and tracks
-   * the result through the normal `addGameToTracking` with `processes` and
-   * `backup_only` pinned. From there backup/sync/restore and the playtime/date
-   * signal (which hoard-pro's recap later consumes) work like any other save.
+   * Two things Hoard can't auto-detect, tracked by hand through one modal:
    *
-   * Kept as its own component so none of this touches the existing detection
-   * flow in Library.svelte.
+   *  - **Game** — a game the catalog/Steam scan misses (indie, DRM-free, odd
+   *    install). The user names it and points at its save folder; play-detection
+   *    falls back to the slug, or to pinned processes if they add them.
+   *  - **Emulator** — no storefront/manifest entry at all, so we also collect
+   *    the emulator's executable(s) to know when the user is "playing". Presets
+   *    pre-fill folder + processes for the common ones.
+   *
+   * Both track through the normal `addGameToTracking`. Emulator saves carry an
+   * `emu-<id>` slug and pin `backup_only` so Hoard never restores the cloud copy
+   * over an in-progress local save; games carry a plain slug. Kept as its own
+   * component so none of this touches the detection flow in Library.svelte.
    */
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { FolderOpen, Plus, X, Gamepad2, Cpu } from "lucide-svelte";
@@ -36,14 +40,25 @@
   };
   let { open, onClose, onAdded }: Props = $props();
 
+  type Mode = "game" | "emulator";
+  let mode = $state<Mode>("game");
+
+  // --- Game mode ---------------------------------------------------------
+  let gameName = $state("");
+
+  // --- Emulator mode -----------------------------------------------------
   let presets = $state<EmulatorPreset[]>([]);
   let loadingPresets = $state(false);
   // "" = nothing chosen yet, "custom" = an emulator not in the catalog.
   let selectedId = $state("");
   let customName = $state("");
+
+  // --- Shared ------------------------------------------------------------
   let folder = $state("");
   let procs = $state<string[]>([]);
   let manualProc = $state("");
+  // Emulators default to backup-only (never restore over an in-progress save);
+  // plain games sync normally unless the user opts in.
   let backupOnly = $state(true);
 
   let running = $state<RunningProcess[]>([]);
@@ -51,23 +66,41 @@
   let detecting = $state(false);
   let submitting = $state(false);
 
+  const isEmulator = $derived(mode === "emulator");
   const selectedPreset = $derived(
     presets.find((p) => p.id === selectedId) ?? null,
   );
   const isCustom = $derived(selectedId === "custom");
+  // Game mode needs a name + folder; emulator mode also needs a chosen
+  // emulator and at least one process (no catalog to derive it from).
   const canSubmit = $derived(
-    selectedId.length > 0 &&
-      folder.trim().length > 0 &&
-      procs.length > 0 &&
-      (!isCustom || customName.trim().length > 0),
+    isEmulator
+      ? selectedId.length > 0 &&
+          folder.trim().length > 0 &&
+          procs.length > 0 &&
+          (!isCustom || customName.trim().length > 0)
+      : gameName.trim().length > 0 && folder.trim().length > 0,
   );
 
-  // Lazy-load the catalog the first time the dialog opens.
+  // Lazy-load the emulator catalog the first time it's needed.
   $effect(() => {
-    if (open && presets.length === 0 && !loadingPresets) {
+    if (open && isEmulator && presets.length === 0 && !loadingPresets) {
       void loadPresets();
     }
   });
+
+  function pickMode(m: Mode) {
+    if (m === mode) return;
+    mode = m;
+    // Switching intent shouldn't carry the other mode's fields over.
+    folder = "";
+    procs = [];
+    running = [];
+    detected = false;
+    selectedId = "";
+    customName = "";
+    backupOnly = m === "emulator";
+  }
 
   async function loadPresets() {
     loadingPresets = true;
@@ -145,6 +178,8 @@
   }
 
   function reset() {
+    mode = "game";
+    gameName = "";
     selectedId = "";
     customName = "";
     folder = "";
@@ -164,18 +199,25 @@
     if (!canSubmit || submitting) return;
     submitting = true;
     try {
-      const slug = isCustom
-        ? `emu-${slugify(customName)}`
-        : `emu-${selectedId}`;
-      const display = isCustom
-        ? customName.trim()
-        : (selectedPreset?.display_name ?? selectedId);
+      let slug: string;
+      let display: string;
+      if (isEmulator) {
+        slug = isCustom ? `emu-${slugify(customName)}` : `emu-${selectedId}`;
+        display = isCustom
+          ? customName.trim()
+          : (selectedPreset?.display_name ?? selectedId);
+      } else {
+        display = gameName.trim();
+        slug = slugify(display);
+      }
       const saved = await addGameToTracking({
         game_slug: slug,
         local_path: folder.trim(),
         display_name: display,
         preset: backupOnly ? "backup_only" : undefined,
-        processes: procs,
+        // Empty process list ⇒ derive play-detection from the slug (games);
+        // emulators always carry at least one (enforced by canSubmit).
+        processes: procs.length > 0 ? procs : undefined,
       });
       onAdded(saved);
       toastSuccess($_("emulators.added", { values: { name: display } }));
@@ -191,62 +233,108 @@
 
 <Modal
   {open}
-  title={$_("emulators.title")}
-  description={$_("emulators.description")}
+  title={$_("manual.title")}
+  description={isEmulator
+    ? $_("emulators.description")
+    : $_("manual.description_game")}
   onClose={close}
 >
   <div class="space-y-4">
-    <!-- Emulator picker -->
-    <div>
-      <label
-        for="emu-select"
-        class="mb-1.5 block text-xs font-medium text-zinc-400"
+    <!-- Mode toggle: game vs emulator -->
+    <div
+      class="grid grid-cols-2 gap-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-1"
+    >
+      <button
+        type="button"
+        onclick={() => pickMode("game")}
+        class="rounded-md px-3 py-1.5 text-sm font-medium transition {mode ===
+        'game'
+          ? 'bg-emerald-600/20 text-emerald-300 ring-1 ring-inset ring-emerald-600/40'
+          : 'text-zinc-400 hover:text-zinc-200'}"
       >
-        {$_("emulators.choose")}
-      </label>
-      <select
-        id="emu-select"
-        bind:value={selectedId}
-        onchange={onSelect}
-        disabled={loadingPresets}
-        class="w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-600 focus:outline-none focus:ring-1 focus:ring-emerald-600 disabled:opacity-50"
+        {$_("manual.mode_game")}
+      </button>
+      <button
+        type="button"
+        onclick={() => pickMode("emulator")}
+        class="rounded-md px-3 py-1.5 text-sm font-medium transition {mode ===
+        'emulator'
+          ? 'bg-emerald-600/20 text-emerald-300 ring-1 ring-inset ring-emerald-600/40'
+          : 'text-zinc-400 hover:text-zinc-200'}"
       >
-        <option value="" disabled>{$_("emulators.choose_placeholder")}</option>
-        {#each presets as p (p.id)}
-          <option value={p.id}>{p.display_name} — {p.system}</option>
-        {/each}
-        <option value="custom">{$_("emulators.custom")}</option>
-      </select>
+        {$_("manual.mode_emulator")}
+      </button>
     </div>
 
-    {#if isCustom}
+    {#if isEmulator}
+      <!-- Emulator picker -->
       <div>
         <label
-          for="emu-custom-name"
+          for="emu-select"
           class="mb-1.5 block text-xs font-medium text-zinc-400"
         >
-          {$_("emulators.custom_name_label")}
+          {$_("emulators.choose")}
+        </label>
+        <select
+          id="emu-select"
+          bind:value={selectedId}
+          onchange={onSelect}
+          disabled={loadingPresets}
+          class="w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-600 focus:outline-none focus:ring-1 focus:ring-emerald-600 disabled:opacity-50"
+        >
+          <option value="" disabled>{$_("emulators.choose_placeholder")}</option
+          >
+          {#each presets as p (p.id)}
+            <option value={p.id}>{p.display_name} — {p.system}</option>
+          {/each}
+          <option value="custom">{$_("emulators.custom")}</option>
+        </select>
+      </div>
+
+      {#if isCustom}
+        <div>
+          <label
+            for="emu-custom-name"
+            class="mb-1.5 block text-xs font-medium text-zinc-400"
+          >
+            {$_("emulators.custom_name_label")}
+          </label>
+          <Input
+            id="emu-custom-name"
+            bind:value={customName}
+            placeholder={$_("emulators.custom_name_placeholder")}
+          />
+        </div>
+      {/if}
+    {:else}
+      <!-- Game name -->
+      <div>
+        <label
+          for="manual-game-name"
+          class="mb-1.5 block text-xs font-medium text-zinc-400"
+        >
+          {$_("manual.game_name_label")}
         </label>
         <Input
-          id="emu-custom-name"
-          bind:value={customName}
-          placeholder={$_("emulators.custom_name_placeholder")}
+          id="manual-game-name"
+          bind:value={gameName}
+          placeholder={$_("manual.game_name_placeholder")}
         />
       </div>
     {/if}
 
-    {#if selectedId.length > 0}
+    {#if isEmulator ? selectedId.length > 0 : true}
       <!-- Save folder -->
       <div>
         <label
-          for="emu-folder"
+          for="manual-folder"
           class="mb-1.5 block text-xs font-medium text-zinc-400"
         >
           {$_("emulators.folder_label")}
         </label>
         <div class="flex gap-2">
           <Input
-            id="emu-folder"
+            id="manual-folder"
             class="flex-1"
             bind:value={folder}
             placeholder={$_("emulators.folder_placeholder")}
@@ -257,14 +345,18 @@
           </Button>
         </div>
         <p class="mt-1.5 text-xs text-zinc-500">
-          {$_("emulators.folder_hint")}
+          {isEmulator
+            ? $_("emulators.folder_hint")
+            : $_("manual.game_folder_hint")}
         </p>
       </div>
 
       <!-- Process(es) -->
       <div>
         <span class="mb-1.5 block text-xs font-medium text-zinc-400">
-          {$_("emulators.processes_label")}
+          {isEmulator
+            ? $_("emulators.processes_label")
+            : $_("manual.processes_label_game")}
         </span>
 
         {#if procs.length > 0}
@@ -351,7 +443,9 @@
           </ul>
         {/if}
         <p class="mt-1.5 text-xs text-zinc-500">
-          {$_("emulators.processes_hint")}
+          {isEmulator
+            ? $_("emulators.processes_hint")
+            : $_("manual.processes_hint_game")}
         </p>
       </div>
 
@@ -378,7 +472,7 @@
     </Button>
     <Button onclick={submit} loading={submitting} disabled={!canSubmit}>
       <Plus size={14} />
-      {submitting ? $_("emulators.submitting") : $_("emulators.submit")}
+      {submitting ? $_("emulators.submitting") : $_("manual.submit")}
     </Button>
   {/snippet}
 </Modal>

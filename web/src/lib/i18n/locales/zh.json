@@ -288,5 +288,16 @@
   "guides.back": "所有指南",
   "guides.updated": "更新于",
   "guides.cta_title": "准备好保护你的存档了吗？",
-  "guides.cta_text": "下载 Hoard，几分钟即可设置自动、带版本管理的备份。"
+  "guides.cta_text": "下载 Hoard，几分钟即可设置自动、带版本管理的备份。",
+  "link.title": "关联设备",
+  "link.subtitle": "批准另一台机器上 Hoard CLI 显示的代码。",
+  "link.need_signin": "登录以批准此设备。",
+  "link.signed_in_as": "已登录为",
+  "link.code_label": "配对码",
+  "link.approve": "批准",
+  "link.approve_hint": "只批准你自己在自己的设备上发起的代码。",
+  "link.approved": "设备已批准。",
+  "link.approved_hint": "回到那台机器：它正在登录。",
+  "link.err_not_found": "该代码无效或已过期。请在你的设备上重新开始。",
+  "link.err_generic": "无法批准该设备。请重试。"
 }

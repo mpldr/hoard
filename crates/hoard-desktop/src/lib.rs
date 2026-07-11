@@ -193,6 +193,7 @@ pub fn run() {
             commands::library::scan_library,
             commands::library::rescan_library,
             commands::library::deep_scan_library,
+            commands::library::scan_folder,
             commands::library::cached_detection,
             commands::library::add_game_to_tracking,
             commands::library::adopt_save,
@@ -285,11 +286,40 @@ pub fn run() {
                 app.state::<TrayController>().set_state(TrayState::Offline);
             }
 
-            // If prefs say "start minimised", hide the main window before it
-            // ever paints. Combined with autostart, this gives users a quiet
-            // launch — Hoard appears only as a tray icon.
-            if let Ok((prefs, _)) = Prefs::load_default() {
-                if prefs.start_minimised {
+            // First-run bootstrap + silent-boot handling. `prefs.json` missing
+            // means a fresh install: apply the shipped defaults to the OS
+            // (autostart on) since the pref alone is just a mirror — the
+            // autostart plugin owns the real entry, and the Settings page
+            // re-probes it, so without registering here the toggle would snap
+            // back to off.
+            let first_run = Prefs::default_path().map(|p| !p.exists()).unwrap_or(false);
+            if let Ok((mut prefs, path)) = Prefs::load_default() {
+                if first_run && prefs.autostart {
+                    use tauri_plugin_autostart::ManagerExt;
+                    #[cfg(target_os = "linux")]
+                    commands::prefs::ensure_autostart_dir();
+                    match app.autolaunch().enable() {
+                        Ok(()) => tracing::info!("first run: autostart enabled"),
+                        Err(e) => {
+                            // Best-effort: some minimal Linux sessions have no
+                            // autostart dir we can write. Reflect the failure in
+                            // the pref so the UI doesn't claim it's on.
+                            tracing::warn!(error = %e, "first run: couldn't enable autostart");
+                            prefs.autostart = false;
+                        }
+                    }
+                    // Persist so the mirror matches the OS truth from the start.
+                    let _ = prefs.save(&path);
+                }
+
+                // Hide the main window before it paints only on a *silent* boot:
+                // the autostart entry launches Hoard with `--silent` (see the
+                // plugin init above), so login starts quiet (tray only) while a
+                // manual double-click always shows the UI — even with
+                // `start_minimised` on. Without this gate a fresh install would
+                // launch invisibly.
+                let silent = std::env::args().any(|a| a == "--silent");
+                if prefs.start_minimised && silent {
                     if let Some(w) = app.get_webview_window("main") {
                         let _ = w.hide();
                     }

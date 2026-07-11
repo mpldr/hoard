@@ -171,6 +171,18 @@ pub struct CloudConfig {
     /// Optional issuer claim check. Empty = skip.
     #[serde(default)]
     pub supabase_issuer: String,
+    /// Supabase project base URL (`https://<project>.supabase.co`). Only the
+    /// device-pairing flow needs it: on approval the server calls the GoTrue
+    /// admin API here to mint a fresh session for the CLI. Empty = the
+    /// `POST /v1/cloud/device/*` endpoints refuse (feature off).
+    /// From `HOARD__CLOUD__SUPABASE_URL`.
+    #[serde(default)]
+    pub supabase_url: String,
+    /// Supabase **service-role** key. Privileged: used only server-side to
+    /// mint device-pairing sessions (admin `generate_link` + `verify`). Never
+    /// sent to clients. From `HOARD__CLOUD__SUPABASE_SERVICE_ROLE_KEY`.
+    #[serde(default)]
+    pub supabase_service_role_key: String,
     /// JWKS refresh interval (seconds). Defaults to one hour.
     #[serde(default = "default_jwks_refresh_secs")]
     pub jwks_refresh_secs: u64,

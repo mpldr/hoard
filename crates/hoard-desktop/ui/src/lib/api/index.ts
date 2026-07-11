@@ -173,6 +173,14 @@ export function deepScanLibrary(): Promise<DetectionReport> {
   return invoke<DetectionReport>("deep_scan_library");
 }
 
+/** Ludusavi-style "add from folder": scan ONE user-chosen folder and return
+ *  the games detected inside it. One-off lookup — never touches the catalog/
+ *  Steam and never persists into the library cache. Backs the folder-picker
+ *  button next to "Manual track". */
+export function scanFolder(path: string): Promise<DetectedGame[]> {
+  return invoke<DetectedGame[]>("scan_folder", { path });
+}
+
 /** Return the previous scan if one is in memory, else null. */
 export function cachedDetection(): Promise<DetectionReport | null> {
   return invoke<DetectionReport | null>("cached_detection");

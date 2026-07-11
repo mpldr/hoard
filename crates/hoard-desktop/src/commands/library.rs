@@ -12,33 +12,34 @@
 //! enriched with the local path from state so the UI doesn't need a second
 //! round-trip.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use hoard_agent::api::{ApiClient, ApiError};
-use hoard_agent::config::CliConfig;
+use hoard_agent::correlation::CorrelationStore;
 use hoard_agent::credentials;
-use hoard_agent::detection::{self, DetectionReport, DetectionTrace};
+use hoard_agent::detection::{
+    self, DetectedGame, DetectionReport, DetectionSource, DetectionTrace,
+};
+use hoard_agent::library;
 use hoard_agent::manifest::Os;
-use hoard_agent::presets;
-use hoard_agent::state::{CliState, SaveState};
-use serde::{Deserialize, Serialize};
+use hoard_agent::state::CliState;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use time::OffsetDateTime;
 
-use super::agent::{attach_save_if_running, detach_save_if_running, watched_save_from};
+use super::agent::{attach_save_if_running, detach_save_if_running};
 use super::auth::pretty_error;
 use super::error::AppError;
 use crate::state::AppState;
 
-/// Persisted detection snapshot. Lives on disk alongside `state.json` so the
-/// Library page paints immediately on cold start without a fresh sweep.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedDetection {
-    pub report: DetectionReport,
-    #[serde(with = "time::serde::rfc3339")]
-    pub scanned_at: OffsetDateTime,
-}
+// Persisted detection snapshot + its disk I/O live in `hoard_agent::library`
+// (the CLI reuses the same cache). Re-exported so the rest of this module and
+// `AppState` keep referring to them under `commands::library::…`.
+pub use hoard_agent::library::{
+    load_detection_from_disk, save_detection_to_disk_atomic, CachedDetection,
+};
 
 /// In-memory cache of the most recent scan, so the Library page can
 /// re-render instantly when the user navigates back without forcing
@@ -60,56 +61,6 @@ const STALE_AFTER_SECS: i64 = 60 * 60 * 24;
 /// after the OS clock jumps forward.
 const POLL_INTERVAL_SECS: u64 = 60 * 30;
 
-/// Path to the persisted detection cache. Lives in the same dir as
-/// `state.json` (see `hoard_agent::config::CliConfig::state_dir`).
-pub fn detection_cache_path() -> anyhow::Result<PathBuf> {
-    Ok(CliConfig::state_dir()?.join("detection.json"))
-}
-
-/// Load the on-disk detection cache. Returns `None` when the file is
-/// missing, malformed, or otherwise unreadable — corruption is logged at
-/// WARN and we fall back to a fresh boot rather than crashing the app.
-pub fn load_detection_from_disk() -> Option<CachedDetection> {
-    let path = match detection_cache_path() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't resolve detection cache path");
-            return None;
-        }
-    };
-    if !path.exists() {
-        return None;
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<CachedDetection>(&text) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "detection cache malformed; ignoring");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "couldn't read detection cache");
-            None
-        }
-    }
-}
-
-/// Write the cache atomically: serialize → tmp file → `fs::rename`.
-/// On Unix that's an atomic operation; on Windows it's atomic for files on
-/// the same volume, which `state_dir` always satisfies.
-fn save_detection_to_disk_atomic(cached: &CachedDetection) -> anyhow::Result<()> {
-    let path = detection_cache_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(cached)?;
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// Wire shape sent to the frontend per progress tick.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanProgress {
@@ -117,67 +68,10 @@ pub struct ScanProgress {
     pub total: usize,
 }
 
-/// Wire shape for one tracked save in the Library list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrackedSave {
-    pub save_id: String,
-    pub game_slug: String,
-    pub label: String,
-    pub local_path: String,
-    pub last_version_num: Option<i64>,
-    pub last_backup_at: Option<String>,
-    /// `true` if the user has paused tracking for this save. Paused saves
-    /// stay in the list but the agent ignores them — useful when the user
-    /// is reorganising files or doesn't want chatty backups during a
-    /// modding session.
-    #[serde(default)]
-    pub paused: bool,
-    /// Total bytes this save occupies on the server, summed across every
-    /// non-deleted snapshot. The server fills this in on `/v1/saves`; we
-    /// surface it so the Library page can show "23.4 MB" next to each
-    /// game.
-    #[serde(default)]
-    pub total_size_bytes: i64,
-    /// `true` when the save exists server-side but this machine has no
-    /// matching `CliState` row — i.e. the user reinstalled, switched PCs,
-    /// or cleared local state without deleting the server data. The UI
-    /// shows these with a discreet "Sin estado local" badge and disables
-    /// the untrack (local-only) button: there's nothing local to clean,
-    /// so the only sensible action is the full `delete_save_completely`.
-    #[serde(default)]
-    pub orphan: bool,
-    /// Bytes this save occupies **on this machine** — the recursive size of
-    /// its local folder. `None` for orphan rows (no local folder here) and
-    /// for freshly-created rows whose size the Library refetches. Distinct
-    /// from [`Self::total_size_bytes`], which is the server-side footprint
-    /// across every snapshot. The "Juegos monitorizados" section shows this
-    /// so the user sees what the save costs *here*, not in the cloud.
-    #[serde(default)]
-    pub local_size_bytes: Option<i64>,
-    /// The active sync preset for this save, if the user picked one
-    /// explicitly. `None` means "standard / inherit global config" — note
-    /// that a built-in per-game preset (e.g. R.E.P.O.) may still apply at
-    /// the agent level even when this is `None`; this field only reflects
-    /// the user's manual override so the selector shows the right value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
-}
-
-/// Fill `local_size_bytes` for every non-orphan row by walking its local
-/// folder (metadata-only, no file reads — cheap even for large saves). Orphan
-/// rows have no local folder on this machine, so they stay `None`. Powers the
-/// "Juegos monitorizados" footprint column (BUG 4).
-fn fill_local_sizes(out: &mut [TrackedSave]) {
-    for t in out.iter_mut() {
-        if t.orphan || t.local_path.is_empty() {
-            continue;
-        }
-        let p = std::path::Path::new(&t.local_path);
-        if p.is_dir() {
-            t.local_size_bytes = Some(hoard_agent::agent::dir_size_bytes(p) as i64);
-        }
-    }
-}
+// Wire types for tracking live in `hoard_agent::library` so the CLI shares
+// them. Re-exported here so the Tauri commands and `automatic.rs` keep the
+// `commands::library::…` paths.
+pub use hoard_agent::library::{AddGameArgs, AdoptArgs, TrackedSave};
 
 /// Run a full auto-detection sweep against the **bundled** catalog (no
 /// server round-trips). Emits `library://scan-progress` events
@@ -260,6 +154,56 @@ pub async fn deep_scan_library(
     Ok(report)
 }
 
+/// Ludusavi-style "add from folder": scan ONE user-chosen folder and return
+/// the games detected inside it, for the folder-picker button next to "Manual
+/// track". Unlike `scan_library` this never touches the catalog or Steam and
+/// never persists into the library cache — it's a one-off lookup whose results
+/// the UI shows as "found <Game> here — track it?".
+///
+/// Runs on the blocking pool: the walk is synchronous filesystem I/O bounded by
+/// the deep per-root timeout, so keeping it off the async runtime avoids
+/// stalling the UI event loop on a slow/large folder.
+#[tauri::command]
+pub async fn scan_folder(path: String) -> Result<Vec<DetectedGame>, String> {
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err(format!("{} isn't a folder.", root.display()));
+    }
+
+    // Skip folders already covered by a tracked save so the list only shows
+    // new candidates, not games the user already added.
+    let (cli_state, _) = CliState::load_default().map_err(|e| e.to_string())?;
+    let known: HashSet<PathBuf> = cli_state
+        .saves
+        .values()
+        .map(|s| s.local_path.clone())
+        .collect();
+
+    tokio::task::spawn_blocking(move || {
+        // Correlation store, best-effort (empty if absent) — same as detect_all,
+        // so a folder the agent has seen a game write to grades higher.
+        let store = CorrelationStore::default_path()
+            .ok()
+            .map(|p| CorrelationStore::load(&p))
+            .unwrap_or_default();
+        detection::discover_in_folder(&root, &store, &known)
+            .into_iter()
+            .map(|a| DetectedGame {
+                slug: a.slug,
+                display_name: a.display_name,
+                found_paths: vec![a.path],
+                path_confidences: vec![a.confidence],
+                confidence: a.confidence,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Return the previous scan if one is in memory. Used by the Library page
 /// to render quickly on navigation; if `None`, the UI triggers `scan_library`.
 #[tauri::command]
@@ -287,474 +231,54 @@ fn persist_scan(state: &State<'_, AppState>, report: DetectionReport) {
     }
 }
 
-/// Args for `add_game_to_tracking`. We keep them in a struct so adding more
-/// optional fields later (label override, paths preference) doesn't reshape
-/// the Tauri command signature.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AddGameArgs {
-    pub game_slug: String,
-    pub label: Option<String>,
-    pub local_path: String,
-    /// Optional catalog metadata. We pass this to the server so it can
-    /// self-heal its games table when the desktop's Ludusavi catalog is
-    /// fresher than the server's seed (e.g. self-hosted server still on
-    /// v1.0.0 while the desktop has auto-refreshed). Older servers ignore
-    /// the extra fields silently.
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub steam_app_id: Option<i64>,
-    /// Pin a sync preset id (see [`presets::ALL_PRESETS`]) instead of letting
-    /// the built-in catalog decide. Manually-added emulator saves pass
-    /// `backup_only` here so Hoard never restores the cloud copy over an
-    /// in-progress local save. `None` = built-in default (unchanged behaviour
-    /// for normal tracked games).
-    #[serde(default)]
-    pub preset: Option<String>,
-    /// Pin the process executable names that mark this save as "playing"
-    /// (emulator exes chosen by the user). Persisted on `SaveState` so the
-    /// play-detection survives restarts. `None` = derive from the slug, exactly
-    /// as before for normal games.
-    #[serde(default)]
-    pub processes: Option<Vec<String>>,
-}
-
 /// Begin tracking a detected game. Creates a Save on the server and writes
 /// the local path into the agent's state file. Returns the resulting
-/// `TrackedSave` so the UI can append it to the list without a re-fetch.
+/// `TrackedSave` so the UI can append it to the list without a re-fetch. All
+/// the business logic (cloud vs self-hosted, dedup, 409 re-link) lives in
+/// `hoard_agent::library`; this wrapper just talks to the live agent and
+/// prettifies errors.
 #[tauri::command]
 pub async fn add_game_to_tracking(
     args: AddGameArgs,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
     let client = current_client(&state)?;
-    let label = args.label.unwrap_or_else(|| "main".to_string());
-
-    // Optional manual overrides (emulator saves). Both fall back to the
-    // existing slug-derived behaviour, so normal tracked games are unaffected.
-    let pinned_processes = args.processes.clone().unwrap_or_default();
-    let preset_name: Option<String> = args
-        .preset
-        .clone()
-        .or_else(|| presets::builtin_preset_for(&args.game_slug).map(str::to_string));
-
-    let local_path = PathBuf::from(&args.local_path);
-    if local_path.as_os_str().is_empty() {
-        return Err("Save folder path can't be empty.".to_string());
-    }
-    // Auto-create when the folder is missing — useful when the user wants
-    // to start tracking a save before launching the game (e.g. restoring
-    // from another machine first).
-    if !local_path.exists() {
-        std::fs::create_dir_all(&local_path)
-            .map_err(|e| format!("Couldn't create {}: {e}", local_path.display()))?;
-    } else if !local_path.is_dir() {
-        return Err(format!("{} isn't a folder.", local_path.display()));
-    }
-
-    // Cloud has no server-side `create_save`: the row is materialized on the
-    // first upload via UPSERT on (user_id, game_slug, label). The client just
-    // mints a local save_id, records the path, and starts watching.
-    if client.is_cloud().await {
-        let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-        // Dedup by (game_slug, label): unlike the self-hosted path — where a
-        // second create hits a 409 and re-links to the one server row — the
-        // cloud path used to mint a fresh uuid every call, so adding the same
-        // game twice (re-track, re-run onboarding, a detection re-add) left
-        // two local rows for one partida and the Library listed it twice.
-        // Reuse the existing id, just refreshing the local path.
-        let save_id = cli_state
-            .saves
-            .iter()
-            .find(|(_, st)| st.game_slug == args.game_slug && st.label == label)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        cli_state.saves.insert(
-            save_id.clone(),
-            SaveState {
-                local_path: local_path.clone(),
-                game_slug: args.game_slug.clone(),
-                label: label.clone(),
-                last_backup_at: None,
-                last_version_num: None,
-                paused: false,
-                // Auto-assign our built-in preset for known-quirky games (or
-                // the caller's pinned one — `backup_only` for emulators) so the
-                // right sync behaviour applies from the first backup; the user
-                // can override it later.
-                preset: preset_name.clone(),
-                set_hash: None,
-                processes: pinned_processes.clone(),
-            },
-        );
-        cli_state.save(&path).map_err(|e| e.to_string())?;
-
-        let watched = watched_save_from(
-            save_id.clone(),
-            args.game_slug.clone(),
-            args.game_slug.clone(),
-            label.clone(),
-            local_path.clone(),
-            preset_name.as_deref(),
-            pinned_processes.clone(),
-        );
-        attach_save_if_running(&state, watched).await;
-
-        let preset = preset_name.clone();
-        return Ok(TrackedSave {
-            save_id,
-            game_slug: args.game_slug,
-            label,
-            local_path: local_path.to_string_lossy().into_owned(),
-            last_version_num: None,
-            last_backup_at: None,
-            paused: false,
-            total_size_bytes: 0,
-            orphan: false,
-            local_size_bytes: None,
-            preset,
-        });
-    }
-
-    let save = match client
-        .create_save_with_meta(
-            &args.game_slug,
-            &label,
-            args.display_name.as_deref(),
-            args.steam_app_id,
-        )
+    let outcome = library::add_to_tracking(&client, args)
         .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            // A 409 means there's already a server-side save for this
-            // (game_slug, label) pair owned by this user. That happens when
-            // the user destracked the save locally — which intentionally
-            // leaves the server row in place to preserve snapshots — and
-            // then re-tracks the same game. Recover by finding the existing
-            // save and re-linking it into local state, so destrack+retrack
-            // restores the user's snapshot history instead of dead-ending
-            // with an opaque error.
-            let is_conflict = e
-                .downcast_ref::<ApiError>()
-                .map(|api| matches!(api, ApiError::Conflict(_)))
-                .unwrap_or(false);
-            if !is_conflict {
-                return Err(pretty_error(e));
-            }
-            let existing = client
-                .list_saves(Some(&args.game_slug))
-                .await
-                .map_err(pretty_error)?;
-            existing
-                .into_iter()
-                .find(|s| s.game_slug == args.game_slug && s.label == label)
-                .ok_or_else(|| "Couldn't re-link the existing save on the server.".to_string())?
-        }
-    };
-
-    // Persist the local-path mapping so backup/restore know where to look.
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    cli_state.saves.insert(
-        save.id.clone(),
-        SaveState {
-            local_path: local_path.clone(),
-            game_slug: save.game_slug.clone(),
-            label: save.label.clone(),
-            last_backup_at: None,
-            last_version_num: None,
-            paused: false,
-            preset: preset_name.clone(),
-            set_hash: None,
-            processes: pinned_processes.clone(),
-        },
-    );
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
+        .map_err(pretty_error)?;
     // Attach to the running agent so it starts watching immediately.
-    let watched = watched_save_from(
-        save.id.clone(),
-        save.game_slug.clone(),
-        args.game_slug.clone(),
-        save.label.clone(),
-        local_path.clone(),
-        preset_name.as_deref(),
-        pinned_processes.clone(),
-    );
-    attach_save_if_running(&state, watched).await;
-
-    // Surface whatever the server already knows about this save — for a
-    // brand-new one these are zero/None; for a re-linked one (destrack +
-    // retrack) they restore the snapshot history into the Library card.
-    let last_version_num = save.latest_version_num;
-    let total_size_bytes = save.total_size_bytes.unwrap_or(0);
-    let preset = preset_name.clone();
-    Ok(TrackedSave {
-        save_id: save.id,
-        game_slug: save.game_slug,
-        label: save.label,
-        local_path: local_path.to_string_lossy().into_owned(),
-        last_version_num,
-        last_backup_at: None,
-        paused: false,
-        total_size_bytes,
-        orphan: false,
-        local_size_bytes: None,
-        preset,
-    })
-}
-
-/// Args for [`adopt_save`].
-#[derive(Debug, Clone, Deserialize)]
-pub struct AdoptArgs {
-    /// The EXISTING cloud save_id to bind to (from the orphan card). Reusing
-    /// it is what makes this an adoption — one save, a folder per machine —
-    /// instead of a brand-new branch.
-    pub save_id: String,
-    pub game_slug: String,
-    pub label: String,
-    pub local_path: String,
+    attach_save_if_running(&state, outcome.watched).await;
+    Ok(outcome.tracked)
 }
 
 /// Adopt (vincular) a cloud save that belongs to another machine: associate a
 /// local folder on THIS machine with the existing `save_id` instead of minting
-/// a new save. Writes the `CliState` row under that id, creates the folder if
-/// missing, and attaches the save to the running agent — which, in sync mode,
-/// auto-restores the latest snapshot on add (the version-gate is left open);
-/// in backup-only mode it just watches the folder without downloading. This is
-/// the core of cross-device sync (BUG 3): a virgin machine binds to the cloud
-/// save and pulls the other machine's progress without the user saving first.
+/// a new save. In sync mode the agent auto-restores the latest snapshot on add
+/// (the version-gate is left open); in backup-only mode it just watches the
+/// folder. Core of cross-device sync. Logic in `hoard_agent::library::adopt`.
 #[tauri::command]
 pub async fn adopt_save(
     args: AdoptArgs,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
-    // Ensure a session exists (and surface a clean error if not).
-    let _client = current_client(&state)?;
-
-    let local_path = PathBuf::from(&args.local_path);
-    if local_path.as_os_str().is_empty() {
-        return Err("Save folder path can't be empty.".to_string());
-    }
-    if !local_path.exists() {
-        std::fs::create_dir_all(&local_path)
-            .map_err(|e| format!("Couldn't create {}: {e}", local_path.display()))?;
-    } else if !local_path.is_dir() {
-        return Err(format!("{} isn't a folder.", local_path.display()));
-    }
-
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let preset = presets::builtin_preset_for(&args.game_slug).map(str::to_string);
-    cli_state.saves.insert(
-        args.save_id.clone(),
-        SaveState {
-            local_path: local_path.clone(),
-            game_slug: args.game_slug.clone(),
-            label: args.label.clone(),
-            last_backup_at: None,
-            // Leave the version cursor open so the agent's on-add auto-restore
-            // pulls the latest cloud snapshot (sync mode). A successful restore
-            // then persists the synced version via `SaveAutoRestored` (BUG 1).
-            last_version_num: None,
-            paused: false,
-            preset: preset.clone(),
-            set_hash: None,
-            // Adopt re-binds an existing cloud save on a fresh machine; process
-            // pins are per-machine and not carried here. Normal games derive
-            // from the slug; an adopted emulator gets its play-detection on the
-            // next manual add or agent restart.
-            processes: Vec::new(),
-        },
-    );
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
-    let watched = watched_save_from(
-        args.save_id.clone(),
-        args.game_slug.clone(),
-        args.game_slug.clone(),
-        args.label.clone(),
-        local_path.clone(),
-        preset.as_deref(),
-        Vec::new(),
-    );
-    attach_save_if_running(&state, watched).await;
-
-    Ok(TrackedSave {
-        save_id: args.save_id,
-        game_slug: args.game_slug,
-        label: args.label,
-        local_path: local_path.to_string_lossy().into_owned(),
-        last_version_num: None,
-        last_backup_at: None,
-        paused: false,
-        total_size_bytes: 0,
-        orphan: false,
-        local_size_bytes: None,
-        preset,
-    })
+    let client = current_client(&state)?;
+    let outcome = library::adopt(&client, args).await.map_err(pretty_error)?;
+    attach_save_if_running(&state, outcome.watched).await;
+    Ok(outcome.tracked)
 }
 
-/// List the saves Hoard is tracking for the logged-in user. Server-side
-/// data is the source of truth for `latest_version_num`; the local path
-/// comes from `CliState`.
+/// List the saves Hoard is tracking for the logged-in user. Server-side data is
+/// the source of truth for `latest_version_num`; the local path comes from
+/// `CliState`. Logic (dedup self-heal, orphan detection, local sizes) lives in
+/// `hoard_agent::library::list_tracked`; this wrapper detaches any duplicate
+/// rows the self-heal pruned from the live agent.
 #[tauri::command]
 pub async fn list_tracked_saves(state: State<'_, AppState>) -> Result<Vec<TrackedSave>, String> {
     let client = current_client(&state)?;
-
-    // Cloud has no per-user save listing that includes never-uploaded saves:
-    // the manifest only carries saves with at least one committed version.
-    // CliState is the tracked-set source of truth here; the manifest just
-    // enriches latest_version_num / size for saves that have been uploaded.
-    if client.is_cloud().await {
-        let manifest = client.cloud_sync().await.map_err(pretty_error)?;
-        let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-
-        // Self-heal duplicate tracking rows. The cloud enforces one save per
-        // (game_slug, label) — UPSERT in `init_upload` — so any extra local
-        // row for the same pair is stale (a manual re-add, a re-run of
-        // onboarding, or a row minted before the 1.9.7 dedup landed). Left in
-        // place it shows up as a phantom card on the Dashboard/Library and a
-        // duplicate branch on the Map. Collapse each pair to a single winner
-        // and prune the rest from CliState so it never comes back.
-        //
-        // Winner = the row that best represents reality: prefer one with an
-        // uploaded version (present in the manifest), then one whose local
-        // folder still exists. Ties keep the first seen.
-        let score = |id: &str, local: &std::path::Path| -> u8 {
-            let in_manifest = manifest.saves.iter().any(|e| e.save_id == id) as u8;
-            let exists = local.exists() as u8;
-            in_manifest * 2 + exists
-        };
-        let mut winners: std::collections::HashMap<(String, String), (String, u8)> =
-            std::collections::HashMap::new();
-        let mut losers: Vec<String> = Vec::new();
-        for (id, st) in &cli_state.saves {
-            let key = (st.game_slug.clone(), st.label.clone());
-            let s = score(id, &st.local_path);
-            match winners.get(&key) {
-                None => {
-                    winners.insert(key, (id.clone(), s));
-                }
-                Some((cur_id, cur_s)) => {
-                    if s > *cur_s {
-                        losers.push(cur_id.clone());
-                        winners.insert(key, (id.clone(), s));
-                    } else {
-                        losers.push(id.clone());
-                    }
-                }
-            }
-        }
-        if !losers.is_empty() {
-            for id in &losers {
-                cli_state.saves.remove(id);
-            }
-            cli_state.save(&path).map_err(|e| e.to_string())?;
-            for id in losers {
-                detach_save_if_running(&state, id).await;
-            }
-        }
-
-        let mut out = Vec::with_capacity(cli_state.saves.len());
-        for (id, st) in &cli_state.saves {
-            let entry = manifest.saves.iter().find(|e| &e.save_id == id);
-            out.push(TrackedSave {
-                save_id: id.clone(),
-                game_slug: st.game_slug.clone(),
-                label: st.label.clone(),
-                local_path: st.local_path.to_string_lossy().into_owned(),
-                last_version_num: entry.map(|e| e.latest_version_num),
-                last_backup_at: None,
-                paused: st.paused,
-                total_size_bytes: entry.map(|e| e.latest_size_bytes).unwrap_or(0),
-                orphan: false,
-                local_size_bytes: None,
-                preset: st.preset.clone(),
-            });
-        }
-
-        // Cross-device visibility: a save uploaded from *another* machine lives
-        // in the cloud manifest but has no local CliState row here. Before, the
-        // loop above only emitted locally-tracked saves, so the user's other
-        // machine's saves were invisible on this one — there was no way to pull
-        // them in. Emit each manifest entry without a local row as an orphan so
-        // the Library shows it with a "Sin estado local" badge and the user can
-        // restore it (which mints the local mapping). This is the device sync:
-        // a device missing a save just adds it from the one that has it.
-        for entry in &manifest.saves {
-            if cli_state.saves.contains_key(&entry.save_id) {
-                continue;
-            }
-            out.push(TrackedSave {
-                save_id: entry.save_id.clone(),
-                game_slug: entry.game_slug.clone(),
-                label: entry.label.clone(),
-                local_path: String::new(),
-                last_version_num: Some(entry.latest_version_num),
-                last_backup_at: None,
-                paused: false,
-                total_size_bytes: entry.latest_size_bytes,
-                orphan: true,
-                local_size_bytes: None,
-                preset: None,
-            });
-        }
-        fill_local_sizes(&mut out);
-        return Ok(out);
+    let (out, detached) = library::list_tracked(&client).await.map_err(pretty_error)?;
+    for id in detached {
+        detach_save_if_running(&state, id).await;
     }
-
-    let saves = client.list_saves(None).await.map_err(pretty_error)?;
-    let (cli_state, _) = CliState::load_default().map_err(|e| e.to_string())?;
-
-    let mut out = Vec::with_capacity(saves.len());
-    for s in saves {
-        // Saves with a matching CliState row are the happy path: this
-        // machine is actively tracking them, so we surface the local path
-        // and pause flag straight from state.
-        //
-        // Saves *without* a CliState row used to be skipped — that hid
-        // server-side rows after a reinstall, a PC switch, or a manual
-        // CliState wipe, leaving the user no way to clean them up from the
-        // UI (only `hoard-admin` worked). Since 1.5.1 we emit them with
-        // `orphan: true` so the Library strip can show them with a "Sin
-        // estado local" badge and offer the destructive
-        // `delete_save_completely` as the only sensible action.
-        match cli_state.saves.get(&s.id) {
-            Some(st) => {
-                let local = st.local_path.to_string_lossy().into_owned();
-                let paused = st.paused;
-                out.push(TrackedSave {
-                    save_id: s.id,
-                    game_slug: s.game_slug,
-                    label: s.label,
-                    local_path: local,
-                    last_version_num: s.latest_version_num,
-                    last_backup_at: format_optional_time(Some(s.updated_at)),
-                    paused,
-                    total_size_bytes: s.total_size_bytes.unwrap_or(0),
-                    orphan: false,
-                    local_size_bytes: None,
-                    preset: st.preset.clone(),
-                });
-            }
-            None => {
-                out.push(TrackedSave {
-                    save_id: s.id,
-                    game_slug: s.game_slug,
-                    label: s.label,
-                    local_path: String::new(),
-                    last_version_num: s.latest_version_num,
-                    last_backup_at: format_optional_time(Some(s.updated_at)),
-                    paused: false,
-                    total_size_bytes: s.total_size_bytes.unwrap_or(0),
-                    orphan: true,
-                    local_size_bytes: None,
-                    preset: None,
-                });
-            }
-        }
-    }
-    fill_local_sizes(&mut out);
     Ok(out)
 }
 
@@ -768,73 +292,31 @@ pub async fn rename_save_label(
     new_label: String,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
-    let trimmed = new_label.trim();
-    if trimmed.is_empty() {
-        return Err("Label can't be empty.".to_string());
-    }
     let client = current_client(&state)?;
-    let updated = client
-        .rename_save_label(&save_id, trimmed)
-        .await
-        .map_err(|e| {
-            let is_conflict = e
-                .downcast_ref::<ApiError>()
-                .map(|api| matches!(api, ApiError::Conflict(_)))
-                .unwrap_or(false);
-            if is_conflict {
-                // Tagged so the JS side can match without parsing the
+    let (tracked, watched) =
+        library::rename_label(&client, &save_id, &new_label)
+            .await
+            .map_err(|e| {
+                // A 409 (another save in the same game already uses that label)
+                // gets tagged so the JS side can match it without parsing the
                 // server's English error text.
-                "conflict:label_collision".to_string()
-            } else {
-                pretty_error(e)
-            }
-        })?;
+                let is_conflict = e
+                    .downcast_ref::<ApiError>()
+                    .map(|api| matches!(api, ApiError::Conflict(_)))
+                    .unwrap_or(false);
+                if is_conflict {
+                    "conflict:label_collision".to_string()
+                } else {
+                    pretty_error(e)
+                }
+            })?;
 
-    // Update local state with the new label so subsequent backups land in
-    // the right directory and the UI doesn't have to refetch.
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let (local_path_string, preset, processes) =
-        if let Some(entry) = cli_state.saves.get_mut(&save_id) {
-            entry.label = updated.label.clone();
-            (
-                entry.local_path.to_string_lossy().into_owned(),
-                entry.preset.clone(),
-                entry.processes.clone(),
-            )
-        } else {
-            (String::new(), None, Vec::new())
-        };
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
-    // Re-attach to the running agent so its in-memory WatchedSave picks up
-    // the new label (the watcher uses label as part of the upload key).
-    let local_path = PathBuf::from(&local_path_string);
-    if !local_path_string.is_empty() {
-        let watched = watched_save_from(
-            updated.id.clone(),
-            updated.game_slug.clone(),
-            updated.game_slug.clone(),
-            updated.label.clone(),
-            local_path.clone(),
-            preset.as_deref(),
-            processes.clone(),
-        );
+    // Re-attach to the running agent so its in-memory WatchedSave picks up the
+    // new label (the watcher uses label as part of the upload key).
+    if let Some(watched) = watched {
         attach_save_if_running(&state, watched).await;
     }
-
-    Ok(TrackedSave {
-        save_id: updated.id,
-        game_slug: updated.game_slug,
-        label: updated.label,
-        local_path: local_path_string,
-        last_version_num: updated.latest_version_num,
-        last_backup_at: None,
-        paused: false,
-        total_size_bytes: updated.total_size_bytes.unwrap_or(0),
-        orphan: false,
-        local_size_bytes: None,
-        preset,
-    })
+    Ok(tracked)
 }
 
 /// Validate a user-picked override path: non-empty, exists, is a directory.
@@ -985,9 +467,7 @@ pub async fn detection_diagnostics(slug: String) -> Result<DetectionTrace, Strin
 /// intact (delete from the History view if you want that gone too).
 #[tauri::command]
 pub async fn untrack_save(save_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    cli_state.saves.remove(&save_id);
-    cli_state.save(&path).map_err(|e| e.to_string())?;
+    library::untrack(&save_id).map_err(|e| e.to_string())?;
     detach_save_if_running(&state, save_id).await;
     Ok(())
 }
@@ -1005,16 +485,9 @@ pub async fn delete_save_completely(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let client = current_client(&state)?;
-    client.delete_save(&save_id).await.map_err(pretty_error)?;
-
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let slug = cli_state.saves.get(&save_id).map(|s| s.game_slug.clone());
-    cli_state.saves.remove(&save_id);
-    if let Some(slug) = slug {
-        cli_state.clear_manual_path(&slug);
-    }
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
+    library::delete_completely(&client, &save_id)
+        .await
+        .map_err(pretty_error)?;
     detach_save_if_running(&state, save_id).await;
     Ok(())
 }
@@ -1072,11 +545,6 @@ pub(crate) fn sync_active_context(state: &AppState) -> Option<String> {
     };
     hoard_agent::state::set_active_context(ctx.clone());
     ctx
-}
-
-fn format_optional_time(t: Option<OffsetDateTime>) -> Option<String> {
-    use time::format_description::well_known::Rfc3339;
-    t.and_then(|x| x.format(&Rfc3339).ok())
 }
 
 /// Spawn a long-lived background task that re-scans the catalog whenever the

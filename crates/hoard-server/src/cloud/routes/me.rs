@@ -420,19 +420,22 @@ async fn register_device(
         .filter(|s| !s.is_empty())
         .unwrap_or("Unknown device");
     let os = header("x-hoard-device-os").filter(|s| !s.is_empty());
+    let app_version = header("x-hoard-app-version").filter(|s| !s.is_empty());
 
     sqlx::query(
-        "INSERT INTO devices (user_id, device_name, device_kind, os, fingerprint)
-             VALUES ($1, $2, 'desktop', $3, $4)
+        "INSERT INTO devices (user_id, device_name, device_kind, os, fingerprint, app_version)
+             VALUES ($1, $2, 'desktop', $3, $4, $5)
          ON CONFLICT (user_id, fingerprint)
          DO UPDATE SET last_seen_at = now(),
                        device_name  = EXCLUDED.device_name,
-                       os           = EXCLUDED.os",
+                       os           = EXCLUDED.os,
+                       app_version  = COALESCE(EXCLUDED.app_version, devices.app_version)",
     )
     .bind(user.user_id)
     .bind(name)
     .bind(os)
     .bind(fingerprint)
+    .bind(app_version)
     .execute(&state.pool)
     .await?;
 

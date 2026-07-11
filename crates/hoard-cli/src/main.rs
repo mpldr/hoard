@@ -8,12 +8,56 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "hoard", version, about = "Hoard save-sync client")]
 struct Cli {
+    // No subcommand: paint the panel (banner::show). With a subcommand: dispatch
+    // below.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open the desktop app (forwards to `hoard-desktop`)
+    Desktop {
+        /// Arguments passed through as-is to the app
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start the self-host server (forwards to `hoard-server`)
+    Server {
+        /// Arguments passed through as-is to the server
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Manage the background sync service — the resident automatic sync (the app
+    /// without a window) run under your OS service manager (systemd --user /
+    /// launchd / Task Scheduler). `hoard sync start|stop|status`.
+    Sync {
+        #[command(subcommand)]
+        action: Option<commands::service::SyncCommand>,
+    },
+    /// (deprecated) shows the status panel; the daemon is now `hoard sync`
+    #[command(hide = true)]
+    Daemon,
+    /// Detect a game, create its save and remember the path (what `daemon`/`sync`
+    /// then watch)
+    Track {
+        /// Game name or slug (optional if --slug is given)
+        query: Option<String>,
+        /// Exact slug: skips the fuzzy search
+        #[arg(long)]
+        slug: Option<String>,
+        /// Explicit save folder (wins over detection)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Save label (default "main")
+        #[arg(long)]
+        label: Option<String>,
+        /// Deep scan (slower, wider coverage)
+        #[arg(long)]
+        deep: bool,
+    },
+    /// List the saves this machine tracks (local, no network)
+    Saves,
     /// Show server status (uses /v1/health)
     Status,
     /// Configuration file management
@@ -21,23 +65,30 @@ enum Commands {
         #[command(subcommand)]
         action: commands::config::ConfigCommand,
     },
-    /// Save the bearer token from the server into the local config
+    /// Sign in. Without `--token`: Hoard Cloud, no browser (email + password,
+    /// or an emailed code). With `--token`: a self-host bearer.
     Login {
-        /// Bearer token (`hoard_v1_<hex>`). Get it from the admin via `hoard-admin token create`.
+        /// Self-host bearer token (`hoard_v1_<hex>`, from `hoard-admin token
+        /// create`). If omitted, signs in to Hoard Cloud.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
     },
-    /// Clear the saved bearer token
+    /// Sign out (Cloud and self-host)
     Logout,
-    /// Show the currently logged-in user
+    /// Show the current session (Cloud or self-host)
     Whoami,
     /// Browse the game catalog
     Games {
         #[command(subcommand)]
         action: commands::games::GameCommand,
     },
-    /// Benchmark the local game-detection scan (the heavy half of what Modo
-    /// Automático runs each tick). No server needed; writes nothing.
+    /// Hoard Cloud account: export, storage/caja negra, entitlements, playtime
+    Cloud {
+        #[command(subcommand)]
+        action: commands::cloud::CloudCommand,
+    },
+    /// Benchmark the local game-detection scan (the heavy half of what Automatic
+    /// Mode runs each tick). No server needed; writes nothing.
     Scan {
         /// List every detected game, not just the summary counts.
         #[arg(long)]
@@ -133,13 +184,38 @@ async fn main() -> Result<()> {
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Some(command) = cli.command else {
+        return commands::banner::show().await;
+    };
+    match command {
+        Commands::Desktop { args } => commands::launch::run("hoard-desktop", &args),
+        Commands::Server { args } => commands::launch::run("hoard-server", &args),
+        Commands::Sync { action } => commands::service::run(action).await,
+        Commands::Daemon => commands::banner::show().await,
+        Commands::Track {
+            query,
+            slug,
+            path,
+            label,
+            deep,
+        } => {
+            commands::track::run(commands::track::Args {
+                query,
+                slug,
+                path,
+                label,
+                deep,
+            })
+            .await
+        }
+        Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
         Commands::Config { action } => commands::config::run(action),
         Commands::Login { token } => commands::auth::login(token).await,
         Commands::Logout => commands::auth::logout().await,
         Commands::Whoami => commands::auth::whoami().await,
         Commands::Games { action } => commands::games::run(action).await,
+        Commands::Cloud { action } => commands::cloud::run(action).await,
         Commands::Scan { verbose, deep } => commands::scan::run(verbose, deep).await,
         Commands::Save { action } => commands::saves::run(action).await,
         Commands::Snapshots { action } => snapshots_dispatch(action).await,

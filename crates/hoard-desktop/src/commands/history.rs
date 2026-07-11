@@ -21,7 +21,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use time::format_description::well_known::Rfc3339;
 
-use super::agent::{attach_save_if_running, detach_save_if_running, watched_save_from};
+use super::agent::apply_reseat;
 use super::auth::pretty_error;
 use super::library::current_client;
 use crate::state::AppState;
@@ -437,35 +437,8 @@ pub async fn set_save_paused(
     paused: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let entry = cli_state
-        .saves
-        .get_mut(&save_id)
-        .ok_or_else(|| "That save isn't tracked on this machine — nothing to pause.".to_string())?;
-    entry.paused = paused;
-    let snapshot = entry.clone();
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
-    if paused {
-        // Detach from the running agent so it stops watching immediately.
-        // No-op if the agent isn't running.
-        detach_save_if_running(&state, save_id).await;
-    } else {
-        // Re-attach using the freshly-read entry so the agent picks up the
-        // current local_path in case it changed since startup.
-        let watched = watched_save_from(
-            save_id,
-            snapshot.game_slug.clone(),
-            snapshot.game_slug.clone(),
-            snapshot.label,
-            snapshot.local_path,
-            snapshot.preset.as_deref(),
-            // Carry the persisted process pins so a re-attached emulator save
-            // keeps its play-detection without waiting for an agent restart.
-            snapshot.processes.clone(),
-        );
-        attach_save_if_running(&state, watched).await;
-    }
+    let reseat = hoard_agent::library::set_paused(&save_id, paused).map_err(|e| e.to_string())?;
+    apply_reseat(&state, reseat).await;
     Ok(())
 }
 
@@ -486,40 +459,8 @@ pub async fn set_save_preset(
     preset: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // Normalise: empty / "standard" means "no override".
-    let preset = preset.filter(|p| !p.is_empty() && p != presets::PRESET_STANDARD);
-    if let Some(p) = &preset {
-        if !presets::ALL_PRESETS.contains(&p.as_str()) {
-            return Err(format!("Unknown preset '{p}'."));
-        }
-    }
-
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let entry = cli_state
-        .saves
-        .get_mut(&save_id)
-        .ok_or_else(|| "That save isn't tracked on this machine.".to_string())?;
-    entry.preset = preset.clone();
-    let snapshot = entry.clone();
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
-    // Reseat the live agent so the resolved policy is applied immediately —
-    // unless the save is paused (the agent isn't watching it anyway).
-    if !snapshot.paused {
-        detach_save_if_running(&state, save_id.clone()).await;
-        let watched = watched_save_from(
-            save_id,
-            snapshot.game_slug.clone(),
-            snapshot.game_slug,
-            snapshot.label,
-            snapshot.local_path,
-            snapshot.preset.as_deref(),
-            // Carry the persisted process pins so a re-attached emulator save
-            // keeps its play-detection without waiting for an agent restart.
-            snapshot.processes.clone(),
-        );
-        attach_save_if_running(&state, watched).await;
-    }
+    let reseat = hoard_agent::library::set_preset(&save_id, preset).map_err(|e| e.to_string())?;
+    apply_reseat(&state, reseat).await;
     Ok(())
 }
 
@@ -535,43 +476,9 @@ pub async fn set_save_local_path(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let path_buf = PathBuf::from(new_path.trim());
-    if path_buf.as_os_str().is_empty() {
-        return Err("Path can't be empty.".to_string());
-    }
-    if !path_buf.exists() {
-        std::fs::create_dir_all(&path_buf)
-            .map_err(|e| format!("Couldn't create {}: {e}", path_buf.display()))?;
-    } else if !path_buf.is_dir() {
-        return Err(format!("{} isn't a folder.", path_buf.display()));
-    }
-
-    let (mut cli_state, path) = CliState::load_default().map_err(|e| e.to_string())?;
-    let entry = cli_state
-        .saves
-        .get_mut(&save_id)
-        .ok_or_else(|| "That save isn't tracked on this machine.".to_string())?;
-    entry.local_path = path_buf.clone();
-    let snapshot = entry.clone();
-    cli_state.save(&path).map_err(|e| e.to_string())?;
-
-    // Reseat the live agent's watch by detaching + reattaching. Cheaper than
-    // a full restart and means the new path is in effect within a tick.
-    detach_save_if_running(&state, save_id.clone()).await;
-    if !snapshot.paused {
-        let watched = watched_save_from(
-            save_id,
-            snapshot.game_slug.clone(),
-            snapshot.game_slug.clone(),
-            snapshot.label,
-            snapshot.local_path,
-            snapshot.preset.as_deref(),
-            // Carry the persisted process pins so a re-attached emulator save
-            // keeps its play-detection without waiting for an agent restart.
-            snapshot.processes.clone(),
-        );
-        attach_save_if_running(&state, watched).await;
-    }
+    let reseat =
+        hoard_agent::library::set_local_path(&save_id, &new_path).map_err(|e| e.to_string())?;
+    apply_reseat(&state, reseat).await;
     Ok(())
 }
 

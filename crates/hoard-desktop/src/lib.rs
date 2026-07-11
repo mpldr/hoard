@@ -181,6 +181,7 @@ pub fn run() {
         .manage(commands::screen::ScreenProc::default())
         .invoke_handler(tauri::generate_handler![
             commands::misc::greet,
+            commands::misc::open_external,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,
             commands::auth::health_check,

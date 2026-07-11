@@ -14,7 +14,6 @@
 import { writable, derived, get, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { bootAgent, shutdownAgent } from "./agent";
 import { auth } from "./auth";
 import { noteStorageStatus } from "./live";
@@ -140,6 +139,13 @@ export async function refreshCloud(): Promise<CloudAccount> {
     internal.update(($s) => ({ ...$s, loading: false }));
     throw e;
   }
+}
+
+/** Open a web URL in the system browser through the Rust `open_external`
+ *  command (not `@tauri-apps/plugin-shell`), which strips the AppImage's
+ *  injected loader env so the spawned browser uses the host's libraries. */
+export async function openExternal(url: string): Promise<void> {
+  await invoke("open_external", { url });
 }
 
 /** Open the OAuth login URL in the system browser. The browser flow ends

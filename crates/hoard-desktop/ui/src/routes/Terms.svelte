@@ -8,11 +8,10 @@
   import { push } from "svelte-spa-router";
   import { fly } from "svelte/transition";
   import { ExternalLink } from "lucide-svelte";
-  import { open as openExternal } from "@tauri-apps/plugin-shell";
   import { _ } from "svelte-i18n";
   import Button from "../lib/components/Button.svelte";
   import WizardShell from "../lib/components/WizardShell.svelte";
-  import { startCloudLogin } from "../lib/stores/cloud";
+  import { startCloudLogin, openExternal } from "../lib/stores/cloud";
   import { toastError } from "../lib/stores/toasts";
 
   const TERMS_URL = "https://hoard.services/legal/terms";

@@ -134,6 +134,11 @@ jobs:
           tagName: ""
           releaseName: ""
 
+      - name: Strip host libs from AppImage (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/fix-appimage-libs.sh "target/${{ matrix.target }}/release/bundle"
+
       - name: Collect bundles
         id: collect
         shell: bash

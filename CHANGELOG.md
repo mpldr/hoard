@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   setups and tools like Dockge/Watchtower. Building locally still works
   (uncomment `build:` in the compose file).
 
+### Fixed
+- **AppImage on SteamOS / Bazzite and other newer distros.** The bundle no
+  longer ships its own `libwayland-client`/`libEGL`/`libGL`/`libgbm` — those
+  now resolve from the host, fixing the solid-white window and
+  `could not create default EGL display: EGL_BAD_PARAMETER` that forced users
+  to launch with `LD_PRELOAD`.
+- **Sign-in did nothing under the AppImage.** Outward links (OAuth sign-in,
+  upgrade/billing, terms) now open through a Rust `open_external` command that
+  strips the AppImage-injected loader env, so the browser starts against the
+  host's libraries instead of Hoard's bundled (mismatched) ones and actually
+  appears.
+
 ### Changed
 - CI now runs only on version tags, pull requests, and manual dispatch —
   routine branch pushes (including docs-only edits) no longer spend Actions

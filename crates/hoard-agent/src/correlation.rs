@@ -124,6 +124,16 @@ const NON_GAME_PROCESS: &[&str] = &[
     // para el caso raro de juego pausado. "NVIDIA Overlay.exe", "nvcontainer.exe".
     "nvidia",
     "nvcontainer",
+    // Apps de chat/dev que viven junto al juego y correlacionaban por error con
+    // carpetas de save (Discord vivo mientras Steam Cloud reescribía el save de
+    // Offworld → atribuido a Discord.exe). Viven en AppData/Local (Windows) o
+    // /usr (Linux), así que la ruta no siempre los alcanza: hay que nombrarlos.
+    // Match por substring.
+    "discord",
+    "slack",
+    "claude",
+    "anthropic",
+    "node",
     // El propio Hoard.
     "hoard",
 ];

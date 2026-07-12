@@ -16,10 +16,10 @@ use hoard_agent::cloud_auth;
 use hoard_agent::config::CliConfig;
 use hoard_agent::state;
 
-pub async fn login(token: Option<String>) -> Result<()> {
+pub async fn login(token: Option<String>, force_email: bool) -> Result<()> {
     match token {
         Some(token) => login_selfhost(token).await,
-        None => login_cloud().await,
+        None => login_cloud(force_email).await,
     }
 }
 
@@ -47,9 +47,15 @@ async fn login_selfhost(token: String) -> Result<()> {
 /// the server mints the session. If the server doesn't have it configured, it falls
 /// back to the email+password / OTP-code path. The session is stored where the
 /// desktop keeps it (keyring + `cloud.toml`) to share the login.
-async fn login_cloud() -> Result<()> {
+async fn login_cloud(force_email: bool) -> Result<()> {
     let base = cloud_auth::cloud_base_url();
     println!("Sign in to Hoard Cloud ({base})");
+
+    // `--email`: skip phone pairing (which just re-approves whatever account the
+    // phone browser already has) and let the user type the address to sign in as.
+    if force_email {
+        return login_cloud_email(&base).await;
+    }
 
     match cloud_auth::device_start(local_hostname().as_deref()).await? {
         // Server with the feature: mobile pairing.
@@ -140,6 +146,10 @@ async fn login_cloud_email(base: &str) -> Result<()> {
 
 /// Persists the session and sets the Cloud context. Shared by both paths.
 async fn finish_cloud_login(base: &str, tokens: &cloud_auth::Tokens) -> Result<()> {
+    // Wipe any previous session first. `store_tokens` is read-modify-write and
+    // would otherwise keep the old `user` snapshot / server_url, so signing in as
+    // a different account would leave the old identity lingering on disk.
+    let _ = cloud_auth::clear_session();
     cloud_auth::store_tokens(tokens, base)?;
     let me = cloud_auth::fetch_me(base, &tokens.access).await?;
     state::set_active_context(Some(state::cloud_context(&me.user_id)));

@@ -6,7 +6,7 @@
 //! tracked and exits.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
@@ -118,6 +118,13 @@ pub async fn run(backup_only: bool) -> Result<()> {
     // on/off). It's removed on exit (Drop), Ctrl-C included.
     let _pid = PidGuard::create();
 
+    // At boot the service manager starts us as soon as the network is up, but a
+    // self-hosted server on the same box may still be coming online — the initial
+    // auto-restore then fails with "connection refused" for every save. Wait for
+    // `/v1/health` to answer before spawning the agent. Bounded, so we never hang
+    // if the server simply isn't running (the agent retries per-save anyway).
+    wait_for_server(&active).await;
+
     // On Cloud, refresh the JWT in the background so the engine doesn't start
     // returning 401 an hour after it starts.
     let _refresh = active
@@ -193,6 +200,37 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Poll `/v1/health` until the server answers, up to a bounded deadline. Skips
+/// the Cloud endpoint (always up — no point adding startup latency there). If the
+/// deadline passes it warns and returns, letting the agent try anyway.
+async fn wait_for_server(active: &Active) {
+    if active.is_cloud {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut announced = false;
+    loop {
+        if active.client.health().await.is_ok() {
+            if announced {
+                println!("server is up.");
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "warning: server at {} still unreachable after 60s; continuing anyway.",
+                active.server
+            );
+            return;
+        }
+        if !announced {
+            println!("waiting for server at {} to come online…", active.server);
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

@@ -72,6 +72,10 @@ enum Commands {
         /// create`). If omitted, signs in to Hoard Cloud.
         #[arg(long)]
         token: Option<String>,
+        /// Force the email + password / emailed-code path instead of phone
+        /// pairing, so you pick which account to sign in as.
+        #[arg(long)]
+        email: bool,
     },
     /// Sign out (Cloud and self-host)
     Logout,
@@ -185,13 +189,13 @@ async fn main() -> Result<()> {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     let Some(command) = cli.command else {
-        return commands::banner::show().await;
+        return commands::banner::show(true).await;
     };
     match command {
         Commands::Desktop { args } => commands::launch::run("hoard-desktop", &args),
         Commands::Server { args } => commands::launch::run("hoard-server", &args),
         Commands::Sync { action } => commands::service::run(action).await,
-        Commands::Daemon => commands::banner::show().await,
+        Commands::Daemon => commands::banner::show(true).await,
         Commands::Track {
             query,
             slug,
@@ -211,7 +215,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
         Commands::Config { action } => commands::config::run(action),
-        Commands::Login { token } => commands::auth::login(token).await,
+        Commands::Login { token, email } => commands::auth::login(token, email).await,
         Commands::Logout => commands::auth::logout().await,
         Commands::Whoami => commands::auth::whoami().await,
         Commands::Games { action } => commands::games::run(action).await,

@@ -30,8 +30,6 @@ pub enum SyncCommand {
     Stop,
     /// Restart the service
     Restart,
-    /// Show the service status
-    Status,
     /// Show the most recent service logs
     Logs,
     /// Internal: the resident sync loop the service runs (not for manual use)
@@ -46,7 +44,12 @@ pub enum SyncCommand {
 /// `hoard sync [action]`. No action prints the status (like `systemctl status`).
 pub async fn run(action: Option<SyncCommand>) -> Result<()> {
     match action {
-        None | Some(SyncCommand::Status) => status().await,
+        None => {
+            // Paint the overall status panel first, then the OS service detail
+            // below it — the banner gives cli/server/session/sync at a glance.
+            let _ = crate::commands::banner::show(false).await;
+            status().await
+        }
         Some(SyncCommand::Start) => start().await,
         Some(SyncCommand::Stop) => stop().await,
         Some(SyncCommand::Restart) => restart().await,
@@ -163,13 +166,13 @@ async fn start() -> Result<()> {
     write_unit()?;
     run_status("systemctl", &["--user", "daemon-reload"]).await?;
     if !run_status("systemctl", &["--user", "enable", "--now", UNIT]).await? {
-        bail!("`systemctl --user enable --now {UNIT}` failed — see `hoard sync status`");
+        bail!("`systemctl --user enable --now {UNIT}` failed — see `hoard sync`");
     }
     // Keep it running without an active login (headless NAS / SteamOS / server).
     // Best-effort: may need a polkit prompt; ignore if it can't.
     let _ = run_quiet("loginctl", &["enable-linger"]).await;
     println!("hoard sync started (systemd --user · {UNIT}).");
-    println!("  status: `hoard sync status`   ·   logs: `hoard sync logs`");
+    println!("  status: `hoard sync`   ·   logs: `hoard sync logs`");
     Ok(())
 }
 
@@ -192,7 +195,7 @@ async fn restart() -> Result<()> {
         return start().await;
     }
     if !run_status("systemctl", &["--user", "restart", UNIT]).await? {
-        bail!("`systemctl --user restart {UNIT}` failed — see `hoard sync status`");
+        bail!("`systemctl --user restart {UNIT}` failed — see `hoard sync`");
     }
     println!("hoard sync restarted.");
     Ok(())
@@ -295,7 +298,7 @@ async fn start() -> Result<()> {
         bail!("`launchctl bootstrap {domain}` failed");
     }
     println!("hoard sync started (launchd · {LABEL}).");
-    println!("  status: `hoard sync status`   ·   logs: `hoard sync logs`");
+    println!("  status: `hoard sync`   ·   logs: `hoard sync logs`");
     Ok(())
 }
 
@@ -382,7 +385,7 @@ async fn start() -> Result<()> {
     // Start it now too, not just at next logon.
     let _ = run_quiet("schtasks", &["/Run", "/TN", TASK]).await;
     println!("hoard sync started (Task Scheduler · {TASK}).");
-    println!("  status: `hoard sync status`");
+    println!("  status: `hoard sync`");
     Ok(())
 }
 

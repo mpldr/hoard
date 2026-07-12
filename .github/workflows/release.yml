@@ -13,14 +13,39 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
+    name: build (${{ matrix.artifact }})
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux keeps the full self-host bundle (CLI + server + admin). The
+          # other platforms ship the `hoard` CLI only — the server/admin are
+          # meant to run on a Linux box. Every target builds on a NATIVE runner
+          # so we never cross-compile the dbus/keyring/OpenSSL C deps.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: linux-x86_64
+            full: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+            full: true
+          - os: macos-latest # Apple Silicon runner
+            target: aarch64-apple-darwin
+            artifact: macos-aarch64
+            full: false
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+            artifact: macos-x86_64
+            full: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x86_64
+            full: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: windows-aarch64
+            full: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -30,29 +55,40 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: System deps
-        # libdbus-1-dev is needed by `libdbus-sys`, which gets pulled in
-        # transitively via hoard-cli → hoard-agent → keyring (its
-        # `sync-secret-service` feature). The CI workflow doesn't hit this
-        # because libwebkit2gtk-4.1-dev's deps include dbus, but the slim
-        # server-release runner has neither.
+        # libdbus-1-dev is needed by `libdbus-sys`, pulled in transitively via
+        # hoard-cli → hoard-agent → keyring (its `sync-secret-service` feature).
+        # Linux only — macOS (Keychain) and Windows (DPAPI) use native stores
+        # with no C dependency.
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
 
       - name: Build release binaries
+        shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} \
-            -p hoard-server -p hoard-admin -p hoard-cli
+          if [ "${{ matrix.full }}" = "true" ]; then
+            cargo build --release --target ${{ matrix.target }} \
+              -p hoard-server -p hoard-admin -p hoard-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p hoard-cli
+          fi
 
       - name: Package
         id: package
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ARTIFACT="hoard-${VERSION}-${{ matrix.artifact }}"
+          BIN="target/${{ matrix.target }}/release"
+          EXT=""
+          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
           mkdir -p "dist/$ARTIFACT"
-          cp target/${{ matrix.target }}/release/hoard-server "dist/$ARTIFACT/"
-          cp target/${{ matrix.target }}/release/hoard-admin  "dist/$ARTIFACT/"
-          cp target/${{ matrix.target }}/release/hoard        "dist/$ARTIFACT/"
-          cp README.md CHANGELOG.md LICENSE                   "dist/$ARTIFACT/"
-          cp deploy/config.toml.example                       "dist/$ARTIFACT/"
+          cp "$BIN/hoard$EXT" "dist/$ARTIFACT/"
+          if [ "${{ matrix.full }}" = "true" ]; then
+            cp "$BIN/hoard-server$EXT" "dist/$ARTIFACT/"
+            cp "$BIN/hoard-admin$EXT"  "dist/$ARTIFACT/"
+            cp deploy/config.toml.example "dist/$ARTIFACT/"
+          fi
+          cp README.md CHANGELOG.md LICENSE "dist/$ARTIFACT/"
           tar -C dist -czf "dist/$ARTIFACT.tar.gz" "$ARTIFACT"
           ( cd dist && sha256sum "$ARTIFACT.tar.gz" > "$ARTIFACT.tar.gz.sha256" )
           echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"

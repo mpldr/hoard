@@ -77,11 +77,11 @@ pub trait CaptureBackend: Send {
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "runtime"))]
 mod macos;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "runtime"))]
 mod windows;
 #[cfg(all(target_os = "linux", feature = "runtime"))]
 mod x11;
@@ -92,11 +92,11 @@ mod x11;
 /// (XComposite) paths is made at runtime inside the linux module from the
 /// session environment, because one binary runs on both.
 pub fn backend() -> Box<dyn CaptureBackend> {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "runtime"))]
     {
         Box::new(windows::WindowsCapture::new())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "runtime"))]
     {
         Box::new(macos::MacCapture::new())
     }
@@ -104,7 +104,13 @@ pub fn backend() -> Box<dyn CaptureBackend> {
     {
         linux::backend()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    // Windows/macOS without the `runtime` feature (the testable core build)
+    // have no native capture backend compiled in.
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "runtime"),
+        all(target_os = "macos", feature = "runtime"),
+        target_os = "linux"
+    )))]
     {
         Box::new(Unsupported)
     }

@@ -27,7 +27,7 @@ use hoard_screen::scene::{Crop, Panel, Rect, ScaleMode, Scene, SourceRef};
 /// `SetWindowPos` lands the panel offset/wrong-sized on the secondary screen.
 /// Must run first in `main` so it also applies to the `--list-monitors` probe,
 /// keeping the editor's coordinates in the same physical space as the runtime.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "runtime"))]
 fn set_dpi_aware() {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -37,7 +37,7 @@ fn set_dpi_aware() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(all(target_os = "windows", feature = "runtime")))]
 fn set_dpi_aware() {}
 
 fn main() {

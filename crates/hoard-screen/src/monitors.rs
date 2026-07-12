@@ -33,7 +33,7 @@ pub struct MonitorInfo {
 
 /// Enumerate monitors, primary first (id 0). Empty on platforms without a
 /// native enumeration (callers treat empty as "single monitor").
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "runtime"))]
 pub fn list_monitors() -> Vec<MonitorInfo> {
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
     use windows::Win32::Graphics::Gdi::{
@@ -94,8 +94,10 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
         .collect()
 }
 
-/// Non-Windows: no native enumeration yet — single-monitor fallback.
-#[cfg(not(target_os = "windows"))]
+/// No native enumeration compiled in — single-monitor fallback. Covers every
+/// non-Windows platform and the Windows core build without the `runtime`
+/// feature (which doesn't pull in the `windows` crate).
+#[cfg(not(all(target_os = "windows", feature = "runtime")))]
 pub fn list_monitors() -> Vec<MonitorInfo> {
     Vec::new()
 }

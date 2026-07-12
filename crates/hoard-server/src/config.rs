@@ -232,7 +232,7 @@ fn default_upgrade_url() -> String {
     "https://hoard.services/upgrade".to_string()
 }
 fn default_storage_downgrade_grace_days() -> u64 {
-    14
+    30
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

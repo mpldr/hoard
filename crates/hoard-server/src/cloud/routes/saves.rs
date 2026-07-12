@@ -136,6 +136,15 @@ pub async fn init_upload(
     //    we credit the window in `commit_upload` once R2 head confirms the
     //    object landed.
     if let Err(resp) = bandwidth::check(&state, user.user_id, body.size_bytes, &limits).await {
+        log_sync_block(
+            &state,
+            user.user_id,
+            "bandwidth_block",
+            &body.save_id,
+            Some(&body.game_slug),
+            body.size_bytes,
+        )
+        .await;
         return Ok(resp);
     }
 
@@ -143,9 +152,10 @@ pub async fn init_upload(
     let info = match quota::check_storage(&state, user.user_id, body.size_bytes).await {
         Ok(i) => i,
         Err(resp) => {
-            log_quota_block(
+            log_sync_block(
                 &state,
                 user.user_id,
+                "quota_block",
                 &body.save_id,
                 Some(&body.game_slug),
                 body.size_bytes,
@@ -354,7 +364,7 @@ pub async fn commit_upload(
             }
             .into_response());
         }
-        log_quota_block(&state, user.user_id, &save_id, None, real).await;
+        log_sync_block(&state, user.user_id, "quota_block", &save_id, None, real).await;
         return Ok(quota::quota_response(&info, real, upgrade_url()).into_response());
     }
 
@@ -558,6 +568,15 @@ pub async fn cas_init(
             new_bytes,
             "cas_init: rejected by bandwidth window"
         );
+        log_sync_block(
+            &state,
+            user.user_id,
+            "bandwidth_block",
+            &body.save_id,
+            Some(&body.game_slug),
+            new_bytes,
+        )
+        .await;
         return Ok(resp);
     }
     let info = match quota::check_storage(&state, user.user_id, new_bytes).await {
@@ -570,9 +589,10 @@ pub async fn cas_init(
                 new_bytes,
                 "cas_init: rejected by storage quota"
             );
-            log_quota_block(
+            log_sync_block(
                 &state,
                 user.user_id,
+                "quota_block",
                 &body.save_id,
                 Some(&body.game_slug),
                 new_bytes,
@@ -874,7 +894,7 @@ pub async fn cas_commit(
                 tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
             }
         }
-        log_quota_block(&state, user.user_id, &save_id, None, new_bytes).await;
+        log_sync_block(&state, user.user_id, "quota_block", &save_id, None, new_bytes).await;
         return Ok(resp);
     }
 
@@ -1507,17 +1527,19 @@ where
     }
 }
 
-/// Record a storage-quota rejection in `sync_log` so failed syncs land in the
-/// same analytics stream as successful uploads/downloads (`kind='quota_block'`,
-/// per the enum documented in migration 0006). Without this a sync that 402s
-/// leaves no trace and the failure rate is invisible.
+/// Record a rejected sync in `sync_log` so failed syncs land in the same
+/// analytics stream as successful uploads/downloads. `kind` is `'quota_block'`
+/// (over storage limit) or `'bandwidth_block'` (over the moving bandwidth
+/// window) — both extend the enum documented in migration 0006. Without this a
+/// sync that 402/429s leaves no trace and the failure rate is invisible.
 ///
-/// Best-effort: a logging failure must never turn a clean 402 into a 500. The
-/// FK `save_id` column stays NULL because on the init paths the `saves` row may
-/// not exist yet; the save id and game slug always ride in `metadata` instead.
-async fn log_quota_block(
+/// Best-effort: a logging failure must never turn a clean rejection into a 500.
+/// The FK `save_id` column stays NULL because on the init paths the `saves` row
+/// may not exist yet; the save id and game slug always ride in `metadata`.
+async fn log_sync_block(
     state: &CloudState,
     user_id: Uuid,
+    kind: &str,
     save_id: &str,
     game_slug: Option<&str>,
     bytes: u64,
@@ -1525,15 +1547,16 @@ async fn log_quota_block(
     let meta = serde_json::json!({ "save_id": save_id, "game_slug": game_slug }).to_string();
     if let Err(e) = sqlx::query(
         "INSERT INTO sync_log (user_id, kind, bytes, metadata)
-             VALUES ($1, 'quota_block', $2, $3::jsonb)",
+             VALUES ($1, $2, $3, $4::jsonb)",
     )
     .bind(user_id)
+    .bind(kind)
     .bind(i64::try_from(bytes).unwrap_or(i64::MAX))
     .bind(meta)
     .execute(&state.pool)
     .await
     {
-        tracing::warn!(error = %e, %user_id, "failed to record quota_block in sync_log");
+        tracing::warn!(error = %e, %user_id, %kind, "failed to record sync block in sync_log");
     }
 }
 

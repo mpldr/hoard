@@ -70,6 +70,11 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # Notas de cambios por versión + dónde tocar. Local.
 /CAMBIOS-1.0.2.local.md
 
+# Dashboard de métricas admin (usa service_role). Solo local, nunca al repo.
+/tools/admin-dashboard.html
+# Su migración/RPC (admin_metrics con mi uid). Se aplica a mano en prod.
+/crates/hoard-server/migrations/postgres/0030_admin_metrics.sql
+
 # Visión del rediseño del CLI. Doc de trabajo local.
 /HOARD-CLI.local.md
 

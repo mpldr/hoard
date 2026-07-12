@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hoard_agent::{api, config};
 use std::path::PathBuf;
+use tracing_appender::non_blocking::WorkerGuard;
 
 #[derive(Parser)]
 #[command(name = "hoard", version, about = "Hoard save-sync client")]
@@ -170,26 +171,57 @@ enum SnapshotCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            // Best-effort log shipping to the connected server. Short-lived
-            // CLI invocations may exit before a batch flushes; that's fine.
-            .with(hoard_agent::logship::start())
-            .init();
-    }
-
     let cli = Cli::parse();
+
+    // Hold the file writer's flush guard for the whole process so the sync
+    // service's log file flushes on exit.
+    let _file_guard = init_tracing(&cli);
+
     if let Err(e) = dispatch(cli).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Initialize the global tracing subscriber: stderr always, plus a file layer
+/// mirroring `tracing` events to `<state_dir>/logs/sync.log` when running as
+/// `hoard sync run`. The Task Scheduler service (Windows) drops stdout/stderr,
+/// so without the file layer `hoard sync logs` would have nothing to show;
+/// macOS launchd and Linux systemd already capture stdout/stderr via the plist
+/// / journald, so the extra file is harmless there. Returns the `WorkerGuard`
+/// that must outlive the process to flush the file on exit (None unless the
+/// file layer is active).
+fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+    // Only `hoard sync run` (the service's ExecStart) writes the file log — a
+    // one-shot CLI command doesn't need a persistent log file.
+    let (file_layer, guard) = match &cli.command {
+        Some(Commands::Sync {
+            action: Some(commands::service::SyncCommand::Run { .. }),
+        }) => match commands::daemon::sync_log_writer() {
+            Some((writer, guard)) => (
+                Some(tracing_subscriber::fmt::layer().with_writer(writer)),
+                Some(guard),
+            ),
+            None => (None, None),
+        },
+        _ => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
+        // Best-effort log shipping to the connected server. Short-lived
+        // CLI invocations may exit before a batch flushes; that's fine.
+        .with(hoard_agent::logship::start())
+        .init();
+    guard
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {

@@ -21,12 +21,29 @@ pub fn lock_path() -> Option<PathBuf> {
 /// pidfile obsoleto (proceso muerto) devuelve `None`, para que un agente que
 /// crasheó no bloquee al siguiente.
 pub fn live_owner() -> Option<u32> {
-    let path = lock_path()?;
-    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    live_owner_from(&lock_path()?)
+}
+
+/// Igual que [`live_owner`] pero leyendo el pid de `path` (no de la ruta de
+/// estado global). Compartido por [`live_owner`] y los tests (que apuntan a un
+/// fichero temporal). `None` si falta el fichero, no parsea, apunta a nuestro
+/// propio pid o el proceso está muerto.
+fn live_owner_from(path: &std::path::Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
     if pid == std::process::id() {
         return None;
     }
-    alive(pid).then_some(pid)
+    is_alive(pid).then_some(pid)
+}
+
+/// True if `pid` is a live Hoard process (the CLI or the desktop app). Guards
+/// against the OS recycling a pid for an unrelated process: on Linux it reads
+/// `/proc/{pid}/cmdline`, on Windows it uses `sysinfo` to confirm the pid
+/// exists AND its name contains "hoard". Shared by the banner (`hoard`) and
+/// the sync status (`hoard sync`) so both agree with the pidfile lock — and by
+/// [`live_owner`].
+pub fn is_alive(pid: u32) -> bool {
+    alive(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -51,9 +68,23 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
-    // Sin comprobación barata en Windows: un pidfile presente = agente vivo.
-    true
+fn alive(pid: u32) -> bool {
+    // Windows: confirma con `sysinfo` que el pid existe y su nombre de proceso
+    // contiene "hoard" (cubre `hoard.exe` y `hoard-desktop.exe`), guardando
+    // contra el reciclaje de pids — el espejo del chequeo `/proc/{pid}/cmdline`
+    // de Linux. Sin esto, un `agent.pid` obsoleto (desktop matado sin Drop
+    // limpio) haría que el banner muestre "running" falso y que
+    // `hoard sync start` se niegue a arrancar.
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    sys.process(pid)
+        .map(|p| p.name().to_string_lossy().to_lowercase().contains("hoard"))
+        .unwrap_or(false)
 }
 
 /// Guarda del lock: escribe nuestro PID al tomarlo y lo borra al `Drop` (solo si
@@ -86,5 +117,46 @@ impl Drop for AgentLock {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_alive, live_owner_from};
+
+    /// A pid this large is effectively never in use on any OS, so liveness
+    /// must report false — the core guard against a stale `agent.pid`.
+    #[test]
+    fn definitely_dead_pid_is_not_alive() {
+        assert!(!is_alive(u32::MAX));
+    }
+
+    /// A stale pidfile pointing at a dead pid yields no live owner: a crashed
+    /// desktop must not block `hoard sync start` (the acceptance criterion of
+    /// Fix 3).
+    #[test]
+    fn live_owner_from_stale_pidfile_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        std::fs::write(&pidfile, format!("{}", u32::MAX)).unwrap();
+        assert_eq!(live_owner_from(&pidfile), None);
+    }
+
+    /// A missing pidfile is the normal "no agent has ever run" case.
+    #[test]
+    fn live_owner_from_missing_pidfile_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("does-not-exist.pid");
+        assert_eq!(live_owner_from(&pidfile), None);
+    }
+
+    /// A pidfile pointing at ourselves is not reported as another owner: the
+    /// daemon reads its own lock back as "nobody else".
+    #[test]
+    fn live_owner_from_self_pid_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        std::fs::write(&pidfile, format!("{}", std::process::id())).unwrap();
+        assert_eq!(live_owner_from(&pidfile), None);
     }
 }

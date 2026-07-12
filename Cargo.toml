@@ -49,6 +49,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# File-rotating tracing layer for `hoard sync run` (so the Windows Task
+# Scheduler service leaves a tail-able log behind; macOS launchd already
+# redirects via the plist). Also used by hoard-desktop.
+tracing-appender = "0.2"
 
 # Error handling
 anyhow = "1"

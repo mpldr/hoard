@@ -410,20 +410,47 @@ async fn restart() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 async fn status() -> Result<()> {
-    if !task_exists().await {
-        println!("hoard sync is not installed. Run `hoard sync start`.");
+    if task_exists().await {
+        let _ = run_status("schtasks", &["/Query", "/TN", TASK, "/V", "/FO", "LIST"]).await;
         return Ok(());
     }
-    let _ = run_status("schtasks", &["/Query", "/TN", TASK, "/V", "/FO", "LIST"]).await;
+    // No installed task: another frontend (the desktop app) may still be
+    // running the shared agent. Report it the same way the banner does so
+    // `hoard` and `hoard sync` agree instead of saying "not installed".
+    if let Some(pid) = hoard_agent::instance::live_owner() {
+        println!("hoard sync running via another frontend (desktop app) · pid {pid}");
+        return Ok(());
+    }
+    println!("hoard sync is not installed. Run `hoard sync start`.");
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 async fn logs() -> Result<()> {
-    println!(
-        "Task Scheduler doesn't capture console output. For live logs run \
-         `hoard sync run` in a terminal, or check Event Viewer."
-    );
+    if task_exists().await {
+        // `hoard sync run` writes tracing events to this file (see
+        // `daemon::sync_log_writer`); tail the last ~80 lines.
+        if let Some(path) = daemon::sync_log_path() {
+            if path.exists() {
+                for line in daemon::tail_last_n_lines(&path, 80)? {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+        }
+        println!("no service logs yet at the expected path.");
+        return Ok(());
+    }
+    // No task: if the desktop app runs the agent, it manages its own logs —
+    // don't reference Task Scheduler (which isn't installed here).
+    if hoard_agent::instance::live_owner().is_some() {
+        println!(
+            "sync is run by the desktop app, which manages its own logs. \
+             Use the desktop app or run `hoard sync run` in a terminal."
+        );
+        return Ok(());
+    }
+    println!("sync isn't running. Start it with `hoard sync start`.");
     Ok(())
 }
 

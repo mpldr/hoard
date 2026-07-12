@@ -17,9 +17,13 @@ toml = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 indicatif = { workspace = true }
 # `hoard saves` formatea las fechas de último backup (OffsetDateTime → RFC3339).
 time = { workspace = true }
 # `hoard login` (Cloud) lee la contraseña sin echo en la terminal.
 rpassword = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

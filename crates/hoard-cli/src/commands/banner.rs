@@ -97,6 +97,46 @@ fn in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether the desktop app appears installed on this machine. On Unix, seeing
+/// `hoard-desktop` on `PATH` is enough (it's a normal binary). On Windows the
+/// Tauri app isn't on `PATH`, so also check its default NSIS install location
+/// and the Start Menu shortcut. Best-effort.
+fn desktop_installed() -> bool {
+    if in_path("hoard-desktop").is_some() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Tauri's default NSIS install location.
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let cand = PathBuf::from(&local)
+                .join("Programs")
+                .join("Hoard")
+                .join("hoard-desktop.exe");
+            if cand.is_file() {
+                return true;
+            }
+        }
+        // Start Menu shortcut — Tauri's MSI/NSIS installers create one.
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let start = PathBuf::from(&appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Hoard.lnk");
+            if start.exists() {
+                return true;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix already covered by the `in_path` check above.
+    }
+    false
+}
+
 /// Normalize a version to `vX.Y.Z` (prepends `v` if missing).
 fn with_v(ver: &str) -> String {
     if ver.starts_with('v') {
@@ -121,24 +161,14 @@ async fn probe_server(url: &str) -> (bool, String, Option<String>) {
     }
 }
 
-/// The daemon's PID if one is alive (reads the pidfile and checks the process).
+/// The daemon's PID if one is alive (reads the pidfile and checks liveness via
+/// the shared `hoard_agent::instance::is_alive`, so this and `hoard sync`
+/// agree — and a stale pidfile no longer reports "running").
 fn daemon_pid() -> Option<u32> {
     let path = daemon::pidfile_path()?;
     let txt = std::fs::read_to_string(path).ok()?;
     let pid: u32 = txt.trim().parse().ok()?;
-    pid_alive(pid).then_some(pid)
-}
-
-#[cfg(target_os = "linux")]
-fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_alive(_pid: u32) -> bool {
-    // Without /proc we can't tell alive from zombie; if there's a pidfile,
-    // assume it's alive.
-    true
+    hoard_agent::instance::is_alive(pid).then_some(pid)
 }
 
 /// `full` prints the whole cheat-sheet. `false` (used above `hoard sync`)
@@ -184,8 +214,10 @@ pub async fn show(full: bool) -> Result<()> {
         (false, _) => "unreachable".to_string(),
     };
 
-    // Desktop: this one is local (it's a GUI); seeing it on PATH is enough.
-    let desktop = in_path("hoard-desktop");
+    // Desktop: this one is local (it's a GUI). On Unix a PATH lookup suffices;
+    // on Windows `desktop_installed` also probes the install location and the
+    // Start Menu shortcut (the Tauri app isn't on PATH).
+    let has_desktop = desktop_installed();
 
     let daemon_pid = daemon_pid();
     let (daemon_on, daemon_label) = match daemon_pid {
@@ -203,8 +235,8 @@ pub async fn show(full: bool) -> Result<()> {
         component(
             "desktop",
             "—",
-            desktop.is_some(),
-            if desktop.is_some() {
+            has_desktop,
+            if has_desktop {
                 "installed"
             } else {
                 "not installed"

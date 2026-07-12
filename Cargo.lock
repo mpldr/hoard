@@ -3154,10 +3154,12 @@ dependencies = [
  "hoard-agent",
  "indicatif",
  "rpassword",
+ "tempfile",
  "time",
  "tokio",
  "toml 0.8.2",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 

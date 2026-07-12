@@ -10,12 +10,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
+// Only used by `tail_last_n_lines` (Windows `logs()` + tests), so gated to
+// match it — avoids an unused-import warning on Linux where the tail helper
+// isn't compiled (Linux `logs()` uses journald).
+#[cfg(any(target_os = "windows", test))]
+use anyhow::Context;
+#[cfg(any(target_os = "windows", test))]
+use std::io::{Read, Seek, SeekFrom};
+
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, WatchedSave};
 use hoard_agent::cloud_live;
 use hoard_agent::config::CliConfig;
 use hoard_agent::library;
 use hoard_agent::state::CliState;
 use tokio::sync::mpsc;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 use crate::commands::session::{self, Active};
 
@@ -24,6 +33,62 @@ use crate::commands::session::{self, Active};
 /// `hoard_agent::instance`), so only one live agent per machine either way.
 pub fn pidfile_path() -> Option<std::path::PathBuf> {
     hoard_agent::instance::lock_path()
+}
+
+/// Path to the sync service log file (`<state_dir>/logs/sync.log`). Written by
+/// `hoard sync run` (see [`sync_log_writer`]) so the Windows Task Scheduler
+/// service — which drops stdout/stderr — leaves a tail-able log behind. macOS
+/// launchd already redirects via the plist; Linux systemd uses journald, so
+/// the extra file is harmless there. `None` if the state dir can't be resolved.
+pub fn sync_log_path() -> Option<std::path::PathBuf> {
+    CliConfig::state_dir()
+        .ok()
+        .map(|d| d.join("logs").join("sync.log"))
+}
+
+/// A non-blocking file writer mirroring `tracing` events to [`sync_log_path`],
+/// plus the `WorkerGuard` that must outlive the process to flush on exit.
+/// `None` if the log dir can't be resolved or created. Wired in by `main`
+/// only when running as `hoard sync run`.
+pub fn sync_log_writer() -> Option<(NonBlocking, WorkerGuard)> {
+    let path = sync_log_path()?;
+    let dir = path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let appender = tracing_appender::rolling::never(dir, "sync.log");
+    Some(tracing_appender::non_blocking(appender))
+}
+
+/// Reads the last `n` lines of `path`. Efficient for large files: only the
+/// trailing 256 KiB is read and the partial line at the chunk boundary is
+/// dropped. Portable (no `tail` subprocess) so it works on Windows where
+/// `tail` isn't available. Only called from the Windows `logs()` (and tests),
+/// so it's gated to those configs to avoid dead-code warnings on Linux (whose
+/// `logs()` uses journald).
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn tail_last_n_lines(path: &Path, n: usize) -> Result<Vec<String>> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?
+        .len();
+    // Read only the trailing chunk so a multi-MB log doesn't load fully.
+    const TAIL: u64 = 256 * 1024;
+    let start = len.saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seeking {}", path.display()))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // If we sliced into the middle of the file, the first line is likely a
+    // partial fragment — drop it so only whole lines are returned.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let drop = lines.len().saturating_sub(n);
+    Ok(lines[drop..].iter().map(|s| s.to_string()).collect())
 }
 
 /// `hoard daemon`: resident. `backup_only` disables restore/global-sync (only
@@ -285,5 +350,58 @@ fn fmt_bytes(b: u64) -> String {
         format!("{:.2}K", b / KB)
     } else {
         format!("{b}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_last_n_lines;
+
+    #[test]
+    fn tail_returns_last_n_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let lines = tail_last_n_lines(&path, 3).unwrap();
+        assert_eq!(
+            lines,
+            vec!["three".to_string(), "four".into(), "five".into()]
+        );
+    }
+
+    #[test]
+    fn tail_fewer_lines_than_n_returns_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.log");
+        std::fs::write(&path, "only\n").unwrap();
+        let lines = tail_last_n_lines(&path, 80).unwrap();
+        assert_eq!(lines, vec!["only".to_string()]);
+    }
+
+    #[test]
+    fn tail_drops_partial_first_line_on_large_file() {
+        // Write well over the 256 KiB tail window so the read slices mid-file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        let mut content = String::from("header\n");
+        for i in 0..1000u32 {
+            content.push_str(&format!("{i:0300}\n"));
+        }
+        std::fs::write(&path, &content).unwrap();
+        let lines = tail_last_n_lines(&path, 2).unwrap();
+        // The last two whole lines are the last two indices (998, 999). The
+        // numbers are zero-padded on the left, so the index sits at the end.
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with("999"));
+        assert!(lines[0].ends_with("998"));
+    }
+
+    #[test]
+    fn tail_handles_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.log");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let lines = tail_last_n_lines(&path, 2).unwrap();
+        assert_eq!(lines, vec!["b".to_string(), "c".into()]);
     }
 }

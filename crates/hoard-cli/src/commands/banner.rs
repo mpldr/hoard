@@ -7,7 +7,7 @@
 //! Docker or on another machine. Everything else is local.
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -131,7 +131,7 @@ fn daemon_pid() -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -5,11 +5,28 @@
   import { reveal } from '$lib/actions/reveal';
   import { localeHref } from '$lib/i18n/href';
   import { onMount } from 'svelte';
-  import { Apple, Github, Monitor, Terminal, ArrowRight, Server, Cpu } from 'lucide-svelte';
+  import { Apple, Github, Monitor, Terminal, ArrowRight, Server, Cpu, Copy, Check } from 'lucide-svelte';
   import { release, ALL_RELEASES } from '$lib/version';
 
   type Platform = 'windows' | 'macos' | 'linux';
   let detected = $state<Platform | null>(null);
+
+  // One-liner installers hosted at the site root (web/static/install.*).
+  const SH_CMD = 'curl -fsSL https://hoard.services/install.sh | sh';
+  const PS_CMD = 'irm https://hoard.services/install.ps1 | iex';
+
+  let copied = $state<string | null>(null);
+  async function copy(text: string, id: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = id;
+      setTimeout(() => {
+        if (copied === id) copied = null;
+      }, 2000);
+    } catch {
+      /* clipboard blocked — the command is still visible to select manually */
+    }
+  }
 
   type Asset = { label: string; sublabel: string; href: string };
 
@@ -114,10 +131,46 @@
     </article>
   </div>
 
-  <!-- Downloads -->
+  <!-- Quick install (one-liner) -->
+  <div class="reveal mt-16" use:reveal>
+    <h2 class="text-center text-2xl font-semibold text-ink">{$_('cli.quick_title')}</h2>
+    <p class="mx-auto mt-2 max-w-xl text-center text-sm text-ink-soft">{$_('cli.quick_body')}</p>
+
+    <div class="mt-8 grid gap-4 sm:grid-cols-2">
+      {#each [{ id: 'sh', os: 'Linux · macOS', cmd: SH_CMD }, { id: 'ps', os: 'Windows · PowerShell', cmd: PS_CMD }] as t (t.id)}
+        <div class="rounded-2xl border border-line bg-surface p-5">
+          <p class="flex items-center gap-2 text-sm font-semibold text-ink">
+            <Terminal class="h-4 w-4 text-accent" />
+            {t.os}
+          </p>
+          <div class="mt-3 flex items-stretch gap-2">
+            <code
+              class="flex-1 overflow-x-auto whitespace-nowrap rounded-lg bg-pine px-4 py-3 font-mono text-[13px] text-white/90"
+              >{t.cmd}</code
+            >
+            <button
+              onclick={() => copy(t.cmd, t.id)}
+              class="grid w-11 flex-none place-items-center rounded-lg border border-line bg-bg text-ink-soft ring-focus transition-colors hover:border-accent hover:text-accent"
+              aria-label={$_('cli.copy')}
+            >
+              {#if copied === t.id}
+                <Check class="h-4 w-4 text-accent" />
+              {:else}
+                <Copy class="h-4 w-4" />
+              {/if}
+            </button>
+          </div>
+        </div>
+      {/each}
+    </div>
+    <p class="mt-3 text-center text-xs text-ink-faint">{$_('cli.quick_note')}</p>
+  </div>
+
+  <!-- Manual download -->
   <h2 class="reveal mt-16 text-center text-2xl font-semibold text-ink" use:reveal>
-    {$_('cli.downloads_title')}
+    {$_('cli.manual_title')}
   </h2>
+  <p class="mx-auto mt-2 max-w-xl text-center text-sm text-ink-soft">{$_('cli.manual_body')}</p>
 
   <div class="mt-8 grid gap-5 sm:grid-cols-3">
     {#each order as p, i (p)}

@@ -58,13 +58,17 @@ impl Engine {
             .iter()
             .map(|p| (p.id.clone(), p.source.clone()))
             .collect();
-        let new_src: HashMap<&str, &SourceRef> =
-            scene.panels.iter().map(|p| (p.id.as_str(), &p.source)).collect();
+        let new_src: HashMap<&str, &SourceRef> = scene
+            .panels
+            .iter()
+            .map(|p| (p.id.as_str(), &p.source))
+            .collect();
 
-        self.sources.retain(|id, _| match (new_src.get(id.as_str()), old_src.get(id)) {
-            (Some(new), Some(old)) => **new == *old,
-            _ => false,
-        });
+        self.sources
+            .retain(|id, _| match (new_src.get(id.as_str()), old_src.get(id)) {
+                (Some(new), Some(old)) => **new == *old,
+                _ => false,
+            });
         self.frames.retain(|id, _| self.sources.contains_key(id));
 
         for panel in &scene.panels {
@@ -147,7 +151,11 @@ struct Placeholder {
 
 impl Placeholder {
     fn new(id: &str, rgba: [u8; 4]) -> Self {
-        Self { id: id.to_string(), rgba, emitted: false }
+        Self {
+            id: id.to_string(),
+            rgba,
+            emitted: false,
+        }
     }
 }
 
@@ -187,12 +195,16 @@ mod tests {
     #[test]
     fn set_scene_opens_and_reconciles_sources() {
         let mut e = Engine::new();
-        e.set_scene(Scene { panels: vec![test_panel("a"), test_panel("b")] });
+        e.set_scene(Scene {
+            panels: vec![test_panel("a"), test_panel("b")],
+        });
         e.tick();
         assert!(e.frames.contains_key("a") && e.frames.contains_key("b"));
 
         // Drop "b": its source and frame are reclaimed.
-        e.set_scene(Scene { panels: vec![test_panel("a")] });
+        e.set_scene(Scene {
+            panels: vec![test_panel("a")],
+        });
         assert!(e.sources.contains_key("a"));
         assert!(!e.sources.contains_key("b"));
         assert!(!e.frames.contains_key("b"));
@@ -201,7 +213,9 @@ mod tests {
     #[test]
     fn swapping_source_under_a_reused_id_reopens() {
         let mut e = Engine::new();
-        e.set_scene(Scene { panels: vec![test_panel("a")] });
+        e.set_scene(Scene {
+            panels: vec![test_panel("a")],
+        });
         e.tick();
         assert!(e.frames.contains_key("a"));
 
@@ -217,7 +231,9 @@ mod tests {
     #[test]
     fn renders_a_non_empty_frame() {
         let mut e = Engine::new();
-        e.set_scene(Scene { panels: vec![test_panel("a")] });
+        e.set_scene(Scene {
+            panels: vec![test_panel("a")],
+        });
         e.tick();
         let (w, h) = (64u32, 64u32);
         let mut out = vec![0u8; (w * h * 4) as usize];
@@ -230,7 +246,9 @@ mod tests {
     fn window_source_degrades_to_placeholder_when_backend_unimplemented() {
         let mut e = Engine::new();
         let mut p = test_panel("w");
-        p.source = SourceRef::Window { id: "0xdead".into() };
+        p.source = SourceRef::Window {
+            id: "0xdead".into(),
+        };
         e.set_scene(Scene { panels: vec![p] });
         e.tick();
         // Placeholder emitted a frame; the panel did not disappear.

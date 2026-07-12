@@ -894,7 +894,15 @@ pub async fn cas_commit(
                 tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
             }
         }
-        log_sync_block(&state, user.user_id, "quota_block", &save_id, None, new_bytes).await;
+        log_sync_block(
+            &state,
+            user.user_id,
+            "quota_block",
+            &save_id,
+            None,
+            new_bytes,
+        )
+        .await;
         return Ok(resp);
     }
 

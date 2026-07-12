@@ -3793,8 +3793,12 @@ fn process_poll(
         }
     }
     let live_now: HashSet<&str> = running.iter().map(|s| s.as_str()).collect();
-    let sticky =
-        Duration::from_secs(config.poll_secs.saturating_mul(RUNNING_STICKY_POLLS).max(90));
+    let sticky = Duration::from_secs(
+        config
+            .poll_secs
+            .saturating_mul(RUNNING_STICKY_POLLS)
+            .max(90),
+    );
     let readd: Vec<String> = slots
         .iter()
         .filter(|(id, slot)| {
@@ -4053,7 +4057,10 @@ mod tests {
     #[test]
     fn game_tokens_drop_short_and_dedup() {
         // Slug y nombre visible que colapsan al mismo token → uno solo.
-        assert_eq!(game_identity_tokens("stellaris", "Stellaris"), ["stellaris"]);
+        assert_eq!(
+            game_identity_tokens("stellaris", "Stellaris"),
+            ["stellaris"]
+        );
         // Token demasiado corto se descarta (colisiona con cualquier carpeta).
         assert!(game_identity_tokens("gta", "GTA").is_empty());
     }
@@ -4063,7 +4070,9 @@ mod tests {
         // Caso Stellaris/Victoria: el exe lleva el nombre del juego.
         let cands = process_identity_candidates(
             "victoria3",
-            Some(Path::new("/home/u/.steam/steamapps/common/Victoria 3/binaries/victoria3")),
+            Some(Path::new(
+                "/home/u/.steam/steamapps/common/Victoria 3/binaries/victoria3",
+            )),
         );
         assert!(cands.contains(&"victoria3".to_string()));
     }
@@ -4103,10 +4112,8 @@ mod tests {
     #[test]
     fn generic_identity_ignores_unrelated_process() {
         // Un proceso sin relación no produce el token del juego.
-        let cands = process_identity_candidates(
-            "firefox",
-            Some(Path::new("/usr/lib/firefox/firefox")),
-        );
+        let cands =
+            process_identity_candidates("firefox", Some(Path::new("/usr/lib/firefox/firefox")));
         assert!(!cands.contains(&"stellaris".to_string()));
     }
 

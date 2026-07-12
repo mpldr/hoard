@@ -72,8 +72,8 @@ type Saved = (i32, i32, u32, u32);
 /// and which of its shapes we changed (so we only reset what we touched).
 struct Managed {
     saved: Saved,
-    cropped: bool,       // we set a BOUNDING shape on it
-    shaped_input: bool,  // we emptied its INPUT shape (click-through)
+    cropped: bool,      // we set a BOUNDING shape on it
+    shaped_input: bool, // we emptied its INPUT shape (click-through)
 }
 
 pub fn run(mut engine: Engine) -> Result<(), String> {
@@ -95,20 +95,40 @@ pub fn run(mut engine: Engine) -> Result<(), String> {
         .colormap(colormap)
         .override_redirect(1)
         .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS | EventMask::STRUCTURE_NOTIFY);
-    conn.create_window(32, window, root, 0, 0, sw, sh, 0, WindowClass::INPUT_OUTPUT, visual, &aux)
-        .map_err(err)?;
+    conn.create_window(
+        32,
+        window,
+        root,
+        0,
+        0,
+        sw,
+        sh,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &aux,
+    )
+    .map_err(err)?;
 
     set_window_type_overlay(&conn, window)?;
     let ewmh = intern_ewmh(&conn)?;
 
     let gc = conn.generate_id().map_err(err)?;
-    conn.create_gc(gc, window, &CreateGCAux::new()).map_err(err)?;
+    conn.create_gc(gc, window, &CreateGCAux::new())
+        .map_err(err)?;
     let _ = shape::ConnectionExt::shape_query_version(&conn);
 
     let o_keycode = keysym_to_keycode(&conn, 0x6f); // XK_o
     if let Some(kc) = o_keycode {
-        conn.grab_key(true, root, ModMask::CONTROL, kc, GrabMode::ASYNC, GrabMode::ASYNC)
-            .map_err(err)?;
+        conn.grab_key(
+            true,
+            root,
+            ModMask::CONTROL,
+            kc,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .map_err(err)?;
     }
     let esc_keycode = keysym_to_keycode(&conn, 0xff1b); // XK_Escape
 
@@ -138,14 +158,22 @@ pub fn run(mut engine: Engine) -> Result<(), String> {
         while let Some(event) = conn.poll_for_event().map_err(err)? {
             match event {
                 Event::KeyPress(ev) => {
-                    let toggle = Some(ev.detail) == o_keycode
-                        && ev.state.contains(KeyButMask::CONTROL);
+                    let toggle =
+                        Some(ev.detail) == o_keycode && ev.state.contains(KeyButMask::CONTROL);
                     let escape = Some(ev.detail) == esc_keycode && mode == Mode::Editor;
                     if toggle || escape {
                         let next = if escape { Mode::View } else { mode.toggled() };
                         set_mode(
-                            &conn, root, &ewmh, sw, sh, esc_keycode, &mut scene, &mut managed,
-                            &mut mode, next,
+                            &conn,
+                            root,
+                            &ewmh,
+                            sw,
+                            sh,
+                            esc_keycode,
+                            &mut scene,
+                            &mut managed,
+                            &mut mode,
+                            next,
                         )?;
                         shape_dirty = true;
                         emit_mode(mode);
@@ -166,15 +194,30 @@ pub fn run(mut engine: Engine) -> Result<(), String> {
                     // The engine never sees window panels (it would GetImage them);
                     // they become real windows over the game.
                     engine.set_scene(engine_subset(&scene));
-                    apply_windows(&conn, root, &ewmh, &scene, &mut managed, mode == Mode::Editor)?;
+                    apply_windows(
+                        &conn,
+                        root,
+                        &ewmh,
+                        &scene,
+                        &mut managed,
+                        mode == Mode::Editor,
+                    )?;
                     shape_dirty = true;
                 }
                 Message::SetEditor { editor } => {
                     let want = if editor { Mode::Editor } else { Mode::View };
                     if want != mode {
                         set_mode(
-                            &conn, root, &ewmh, sw, sh, esc_keycode, &mut scene, &mut managed,
-                            &mut mode, want,
+                            &conn,
+                            root,
+                            &ewmh,
+                            sw,
+                            sh,
+                            esc_keycode,
+                            &mut scene,
+                            &mut managed,
+                            &mut mode,
+                            want,
                         )?;
                         shape_dirty = true;
                         if mode == Mode::View {
@@ -243,7 +286,10 @@ fn engine_subset(scene: &Scene) -> Scene {
 
 /// True when the scene has at least one note/image/test panel (the overlay's job).
 fn has_overlay_panels(scene: &Scene) -> bool {
-    scene.panels.iter().any(|p| !matches!(p.source, SourceRef::Window { .. }))
+    scene
+        .panels
+        .iter()
+        .any(|p| !matches!(p.source, SourceRef::Window { .. }))
 }
 
 // --- real-window placement --------------------------------------------------
@@ -265,13 +311,24 @@ fn apply_windows(
         desired.insert(win);
         if !managed.contains_key(&win) {
             let saved = abs_geom(conn, root, win).unwrap_or((0, 0, 1, 1));
-            managed.insert(win, Managed { saved, cropped: false, shaped_input: false });
+            managed.insert(
+                win,
+                Managed {
+                    saved,
+                    cropped: false,
+                    shaped_input: false,
+                },
+            );
         }
         let m = managed.get_mut(&win).unwrap();
         place_panel(conn, root, ewmh, win, p, interactive, m);
     }
     // Restore windows whose panel is gone.
-    let gone: Vec<u32> = managed.keys().copied().filter(|w| !desired.contains(w)).collect();
+    let gone: Vec<u32> = managed
+        .keys()
+        .copied()
+        .filter(|w| !desired.contains(w))
+        .collect();
     for win in gone {
         if let Some(m) = managed.remove(&win) {
             restore_window(conn, root, ewmh, win, &m);
@@ -293,11 +350,23 @@ fn place_panel(
     m: &mut Managed,
 ) {
     let r = p.rect.normalized();
-    let _ = client_msg(conn, root, win, ewmh.wm_state, [1, ewmh.state_above, 0, 1, 0]);
+    let _ = client_msg(
+        conn,
+        root,
+        win,
+        ewmh.wm_state,
+        [1, ewmh.state_above, 0, 1, 0],
+    );
     if interactive {
         let _ = client_msg(conn, root, win, ewmh.active, [2, 0, 0, 0, 0]);
     }
-    move_resize(conn, root, ewmh, win, (r.x as i32, r.y as i32, r.w as i32, r.h as i32));
+    move_resize(
+        conn,
+        root,
+        ewmh,
+        win,
+        (r.x as i32, r.y as i32, r.w as i32, r.h as i32),
+    );
     set_clickthrough(conn, win, !interactive, m);
     apply_crop(conn, win, r.w as i32, r.h as i32, p.crop, m);
 }
@@ -336,7 +405,15 @@ fn apply_crop(conn: &impl Connection, win: u32, w: i32, h: i32, crop: Crop, m: &
         width: (l.max(r) - x0).max(1) as u16,
         height: (b.max(t) - y0).max(1) as u16,
     };
-    let _ = conn.shape_rectangles(SO::SET, SK::BOUNDING, ClipOrdering::UNSORTED, win, 0, 0, &[rect]);
+    let _ = conn.shape_rectangles(
+        SO::SET,
+        SK::BOUNDING,
+        ClipOrdering::UNSORTED,
+        win,
+        0,
+        0,
+        &[rect],
+    );
     m.cropped = true;
 }
 
@@ -349,13 +426,24 @@ fn restore_window(conn: &impl Connection, root: Window, ewmh: &Ewmh, win: u32, m
     if m.cropped {
         let _ = conn.shape_mask(SO::SET, SK::BOUNDING, win, 0, 0, 0u32);
     }
-    let _ = client_msg(conn, root, win, ewmh.wm_state, [0, ewmh.state_above, 0, 1, 0]);
+    let _ = client_msg(
+        conn,
+        root,
+        win,
+        ewmh.wm_state,
+        [0, ewmh.state_above, 0, 1, 0],
+    );
     let (x, y, w, h) = m.saved;
     move_resize(conn, root, ewmh, win, (x, y, w as i32, h as i32));
 }
 
 /// Restore every relocated window to its saved state (used on quit).
-fn restore_all(conn: &impl Connection, root: Window, ewmh: &Ewmh, managed: &mut HashMap<u32, Managed>) {
+fn restore_all(
+    conn: &impl Connection,
+    root: Window,
+    ewmh: &Ewmh,
+    managed: &mut HashMap<u32, Managed>,
+) {
     for (&win, m) in managed.iter() {
         restore_window(conn, root, ewmh, win, m);
     }
@@ -374,7 +462,13 @@ fn reassert_above(
     for p in scene.draw_order() {
         let Some(win) = panel_win(p) else { continue };
         if managed.contains_key(&win) {
-            let _ = client_msg(conn, root, win, ewmh.wm_state, [1, ewmh.state_above, 0, 1, 0]);
+            let _ = client_msg(
+                conn,
+                root,
+                win,
+                ewmh.wm_state,
+                [1, ewmh.state_above, 0, 1, 0],
+            );
         }
     }
 }
@@ -456,15 +550,29 @@ fn parse_win(id: &str) -> Option<u32> {
 /// Absolute root-space geometry of a window (top-left of its content + size).
 fn abs_geom(conn: &impl Connection, root: Window, win: u32) -> Option<Saved> {
     let g = conn.get_geometry(win).ok()?.reply().ok()?;
-    let t = conn.translate_coordinates(win, root, 0, 0).ok()?.reply().ok()?;
-    Some((t.dst_x as i32, t.dst_y as i32, g.width as u32, g.height as u32))
+    let t = conn
+        .translate_coordinates(win, root, 0, 0)
+        .ok()?
+        .reply()
+        .ok()?;
+    Some((
+        t.dst_x as i32,
+        t.dst_y as i32,
+        g.width as u32,
+        g.height as u32,
+    ))
 }
 
 // --- EWMH / WM cooperation --------------------------------------------------
 
 fn intern_ewmh(conn: &impl Connection) -> Result<Ewmh, String> {
     let intern = |name: &str| -> Result<Atom, String> {
-        Ok(conn.intern_atom(false, name.as_bytes()).map_err(err)?.reply().map_err(err)?.atom)
+        Ok(conn
+            .intern_atom(false, name.as_bytes())
+            .map_err(err)?
+            .reply()
+            .map_err(err)?
+            .atom)
     };
     Ok(Ewmh {
         moveresize: intern("_NET_MOVERESIZE_WINDOW")?,
@@ -493,7 +601,13 @@ fn client_msg(
 }
 
 /// Ask the WM to move+resize a window via `_NET_MOVERESIZE_WINDOW`.
-fn move_resize(conn: &impl Connection, root: Window, ewmh: &Ewmh, win: u32, rect: (i32, i32, i32, i32)) {
+fn move_resize(
+    conn: &impl Connection,
+    root: Window,
+    ewmh: &Ewmh,
+    win: u32,
+    rect: (i32, i32, i32, i32),
+) {
     // flags: gravity 0 | x,y,w,h present (bits 8..11) | source = application (bit 12).
     let flags: u32 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12);
     let (x, y, w, h) = rect;
@@ -509,8 +623,11 @@ fn move_resize(conn: &impl Connection, root: Window, ewmh: &Ewmh, win: u32, rect
 // --- overlay layer ----------------------------------------------------------
 
 fn restack(conn: &impl Connection, window: Window) -> Result<(), String> {
-    conn.configure_window(window, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
-        .map_err(err)?;
+    conn.configure_window(
+        window,
+        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -527,25 +644,65 @@ fn set_escape_grab(conn: &impl Connection, root: Window, esc_kc: Option<u8>, on:
 
 /// Overlay BOUNDING = full screen minus a hole per window panel (so real windows
 /// always show through, whatever the stack order), INPUT empty (click-through).
-fn overlay_shape(conn: &impl Connection, window: Window, sw: u16, sh: u16, scene: &Scene) -> Result<(), String> {
-    let full = Rectangle { x: 0, y: 0, width: sw, height: sh };
-    conn.shape_rectangles(SO::SET, SK::BOUNDING, ClipOrdering::UNSORTED, window, 0, 0, &[full])
-        .map_err(err)?;
+fn overlay_shape(
+    conn: &impl Connection,
+    window: Window,
+    sw: u16,
+    sh: u16,
+    scene: &Scene,
+) -> Result<(), String> {
+    let full = Rectangle {
+        x: 0,
+        y: 0,
+        width: sw,
+        height: sh,
+    };
+    conn.shape_rectangles(
+        SO::SET,
+        SK::BOUNDING,
+        ClipOrdering::UNSORTED,
+        window,
+        0,
+        0,
+        &[full],
+    )
+    .map_err(err)?;
     let holes: Vec<Rectangle> = scene
         .panels
         .iter()
         .filter(|p| matches!(p.source, SourceRef::Window { .. }))
         .map(|p| {
             let r = p.rect.normalized();
-            Rectangle { x: r.x as i16, y: r.y as i16, width: r.w.max(1.0) as u16, height: r.h.max(1.0) as u16 }
+            Rectangle {
+                x: r.x as i16,
+                y: r.y as i16,
+                width: r.w.max(1.0) as u16,
+                height: r.h.max(1.0) as u16,
+            }
         })
         .collect();
     if !holes.is_empty() {
-        conn.shape_rectangles(SO::SUBTRACT, SK::BOUNDING, ClipOrdering::UNSORTED, window, 0, 0, &holes)
-            .map_err(err)?;
-    }
-    conn.shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, window, 0, 0, &[])
+        conn.shape_rectangles(
+            SO::SUBTRACT,
+            SK::BOUNDING,
+            ClipOrdering::UNSORTED,
+            window,
+            0,
+            0,
+            &holes,
+        )
         .map_err(err)?;
+    }
+    conn.shape_rectangles(
+        SO::SET,
+        SK::INPUT,
+        ClipOrdering::UNSORTED,
+        window,
+        0,
+        0,
+        &[],
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -566,11 +723,17 @@ fn find_argb_visual(screen: &Screen) -> Option<Visualid> {
 
 fn set_window_type_overlay(conn: &impl Connection, window: Window) -> Result<(), String> {
     let intern = |name: &str| -> Result<Atom, String> {
-        Ok(conn.intern_atom(false, name.as_bytes()).map_err(err)?.reply().map_err(err)?.atom)
+        Ok(conn
+            .intern_atom(false, name.as_bytes())
+            .map_err(err)?
+            .reply()
+            .map_err(err)?
+            .atom)
     };
-    if let (Ok(wt), Ok(notif)) =
-        (intern("_NET_WM_WINDOW_TYPE"), intern("_NET_WM_WINDOW_TYPE_NOTIFICATION"))
-    {
+    if let (Ok(wt), Ok(notif)) = (
+        intern("_NET_WM_WINDOW_TYPE"),
+        intern("_NET_WM_WINDOW_TYPE_NOTIFICATION"),
+    ) {
         let _ = conn.change_property32(PropMode::REPLACE, window, wt, AtomEnum::ATOM, &[notif]);
     }
     Ok(())

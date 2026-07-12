@@ -231,21 +231,53 @@ pub async fn show(full: bool) -> Result<()> {
     if full {
         println!("  Commands");
         println!("{}", cmd_line("hoard", "this status panel", color));
-        println!("{}", cmd_line("hoard desktop", "open the desktop app", color));
-        println!("{}", cmd_line("hoard server", "start the self-host server", color));
+        println!(
+            "{}",
+            cmd_line("hoard desktop", "open the desktop app", color)
+        );
+        println!(
+            "{}",
+            cmd_line("hoard server", "start the self-host server", color)
+        );
         println!();
         println!("  Cloud & saves");
-        println!("{}", cmd_line("hoard login", "sign in (Cloud, no browser)", color));
+        println!(
+            "{}",
+            cmd_line("hoard login", "sign in (Cloud, no browser)", color)
+        );
         println!("{}", cmd_line("hoard logout", "sign out", color));
-        println!("{}", cmd_line("hoard track", "track a game (detect + remember)", color));
+        println!(
+            "{}",
+            cmd_line("hoard track", "track a game (detect + remember)", color)
+        );
         println!("{}", cmd_line("hoard saves", "list what you track", color));
         println!();
     }
     println!("  Sync service");
-    println!("{}", cmd_line("hoard sync start", "install & run automatic sync (now + every login)", color));
-    println!("{}", cmd_line("hoard sync stop", "stop it and remove from autostart", color));
-    println!("{}", cmd_line("hoard sync restart", "restart the service", color));
-    println!("{}", cmd_line("hoard sync logs", "show recent service logs", color));
+    println!(
+        "{}",
+        cmd_line(
+            "hoard sync start",
+            "install & run automatic sync (now + every login)",
+            color
+        )
+    );
+    println!(
+        "{}",
+        cmd_line(
+            "hoard sync stop",
+            "stop it and remove from autostart",
+            color
+        )
+    );
+    println!(
+        "{}",
+        cmd_line("hoard sync restart", "restart the service", color)
+    );
+    println!(
+        "{}",
+        cmd_line("hoard sync logs", "show recent service logs", color)
+    );
     println!();
     if full {
         println!("{}", cmd_line("hoard --help", "all commands", color));

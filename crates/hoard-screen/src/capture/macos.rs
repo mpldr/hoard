@@ -115,7 +115,9 @@ impl CaptureBackend for MacCapture {
                 if dict.is_null() {
                     continue;
                 }
-                let Some(id) = dict_number(dict, kCGWindowNumber) else { continue };
+                let Some(id) = dict_number(dict, kCGWindowNumber) else {
+                    continue;
+                };
                 let title = dict_string(dict, kCGWindowName).unwrap_or_default();
                 let app = dict_string(dict, kCGWindowOwnerName).unwrap_or_default();
                 // Skip the chromeless 0-size helper windows with no title and no app.
@@ -139,7 +141,11 @@ impl CaptureBackend for MacCapture {
             .trim()
             .parse()
             .map_err(|_| CaptureError::Backend(format!("bad window id: {id}")))?;
-        Ok(Box::new(CgWindowSource { id: id.clone(), wid, last: None }))
+        Ok(Box::new(CgWindowSource {
+            id: id.clone(),
+            wid,
+            last: None,
+        }))
     }
 }
 

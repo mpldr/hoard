@@ -63,7 +63,9 @@ pub struct WaylandSource {
 
 impl WaylandSource {
     fn start() -> Result<Self> {
-        let shared = Arc::new(Shared { frame: Mutex::new(None) });
+        let shared = Arc::new(Shared {
+            frame: Mutex::new(None),
+        });
         let sink = Arc::clone(&shared);
         // Portal negotiation blocks on the user's window pick + permission dialog.
         // Run it (and the PipeWire loop it feeds) on this dedicated thread, never
@@ -85,7 +87,11 @@ impl WaylandSource {
                 }
             })
             .map_err(be)?;
-        Ok(Self { id: "wayland".into(), shared, _thread: thread })
+        Ok(Self {
+            id: "wayland".into(),
+            shared,
+            _thread: thread,
+        })
     }
 }
 
@@ -100,8 +106,8 @@ impl Source for WaylandSource {
 
 /// Drive the ScreenCast portal to obtain `(pipewire_fd, node_id)`.
 fn negotiate_portal() -> Result<(OwnedFd, u32)> {
-    use ashpd::desktop::PersistMode;
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::PersistMode;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -145,7 +151,7 @@ fn negotiate_portal() -> Result<(OwnedFd, u32)> {
 fn pipewire_loop(fd: OwnedFd, node_id: u32, sink: Arc<Shared>) -> std::result::Result<(), String> {
     use pipewire as pw;
     use pw::spa;
-    use pw::spa::pod::{property, object};
+    use pw::spa::pod::{object, property};
     use pw::{context::ContextBox, main_loop::MainLoopBox, stream::StreamBox};
 
     pw::init();
@@ -184,9 +190,13 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, sink: Arc<Shared>) -> std::result::R
             }
         })
         .process(move |stream, _ud| {
-            let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
             let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
             let chunk = data.chunk();
             let stride = chunk.stride().max(0) as usize;
             let info = fmt_cb_geometry(&fmt_proc);
@@ -227,8 +237,9 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, sink: Arc<Shared>) -> std::result::R
     .map_err(|e| e.to_string())?
     .0
     .into_inner();
-    let mut params = [pw::spa::pod::Pod::from_bytes(&values)
-        .ok_or_else(|| "invalid format pod".to_string())?];
+    let mut params = [
+        pw::spa::pod::Pod::from_bytes(&values).ok_or_else(|| "invalid format pod".to_string())?
+    ];
 
     stream
         .connect(
@@ -247,7 +258,11 @@ fn fmt_cb_geometry(
     fmt: &Rc<RefCell<pipewire::spa::param::video::VideoInfoRaw>>,
 ) -> (usize, usize, pipewire::spa::param::video::VideoFormat) {
     let b = fmt.borrow();
-    (b.size().width as usize, b.size().height as usize, b.format())
+    (
+        b.size().width as usize,
+        b.size().height as usize,
+        b.format(),
+    )
 }
 
 /// Convert a captured frame (BGRx/RGBx/BGRA/RGBA, possibly padded) to RGBA.

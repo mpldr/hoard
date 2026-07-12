@@ -355,12 +355,11 @@ pub async fn handle(
     } else if status == "expired" {
         // Subscription expired: downgrade to Free with grace window. User keeps Pro
         // storage for `storage_downgrade_grace_days` then it shrinks to Free (1 GB).
-        if let Err(e) = sqlx::query(
-            "UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .execute(&state.pool)
-        .await
+        if let Err(e) =
+            sqlx::query("UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1")
+                .bind(user_id)
+                .execute(&state.pool)
+                .await
         {
             warn!(error = %e, "polar webhook: plan reset to free failed");
             return CloudError::Db(e).into_response();

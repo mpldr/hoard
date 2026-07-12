@@ -277,7 +277,12 @@ pub fn resolve_blit(panel: &Panel, src_w: u32, src_h: u32) -> Blit {
             } else {
                 (box_.h * ar, box_.h)
             };
-            Rect::new(box_.x + (box_.w - w) / 2.0, box_.y + (box_.h - h) / 2.0, w, h)
+            Rect::new(
+                box_.x + (box_.w - w) / 2.0,
+                box_.y + (box_.h - h) / 2.0,
+                w,
+                h,
+            )
         }
     };
     Blit { src, dst }
@@ -307,14 +312,35 @@ mod tests {
         let b = resolve_blit(&panel(ScaleMode::Fill, Crop::NONE), 1920, 1080);
         // dst is exactly the panel box: the content can never exceed it.
         assert_eq!(b.dst, Rect::new(100.0, 50.0, 800.0, 600.0));
-        assert_eq!(b.src, PixRect { x: 0, y: 0, w: 1920, h: 1080 });
+        assert_eq!(
+            b.src,
+            PixRect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080
+            }
+        );
     }
 
     #[test]
     fn crop_selects_a_subrect_of_the_source() {
-        let c = Crop { top: 0.25, right: 0.0, bottom: 0.25, left: 0.5 };
+        let c = Crop {
+            top: 0.25,
+            right: 0.0,
+            bottom: 0.25,
+            left: 0.5,
+        };
         let b = resolve_blit(&panel(ScaleMode::Fill, c), 1000, 800);
-        assert_eq!(b.src, PixRect { x: 500, y: 200, w: 500, h: 400 });
+        assert_eq!(
+            b.src,
+            PixRect {
+                x: 500,
+                y: 200,
+                w: 500,
+                h: 400
+            }
+        );
     }
 
     #[test]
@@ -329,7 +355,12 @@ mod tests {
 
     #[test]
     fn collapsed_crop_cannot_produce_zero_area() {
-        let c = Crop { top: 0.9, right: 0.9, bottom: 0.9, left: 0.9 };
+        let c = Crop {
+            top: 0.9,
+            right: 0.9,
+            bottom: 0.9,
+            left: 0.9,
+        };
         let b = resolve_blit(&panel(ScaleMode::Fill, c), 100, 100);
         assert!(b.src.w >= 1 && b.src.h >= 1);
     }
@@ -348,7 +379,9 @@ mod tests {
             compat: false,
             passthrough_radius: 90.0,
         };
-        let s = Scene { panels: vec![mk("a", 5), mk("b", -1), mk("c", 2)] };
+        let s = Scene {
+            panels: vec![mk("a", 5), mk("b", -1), mk("c", 2)],
+        };
         let order: Vec<_> = s.draw_order().into_iter().map(|p| p.id.as_str()).collect();
         assert_eq!(order, ["b", "c", "a"]);
     }

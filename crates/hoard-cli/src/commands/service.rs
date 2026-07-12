@@ -208,11 +208,7 @@ async fn status() -> Result<()> {
         return Ok(());
     }
     // `status` exits non-zero when the unit is inactive; that's not our error.
-    let _ = run_status(
-        "systemctl",
-        &["--user", "status", UNIT, "--no-pager"],
-    )
-    .await;
+    let _ = run_status("systemctl", &["--user", "status", UNIT, "--no-pager"]).await;
     Ok(())
 }
 

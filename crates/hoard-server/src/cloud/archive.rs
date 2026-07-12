@@ -249,9 +249,7 @@ pub async fn reactivate_save(
         return Err(CloudError::BadRequest("save is not archived".into()));
     };
     if archived_at < time::OffsetDateTime::now_utc() - time::Duration::days(ARCHIVE_GRACE_DAYS) {
-        return Err(CloudError::NotFound(
-            "archived save expired and was purged",
-        ));
+        return Err(CloudError::NotFound("archived save expired and was purged"));
     }
 
     // Bytes that will re-count once reactivated: currently-frozen blobs
@@ -413,15 +411,17 @@ pub async fn storage_games(
 
     let games = rows
         .into_iter()
-        .map(|(save_id, game_slug, label, freeable, archived_at)| GameFootprint {
-            save_id,
-            game_slug,
-            label,
-            freeable_bytes: freeable,
-            archived: archived_at.is_some(),
-            purge_after: archived_at
-                .map(|a| fmt_ts(a + time::Duration::days(ARCHIVE_GRACE_DAYS))),
-        })
+        .map(
+            |(save_id, game_slug, label, freeable, archived_at)| GameFootprint {
+                save_id,
+                game_slug,
+                label,
+                freeable_bytes: freeable,
+                archived: archived_at.is_some(),
+                purge_after: archived_at
+                    .map(|a| fmt_ts(a + time::Duration::days(ARCHIVE_GRACE_DAYS))),
+            },
+        )
         .collect();
 
     let over = info.used_bytes.saturating_sub(info.limit_bytes);

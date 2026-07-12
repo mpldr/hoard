@@ -50,7 +50,9 @@ pub async fn run(cmd: CloudCommand) -> Result<()> {
 
     match cmd {
         CloudCommand::Storage => {
-            let sg = cloud_account::storage_games(base, token).await.map_err(err)?;
+            let sg = cloud_account::storage_games(base, token)
+                .await
+                .map_err(err)?;
             println!(
                 "plan {} · {} / {} usados{}",
                 sg.plan,
@@ -87,7 +89,9 @@ pub async fn run(cmd: CloudCommand) -> Result<()> {
             println!("sondea el estado con `hoard cloud export-status`");
         }
         CloudCommand::ExportStatus => {
-            let st = cloud_account::export_status(base, token).await.map_err(err)?;
+            let st = cloud_account::export_status(base, token)
+                .await
+                .map_err(err)?;
             match st.status {
                 None => println!("(nunca has solicitado un export)"),
                 Some(status) => {
@@ -125,7 +129,9 @@ pub async fn run(cmd: CloudCommand) -> Result<()> {
             println!("reactivada {save_id}");
         }
         CloudCommand::Entitlements => {
-            let ent = cloud_account::entitlements(base, token).await.map_err(err)?;
+            let ent = cloud_account::entitlements(base, token)
+                .await
+                .map_err(err)?;
             println!("plan: {}", ent.plan);
             println!("screen:  {}", fmt_feature(&ent.features.screen));
             println!("wrapple: {}", fmt_feature(&ent.features.wrapple));

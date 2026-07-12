@@ -53,7 +53,11 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
             let mut mi = MONITORINFOEXW::default();
             mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
             if GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut MONITORINFO).as_bool() {
-                let end = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+                let end = mi
+                    .szDevice
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(mi.szDevice.len());
                 out.push(Raw {
                     name: String::from_utf16_lossy(&mi.szDevice[..end]),
                     rect: mi.monitorInfo.rcMonitor,
@@ -66,12 +70,7 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
 
     let mut raw: Vec<Raw> = Vec::new();
     unsafe {
-        let _ = EnumDisplayMonitors(
-            None,
-            None,
-            Some(cb),
-            LPARAM(&mut raw as *mut _ as isize),
-        );
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut raw as *mut _ as isize));
     }
     // Primary first, then left-to-right / top-to-bottom, so ids are stable and
     // id 0 is the primary (PanelTarget's default).

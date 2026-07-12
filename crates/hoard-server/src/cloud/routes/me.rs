@@ -157,12 +157,11 @@ pub async fn get_me(
         .bind(user.user_id)
         .execute(&state.pool)
         .await;
-        let _ = sqlx::query(
-            "UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1",
-        )
-        .bind(user.user_id)
-        .execute(&state.pool)
-        .await;
+        let _ =
+            sqlx::query("UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1")
+                .bind(user.user_id)
+                .execute(&state.pool)
+                .await;
         // Apply grace window for storage downgrade (same as webhook).
         if let Some(ref cloud) = state.config.cloud {
             let _ = quota::settle_storage_on_active(

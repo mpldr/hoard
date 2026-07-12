@@ -295,4 +295,3 @@ fn network_message(err: &reqwest::Error) -> String {
     }
     err.to_string()
 }
-

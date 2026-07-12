@@ -24,6 +24,11 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};
 
+use smithay_client_toolkit::reexports::client::{
+    globals::registry_queue_init,
+    protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
@@ -32,7 +37,7 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        keyboard::{KeyEvent, Keysym, KeyboardHandler, Modifiers},
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -43,11 +48,6 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
-};
-use smithay_client_toolkit::reexports::client::{
-    globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
 };
 
 use crate::engine::Engine;
@@ -70,7 +70,8 @@ pub fn run(engine: Engine) -> Result<(), String> {
 
     let compositor =
         CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
-    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|e| format!("{}: {e}", gamescope_hint()))?;
+    let layer_shell =
+        LayerShell::bind(&globals, &qh).map_err(|e| format!("{}: {e}", gamescope_hint()))?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
 
     let surface = compositor.create_surface(&qh);
@@ -182,18 +183,17 @@ impl Overlay {
 
         let (w, h) = (self.width, self.height);
         let stride = w as i32 * 4;
-        let (buffer, canvas) = match self.pool.create_buffer(
-            w as i32,
-            h as i32,
-            stride,
-            wl_shm::Format::Argb8888,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("hoard-screen: shm buffer: {e}");
-                return;
-            }
-        };
+        let (buffer, canvas) =
+            match self
+                .pool
+                .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("hoard-screen: shm buffer: {e}");
+                    return;
+                }
+            };
 
         // Engine renders RGBA; shm Argb8888 is little-endian => bytes B,G,R,A.
         self.engine.render(canvas, w, h);
@@ -213,13 +213,41 @@ impl Overlay {
 }
 
 impl CompositorHandler for Overlay {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
         self.draw(qh);
     }
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl LayerShellHandler for Overlay {
@@ -249,14 +277,26 @@ impl SeatHandler for Overlay {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             if let Ok(kb) = self.seat_state.get_keyboard(qh, &seat, None) {
                 self.keyboard = Some(kb);
             }
         }
     }
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard {
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
@@ -267,9 +307,34 @@ impl SeatHandler for Overlay {
 }
 
 impl KeyboardHandler for Overlay {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
         // While focused (Editor mode), Ctrl+O or Esc drops back to View.
         let ctrl_o = self.modifiers.ctrl && event.keysym == Keysym::o;
         if ctrl_o || event.keysym == Keysym::Escape {
@@ -279,8 +344,24 @@ impl KeyboardHandler for Overlay {
             }
         }
     }
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, modifiers: Modifiers, _: u32) {
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: u32,
+    ) {
         self.modifiers = modifiers;
     }
 }
@@ -324,7 +405,10 @@ fn spawn_stdin_reader() -> Arc<Mutex<VecDeque<Message>>> {
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
             match parse_line(&line) {
-                Ok(Some(msg)) => sink.lock().unwrap_or_else(|e| e.into_inner()).push_back(msg),
+                Ok(Some(msg)) => sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(msg),
                 Ok(None) => {}
                 Err(e) => eprintln!("hoard-screen: bad ipc: {e}"),
             }

@@ -454,10 +454,7 @@ fn windows_registry_root() -> Option<PathBuf> {
         }
     }
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    for subkey in [
-        r"SOFTWARE\Wow6432Node\Valve\Steam",
-        r"SOFTWARE\Valve\Steam",
-    ] {
+    for subkey in [r"SOFTWARE\Wow6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"] {
         if let Ok(key) = hklm.open_subkey(subkey) {
             if let Ok(p) = key.get_value::<String, _>("InstallPath") {
                 if !p.is_empty() {

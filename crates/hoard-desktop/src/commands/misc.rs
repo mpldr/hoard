@@ -23,9 +23,8 @@ pub fn greet(name: &str) -> String {
 #[tauri::command]
 pub async fn open_external(url: String) -> Result<(), String> {
     // Never feed an arbitrary string to a shell/opener — web schemes only.
-    let allowed = url.starts_with("https://")
-        || url.starts_with("http://")
-        || url.starts_with("mailto:");
+    let allowed =
+        url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:");
     if !allowed {
         return Err("refusing to open non-web URL".into());
     }

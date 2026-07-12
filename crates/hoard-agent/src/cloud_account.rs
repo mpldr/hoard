@@ -36,9 +36,7 @@ impl CloudError {
     /// desktop para los casos que no intercepta por código.
     pub fn message(&self) -> String {
         match self {
-            CloudError::Unauthorized => {
-                "la sesión Cloud caducó — vuelve a iniciar sesión".into()
-            }
+            CloudError::Unauthorized => "la sesión Cloud caducó — vuelve a iniciar sesión".into(),
             CloudError::Http { status, body } => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
                     if let Some(msg) = v.get("error").and_then(|x| x.as_str()) {

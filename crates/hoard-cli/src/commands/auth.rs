@@ -208,7 +208,10 @@ async fn finish_cloud_login(base: &str, tokens: &cloud_auth::Tokens) -> Result<(
     cloud_auth::store_tokens(tokens, base)?;
     let me = cloud_auth::fetch_me(base, &tokens.access).await?;
     state::set_active_context(Some(state::cloud_context(&me.user_id)));
-    println!("connected to Hoard Cloud as {} · plan {}", me.email, me.plan);
+    println!(
+        "connected to Hoard Cloud as {} · plan {}",
+        me.email, me.plan
+    );
     Ok(())
 }
 

@@ -23,7 +23,11 @@ pub struct Frame {
 impl Frame {
     pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
         debug_assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
-        Self { width, height, rgba: rgba.into() }
+        Self {
+            width,
+            height,
+            rgba: rgba.into(),
+        }
     }
 
     /// A solid-colour frame; handy for tests and as a placeholder while a real
@@ -39,7 +43,12 @@ impl Frame {
     #[inline]
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+        [
+            self.rgba[i],
+            self.rgba[i + 1],
+            self.rgba[i + 2],
+            self.rgba[i + 3],
+        ]
     }
 }
 
@@ -63,7 +72,12 @@ pub struct TestPattern {
 
 impl TestPattern {
     pub fn new(id: impl Into<String>, width: u32, height: u32) -> Self {
-        Self { id: id.into(), width, height, tick: 0 }
+        Self {
+            id: id.into(),
+            width,
+            height,
+            tick: 0,
+        }
     }
 }
 

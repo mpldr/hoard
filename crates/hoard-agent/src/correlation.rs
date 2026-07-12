@@ -168,8 +168,9 @@ pub struct GameProcess {
 /// `/usr/lib/...`, `gsd-*` en `/usr/libexec`).
 /// Vale para Linux/SteamOS y macOS (`/System/` = daemons del sistema; los juegos
 /// de mac viven en `/Applications/*.app`, no aquí).
-const SYSTEM_EXE_PREFIXES: &[&str] =
-    &["/usr/", "/lib", "/lib64", "/bin", "/sbin", "/run/", "/System/"];
+const SYSTEM_EXE_PREFIXES: &[&str] = &[
+    "/usr/", "/lib", "/lib64", "/bin", "/sbin", "/run/", "/System/",
+];
 
 /// Igual pero para Windows: un exe bajo el directorio de Windows (`C:\Windows\`,
 /// System32, SysWOW64, WinSxS…) es del sistema, nunca un juego. Match por

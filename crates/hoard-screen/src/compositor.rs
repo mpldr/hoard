@@ -126,10 +126,7 @@ fn draw_blit(frame: &Frame, blit: &crate::scene::Blit, out: &mut [u8], out_w: u3
 pub fn rgba_to_argb_u32(rgba: &[u8], out: &mut [u32]) {
     debug_assert_eq!(rgba.len(), out.len() * 4);
     for (px, o) in rgba.chunks_exact(4).zip(out.iter_mut()) {
-        *o = (px[3] as u32) << 24
-            | (px[0] as u32) << 16
-            | (px[1] as u32) << 8
-            | (px[2] as u32);
+        *o = (px[3] as u32) << 24 | (px[0] as u32) << 16 | (px[1] as u32) << 8 | (px[2] as u32);
     }
 }
 
@@ -247,7 +244,10 @@ mod tests {
         for win in lum.windows(2) {
             assert!(win[1] >= win[0], "must be non-decreasing: {lum:?}");
         }
-        assert!(lum[4] > 100 && lum[4] < 200, "midpoint interpolated: {lum:?}");
+        assert!(
+            lum[4] > 100 && lum[4] < 200,
+            "midpoint interpolated: {lum:?}"
+        );
     }
 
     #[test]

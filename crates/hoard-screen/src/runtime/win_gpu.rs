@@ -28,38 +28,37 @@ use std::collections::HashMap;
 
 use windows::core::{s, Interface, Result, PCSTR};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
-use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+    ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D_DRIVER_TYPE_HARDWARE,
+    D3D_DRIVER_TYPE_WARP,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
     ID3D11InputLayout, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
     D3D11_BIND_VERTEX_BUFFER, D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
-    D3D11_BLEND_OP_ADD, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_INPUT_ELEMENT_DESC,
-    D3D11_INPUT_PER_VERTEX_DATA, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
-    D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
-    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_COMPARISON_NEVER,
+    D3D11_BLEND_OP_ADD, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_NEVER,
+    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CULL_NONE, D3D11_FILL_SOLID,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_RASTERIZER_DESC,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-};
-use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -241,9 +240,13 @@ impl GpuCapture {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DEFAULT,
-                BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0
+                    as u32,
                 ..Default::default()
             };
             let mut tex = None;
@@ -433,7 +436,10 @@ impl GpuOverlay {
             // plain B8G8R8A8 is correct and keeps the cursor visible.
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
@@ -441,8 +447,9 @@ impl GpuOverlay {
             AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
             Flags: 0,
         };
-        let swapchain =
-            self.factory.CreateSwapChainForComposition(&self.device, &desc, None)?;
+        let swapchain = self
+            .factory
+            .CreateSwapChainForComposition(&self.device, &desc, None)?;
         let target = self.dcomp.CreateTargetForHwnd(hwnd, true)?;
         let visual = self.dcomp.CreateVisual()?;
         visual.SetContent(&swapchain)?;
@@ -554,9 +561,13 @@ impl GpuOverlay {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
-                BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0
+                    as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
                 ..Default::default()
             };
@@ -596,7 +607,8 @@ impl GpuOverlay {
         let swapchain = self.mons[idx].swapchain.clone();
         let back: ID3D11Texture2D = swapchain.GetBuffer(0)?;
         let mut rtv: Option<ID3D11RenderTargetView> = None;
-        self.device.CreateRenderTargetView(&back, None, Some(&mut rtv))?;
+        self.device
+            .CreateRenderTargetView(&back, None, Some(&mut rtv))?;
         let rtv = rtv.unwrap();
 
         let ctx = &self.context;
@@ -639,10 +651,22 @@ impl GpuOverlay {
             let b = 1.0 - (y + qh) / h * 2.0;
             let (u0, v0, u1, v1) = q.uv;
             let verts = [
-                Vertex { pos: [l, t], uv: [u0, v0] },
-                Vertex { pos: [r, t], uv: [u1, v0] },
-                Vertex { pos: [l, b], uv: [u0, v1] },
-                Vertex { pos: [r, b], uv: [u1, v1] },
+                Vertex {
+                    pos: [l, t],
+                    uv: [u0, v0],
+                },
+                Vertex {
+                    pos: [r, t],
+                    uv: [u1, v0],
+                },
+                Vertex {
+                    pos: [l, b],
+                    uv: [u0, v1],
+                },
+                Vertex {
+                    pos: [r, b],
+                    uv: [u1, v1],
+                },
             ];
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             ctx.Map(&self.vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
@@ -653,7 +677,11 @@ impl GpuOverlay {
             );
             ctx.Unmap(&self.vbuf, 0);
 
-            let ps = if q.opaque { &self.ps_opaque } else { &self.ps_alpha };
+            let ps = if q.opaque {
+                &self.ps_opaque
+            } else {
+                &self.ps_alpha
+            };
             ctx.PSSetShader(ps, None);
             ctx.PSSetShaderResources(0, Some(&[Some(q.srv.clone())]));
             ctx.Draw(4, 0);
@@ -690,7 +718,11 @@ unsafe fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
             Some(&mut context),
         );
         if hr.is_ok() {
-            let kind = if driver == D3D_DRIVER_TYPE_HARDWARE { "hardware" } else { "WARP" };
+            let kind = if driver == D3D_DRIVER_TYPE_HARDWARE {
+                "hardware"
+            } else {
+                "WARP"
+            };
             crate::slog!("gpu device created ({kind})");
             return Ok((device.unwrap(), context.unwrap()));
         }
@@ -712,7 +744,10 @@ unsafe fn create_srv(
         Format: format,
         ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
         Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-            Texture2D: D3D11_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1 },
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
         },
     };
     let mut srv = None;
@@ -748,7 +783,10 @@ unsafe fn compile(src: &str, target: windows::core::PCSTR) -> Result<ID3DBlob> {
                 err.GetBufferPointer() as *const u8,
                 err.GetBufferSize(),
             );
-            eprintln!("hoard-screen: shader compile error: {}", String::from_utf8_lossy(msg));
+            eprintln!(
+                "hoard-screen: shader compile error: {}",
+                String::from_utf8_lossy(msg)
+            );
         }
         return Err(e);
     }

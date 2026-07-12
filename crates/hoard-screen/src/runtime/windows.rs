@@ -49,30 +49,26 @@ use windows::Win32::Graphics::Gdi::{
     RGN_DIFF, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT,
     VK_LBUTTON, VK_RBUTTON,
 };
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    GetTopWindow, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
-    GetWindowThreadProcessId, GW_HWNDNEXT, IsIconic, IsWindowVisible, IsZoomed,
-    MsgWaitForMultipleObjectsEx, PeekMessageW,
-    PostMessageW, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongW,
-    SetWindowPlacement, SetWindowPos, ShowWindow, TranslateMessage, CWP_SKIPINVISIBLE,
-    CWP_SKIPTRANSPARENT, GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST,
-    HWND_TOPMOST, LWA_ALPHA, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE,
-    SWP_NOSIZE, WINDOWPLACEMENT, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL,
-    WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION,
-    WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos,
+    GetForegroundWindow, GetSystemMetrics, GetTopWindow, GetWindow, GetWindowLongW,
+    GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    IsZoomed, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, RegisterClassW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPlacement,
+    SetWindowPos, ShowWindow, TranslateMessage, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT,
+    GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST,
+    LWA_ALPHA, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WINDOWPLACEMENT, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use super::win_gpu::{GpuOverlay, Quad};
@@ -223,10 +219,16 @@ unsafe fn force_foreground(target: HWND) {
         return;
     }
     let cur = GetCurrentThreadId();
-    let fg_tid = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+    let fg_tid = if fg.0.is_null() {
+        0
+    } else {
+        GetWindowThreadProcessId(fg, None)
+    };
     let tgt_tid = GetWindowThreadProcessId(target, None);
     let a1 = fg_tid != 0 && fg_tid != cur && AttachThreadInput(cur, fg_tid, true).as_bool();
-    let a2 = tgt_tid != 0 && tgt_tid != cur && tgt_tid != fg_tid
+    let a2 = tgt_tid != 0
+        && tgt_tid != cur
+        && tgt_tid != fg_tid
         && AttachThreadInput(cur, tgt_tid, true).as_bool();
     let _ = SetForegroundWindow(target);
     let _ = SetFocus(target);
@@ -248,7 +250,12 @@ unsafe fn forward_pointer(message: u32, wparam: WPARAM) {
     if GetCursorPos(&mut pt).is_err() {
         return;
     }
-    let slot = SLOTS.with(|s| s.borrow().iter().find(|sl| slot_contains(sl, pt.x, pt.y)).cloned());
+    let slot = SLOTS.with(|s| {
+        s.borrow()
+            .iter()
+            .find(|sl| slot_contains(sl, pt.x, pt.y))
+            .cloned()
+    });
     let Some(slot) = slot else { return };
     // Passthrough ON ("clics pasan al juego"): handled by the click-through hole —
     // a circular cut-out of the overlay follows the cursor over the panel, so the
@@ -291,7 +298,10 @@ unsafe fn forward_pointer(message: u32, wparam: WPARAM) {
             if lx < offx || lx > offx + dw || ly < offy || ly > offy + dh {
                 return;
             }
-            (((lx - offx) / dw).clamp(0.0, 1.0), ((ly - offy) / dh).clamp(0.0, 1.0))
+            (
+                ((lx - offx) / dw).clamp(0.0, 1.0),
+                ((ly - offy) / dh).clamp(0.0, 1.0),
+            )
         }
     };
     let fx = c.left + cu * (1.0 - c.left - c.right);
@@ -361,7 +371,12 @@ unsafe fn forward_pointer(message: u32, wparam: WPARAM) {
             // ask the run loop to relocate that popup under the real cursor.
             let mut pid = 0u32;
             GetWindowThreadProcessId(target, Some(&mut pid));
-            crate::slog!("rclick forwarded, watching popups pid={} cursor=({},{})", pid, pt.x, pt.y);
+            crate::slog!(
+                "rclick forwarded, watching popups pid={} cursor=({},{})",
+                pid,
+                pt.x,
+                pt.y
+            );
             if pid != 0 {
                 PENDING_POPUP.with(|p| {
                     *p.borrow_mut() = Some((
@@ -394,7 +409,6 @@ unsafe fn forward_pointer(message: u32, wparam: WPARAM) {
         _ => Ok(()),
     };
 }
-
 
 pub fn run(mut engine: Engine) -> Result<(), String> {
     unsafe { run_inner(&mut engine) }
@@ -531,7 +545,9 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
     crate::slog!(
         "overlays ready: {} monitor(s) {:?}",
         overlays.len(),
-        mons.iter().map(|m| (m.x, m.y, m.w, m.h)).collect::<Vec<_>>()
+        mons.iter()
+            .map(|m| (m.x, m.y, m.w, m.h))
+            .collect::<Vec<_>>()
     );
 
     // No low-level mouse hook: an interactive (passthrough-OFF) compat slot is
@@ -588,7 +604,14 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                 match msg.wParam.0 as i32 {
                     HOTKEY_TOGGLE => {
                         let next = mode.toggled();
-                        set_mode(hotkey_hwnd, &mut scene, &mut managed, &mut mode, &mons, next);
+                        set_mode(
+                            hotkey_hwnd,
+                            &mut scene,
+                            &mut managed,
+                            &mut mode,
+                            &mons,
+                            next,
+                        );
                         scene_dirty = true;
                         emit_mode(mode);
                         if mode == Mode::View {
@@ -596,7 +619,14 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                         }
                     }
                     HOTKEY_ESCAPE if mode == Mode::Editor => {
-                        set_mode(hotkey_hwnd, &mut scene, &mut managed, &mut mode, &mons, Mode::View);
+                        set_mode(
+                            hotkey_hwnd,
+                            &mut scene,
+                            &mut managed,
+                            &mut mode,
+                            &mons,
+                            Mode::View,
+                        );
                         scene_dirty = true;
                         emit_mode(mode);
                         emit_scene(&scene);
@@ -629,7 +659,14 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                 Message::SetEditor { editor } => {
                     let want = if editor { Mode::Editor } else { Mode::View };
                     if want != mode {
-                        set_mode(hotkey_hwnd, &mut scene, &mut managed, &mut mode, &mons, want);
+                        set_mode(
+                            hotkey_hwnd,
+                            &mut scene,
+                            &mut managed,
+                            &mut mode,
+                            &mons,
+                            want,
+                        );
                         scene_dirty = true;
                         if mode == Mode::View {
                             emit_scene(&scene);
@@ -699,7 +736,9 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                         if !p.compat || !p.monitor.draws_on(ov.mon.id) {
                             continue;
                         }
-                        let Some((srv, sw, sh)) = gpu.capture_srv(win) else { continue };
+                        let Some((srv, sw, sh)) = gpu.capture_srv(win) else {
+                            continue;
+                        };
                         let r = p.rect.normalized();
                         let c = p.crop.sanitized();
                         let uv = (
@@ -713,9 +752,12 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                         // across the whole box; Fit centers it with letterbox bars
                         // (left transparent so the game shows through).
                         let dst = match p.scale {
-                            ScaleMode::Fill => {
-                                (r.x as f32, r.y as f32, r.w.max(1.0) as f32, r.h.max(1.0) as f32)
-                            }
+                            ScaleMode::Fill => (
+                                r.x as f32,
+                                r.y as f32,
+                                r.w.max(1.0) as f32,
+                                r.h.max(1.0) as f32,
+                            ),
                             ScaleMode::Fit => {
                                 let src_w = (1.0 - c.left - c.right).max(0.001) * sw as f64;
                                 let src_h = (1.0 - c.top - c.bottom).max(0.001) * sh as f64;
@@ -729,7 +771,12 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                                 )
                             }
                         };
-                        quads.push(Quad { srv, dst, uv, opaque: true });
+                        quads.push(Quad {
+                            srv,
+                            dst,
+                            uv,
+                            opaque: true,
+                        });
                     }
                 }
                 // Notes/images on top of the captured video.
@@ -753,14 +800,16 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
         // full-screen topmost window never blankets the desktop / blocks clicks.
         for (idx, ov) in overlays.iter_mut().enumerate() {
             let has_compat = mode == Mode::View
-                && scene.draw_order().iter().any(|p| {
-                    p.compat && panel_win(p).is_some() && p.monitor.draws_on(ov.mon.id)
-                });
+                && scene
+                    .draw_order()
+                    .iter()
+                    .any(|p| p.compat && panel_win(p).is_some() && p.monitor.draws_on(ov.mon.id));
             let active = has_compat || notes_present[idx];
             // Clip the overlay to just its content so the rest of the monitor is
             // not covered by any window (clicks reach the game/background apps).
             if active {
-                let rects = overlay_content_rects(&scene, engine, &ov.mon, mode, notes_present[idx]);
+                let rects =
+                    overlay_content_rects(&scene, engine, &ov.mon, mode, notes_present[idx]);
                 // Circular click-through lens: a hole under the cursor while it
                 // hovers a passthrough-ON panel, so clicks reach the game/desktop
                 // behind NATIVELY (no synthetic forwarding). Recomputed every frame
@@ -835,7 +884,6 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
     }
 }
 
-
 /// Monitor-local bounding box `(x, y, w, h)` of every engine panel drawing on
 /// `mon`, clamped to the monitor. `None` when no panel touches this monitor, so
 /// the caller can hide that surface instead of presenting an empty full screen.
@@ -885,7 +933,12 @@ fn overlay_content_rects(
                 continue;
             }
             let r = p.rect.normalized();
-            rects.push((r.x as i32, r.y as i32, r.w.max(1.0) as i32, r.h.max(1.0) as i32));
+            rects.push((
+                r.x as i32,
+                r.y as i32,
+                r.w.max(1.0) as i32,
+                r.h.max(1.0) as i32,
+            ));
         }
     }
     if notes_present {
@@ -968,7 +1021,9 @@ unsafe fn reposition_popup(mons: &[MonitorInfo]) {
         // Place it under the cursor, clamped so it stays fully on the cursor's monitor.
         let mon = mons
             .iter()
-            .find(|m| cursor.x >= m.x && cursor.x < m.x + m.w && cursor.y >= m.y && cursor.y < m.y + m.h)
+            .find(|m| {
+                cursor.x >= m.x && cursor.x < m.x + m.w && cursor.y >= m.y && cursor.y < m.y + m.h
+            })
             .or_else(|| mons.first());
         let (mut nx, mut ny) = (cursor.x, cursor.y);
         if let Some(m) = mon {
@@ -1043,7 +1098,9 @@ unsafe fn apply_windows(
         let Some(win) = panel_win(p) else { continue };
         desired.insert(win);
         let target = HWND(win as *mut core::ffi::c_void);
-        let m = managed.entry(win).or_insert_with(|| unsafe { adopt(target) });
+        let m = managed
+            .entry(win)
+            .or_insert_with(|| unsafe { adopt(target) });
         if !interactive && p.compat {
             // View + compat: get the real window out of the way but keep it
             // rendering; the engine WGC-captures it and the compositor draws the
@@ -1057,7 +1114,11 @@ unsafe fn apply_windows(
         }
     }
     // Restore windows whose panel is gone.
-    let gone: Vec<isize> = managed.keys().copied().filter(|w| !desired.contains(w)).collect();
+    let gone: Vec<isize> = managed
+        .keys()
+        .copied()
+        .filter(|w| !desired.contains(w))
+        .collect();
     for win in gone {
         if let Some(m) = managed.remove(&win) {
             restore_window(HWND(win as *mut core::ffi::c_void), &m);
@@ -1103,15 +1164,7 @@ unsafe fn park_window(hwnd: HWND, mons: &[MonitorInfo], m: &mut Managed, cap_w: 
             if w != cw || h != ch {
                 // Reassert TOPMOST on resize (drop SWP_NOZORDER) so the 2px nub
                 // stays above any app the user maximizes over it (see below).
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_TOPMOST,
-                    park_x,
-                    park_y,
-                    cw,
-                    ch,
-                    SWP_NOACTIVATE,
-                );
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, park_x, park_y, cw, ch, SWP_NOACTIVATE);
             }
         }
         return;
@@ -1182,7 +1235,13 @@ unsafe fn park_window(hwnd: HWND, mons: &[MonitorInfo], m: &mut Managed, cap_w: 
 /// Move/size a real window onto its panel slot, set click-through per mode, and
 /// clip it to its crop. Panel rects are monitor-local, so offset by the target
 /// monitor's origin (a mirror panel is placed on the primary).
-unsafe fn place_window(hwnd: HWND, mon: &MonitorInfo, p: &Panel, interactive: bool, m: &mut Managed) {
+unsafe fn place_window(
+    hwnd: HWND,
+    mon: &MonitorInfo,
+    p: &Panel,
+    interactive: bool,
+    m: &mut Managed,
+) {
     // Taking the window back from a parked (compat) state: it's a normal placed
     // window again from here on; the style/pos/crop below re-establish it.
     m.parked = false;
@@ -1433,9 +1492,15 @@ unsafe fn readback_geometry(
             continue;
         }
         let target = HWND(win as *mut core::ffi::c_void);
-        let Some((x, y, w, h)) = window_rect(target) else { continue };
+        let Some((x, y, w, h)) = window_rect(target) else {
+            continue;
+        };
         let was_all = matches!(p.monitor, PanelTarget::All);
-        let mon = if was_all { &mons[0] } else { monitor_at(mons, x, y) };
+        let mon = if was_all {
+            &mons[0]
+        } else {
+            monitor_at(mons, x, y)
+        };
         if !was_all {
             p.monitor = PanelTarget::Monitor { id: mon.id };
         }
@@ -1490,7 +1555,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
         let x = (l.0 & 0xffff) as i16 as i32;
         let y = ((l.0 >> 16) & 0xffff) as i16 as i32;
         let hit = SLOTS.with(|s| s.borrow().iter().any(|sl| slot_contains(sl, x, y)));
-        return LRESULT(if hit { HTCLIENT as isize } else { HTTRANSPARENT as isize });
+        return LRESULT(if hit {
+            HTCLIENT as isize
+        } else {
+            HTTRANSPARENT as isize
+        });
     }
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }

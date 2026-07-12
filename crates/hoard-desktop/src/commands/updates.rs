@@ -585,20 +585,32 @@ async fn verify_installer_signature(
 fn linux_prefers_rpm() -> bool {
     fn on_path(bin: &str) -> bool {
         std::env::var_os("PATH")
-            .map(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
-            })
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
             .unwrap_or(false)
     }
     if on_path("dpkg") {
         return false;
     }
     if let Ok(os) = std::fs::read_to_string("/etc/os-release") {
-        let rpm_ids = ["fedora", "rhel", "centos", "opensuse", "suse", "rocky", "almalinux"];
+        let rpm_ids = [
+            "fedora",
+            "rhel",
+            "centos",
+            "opensuse",
+            "suse",
+            "rocky",
+            "almalinux",
+        ];
         for line in os.lines() {
-            if let Some(v) = line.strip_prefix("ID=").or_else(|| line.strip_prefix("ID_LIKE=")) {
+            if let Some(v) = line
+                .strip_prefix("ID=")
+                .or_else(|| line.strip_prefix("ID_LIKE="))
+            {
                 let v = v.trim_matches('"');
-                if rpm_ids.iter().any(|id| v.split_whitespace().any(|w| w == *id)) {
+                if rpm_ids
+                    .iter()
+                    .any(|id| v.split_whitespace().any(|w| w == *id))
+                {
                     return true;
                 }
             }
@@ -613,7 +625,9 @@ async fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     // If the user cancels, it never runs and we get a non-zero exit; we treat
     // that as an error so the UI can fall back to "Downloaded".
     let p = path.to_string_lossy().to_string();
-    let is_rpm = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpm"));
+    let is_rpm = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("rpm"));
 
     // For .rpm prefer dnf (resolves deps) and fall back to plain rpm -U; for
     // .deb use dpkg -i (deps already vendored in the Tauri bundle).

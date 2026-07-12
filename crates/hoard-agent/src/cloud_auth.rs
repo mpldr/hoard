@@ -109,7 +109,10 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<Tokens> {
     let body = resp.text().await.unwrap_or_default();
     if status.is_success() {
         let parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
-            format!("parseando respuesta de login (status {status}, {} bytes)", body.len())
+            format!(
+                "parseando respuesta de login (status {status}, {} bytes)",
+                body.len()
+            )
         })?;
         return Ok(Tokens {
             access: parsed.access_token,
@@ -164,7 +167,10 @@ pub async fn otp_start(email: &str) -> Result<()> {
         return Ok(());
     }
     let body = resp.text().await.unwrap_or_default();
-    bail!("no pude enviar el código: {}", supabase_error_message(status, &body));
+    bail!(
+        "no pude enviar el código: {}",
+        supabase_error_message(status, &body)
+    );
 }
 
 /// Canjea el código OTP recibido por email por una sesión (`/auth/v1/verify`).
@@ -569,9 +575,10 @@ pub async fn refresh_and_store(sess: &Session) -> Result<Tokens> {
             Ok(tokens)
         }
         Err(e) if e.downcast_ref::<RefreshTokenStale>().is_some() => {
-            let healed = load_session().ok().flatten().filter(|s| {
-                !s.refresh.trim().is_empty() && s.refresh != attempted
-            });
+            let healed = load_session()
+                .ok()
+                .flatten()
+                .filter(|s| !s.refresh.trim().is_empty() && s.refresh != attempted);
             if let Some(s) = healed {
                 return Ok(Tokens {
                     access: s.access,

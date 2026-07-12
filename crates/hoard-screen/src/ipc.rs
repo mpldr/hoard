@@ -55,7 +55,12 @@ mod tests {
                 id: "v1".into(),
                 source: SourceRef::Window { id: "0xabc".into() },
                 rect: Rect::new(10.0, 10.0, 640.0, 360.0),
-                crop: Crop { top: 0.1, right: 0.0, bottom: 0.1, left: 0.0 },
+                crop: Crop {
+                    top: 0.1,
+                    right: 0.0,
+                    bottom: 0.1,
+                    left: 0.0,
+                },
                 scale: ScaleMode::Fill,
                 z: 2,
                 monitor: Default::default(),
@@ -85,6 +90,9 @@ mod tests {
 
     #[test]
     fn parses_quit() {
-        assert_eq!(parse_line(r#"{"type":"quit"}"#).unwrap(), Some(Message::Quit));
+        assert_eq!(
+            parse_line(r#"{"type":"quit"}"#).unwrap(),
+            Some(Message::Quit)
+        );
     }
 }

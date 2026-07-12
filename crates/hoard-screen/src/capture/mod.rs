@@ -75,16 +75,16 @@ pub trait CaptureBackend: Send {
     fn capture(&self, id: &WindowId) -> Result<Box<dyn Source>>;
 }
 
-#[cfg(target_os = "windows")]
-mod windows;
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(all(target_os = "linux", feature = "runtime"))]
-mod x11;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(all(target_os = "linux", feature = "runtime"))]
+mod x11;
 
 /// The capture backend for the host OS.
 ///

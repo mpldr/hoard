@@ -71,7 +71,10 @@ fn main() {
                 i += 2;
             }
             f if f.starts_with("--") => {
-                flags.insert(f.trim_start_matches("--").to_string(), args.get(i + 1).cloned().unwrap_or_default());
+                flags.insert(
+                    f.trim_start_matches("--").to_string(),
+                    args.get(i + 1).cloned().unwrap_or_default(),
+                );
                 i += 2;
             }
             _ => i += 1,
@@ -84,7 +87,10 @@ fn main() {
     if snapshot.is_none() {
         hoard_screen::slog::init("runtime");
         let engine = Engine::new();
-        hoard_screen::slog::line("info", &format!("capture backend = {}", engine.backend_name()));
+        hoard_screen::slog::line(
+            "info",
+            &format!("capture backend = {}", engine.backend_name()),
+        );
         if let Err(e) = hoard_screen::runtime::run(engine) {
             eprintln!("hoard-screen: runtime exited: {e}");
             std::process::exit(1);
@@ -93,8 +99,14 @@ fn main() {
     }
 
     if let Some(path) = snapshot {
-        let w: u32 = flags.get("width").and_then(|v| v.parse().ok()).unwrap_or(1280);
-        let h: u32 = flags.get("height").and_then(|v| v.parse().ok()).unwrap_or(720);
+        let w: u32 = flags
+            .get("width")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1280);
+        let h: u32 = flags
+            .get("height")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(720);
         let scene = match flags.get("scene") {
             Some(p) => {
                 let txt = std::fs::read_to_string(p).expect("read scene json");
@@ -119,7 +131,12 @@ fn demo_scene(w: u32, h: u32) -> Scene {
                 id: "video".into(),
                 source: SourceRef::Test,
                 rect: Rect::new(fw * 0.05, fh * 0.08, fw * 0.5, fh * 0.5),
-                crop: Crop { top: 0.15, right: 0.1, bottom: 0.15, left: 0.1 },
+                crop: Crop {
+                    top: 0.15,
+                    right: 0.1,
+                    bottom: 0.15,
+                    left: 0.1,
+                },
                 scale: ScaleMode::Fill,
                 z: 0,
                 monitor: Default::default(),
@@ -162,7 +179,11 @@ fn write_ppm(path: &str, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
         for x in 0..w {
             let i = ((y * w + x) * 4) as usize;
             let a = rgba[i + 3] as u32;
-            let bg = if ((x / 16) + (y / 16)) % 2 == 0 { 30 } else { 60 };
+            let bg = if ((x / 16) + (y / 16)) % 2 == 0 {
+                30
+            } else {
+                60
+            };
             for c in 0..3 {
                 let v = (rgba[i + c] as u32 * a + bg * (255 - a)) / 255;
                 out.push(v as u8);
@@ -207,7 +228,10 @@ fn run_headless() {
             Ok(Some(Message::SetScene { scene })) => {
                 e.set_scene(scene);
                 e.tick();
-                eprintln!("hoard-screen: scene set, {} panel(s)", e.scene().panels.len());
+                eprintln!(
+                    "hoard-screen: scene set, {} panel(s)",
+                    e.scene().panels.len()
+                );
             }
             Ok(Some(Message::SetEditor { editor })) => eprintln!("hoard-screen: editor={editor}"),
             Ok(Some(Message::Quit)) => break,

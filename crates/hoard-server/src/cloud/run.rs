@@ -145,7 +145,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                     .await;
                 match res {
                     Ok(r) if r.rows_affected() > 0 => {
-                        tracing::debug!(rows = r.rows_affected(), "device pairings: pruned expired");
+                        tracing::debug!(
+                            rows = r.rows_affected(),
+                            "device pairings: pruned expired"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "device pairings: prune failed"),

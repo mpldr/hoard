@@ -678,6 +678,7 @@ pub fn handle_session_expired(app: &AppHandle) {
     );
 }
 
+use hoard_agent::cloud_account::{self, CloudError};
 /// Cuenta Cloud portable: los tipos wire y las llamadas REST viven en
 /// `hoard_agent::cloud_account` (compartidos con la CLI). Aquí solo re-exportamos
 /// los tipos (las bindings JS no cambian) y envolvemos cada llamada con la glue
@@ -685,7 +686,6 @@ pub fn handle_session_expired(app: &AppHandle) {
 pub use hoard_agent::cloud_account::{
     ArchiveResult, CloudEntitlements, ExportJob, ExportStatus, FeatureState, StorageGames,
 };
-use hoard_agent::cloud_account::{self, CloudError};
 
 /// Traduce un [`CloudError`] al `String` que la UI ya esperaba, reusando
 /// `format_http_error` para conservar el mapeo `i18n:<key>` intacto.
@@ -1126,8 +1126,8 @@ pub async fn cloud_sync_playtime(
             Ok(fresh) => {
                 token = fresh.access_token.clone();
                 base = fresh.server_url.clone();
-                let _ = cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body)
-                    .await;
+                let _ =
+                    cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body).await;
             }
             Err(e) => {
                 if is_session_expired(&e) {
@@ -1143,15 +1143,13 @@ pub async fn cloud_sync_playtime(
     match cloud_account::fetch_playtime(&base, "/v1/cloud/playtime", &token).await {
         Ok(sum) => Ok(sum),
         Err(CloudError::Unauthorized) => match refresh_active_session().await {
-            Ok(fresh) => {
-                cloud_account::fetch_playtime(
-                    &fresh.server_url,
-                    "/v1/cloud/playtime",
-                    &fresh.access_token,
-                )
-                .await
-                .or_else(|_| empty())
-            }
+            Ok(fresh) => cloud_account::fetch_playtime(
+                &fresh.server_url,
+                "/v1/cloud/playtime",
+                &fresh.access_token,
+            )
+            .await
+            .or_else(|_| empty()),
             Err(e) => {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);

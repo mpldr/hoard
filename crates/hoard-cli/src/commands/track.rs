@@ -155,9 +155,7 @@ async fn resolve_target(args: &Args, state: &CliState) -> Result<Target> {
                 .map(|g| format!("  {} ({})", g.display_name, g.slug))
                 .collect::<Vec<_>>()
                 .join("\n");
-            bail!(
-                "\"{query}\" matches several games; narrow it down with --slug:\n{list}"
-            )
+            bail!("\"{query}\" matches several games; narrow it down with --slug:\n{list}")
         }
     }
 }

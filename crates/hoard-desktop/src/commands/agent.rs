@@ -437,7 +437,10 @@ pub(crate) async fn attach_save_if_running(state: &State<'_, AppState>, save: Wa
 /// (`hoard_agent::library::set_paused`/`set_preset`/`set_local_path`) asks for.
 /// Keeps the desktop's attach/detach glue in one place; the CLI ignores the
 /// reseat entirely (a separate daemon picks the change up on restart).
-pub(crate) async fn apply_reseat(state: &State<'_, AppState>, reseat: hoard_agent::library::LiveReseat) {
+pub(crate) async fn apply_reseat(
+    state: &State<'_, AppState>,
+    reseat: hoard_agent::library::LiveReseat,
+) {
     use hoard_agent::library::LiveReseat;
     match reseat {
         LiveReseat::Detach(id) => detach_save_if_running(state, id).await,

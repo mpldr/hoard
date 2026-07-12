@@ -821,7 +821,10 @@ pub fn set_paused(save_id: &str, paused: bool) -> Result<LiveReseat> {
     Ok(if paused {
         LiveReseat::Detach(save_id.to_string())
     } else {
-        LiveReseat::Attach(Box::new(watched_from_snapshot(save_id.to_string(), &snapshot)))
+        LiveReseat::Attach(Box::new(watched_from_snapshot(
+            save_id.to_string(),
+            &snapshot,
+        )))
     })
 }
 

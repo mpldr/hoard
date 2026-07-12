@@ -33,7 +33,9 @@ pub enum Server {
 
 pub fn detect_server() -> Server {
     if std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false)
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s == "wayland")
+            .unwrap_or(false)
     {
         Server::Wayland
     } else {

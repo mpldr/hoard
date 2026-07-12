@@ -14,9 +14,7 @@
 use std::sync::Arc;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt as _, ImageFormat, Window,
-};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
 use super::{CaptureBackend, CaptureError, Result, WindowId, WindowInfo};
@@ -35,7 +33,10 @@ impl X11Capture {
     pub fn connect() -> Result<Self> {
         let (conn, screen_num) = x11rb::connect(None).map_err(backend_err)?;
         let root = conn.setup().roots[screen_num].root;
-        Ok(Self { conn: Arc::new(conn), root })
+        Ok(Self {
+            conn: Arc::new(conn),
+            root,
+        })
     }
 
     fn atom(&self, name: &str) -> Result<u32> {

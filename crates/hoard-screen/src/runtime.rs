@@ -17,16 +17,16 @@
 
 use crate::engine::Engine;
 
-#[cfg(all(target_os = "linux", feature = "runtime"))]
-pub mod x11;
+#[cfg(all(target_os = "macos", feature = "runtime"))]
+pub mod macos;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 pub mod wayland;
 #[cfg(all(target_os = "windows", feature = "runtime"))]
-pub mod windows;
-#[cfg(all(target_os = "windows", feature = "runtime"))]
 pub mod win_gpu;
-#[cfg(all(target_os = "macos", feature = "runtime"))]
-pub mod macos;
+#[cfg(all(target_os = "windows", feature = "runtime"))]
+pub mod windows;
+#[cfg(all(target_os = "linux", feature = "runtime"))]
+pub mod x11;
 
 /// Run the overlay: own the [`Engine`], present each frame, toggle View/Editor.
 /// Blocks until the overlay quits.
@@ -49,9 +49,11 @@ pub fn run(engine: Engine) -> Result<(), String> {
     {
         // Wayland-only build on an X11 session: nothing to present.
         let _ = &engine;
-        Err("hoard-screen: built with the Wayland backend only, but this is an \
+        Err(
+            "hoard-screen: built with the Wayland backend only, but this is an \
              X11 session — rebuild with --features runtime"
-            .into())
+                .into(),
+        )
     }
 }
 
@@ -71,7 +73,9 @@ pub fn run(engine: Engine) -> Result<(), String> {
     all(target_os = "macos", feature = "runtime"),
 )))]
 pub fn run(_engine: Engine) -> Result<(), String> {
-    Err("hoard-screen: on-screen runtime for this OS is not built in this \
+    Err(
+        "hoard-screen: on-screen runtime for this OS is not built in this \
          configuration — see src/runtime.rs for the per-platform plan"
-        .into())
+            .into(),
+    )
 }

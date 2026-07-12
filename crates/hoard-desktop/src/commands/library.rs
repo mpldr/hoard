@@ -293,23 +293,22 @@ pub async fn rename_save_label(
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
     let client = current_client(&state)?;
-    let (tracked, watched) =
-        library::rename_label(&client, &save_id, &new_label)
-            .await
-            .map_err(|e| {
-                // A 409 (another save in the same game already uses that label)
-                // gets tagged so the JS side can match it without parsing the
-                // server's English error text.
-                let is_conflict = e
-                    .downcast_ref::<ApiError>()
-                    .map(|api| matches!(api, ApiError::Conflict(_)))
-                    .unwrap_or(false);
-                if is_conflict {
-                    "conflict:label_collision".to_string()
-                } else {
-                    pretty_error(e)
-                }
-            })?;
+    let (tracked, watched) = library::rename_label(&client, &save_id, &new_label)
+        .await
+        .map_err(|e| {
+            // A 409 (another save in the same game already uses that label)
+            // gets tagged so the JS side can match it without parsing the
+            // server's English error text.
+            let is_conflict = e
+                .downcast_ref::<ApiError>()
+                .map(|api| matches!(api, ApiError::Conflict(_)))
+                .unwrap_or(false);
+            if is_conflict {
+                "conflict:label_collision".to_string()
+            } else {
+                pretty_error(e)
+            }
+        })?;
 
     // Re-attach to the running agent so its in-memory WatchedSave picks up the
     // new label (the watcher uses label as part of the upload key).

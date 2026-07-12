@@ -15,6 +15,13 @@
 $ErrorActionPreference = 'Stop'
 $Repo = 'rleeon/hoard'
 
+# Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub rejects. Opt into
+# TLS 1.2 so the API + download calls below succeed. Harmless on PowerShell 7+.
+try {
+  [Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+
 function Info($m) { Write-Host "==> $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "warning: $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
@@ -25,10 +32,18 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
 }
 
 # ---- detect architecture ---------------------------------------------------
-switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+# Use the OS env vars (always set on Windows) rather than RuntimeInformation,
+# which returns empty in some Windows PowerShell 5.1 hosts. PROCESSOR_ARCHITEW6432
+# is set when a 32-bit or emulated shell runs on a 64-bit/ARM64 OS, and holds the
+# *real* machine arch — so it wins when present.
+$rawArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+switch ("$rawArch".ToUpper()) {
+  'AMD64' { $arch = 'x86_64' }
   'X64'   { $arch = 'x86_64' }
-  'Arm64' { $arch = 'aarch64' }
-  default { Die "unsupported architecture: $_" }
+  'ARM64' { $arch = 'aarch64' }
+  default {
+    Die "could not detect a supported architecture (got '$rawArch'). Download manually from https://hoard.services/cli"
+  }
 }
 $platform = "windows-$arch"
 
@@ -38,7 +53,7 @@ if ([string]::IsNullOrWhiteSpace($ver)) {
   Info "Looking up the latest release..."
   try {
     $rel = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" `
-             -Headers @{ 'User-Agent' = 'hoard-installer' }
+             -UseBasicParsing -Headers @{ 'User-Agent' = 'hoard-installer' }
     $ver = $rel.tag_name
   } catch {
     Die "could not reach the GitHub API (rate limited?). Set `$env:HOARD_VERSION and retry."

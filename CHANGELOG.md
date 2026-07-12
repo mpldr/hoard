@@ -27,6 +27,9 @@ and a round of detection and reliability fixes.
   desktop app run the exact same `hoard-agent` core, so every feature lands in
   both. New: an interactive `hoard login` flow that no longer needs a
   hand-pasted token.
+- **Sign in the CLI by pairing a device.** Cloud login on a headless box can now
+  be approved from an already-signed-in device instead of copying credentials
+  around, with a `/link` page to complete the pairing.
 - **More install options.** An official multi-arch Docker image on GHCR
   (`ghcr.io/rleeon/hoard`, amd64 + arm64) — `docker compose pull && docker
   compose up -d` to update instead of building on your box — plus `.rpm` and

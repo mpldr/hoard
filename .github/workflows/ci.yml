@@ -65,6 +65,12 @@ jobs:
         run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
       - name: Build frontend
         run: pnpm --dir crates/hoard-desktop/ui build
+      # hoard-desktop's tauri build script requires the `hoard-screen`
+      # externalBin to exist. Lint/test jobs don't bundle or run it, so a
+      # zero-byte placeholder is enough to satisfy the existence check; the
+      # release workflow builds the real sidecar.
+      - name: Placeholder sidecar (hoard-screen externalBin)
+        run: touch "crates/hoard-desktop/hoard-screen-$(rustc -Vv | sed -n 's/^host: //p')"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: svelte-check
         run: pnpm --dir crates/hoard-desktop/ui check
@@ -117,6 +123,11 @@ jobs:
       - name: Build frontend
         if: runner.os == 'Linux'
         run: pnpm --dir crates/hoard-desktop/ui build
+      # See the clippy job: hoard-desktop's build script needs the sidecar to
+      # exist. Only Linux builds the desktop crate here, so only Linux needs it.
+      - name: Placeholder sidecar (hoard-screen externalBin)
+        if: runner.os == 'Linux'
+        run: touch "crates/hoard-desktop/hoard-screen-$(rustc -Vv | sed -n 's/^host: //p')"
       # On Linux the full workspace builds (hoard-desktop included). On Windows
       # and macOS we skip the desktop crate — it needs the prebuilt frontend
       # plus host-specific webview shims, which the release pipeline already
@@ -174,6 +185,10 @@ jobs:
         run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
       - name: Build frontend
         run: pnpm --dir crates/hoard-desktop/ui build
+      # `cargo sqlx prepare --workspace` runs every member's build script,
+      # including hoard-desktop's, which needs the sidecar to exist.
+      - name: Placeholder sidecar (hoard-screen externalBin)
+        run: touch "crates/hoard-desktop/hoard-screen-$(rustc -Vv | sed -n 's/^host: //p')"
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version 0.8.2 --no-default-features --features sqlite,rustls --locked
       - name: Prepare database

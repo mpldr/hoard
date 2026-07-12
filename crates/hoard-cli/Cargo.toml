@@ -21,9 +21,5 @@ anyhow = { workspace = true }
 indicatif = { workspace = true }
 # `hoard saves` formatea las fechas de último backup (OffsetDateTime → RFC3339).
 time = { workspace = true }
-# `hoard track` en Cloud acuña un save_id local (Cloud no tiene create_save
-# server-side; la fila se materializa en el primer upload por UPSERT). Mismo
-# patrón que `add_game_to_tracking` de la desktop.
-uuid = { workspace = true }
 # `hoard login` (Cloud) lee la contraseña sin echo en la terminal.
 rpassword = { workspace = true }

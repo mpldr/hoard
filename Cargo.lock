@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-admin"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-agent"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3159,12 +3159,11 @@ dependencies = [
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
 name = "hoard-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3179,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-desktop"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -3214,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-manifest"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "directories",
  "serde",
@@ -3228,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-screen"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "ashpd",
  "cocoa",
@@ -3247,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-server"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3290,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-watcher"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "notify",
  "notify-debouncer-mini",
@@ -3301,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-wrapple"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "home"

@@ -87,6 +87,12 @@ jobs:
       - name: System deps (Linux)
         if: runner.os == 'Linux'
         run: |
+          # ubuntu-22.04 ships libpipewire-0.3-dev 0.3.48, too old for the
+          # `libspa` 0.10 Rust bindings the Wayland sidecar uses (missing
+          # spa_meta_region_is_valid / spa_video_info_raw.flags). Pull a recent
+          # PipeWire from the upstream PPA. We stay on 22.04 so the AppImage
+          # keeps linking against an older glibc and runs on more distros.
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \

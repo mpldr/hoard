@@ -6,7 +6,7 @@
 //!   email + password, or an email OTP code if you leave the password blank.
 //! - **self-host** (`hoard login --token <token>`): the server's bearer token.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,17 +16,55 @@ use hoard_agent::cloud_auth;
 use hoard_agent::config::CliConfig;
 use hoard_agent::state;
 
-pub async fn login(token: Option<String>, force_email: bool) -> Result<()> {
-    match token {
-        Some(token) => login_selfhost(token).await,
-        None => login_cloud(force_email).await,
+pub async fn login(token: Option<String>, server: Option<String>, force_email: bool) -> Result<()> {
+    // Explicit flags skip the menu and stay scriptable.
+    if let Some(token) = token {
+        return login_selfhost(token, server).await;
+    }
+    if force_email {
+        return login_cloud_email(&cloud_auth::cloud_base_url()).await;
+    }
+
+    // No flags: ask what to sign in to — but only if there's a terminal to ask
+    // on. Piped/CI/service contexts can't answer a prompt, so default to Cloud
+    // (its device/email flow doesn't depend on an interactive menu).
+    if !io::stdin().is_terminal() {
+        return login_cloud(false).await;
+    }
+    match choose_kind()? {
+        Kind::Cloud => login_cloud(false).await,
+        Kind::SelfHost => login_selfhost_interactive().await,
+    }
+}
+
+enum Kind {
+    Cloud,
+    SelfHost,
+}
+
+/// Interactive top-level choice: Hoard Cloud or a self-hosted server.
+fn choose_kind() -> Result<Kind> {
+    println!("Where do you want to sign in?");
+    println!("   1) Hoard Cloud          (managed, no browser)");
+    println!("   2) Self-hosted server   (your own Hoard server + access token)");
+    println!();
+    loop {
+        match prompt("Pick [1-2, default 1]: ")?.as_str() {
+            "" | "1" => return Ok(Kind::Cloud),
+            "2" => return Ok(Kind::SelfHost),
+            _ => println!("Type 1 or 2."),
+        }
     }
 }
 
 /// self-host: validates the bearer against the server and saves it in the config.
-async fn login_selfhost(token: String) -> Result<()> {
+/// `server` overrides the configured URL (and is persisted) when given.
+async fn login_selfhost(token: String, server: Option<String>) -> Result<()> {
     let path = CliConfig::default_path()?;
     let mut cfg = CliConfig::load(&path)?;
+    if let Some(url) = server {
+        cfg.server.url = url.trim().to_string();
+    }
 
     let client = ApiClient::new(cfg.server.url.clone(), token.clone())?;
     let me = client.whoami().await?;
@@ -34,12 +72,29 @@ async fn login_selfhost(token: String) -> Result<()> {
     cfg.auth.token = Some(token);
     cfg.save(&path)?;
     println!(
-        "connected to self-host as {} (admin: {}) — token saved to {}",
+        "connected to self-host ({}) as {} (admin: {}) — saved to {}",
+        cfg.server.url,
         me.username,
         me.is_admin,
         path.display()
     );
     Ok(())
+}
+
+/// self-host from the interactive menu: asks for the server URL (defaulting to
+/// whatever's in the config) and the access token, then validates and saves.
+async fn login_selfhost_interactive() -> Result<()> {
+    let (cfg, _) = CliConfig::load_default()?;
+    let default_url = cfg.server.url.clone();
+
+    let url = prompt(&format!("Server URL [{default_url}]: "))?;
+    let url = if url.is_empty() { default_url } else { url };
+
+    let token = prompt("Access token (hoard_v1_…): ")?;
+    if token.is_empty() {
+        anyhow::bail!("no access token given");
+    }
+    login_selfhost(token, Some(url)).await
 }
 
 /// Cloud without a browser. Main path: **mobile pairing** — the CLI shows a URL

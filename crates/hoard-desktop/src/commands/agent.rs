@@ -119,6 +119,22 @@ pub async fn start_agent(
         });
     }
 
+    // One agent per machine: if a `hoard sync` daemon already holds the shared
+    // lock, don't spin up ours too — two agents fight over each save and rotate
+    // the shared Cloud refresh token against each other (reuse-detection → 401).
+    // Skip quietly (not an error): the GUI still works, sync just runs in the
+    // daemon. When the daemon stops the next scan boots our agent.
+    if let Some(pid) = hoard_agent::instance::live_owner() {
+        tracing::warn!(
+            pid,
+            "another Hoard agent (CLI sync) is running; not starting the desktop agent"
+        );
+        return Ok(AgentStatus {
+            running: false,
+            watched_count: 0,
+        });
+    }
+
     let client = current_client(&state)?;
     // Keep a handle on the agent's client so the cloud token-refresh path can
     // swap in a fresh JWT as it rotates (see `update_agent_token`). `ApiClient`
@@ -300,6 +316,9 @@ pub async fn start_agent(
     });
 
     *state.agent.lock().unwrap() = Some(handle);
+    // Hold the cross-process lock for as long as our agent lives, so a `hoard
+    // sync` daemon started afterwards backs off instead of double-running.
+    *state.agent_lock.lock().unwrap() = Some(hoard_agent::instance::AgentLock::acquire());
 
     // Self-hosted server→app push. Rides alongside the agent: on each pushed
     // save it force-restores under sync global (the agent sweep is the airbag
@@ -330,6 +349,8 @@ pub async fn stop_agent(app: AppHandle, state: State<'_, AppState>) -> Result<()
     crate::commands::selfhosted_events::stop(&app);
     let handle = state.agent.lock().unwrap().take();
     clear_agent_client();
+    // Release the shared agent lock so a `hoard sync` daemon can take over.
+    *state.agent_lock.lock().unwrap() = None;
     if let Some(h) = handle {
         h.shutdown().await.map_err(|e| e.to_string())?;
     }

@@ -25,6 +25,11 @@ pub struct AppState {
     /// Live agent handle. Populated lazily by the agent bootstrapper; tests
     /// and the logged-out state both leave it `None`.
     pub agent: Mutex<Option<AgentHandle>>,
+    /// Cross-process "one agent per machine" lock, shared with the CLI daemon
+    /// (`hoard_agent::instance`). Held while our agent is running so a `hoard
+    /// sync` daemon won't also spin up and fight over saves / the Cloud refresh
+    /// token. Dropped when the agent stops or the app exits.
+    pub agent_lock: Mutex<Option<hoard_agent::instance::AgentLock>>,
     /// Buffered `hoard://` deep-link URL captured before the frontend's
     /// listener was ready (cold start passes the OAuth callback as a launch
     /// argument; the webview registers its `deep-link://new-url` listener only
@@ -77,6 +82,7 @@ impl AppState {
             cloud_account: Mutex::new(None),
             detection_cache,
             agent: Mutex::new(None),
+            agent_lock: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
             pending_login_state: Mutex::new(None),
         };

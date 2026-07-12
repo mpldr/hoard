@@ -19,84 +19,25 @@ use tokio::sync::mpsc;
 
 use crate::commands::session::{self, Active};
 
-/// Path to the daemon's pidfile. The banner (bare `hoard`) reads it to paint the
-/// on/off. It lives in `state_dir` so it doesn't depend on the active context.
+/// Path to the shared agent lock. The banner (bare `hoard`) reads it to paint the
+/// sync on/off. It's the same file the desktop agent uses (see
+/// `hoard_agent::instance`), so only one live agent per machine either way.
 pub fn pidfile_path() -> Option<std::path::PathBuf> {
-    CliConfig::state_dir().ok().map(|d| d.join("daemon.pid"))
-}
-
-/// Writes the pidfile on creation and removes it on Drop, so the banner's on/off
-/// reflects reality even when the daemon stops via Ctrl-C. Best-effort: if it
-/// can't be written, the daemon runs the same.
-struct PidGuard(Option<std::path::PathBuf>);
-
-impl PidGuard {
-    fn create() -> Self {
-        let path = pidfile_path();
-        if let Some(ref p) = path {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, std::process::id().to_string());
-        }
-        PidGuard(path)
-    }
-}
-
-impl Drop for PidGuard {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-/// Reports the PID of another live `hoard daemon` if one is already running,
-/// reading the pidfile and confirming the process is still alive. A stale
-/// pidfile (the process is gone) returns `None` so a crashed daemon doesn't
-/// block a restart. Two daemons on the same machine fight over each save (a
-/// restore/backup ping-pong) and thrash the shared Cloud refresh token, so we
-/// refuse the second one.
-fn running_daemon_pid() -> Option<u32> {
-    let path = pidfile_path()?;
-    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
-    if pid == std::process::id() {
-        return None;
-    }
-    daemon_alive(pid).then_some(pid)
-}
-
-#[cfg(unix)]
-fn daemon_alive(pid: u32) -> bool {
-    // On Linux confirm it's actually a hoard process — guards against a PID the
-    // OS has since recycled for something else.
-    #[cfg(target_os = "linux")]
-    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        return String::from_utf8_lossy(&bytes).contains("hoard");
-    }
-    // Elsewhere (macOS): a liveness probe. `kill -0` succeeds iff the process
-    // exists and we may signal it.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn daemon_alive(_pid: u32) -> bool {
-    // No cheap dependency-free liveness check on Windows; treat a present
-    // pidfile as a live daemon.
-    true
+    hoard_agent::instance::lock_path()
 }
 
 /// `hoard daemon`: resident. `backup_only` disables restore/global-sync (only
 /// backs up, never writes to your disk).
 pub async fn run(backup_only: bool) -> Result<()> {
-    if let Some(pid) = running_daemon_pid() {
+    // Refuse to start if another Hoard agent already holds the lock — a second
+    // CLI daemon *or* the desktop app. Two agents fight over each save (a
+    // restore/backup ping-pong) and rotate the shared Cloud refresh token
+    // against each other (reuse-detection → 401).
+    if let Some(pid) = hoard_agent::instance::live_owner() {
         bail!(
-            "another `hoard daemon` is already running (pid {pid}). \
-             Stop it first, or use `hoard sync` for a one-shot backup."
+            "another Hoard agent is already running (pid {pid}) — the desktop app \
+             or another `hoard sync`. Close it first, or use `hoard sync` for a \
+             one-shot backup."
         );
     }
 
@@ -114,9 +55,9 @@ pub async fn run(backup_only: bool) -> Result<()> {
     );
     println!("Ctrl-C (or `hoard sync stop`) to stop.\n");
 
-    // Leaves a trace that the daemon is running (the banner reads it for the
-    // on/off). It's removed on exit (Drop), Ctrl-C included.
-    let _pid = PidGuard::create();
+    // Take the shared agent lock (also what the banner reads for on/off). Removed
+    // on exit (Drop), Ctrl-C included.
+    let _pid = hoard_agent::instance::AgentLock::acquire();
 
     // At boot the service manager starts us as soon as the network is up, but a
     // self-hosted server on the same box may still be coming online — the initial

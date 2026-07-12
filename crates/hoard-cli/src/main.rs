@@ -65,14 +65,19 @@ enum Commands {
         #[command(subcommand)]
         action: commands::config::ConfigCommand,
     },
-    /// Sign in. Without `--token`: Hoard Cloud, no browser (email + password,
-    /// or an emailed code). With `--token`: a self-host bearer.
+    /// Sign in. With no flags it asks whether you want Hoard Cloud or a
+    /// self-hosted server. `--token` goes straight to self-host; `--email`
+    /// forces the Cloud email/code path.
     Login {
         /// Self-host bearer token (`hoard_v1_<hex>`, from `hoard-admin token
-        /// create`). If omitted, signs in to Hoard Cloud.
+        /// create`). Skips the interactive menu and signs in to self-host.
         #[arg(long)]
         token: Option<String>,
-        /// Force the email + password / emailed-code path instead of phone
+        /// Self-host server URL (used with `--token`; otherwise taken from your
+        /// config). E.g. `http://ubserver:12421`.
+        #[arg(long)]
+        server: Option<String>,
+        /// Force the Cloud email + password / emailed-code path instead of phone
         /// pairing, so you pick which account to sign in as.
         #[arg(long)]
         email: bool,
@@ -215,7 +220,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
         Commands::Config { action } => commands::config::run(action),
-        Commands::Login { token, email } => commands::auth::login(token, email).await,
+        Commands::Login {
+            token,
+            server,
+            email,
+        } => commands::auth::login(token, server, email).await,
         Commands::Logout => commands::auth::logout().await,
         Commands::Whoami => commands::auth::whoami().await,
         Commands::Games { action } => commands::games::run(action).await,

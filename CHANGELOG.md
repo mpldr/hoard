@@ -7,13 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-07-12
+
+The open-source release. The whole app — including the Pro layer — now lives in
+one AGPL repo, the CLI grows into a first-class frontend, and Hoard Wrapped is
+free for everyone. Plus an official Docker image, packaging for more distros,
+and a round of detection and reliability fixes.
+
 ### Added
-- **Official self-hosted Docker image on GHCR.** Every release tag now
-  publishes a prebuilt multi-arch image (`ghcr.io/rleeon/hoard`, amd64 +
-  arm64), so operators can `docker compose pull && docker compose up -d` to
-  update instead of building from source on their box — friendlier to NAS
-  setups and tools like Dockge/Watchtower. Building locally still works
-  (uncomment `build:` in the compose file).
+- **The Pro layer is now open source, in this repo.** Hoard Screen (the in-game
+  overlay) and Hoard Wrapped (the year-in-games recap) ship as regular AGPL
+  crates. The paywall isn't the code — the Hoard Screen entitlement is signed
+  server-side, so anyone can build it but only Cloud unlocks it. There's nothing
+  to patch out locally.
+- **Hoard Wrapped is free for everyone.** The playtime recap renders for Cloud
+  and self-hosted alike, with no gate — a two-mode engine that generates the
+  recap server-side on Cloud and locally when self-hosted.
+- **The CLI is now a full frontend of the shared engine.** `hoard` and the
+  desktop app run the exact same `hoard-agent` core, so every feature lands in
+  both. New: an interactive `hoard login` flow that no longer needs a
+  hand-pasted token.
+- **More install options.** An official multi-arch Docker image on GHCR
+  (`ghcr.io/rleeon/hoard`, amd64 + arm64) — `docker compose pull && docker
+  compose up -d` to update instead of building on your box — plus `.rpm` and
+  Snap packages for the desktop app.
+- **Reclaim archived games from the app.** Games you archived to free quota now
+  show up in Library and History with a **Reactivar** action, so bringing one
+  back no longer means digging through the CLI.
 
 ### Fixed
 - **AppImage on SteamOS / Bazzite and other newer distros.** The bundle no
@@ -26,8 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   strips the AppImage-injected loader env, so the browser starts against the
   host's libraries instead of Hoard's bundled (mismatched) ones and actually
   appears.
+- **Detection sweep.** Several fixes to game/save detection and the backup
+  queue, so more games are found automatically and fewer get stuck.
+- **No more phantom "game started" flaps.** A brief CPU dip on a correlation
+  match is now debounced instead of flapping the running-game state.
+- **One agent per machine.** A single-instance lock stops two daemons from
+  rotating the same token and 401-ing each other's syncs.
+- **Safer self-hosted upgrades.** `hoard-server upgrade` refuses to run inside a
+  container and points you at rebuilding the image instead of swapping a binary
+  that a `docker compose pull` will overwrite.
 
 ### Changed
+- **Failed syncs are now visible.** Bandwidth-window rejections are recorded in
+  `sync_log` alongside quota rejections, so the sync failure rate is no longer
+  invisible.
+- **Storage downgrade grace widened to 30 days** (was 14) — more room before a
+  plan change trims your ceiling.
+- **Community docs in the repo.** Added CONTRIBUTING, a self-hosting guide, a
+  funding breakdown, and a GitHub Sponsor button.
 - CI now runs only on version tags, pull requests, and manual dispatch —
   routine branch pushes (including docs-only edits) no longer spend Actions
   minutes. Validate locally with `cargo check` + `pnpm check` before pushing.

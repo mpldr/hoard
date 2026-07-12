@@ -1,0 +1,50 @@
+name: Test installers
+
+# Exercises the hosted install scripts end-to-end on real runners: download the
+# latest release, verify its checksum, install, and confirm `hoard --version`
+# runs. Windows is tested on BOTH Windows PowerShell 5.1 (`powershell`) and
+# PowerShell 7 (`pwsh`) — the 5.1 host is where the tricky bugs live (empty
+# RuntimeInformation, TLS 1.0 default, byte[] response bodies).
+
+on:
+  push:
+    paths:
+      - 'web/static/install.sh'
+      - 'web/static/install.ps1'
+      - '.github/workflows/test-installers.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: install.ps1 (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run installer
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File web/static/install.ps1
+      - name: Verify the binary runs
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'hoard\bin\hoard.exe'
+          if (-not (Test-Path $exe)) { throw "hoard.exe was not installed at $exe" }
+          & $exe --version
+
+  unix:
+    name: install.sh (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run installer
+        run: sh web/static/install.sh
+      - name: Verify the binary runs
+        run: |
+          test -x "$HOME/.local/bin/hoard" || { echo "hoard was not installed"; exit 1; }
+          "$HOME/.local/bin/hoard" --version

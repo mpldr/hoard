@@ -13,6 +13,10 @@
 # After install:  hoard login ; hoard sync start
 
 $ErrorActionPreference = 'Stop'
+# Invoke-WebRequest's progress bar makes large downloads crawl on Windows
+# PowerShell 5.1 — turning it off speeds the tarball fetch up by orders of
+# magnitude and avoids rendering glitches in non-interactive hosts.
+$ProgressPreference = 'SilentlyContinue'
 $Repo = 'rleeon/hoard'
 
 # Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub rejects. Opt into
@@ -77,17 +81,30 @@ try {
   }
 
   # ---- verify sha256 -------------------------------------------------------
+  # Download the .sha256 to a file and read it as text. GitHub serves it as
+  # application/octet-stream, and on Windows PowerShell 5.1 `.Content` of a
+  # non-text response is a byte[], not a string — splitting that yielded the
+  # first byte's decimal value (0x65 = 101) instead of the hash.
+  $shaFile = Join-Path $tmp 'pkg.sha256'
+  $verified = $false
   try {
-    $sha = (Invoke-WebRequest "$url.sha256" -UseBasicParsing `
-              -Headers @{ 'User-Agent' = 'hoard-installer' }).Content
-    $expected = ($sha -split '\s+')[0].Trim().ToLower()
-    $actual   = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
-    if ($expected -and $expected -ne $actual) {
-      Die "checksum mismatch! expected $expected, got $actual. Aborting."
-    }
-    Info "Checksum verified."
+    Invoke-WebRequest "$url.sha256" -OutFile $shaFile -UseBasicParsing `
+      -Headers @{ 'User-Agent' = 'hoard-installer' }
+    $shaText  = (Get-Content $shaFile -Raw).Trim()
+    $expected = ($shaText -split '\s+')[0].ToLower()   # "<hash> *<file>" -> hash
+    $verified = $true
   } catch {
-    Warn "could not verify checksum - continuing."
+    Warn "could not download the checksum file - skipping verification."
+  }
+  if ($verified) {
+    $actual = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
+    if ($expected.Length -ne 64) {
+      Warn "unexpected checksum format - skipping verification."
+    } elseif ($expected -ne $actual) {
+      Die "checksum mismatch! expected $expected, got $actual. Aborting."
+    } else {
+      Info "Checksum verified."
+    }
   }
 
   # ---- extract -------------------------------------------------------------

@@ -22,6 +22,13 @@ export type ReleaseAssets = {
   linuxDeb: string;
   linuxAppImage: string;
   linuxRpm: string;
+  // Headless CLI tarballs (`hoard` binary; Linux tarballs also bundle
+  // hoard-server + hoard-admin). See `/cli`.
+  cliLinuxX64: string;
+  cliLinuxArm64: string;
+  cliMacosArm64: string;
+  cliWindowsX64: string;
+  cliWindowsArm64: string;
 };
 
 export type ReleaseInfo = { v: string; date: string; assets: ReleaseAssets };
@@ -36,7 +43,12 @@ function assetsFor(v: string): ReleaseAssets {
     macosDmg: `${base}/Hoard_${v}_aarch64.dmg`,
     linuxDeb: `${base}/Hoard_${v}_amd64.deb`,
     linuxAppImage: `${base}/Hoard_${v}_amd64.AppImage`,
-    linuxRpm: `${base}/Hoard-${v}-1.x86_64.rpm`
+    linuxRpm: `${base}/Hoard-${v}-1.x86_64.rpm`,
+    cliLinuxX64: `${base}/hoard-${v}-linux-x86_64.tar.gz`,
+    cliLinuxArm64: `${base}/hoard-${v}-linux-aarch64.tar.gz`,
+    cliMacosArm64: `${base}/hoard-${v}-macos-aarch64.tar.gz`,
+    cliWindowsX64: `${base}/hoard-${v}-windows-x86_64.tar.gz`,
+    cliWindowsArm64: `${base}/hoard-${v}-windows-aarch64.tar.gz`
   };
 }
 
@@ -50,7 +62,14 @@ function pickAssets(urls: string[], v: string): ReleaseAssets {
     macosDmg: find(/\.dmg$/) ?? guess.macosDmg,
     linuxDeb: find(/\.deb$/) ?? guess.linuxDeb,
     linuxAppImage: find(/\.appimage$/i) ?? guess.linuxAppImage,
-    linuxRpm: find(/\.rpm$/) ?? guess.linuxRpm
+    linuxRpm: find(/\.rpm$/) ?? guess.linuxRpm,
+    // Match the CLI tarballs by their exact platform-arch suffix so they never
+    // collide with the desktop `Hoard.app.tar.gz` (which also ends in .tar.gz).
+    cliLinuxX64: find(/linux-x86_64\.tar\.gz$/) ?? guess.cliLinuxX64,
+    cliLinuxArm64: find(/linux-aarch64\.tar\.gz$/) ?? guess.cliLinuxArm64,
+    cliMacosArm64: find(/macos-aarch64\.tar\.gz$/) ?? guess.cliMacosArm64,
+    cliWindowsX64: find(/windows-x86_64\.tar\.gz$/) ?? guess.cliWindowsX64,
+    cliWindowsArm64: find(/windows-aarch64\.tar\.gz$/) ?? guess.cliWindowsArm64
   };
 }
 

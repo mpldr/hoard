@@ -103,6 +103,14 @@
       >
         {$_('nav.download')}
       </a>
+      <a
+        href={$localeHref('/cli')}
+        class="link-underline ring-focus text-sm transition-colors {isActive('/cli')
+          ? 'text-ink'
+          : 'text-ink-soft hover:text-ink'}"
+      >
+        {$_('nav.cli')}
+      </a>
     </div>
 
     <div class="hidden items-center gap-3 md:flex">
@@ -217,6 +225,9 @@
         </a>
         <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/download')} onclick={() => (open = false)}>
           {$_('nav.download')}
+        </a>
+        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/cli')} onclick={() => (open = false)}>
+          {$_('nav.cli')}
         </a>
         {#if $session}
           <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href="/account" onclick={() => (open = false)}>

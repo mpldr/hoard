@@ -10,6 +10,7 @@ const PATHS = [
   '/pricing',
   '/help',
   '/download',
+  '/cli',
   '/guides',
   ...guideSlugs().map((slug) => `/guides/${slug}`),
   '/legal/terms',

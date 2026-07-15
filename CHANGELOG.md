@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-07-15
+
+Sync you can trust, and an app that feels alive. Three deep fixes end the
+"reload Steam on both devices" dance and the download-timeout loop; on top of
+that, see every machine on your account live, hear from the dev through an
+in-app bell, and pick a theme.
+
+### Added
+- **The Eye: your devices, live.** (Cloud) A header panel listing every
+  machine on the account — online dot, which games each one is running right
+  now and for how long. Agents heartbeat every 30 s and beat instantly when a
+  game starts or stops, so launching a game on the Deck shows on the desktop
+  in a second or two; a crashed machine simply ages out of the window instead
+  of staying green. Desktop and CLI daemon both report.
+- **The bell: announcements from the dev.** (Cloud) Operator broadcasts land
+  in seconds over Realtime push (cursor-based polling as fallback, so nothing
+  is ever re-delivered), render a mini-markdown subset, can carry an action
+  button and expire on their own. Only the operator can send one — rows are
+  inserted via direct service-role SQL, there is no HTTP write path.
+  Dismissals sync server-side: dismissed on one device, gone on all of them.
+- **Themes.** Obsidian (the classic dark), Quartz (light) or Auto to follow
+  the OS scheme, plus an accent-colour picker — all in Settings. A pure
+  CSS-variable re-skin that persists locally.
+- **Link a cloud save without hunting for the folder.** When a save lives in
+  the cloud but isn't linked on this machine, the link dialog now leads with
+  the folders detection already found here — one click and done. The folder
+  picker stays as the fallback, and a never-scanned machine is offered the
+  scan instead of a false "nothing found".
+- **Rename works on Hoard Cloud saves.** The cloud grew the rename endpoint
+  the self-hosted server already had; duplicate labels are rejected cleanly.
+- **Wrapped: browse any year.** The playtime recap grew a year picker —
+  every year with playtime, latest first.
+- **Operator tools** in `tools/`: the broadcast sender
+  (`send-notification.sh`) and a single-file metrics dashboard.
+
+### Fixed
+- **Saves from another device now arrive without reloading Steam.** On the
+  Steam Deck, Proton often leaves zombie processes behind after a game
+  closes, so the engine kept believing the game was still running and held
+  the cross-device restore forever — the hold itself is deliberate (never
+  swap saves under a live game), but it had no way out. Zombie processes no
+  longer count as running, a held restore is delivered the moment the game
+  actually stops, and while it waits the app says so ("update ready — waiting
+  for the game to close") instead of staying silent. Failed backups also
+  retry on a 10-minute backoff instead of wedging restores until the next
+  file event.
+- **A Cloud session can no longer die permanently.** Two internal refresh
+  paths could race over the same refresh token, and losing that race revoked
+  the whole token family — sync stopped for good until re-login plus a
+  restart. Every refresh now goes through one serialized path that re-reads
+  the token from disk and collapses bursts into a single request. If a
+  session does expire, the daemon announces it once, re-checks quietly, and
+  everything — refresher and realtime push — reconnects on its own after
+  `hoard login`, no restart needed. Daemon boot also survives starting before
+  the network is up instead of exiting.
+- **Big saves no longer die with "operation timed out".** Snapshot transfers
+  ran on an HTTP client whose 60-second total timeout covered the response
+  body too, so any download longer than a minute (Paradox-sized saves) was
+  killed mid-stream and retried in a loop — and slow uploads could hang the
+  "Uploading…" pill the same way. Transfers now use dedicated streaming
+  clients: no total cap, a stall detector on downloads, TCP keepalive on
+  uploads.
+
 ## [1.0.2] — 2026-07-12
 
 The open-source release. The whole app — including the Pro layer — now lives in

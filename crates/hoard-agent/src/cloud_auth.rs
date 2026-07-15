@@ -619,7 +619,9 @@ pub async fn refresh_freshest() -> Result<Tokens> {
         Err(e) if e.downcast_ref::<RefreshTokenStale>().is_some() => {
             match adoptable(&attempted, load_session().ok().flatten().as_ref()) {
                 Some(tokens) => {
-                    tracing::debug!("cloud: el refresh token lo rotó otra ejecución; adopto el de disco");
+                    tracing::debug!(
+                        "cloud: el refresh token lo rotó otra ejecución; adopto el de disco"
+                    );
                     *last = Some((Instant::now(), tokens.clone()));
                     Ok(tokens)
                 }

@@ -3990,7 +3990,9 @@ fn process_poll(
         // igualdad exacta con el slug/nombre del juego es señal fuerte por sí
         // sola, y así un juego pausado (menús de Paradox, a 0% de CPU) sigue
         // contando como "corriendo". `is_game_like` descarta sistema/launchers.
-        if !defunct && !token_index.is_empty() && crate::correlation::is_game_like(&name, proc.exe())
+        if !defunct
+            && !token_index.is_empty()
+            && crate::correlation::is_game_like(&name, proc.exe())
         {
             for cand in process_identity_candidates(&name, proc.exe()) {
                 if let Some(ids) = token_index.get(&cand) {

@@ -268,15 +268,12 @@ pub async fn devices_refresh(app: AppHandle) -> Result<(), String> {
 /// immediately, and a dropped network call just means the server picks the
 /// dismissal up on a future dismiss/retry).
 #[tauri::command]
-pub async fn notification_dismiss(
-    app: AppHandle,
-    id: String,
-) -> Result<(), String> {
-    use hoard_agent::cloud_account::{self, CloudError};
+pub async fn notification_dismiss(app: AppHandle, id: String) -> Result<(), String> {
     use crate::commands::cloud::{
         cloud_err_to_string, handle_session_expired, is_session_expired, load_active_creds,
         refresh_active_session,
     };
+    use hoard_agent::cloud_account::{self, CloudError};
     let Some(creds) = load_active_creds().map_err(|e| e.to_string())? else {
         return Err("Not signed in to Hoard Cloud.".into());
     };

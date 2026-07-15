@@ -1579,7 +1579,10 @@ async fn fetch_save_summary(
     game_slug: &str,
 ) -> Result<Json<SaveSummary>, CloudError> {
     let (label, latest_version_num, created_at, updated_at): (
-        String, i64, time::OffsetDateTime, time::OffsetDateTime,
+        String,
+        i64,
+        time::OffsetDateTime,
+        time::OffsetDateTime,
     ) = sqlx::query_as(
         "SELECT label, latest_version_num, created_at, updated_at FROM saves WHERE id = $1",
     )

@@ -160,7 +160,7 @@ fn expand_glob_tail(base: &Path, tail: &str, out: &mut Vec<PathBuf>) {
         out.push(base.to_path_buf());
         return;
     }
-    let (first, rest) = match tail.find(|c| c == '/' || c == '\\') {
+    let (first, rest) = match tail.find(['/', '\\']) {
         Some(i) => (&tail[..i], &tail[i + 1..]),
         None => (tail, ""),
     };
@@ -183,13 +183,11 @@ fn expand_glob_tail(base: &Path, tail: &str, out: &mut Vec<PathBuf>) {
             return;
         }
         if let Ok(rd) = std::fs::read_dir(base) {
-            for entry in rd.take(MAX_GLOB_FANOUT) {
-                if let Ok(e) = entry {
-                    if let Some(name) = e.file_name().to_str() {
-                        if glob_match(first, name) {
-                            out.push(base.to_path_buf());
-                            return;
-                        }
+            for e in rd.take(MAX_GLOB_FANOUT).flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    if glob_match(first, name) {
+                        out.push(base.to_path_buf());
+                        return;
                     }
                 }
             }

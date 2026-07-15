@@ -189,10 +189,7 @@ async fn realtime_loop(kick_tx: mpsc::Sender<()>) {
                 // Sin sesión utilizable (ausente o revocada). Vigila el disco
                 // sin tocar red: replayar un token revocado cada pocos minutos
                 // contra GoTrue es justo el ruido que se le quitó al refresher.
-                let dead = cloud_auth::load_session()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.refresh);
+                let dead = cloud_auth::load_session().ok().flatten().map(|s| s.refresh);
                 tracing::info!("cloud-live: realtime en pausa — esperando un login nuevo");
                 loop {
                     sleep(Duration::from_secs(RELOGIN_RECHECK_SECS)).await;

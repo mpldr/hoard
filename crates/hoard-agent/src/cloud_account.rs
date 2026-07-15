@@ -231,6 +231,25 @@ pub async fn reactivate_save(base: &str, token: &str, save_id: &str) -> Result<(
     Ok(())
 }
 
+/// `POST {base}/v1/notifications/:id/dismiss` — registra el descarte de un
+/// broadcast para que el server no lo vuelva a entregar a ese usuario (en
+/// ningún dispositivo ni tras reinstalar). Idempotente server-side; un solo
+/// intento, el reintento-tras-401 lo hace el llamador (igual que
+/// `entitlements`).
+pub async fn dismiss_notification(base: &str, token: &str, id: &str) -> Result<(), CloudError> {
+    let url = format!("{base}/v1/notifications/{id}/dismiss");
+    let resp = http_client()?
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| CloudError::Network(format!("Network error: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(into_error(resp).await);
+    }
+    Ok(())
+}
+
 // ---- cuenta -----------------------------------------------------------
 
 /// `DELETE {base}/v1/me` — soft-delete + freeze de la cuenta (gracia 30 días).

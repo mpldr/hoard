@@ -220,7 +220,11 @@
         processes: procs.length > 0 ? procs : undefined,
       });
       onAdded(saved);
-      toastSuccess($_("emulators.added", { values: { name: display } }));
+      toastSuccess(
+        isEmulator
+          ? $_("emulators.added", { values: { name: display } })
+          : $_("manual.added_game", { values: { name: display } }),
+      );
       reset();
       onClose();
     } catch (e) {
@@ -332,7 +336,7 @@
         >
           {$_("emulators.folder_label")}
         </label>
-        <div class="flex gap-2">
+        <div class="flex flex-wrap gap-2">
           <Input
             id="manual-folder"
             class="flex-1"
@@ -379,7 +383,7 @@
           </div>
         {/if}
 
-        <div class="flex gap-2">
+        <div class="flex flex-wrap gap-2">
           <Input
             class="flex-1"
             bind:value={manualProc}

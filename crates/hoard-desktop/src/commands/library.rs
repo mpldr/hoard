@@ -217,6 +217,22 @@ pub fn cached_detection(state: State<'_, AppState>) -> Option<DetectionReport> {
         .map(|c| c.report.clone())
 }
 
+/// What local detection already knows about one slug, so "Vincular a esta
+/// máquina" can offer the detected folders as one-click options instead of
+/// sending the user hunting through a folder picker.
+///
+/// Reads the in-memory cache (fresher than disk: `scan_library` writes it
+/// first). A `scanned_at: None` result means nobody ever scanned here — the UI
+/// offers a scan rather than claiming there's nothing.
+#[tauri::command]
+pub fn detected_paths_for_game(
+    game_slug: String,
+    state: State<'_, AppState>,
+) -> library::LocalDetection {
+    let guard = state.detection_cache.last.lock().unwrap();
+    library::local_detection(guard.as_ref(), &game_slug)
+}
+
 /// Update both the in-memory cache and the on-disk copy. Disk failures are
 /// logged at WARN — the user still has a working session, we just lose the
 /// cold-start optimisation on next launch.

@@ -199,6 +199,10 @@ pub async fn start_agent(
     // Capturado antes de mover `config` al agente (lo usa el forwarder para no
     // marcar como "esperando" el debounce rutinario).
     let debounce_ms = config.debounce_secs.saturating_mul(1000);
+    // Presence heartbeater (Eye panel): same client (shared token cell keeps
+    // it authenticated across JWT rotations), cloned before `client` moves
+    // into the agent. It gates itself to Cloud servers internally.
+    let (presence, _presence_task) = hoard_agent::presence::spawn(client.clone());
     let (handle, _task) = agent::spawn(client, config, saves, events_tx);
 
     // Fan out the synthetic watcher-armed events. Done after `spawn` so the
@@ -217,12 +221,24 @@ pub async fn start_agent(
     // semantic names ("upload", "throttled") without forcing every legacy
     // listener to rename. The original `agent://backup-*` topics stay live.
     let app_for_emit = app.clone();
+    let presence_for_events = presence.clone();
     // `debounce_ms` (capturado arriba, antes de mover `config`) distingue una
     // espera REAL por throttle —el min-interval aplazó la subida por encima del
     // debounce— del debounce rutinario de cada autosave. Sin esto, "en cola —
     // esperando…" salía en cada guardado aunque el suelo por defecto sea 0.
     tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
+            // Presence: mirror game transitions to the heartbeater so the
+            // other devices' Eye panels flip to "jugando" within a beat.
+            match &ev {
+                AgentEvent::GameStarted { game_slug, .. } => {
+                    presence_for_events.game_started(game_slug.clone());
+                }
+                AgentEvent::GameStopped { game_slug, .. } => {
+                    presence_for_events.game_stopped(game_slug.clone());
+                }
+                _ => {}
+            }
             // The event variant name doubles as the Tauri channel suffix.
             // Serializing the whole enum gives the frontend a tagged
             // payload that's easy to discriminate on.
@@ -241,6 +257,8 @@ pub async fn start_agent(
                 AgentEvent::BackupSkippedEmpty { .. } => "agent://backup-skipped-empty",
                 AgentEvent::SaveConflictsBackedUp { .. } => "agent://save-conflicts-backed-up",
                 AgentEvent::HeavyProcessDetected { .. } => "agent://heavy-process-detected",
+                // Emitted for parity with the CLI feed; no UI listens yet.
+                AgentEvent::RestoreDeferred { .. } => "agent://restore-deferred",
             };
             let _ = app_for_emit.emit(topic, &ev);
 
@@ -316,6 +334,7 @@ pub async fn start_agent(
     });
 
     *state.agent.lock().unwrap() = Some(handle);
+    *state.presence.lock().unwrap() = Some(presence);
     // Hold the cross-process lock for as long as our agent lives, so a `hoard
     // sync` daemon started afterwards backs off instead of double-running.
     *state.agent_lock.lock().unwrap() = Some(hoard_agent::instance::AgentLock::acquire());
@@ -348,6 +367,13 @@ pub async fn stop_agent(app: AppHandle, state: State<'_, AppState>) -> Result<()
     // it reads are about to be wiped. No-op when it wasn't running.
     crate::commands::selfhosted_events::stop(&app);
     let handle = state.agent.lock().unwrap().take();
+    // Final presence beat first, while the client's token is still valid (on
+    // logout the creds are about to be wiped): flips this device's dot to
+    // grey on the other machines' Eye panels immediately. Bounded wait inside.
+    let presence = state.presence.lock().unwrap().take();
+    if let Some(p) = presence {
+        p.closing().await;
+    }
     clear_agent_client();
     // Release the shared agent lock so a `hoard sync` daemon can take over.
     *state.agent_lock.lock().unwrap() = None;

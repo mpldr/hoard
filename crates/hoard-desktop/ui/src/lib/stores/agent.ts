@@ -51,6 +51,9 @@ export type SaveActivity = {
     | "failed";
   /** When the next backup is expected to fire (epoch ms), if scheduled. */
   next_backup_at?: number;
+  /** When the current game session started (epoch ms), if running. Drives
+   *  the elapsed-time counter in the Eye panel. */
+  running_since?: number;
   reason?: BackupReason;
   last_version?: number;
   last_bytes?: number;
@@ -125,10 +128,10 @@ function patch(save_id: string, partial: Partial<SaveActivity>) {
 function applyEvent(ev: AgentEvent) {
   switch (ev.type) {
     case "game_started":
-      patch(ev.save_id, { state: "running" });
+      patch(ev.save_id, { state: "running", running_since: Date.now() });
       break;
     case "game_stopped":
-      patch(ev.save_id, { state: "idle" });
+      patch(ev.save_id, { state: "idle", running_since: undefined });
       break;
     case "backup_scheduled":
       patch(ev.save_id, {

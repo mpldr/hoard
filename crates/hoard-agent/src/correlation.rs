@@ -134,9 +134,21 @@ const NON_GAME_PROCESS: &[&str] = &[
     "claude",
     "anthropic",
     "node",
+    "opencode",
+    // OneDrive (sync daemon), Xbox / GamingServices (Windows gaming
+    // infrastructure, not the game itself).
+    "onedrive",
+    "xbox",
+    "gamingservices",
     // El propio Hoard.
     "hoard",
 ];
+
+/// Procesos que nunca son juego pero cuyo nombre es demasiado corto para un
+/// match por substring sin falsos positivos (`"code"` colisionaba con
+/// `codename.exe`, `decode.exe`). Se aplica como match EXACTO (case-
+/// insensitive) del basename del proceso y del exe.
+const NON_GAME_PROCESS_EXACT: &[&str] = &["code", "code.exe"];
 
 /// Un proceso nacido dentro de esta ventana tras el arranque del SISTEMA es
 /// infraestructura de autostart (Discord, trays, overlays de GPU, daemons de
@@ -192,6 +204,9 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
     if NON_GAME_PROCESS.iter().any(|bad| lower.contains(bad)) {
         return false;
     }
+    if NON_GAME_PROCESS_EXACT.iter().any(|bad| lower == *bad) {
+        return false;
+    }
     if let Some(exe) = exe {
         let exe_str = exe.to_string_lossy().to_lowercase();
         if SYSTEM_EXE_PREFIXES.iter().any(|p| exe_str.starts_with(p)) {
@@ -205,6 +220,9 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
         if let Some(base) = exe.file_name().and_then(|s| s.to_str()) {
             let base = base.to_lowercase();
             if NON_GAME_PROCESS.iter().any(|bad| base.contains(bad)) {
+                return false;
+            }
+            if NON_GAME_PROCESS_EXACT.iter().any(|bad| base == *bad) {
                 return false;
             }
         }
@@ -577,6 +595,51 @@ mod tests {
             Some(Path::new(
                 "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Europa Universalis V\\eu5.exe"
             ))
+        ));
+    }
+
+    #[test]
+    fn is_game_like_rejects_onedrive_xbox_gamingservices_opencode() {
+        // OneDrive sync daemon, Xbox infrastructure, GamingServices, opencode.
+        for n in [
+            "OneDrive.exe",
+            "xbox.exe",
+            "GamingServices.exe",
+            "opencode",
+            "opencode.exe",
+        ] {
+            assert!(!is_game_like(n, None), "{n} should be filtered");
+        }
+        // Real games still pass.
+        assert!(is_game_like("eldenring.exe", None));
+        assert!(is_game_like("Hades.exe", None));
+    }
+
+    #[test]
+    fn is_game_like_rejects_code_by_exact_basename_not_substring() {
+        // "code" as a substring would clobber codename.exe, decode.exe, etc.
+        // The exact match catches VSCode without false positives.
+        assert!(!is_game_like("code", None));
+        assert!(!is_game_like("Code.exe", None));
+        assert!(!is_game_like("code.exe", None));
+        // Substring matches that look like "code" but aren't exact still pass.
+        assert!(is_game_like("codename.exe", None));
+        assert!(is_game_like("decode.exe", None));
+        // Via exe basename too.
+        assert!(!is_game_like(
+            "ThreadPoolForeg",
+            Some(Path::new("/usr/share/code/code"))
+        ));
+        assert!(!is_game_like(
+            "Code",
+            Some(Path::new(
+                "C:\\Users\\dev\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
+            ))
+        ));
+        // A real game whose exe basename is NOT "code" still passes.
+        assert!(is_game_like(
+            "eldenring.exe",
+            Some(Path::new("D:\\Steam\\eldenring.exe"))
         ));
     }
 

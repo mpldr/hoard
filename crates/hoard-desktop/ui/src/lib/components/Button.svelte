@@ -12,6 +12,7 @@
     HTMLAnchorAttributes,
   } from "svelte/elements";
   import { Loader2 } from "lucide-svelte";
+  import { glow } from "../actions/glow";
 
   type Variant = "primary" | "secondary" | "ghost" | "danger";
   type Size = "md" | "lg";
@@ -41,8 +42,8 @@
     // Primary = the gem. Emerald with a faint inner top-light and an
     // outer glow that intensifies on hover.
     primary:
-      "bg-emerald-600 text-emerald-50 shadow-[0_1px_0_0_rgba(255,255,255,0.18)_inset,0_6px_20px_-8px_rgba(16,185,129,0.55)] " +
-      "hover:bg-emerald-500 hover:shadow-[0_1px_0_0_rgba(255,255,255,0.22)_inset,0_8px_26px_-6px_rgba(16,185,129,0.75)] " +
+      "bg-emerald-600 text-emerald-50 shadow-[0_1px_0_0_rgba(255,255,255,0.2)_inset,0_8px_24px_-10px_rgba(16,185,129,0.7),0_0_0_1px_rgba(16,185,129,0.22)] " +
+      "hover:bg-emerald-500 hover:shadow-[0_1px_0_0_rgba(255,255,255,0.25)_inset,0_12px_32px_-8px_rgba(16,185,129,0.95),0_0_0_1px_rgba(16,185,129,0.34)] " +
       "focus-visible:ring-emerald-400/70 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none",
     secondary:
       "border border-white/[0.08] bg-white/[0.04] text-zinc-100 hover:bg-white/[0.08] hover:border-white/[0.14] " +
@@ -60,8 +61,8 @@
   };
 
   const baseClass =
-    "inline-flex items-center justify-center gap-2 rounded-lg font-medium tracking-[-0.005em] " +
-    "transition-all duration-150 active:scale-[0.98] " +
+    "glow inline-flex items-center justify-center gap-2 rounded-lg font-medium tracking-[-0.005em] " +
+    "transition-all duration-150 active:scale-[0.97] " +
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 " +
     "focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:active:scale-100";
 </script>
@@ -69,6 +70,7 @@
 {#if href}
   <a
     {href}
+    use:glow
     class="{baseClass} {variantClasses[variant]} {sizeClasses[size]} {extraClass}"
     aria-disabled={disabled || loading ? "true" : undefined}
     {...rest}
@@ -81,6 +83,7 @@
 {:else}
   <button
     {type}
+    use:glow
     class="{baseClass} {variantClasses[variant]} {sizeClasses[size]} {extraClass}"
     disabled={disabled || loading}
     {...rest}

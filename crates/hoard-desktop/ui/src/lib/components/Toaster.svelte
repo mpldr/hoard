@@ -39,7 +39,7 @@
   {#each $toasts as toast (toast.id)}
     {@const Icon = ICONS[toast.kind]}
     <div
-      class="pointer-events-auto flex items-start gap-3 rounded-lg border px-4 py-3 shadow-lg backdrop-blur {TINTS[
+      class="card-glass pointer-events-auto flex items-start gap-3 rounded-lg border px-4 py-3 shadow-lg backdrop-blur {TINTS[
         toast.kind
       ]}"
       transition:fly={{ y: 12, duration: 180 }}

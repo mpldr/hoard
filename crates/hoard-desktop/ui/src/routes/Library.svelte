@@ -10,6 +10,7 @@
    * `library://scan-progress` events to drive the progress bar.
    */
   import { onDestroy, onMount } from "svelte";
+  import { tilt } from "../lib/actions/tilt";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import {
     Search as SearchIcon,
@@ -31,6 +32,7 @@
     Clock,
     Snowflake,
     X,
+    PauseCircle,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -41,6 +43,7 @@
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import ManualTrackModal from "../lib/components/ManualTrackModal.svelte";
+  import LinkOrphanModal from "../lib/components/LinkOrphanModal.svelte";
   import ScanFolderModal from "../lib/components/ScanFolderModal.svelte";
   import * as api from "../lib/api";
   import type {
@@ -48,6 +51,7 @@
     DetectedGame,
     DetectionReport,
     DetectionSource,
+    LocalDetection,
     PlaytimeGameInfo,
     ScanProgress,
     TrackedSave,
@@ -66,6 +70,12 @@
   // both independent of the auto-detection flow.
   let emulatorModalOpen = $state(false);
   let scanFolderOpen = $state(false);
+  // The cloud orphan whose "Vincular a esta máquina" modal is open, if any.
+  let linkTarget = $state<TrackedSave | null>(null);
+  // What local detection knows per orphan slug, so a card can offer a direct
+  // "Vincular a <ruta>" instead of sending the user to the picker. Filled from
+  // the scan cache; a slug missing here just means no offer, never an error.
+  let orphanDetections = $state<Record<string, LocalDetection>>({});
 
   // Manually-added emulator saves carry a synthesized slug: `emu-<id>` for a
   // catalog pick or `emu-<slugified name>` for a custom one. The Library shows
@@ -645,6 +655,45 @@
   const localSaves = $derived(tracked.filter((t) => !t.orphan));
   const cloudOrphans = $derived(tracked.filter((t) => t.orphan));
 
+  /** Re-read what detection knows for every orphan on screen. One cheap
+   *  in-memory lookup per row (no scan), and orphans are few — they're games
+   *  from OTHER machines. Never auto-adopts: it only decides whether a card can
+   *  offer a one-click link. */
+  async function refreshOrphanDetections(slugs: string[]) {
+    if (slugs.length === 0) {
+      orphanDetections = {};
+      return;
+    }
+    const found = await Promise.all(
+      slugs.map(async (slug) => {
+        try {
+          return [slug, await api.detectedPathsForGame(slug)] as const;
+        } catch {
+          // A failed probe just means no offer for this card; the picker still
+          // works. Not worth a toast on page load.
+          return null;
+        }
+      }),
+    );
+    orphanDetections = Object.fromEntries(
+      found.filter((e): e is NonNullable<typeof e> => e !== null),
+    );
+  }
+
+  // Refresh whenever the orphan set changes (load, adopt, delete).
+  $effect(() => {
+    const slugs = [...new Set(cloudOrphans.map((o) => o.game_slug))];
+    void refreshOrphanDetections(slugs);
+  });
+
+  /** The single detected folder for an orphan, or `null` when detection is
+   *  ambiguous (several candidates ⇒ the user picks in the modal), found
+   *  nothing, or never ran. Mirrors `LocalDetection::unambiguous` agent-side. */
+  function directLinkFor(slug: string): string | null {
+    const paths = orphanDetections[slug]?.paths ?? [];
+    return paths.length === 1 ? paths[0].path : null;
+  }
+
   /** The cloud orphan for a slug, if any (prefers the "main" label). Lets the
    *  "+" / track flow adopt an existing cloud save instead of forking a new
    *  branch (BUG 3). */
@@ -672,12 +721,18 @@
     }
   }
 
-  /** "Vincular a esta máquina…" on a cloud-orphan card: pick a folder, then
-   *  adopt the existing save into it. */
-  async function linkOrphan(orphan: TrackedSave) {
-    const chosen = await pickFolder(orphan.game_slug);
-    if (!chosen) return;
-    await adoptOrphan(orphan, chosen);
+  /** "Vincular a esta máquina…" on a cloud-orphan card: offer whatever
+   *  detection already knows before falling back to the folder picker. */
+  function linkOrphan(orphan: TrackedSave) {
+    linkTarget = orphan;
+  }
+
+  /** A pick from the link modal — a detected folder or a hand-picked one. */
+  async function onLinkPick(path: string) {
+    const target = linkTarget;
+    if (!target) return;
+    linkTarget = null;
+    await adoptOrphan(target, path);
   }
 
   const filtered = $derived.by(() => {
@@ -835,132 +890,109 @@
       <div
         class="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4"
       >
-        {#each localSaves as save (save.save_id)}
+{#each localSaves as save (save.save_id)}
           <div
-            class="group flex items-start justify-between gap-2 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
+            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            use:tilt
           >
-            <Cover
-              appId={appIdBySlug.get(save.game_slug) ?? null}
-              slug={save.game_slug}
-              name={displayName(save.game_slug)}
-              class="h-9 w-9 shrink-0 rounded-md"
-              initialClass="text-sm"
-            />
-            <div class="min-w-0 flex-1">
-              <div class="flex items-center gap-1.5">
-                <p
-                  class="truncate text-sm font-medium text-zinc-100"
-                  title={save.game_slug}
-                >
-                  {displayName(save.game_slug)}
-                </p>
-                {#if isEmu(save.game_slug)}
-                  <span
-                    class="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-300"
+            <div class="flex items-start gap-2.5">
+              <Cover
+                appId={appIdBySlug.get(save.game_slug) ?? null}
+                slug={save.game_slug}
+                name={displayName(save.game_slug)}
+                class="h-9 w-9 shrink-0 rounded-lg"
+                initialClass="text-xs"
+              />
+
+              <div class="min-w-0 flex-1 flex flex-col gap-0.5">
+                <div class="flex items-center justify-between gap-1">
+                  <p
+                    class="truncate text-sm font-medium text-zinc-100"
+                    title={save.game_slug}
                   >
-                    {$_("library.emulator_badge")}
-                  </span>
-                {/if}
+                    {displayName(save.game_slug)}
+                  </p>
+                  <div class="flex shrink-0 items-center gap-0.5">
+                    {#if purgeDate(save.save_id)}
+                      <button
+                        type="button"
+                        onclick={() => reactivate(save)}
+                        disabled={reactivating.has(save.save_id)}
+                        title={$_("archived.reactivate")}
+                        class="inline-flex shrink-0 items-center rounded-md bg-sky-500/15 p-1 text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
+                      >
+                        <RotateCw
+                          size={11}
+                          class={reactivating.has(save.save_id) ? "animate-spin" : ""}
+                        />
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      onclick={() => askRename(save)}
+                      aria-label={$_("library.rename_button")}
+                      title={$_("library.rename_title")}
+                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                    >
+                      <Pencil size={11} />
+                    </button>
+                    {#if hasManualOverride(save.game_slug)}
+                      <button
+                        type="button"
+                        onclick={() => revertToAutoDetection(save)}
+                        class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                        title={$_("library.revert_to_auto")}
+                      >
+                        <RotateCcw size={11} />
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      onclick={() => askUntrack(save)}
+                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                      title={$_("library.untrack_title")}
+                    >
+                      <Trash size={11} />
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => askDelete(save)}
+                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-rose-400"
+                      title={$_("library.delete_title")}
+                    >
+                      <Trash size={11} class="text-rose-500" />
+                    </button>
+                  </div>
+                </div>
+
+                <p
+                  class="flex items-center gap-1 text-[10px] text-zinc-500"
+                  title={save.local_path}
+                >
+                  <FolderOpen size={10} class="shrink-0" />
+                  <span class="truncate">{save.local_path}</span>
+                </p>
               </div>
-              <p
-                class="mt-0.5 flex items-center gap-1 text-[11px] text-zinc-500"
-                title={save.local_path}
-              >
-                <FolderOpen size={11} class="shrink-0" />
-                <span class="truncate">{save.local_path}</span>
-              </p>
+            </div>
+
+            <div class="mt-1.5 flex items-center justify-between text-[10px]">
               {#if purgeDate(save.save_id)}
-                <p
-                  class="mt-0.5 flex items-center gap-1 text-[11px] text-sky-300"
-                  title={$_("archived.banner_body", {
-                    values: { date: purgeDate(save.save_id) },
-                  })}
-                >
-                  <Snowflake size={11} class="shrink-0" />
-                  <span class="truncate"
-                    >{$_("archived.frozen_note", {
-                      values: { date: purgeDate(save.save_id) },
-                    })}</span
-                  >
-                </p>
+                <span class="flex items-center gap-1 text-sky-300">
+                  <Snowflake size={10} class="shrink-0" />
+                  <span class="truncate">{$_("archived.frozen_note", { values: { date: purgeDate(save.save_id) } })}</span>
+                </span>
               {:else}
-                <p class="mt-0.5 flex items-center gap-1.5 text-[11px]">
-                  <span
-                    class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
-                      ? 'bg-amber-400'
-                      : 'bg-emerald-400'}"
-                  ></span>
+                <span class="flex items-center gap-1.5">
+                  <span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused ? 'bg-amber-400' : 'bg-emerald-400'}"></span>
                   <span class={save.paused ? "text-amber-400" : "text-emerald-400/90"}>
-                    {save.paused
-                      ? $_("library.paused_badge")
-                      : $_("library.monitored_badge")}
+                    {save.paused ? $_("library.paused_badge") : $_("library.monitored_badge")}
                   </span>
-                </p>
+                </span>
+              {/if}
+              {#if save.total_size_bytes > 0}
+                <span class="font-medium tabular-nums text-zinc-300">{fmtBytes(save.total_size_bytes)}</span>
               {/if}
             </div>
-            <span
-              class="shrink-0 rounded bg-zinc-800 px-2 py-0.5 text-xs font-medium tabular-nums text-zinc-300"
-              title={$_("library.local_size_title")}
-            >
-              {save.local_size_bytes && save.local_size_bytes > 0
-                ? fmtBytes(save.local_size_bytes)
-                : "—"}
-            </span>
-            {#if purgeDate(save.save_id)}
-              <button
-                type="button"
-                onclick={() => reactivate(save)}
-                disabled={reactivating.has(save.save_id)}
-                title={$_("archived.reactivate")}
-                class="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-500/15 px-2 py-1 text-[11px] font-medium text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
-              >
-                <RotateCw
-                  size={12}
-                  class={reactivating.has(save.save_id) ? "animate-spin" : ""}
-                />
-                {reactivating.has(save.save_id)
-                  ? $_("archived.reactivating")
-                  : $_("archived.reactivate")}
-              </button>
-            {/if}
-            <button
-              type="button"
-              onclick={() => askRename(save)}
-              aria-label={$_("library.rename_button")}
-              title={$_("library.rename_title")}
-              class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-            >
-              <Pencil size={14} />
-            </button>
-            {#if hasManualOverride(save.game_slug)}
-              <button
-                type="button"
-                onclick={() => revertToAutoDetection(save)}
-                aria-label={$_("library.use_auto_detection")}
-                title={$_("library.use_auto_detection")}
-                class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-              >
-                <RotateCcw size={14} />
-              </button>
-            {/if}
-            <button
-              type="button"
-              onclick={() => askUntrack(save)}
-              aria-label={$_("library.untrack_button")}
-              title={$_("library.untrack_title")}
-              class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-            >
-              <Trash2 size={14} />
-            </button>
-            <button
-              type="button"
-              onclick={() => askDelete(save)}
-              aria-label={$_("library.delete_button")}
-              title={$_("library.delete_title")}
-              class="shrink-0 rounded p-1 text-rose-500 transition-colors hover:bg-rose-500/20 hover:text-rose-300"
-            >
-              <Trash size={14} />
-            </button>
           </div>
         {/each}
       </div>
@@ -985,52 +1017,78 @@
       >
         {#each cloudOrphans as save (save.save_id)}
           <div
-            class="group flex items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
+            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            use:tilt
           >
-            <Cover
-              appId={appIdBySlug.get(save.game_slug) ?? null}
-              slug={save.game_slug}
-              name={save.game_slug}
-              class="h-9 w-9 shrink-0 rounded-md"
-              initialClass="text-sm"
-            />
-            <div class="min-w-0 flex-1">
-              <p
-                class="truncate text-sm font-medium text-zinc-100"
-                title={save.game_slug}
-              >
-                {save.game_slug}
-              </p>
-              <p class="truncate text-[11px] text-zinc-500">
-                {save.label} · {$_("library.cloud_only_badge")}
-              </p>
+            <div class="flex items-start gap-2.5">
+              <Cover
+                appId={appIdBySlug.get(save.game_slug) ?? null}
+                slug={save.game_slug}
+                name={save.game_slug}
+                class="h-9 w-9 shrink-0 rounded-lg"
+                initialClass="text-xs"
+              />
+              <div class="min-w-0 flex-1 flex flex-col gap-0.5">
+                <div class="flex items-center justify-between gap-1">
+                  <p
+                    class="truncate text-sm font-medium text-zinc-100"
+                    title={save.game_slug}
+                  >
+                    {save.game_slug}
+                  </p>
+                  <div class="flex shrink-0 items-center gap-0.5">
+                    <button
+                      type="button"
+                      onclick={() => linkOrphan(save)}
+                      aria-label={$_("library.link_to_machine")}
+                      title={$_("library.link_to_machine")}
+                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-emerald-300"
+                    >
+                      <Link size={11} />
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => askDelete(save)}
+                      aria-label={$_("library.delete_button")}
+                      title={$_("library.delete_title")}
+                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-rose-400"
+                    >
+                      <Trash size={11} class="text-rose-500" />
+                    </button>
+                  </div>
+                </div>
+                <p class="truncate text-[10px] text-zinc-500">
+                  {save.label} · {$_("library.cloud_only_badge")}
+                </p>
+              </div>
             </div>
-            <span
-              class="shrink-0 rounded bg-zinc-800 px-2 py-0.5 text-xs font-medium tabular-nums text-zinc-300"
-              title={$_("library.tracked_size_title")}
-            >
-              {save.total_size_bytes > 0
-                ? fmtBytes(save.total_size_bytes)
-                : "—"}
-            </span>
-            <button
-              type="button"
-              onclick={() => linkOrphan(save)}
-              aria-label={$_("library.link_to_machine")}
-              title={$_("library.link_to_machine")}
-              class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-emerald-500/10 hover:text-emerald-300"
-            >
-              <Link size={14} />
-            </button>
-            <button
-              type="button"
-              onclick={() => askDelete(save)}
-              aria-label={$_("library.delete_button")}
-              title={$_("library.delete_title")}
-              class="shrink-0 rounded p-1 text-rose-500 transition-colors hover:bg-rose-500/20 hover:text-rose-300"
-            >
-              <Trash size={14} />
-            </button>
+
+            {#if directLinkFor(save.game_slug)}
+              {@const path = directLinkFor(save.game_slug) ?? ""}
+              <!-- Detection knows exactly where this game saves here, so skip
+                   the picker. Explicit click, never a silent auto-adopt. -->
+              <button
+                type="button"
+                onclick={() => adoptOrphan(save, path)}
+                title={path}
+                class="mt-2 flex w-full items-center gap-1.5 rounded-lg border border-emerald-600/40 bg-emerald-600/10 px-2 py-1.5 text-left transition-colors hover:border-emerald-500/60 hover:bg-emerald-600/20"
+              >
+                <Link size={11} class="shrink-0 text-emerald-300" />
+                <span class="min-w-0 flex-1 truncate text-[10px] text-emerald-200">
+                  {$_("library.link_to_path", { values: { path } })}
+                </span>
+              </button>
+            {/if}
+
+            <div class="mt-1.5 flex items-center justify-between text-[10px]">
+              <span class="flex items-center gap-1.5 text-zinc-500">
+                <span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-500"></span>
+                {$_("library.cloud_only_badge")}
+              </span>
+              {#if save.total_size_bytes > 0}
+                <span class="font-medium tabular-nums text-zinc-300">{fmtBytes(save.total_size_bytes)}</span>
+              {/if}
+            </div>
           </div>
         {/each}
       </div>
@@ -1058,7 +1116,7 @@
         {#each playtimeGames as game (game.slug)}
           <div
             class="group flex items-center justify-between gap-2 rounded-xl border p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 {game.excluded
-              ? 'border-white/[0.06] bg-zinc-950/40 opacity-50'
+              ? 'border-white/[0.08] bg-zinc-950/40 opacity-50'
               : 'border-amber-500/40 bg-amber-500/10 hover:border-amber-500/60'}"
           >
             <Cover
@@ -1111,7 +1169,7 @@
   {/if}
 
   {#if scanning && progress}
-    <div class="mb-6 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)]">
+    <div class="mb-6 rounded-xl border border-white/[0.08] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)]">
       <div class="mb-2 flex items-center justify-between text-xs text-zinc-400">
         <span>{$_("library.scanning_catalog")}</span>
         <span class="tabular-nums">
@@ -1164,8 +1222,9 @@
         type="button"
         onclick={runDeepScan}
         disabled={scanning}
+        use:tilt
         title={$_("library.deep_scan_hint")}
-        class="group flex flex-col rounded-xl border border-red-500/30 bg-red-950/20 p-4 text-left shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-red-500/55 hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-60"
+        class="tilt group flex flex-col rounded-xl border border-red-500/30 bg-red-950/20 p-4 text-left shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-red-500/55 hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-60"
       >
         <div class="mb-2 flex items-start gap-2.5">
           <div
@@ -1196,24 +1255,25 @@
             : $_("library.no_results_filtered")}
         </div>
       </Card>
-      <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div class="mt-3 grid grid-cols-1 gap-3 px-3 md:grid-cols-2 xl:grid-cols-3">
         {@render deepScanTile()}
       </div>
     {:else}
-      <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div class="grid grid-cols-1 gap-3 px-3 md:grid-cols-2 xl:grid-cols-3">
         {#each filtered as game (game.slug)}
           {@const isTracked = trackedSlugs.has(game.slug)}
           <div
-            class="group flex flex-col rounded-xl border border-white/[0.06] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
+            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-1 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            use:tilt
           >
-            <div class="mb-2 flex items-start justify-between gap-2">
-              <div class="flex min-w-0 items-center gap-2.5">
+            <div class="flex items-start justify-between gap-2 p-4 pb-3">
+              <div class="flex min-w-0 items-center gap-3">
                 <Cover
                   appId={game.steam_app_id}
                   slug={game.slug}
                   name={game.display_name}
-                  class="h-10 w-10 shrink-0 rounded-md"
-                  initialClass="text-base"
+                  class="h-12 w-12 shrink-0 rounded-xl"
+                  initialClass="text-lg"
                 />
                 <div class="min-w-0">
                   <h3
@@ -1459,6 +1519,22 @@
     onClose={() => (scanFolderOpen = false)}
     onAdded={(saved) => {
       tracked = [...tracked, saved];
+    }}
+  />
+
+  <LinkOrphanModal
+    open={linkTarget !== null}
+    orphan={linkTarget}
+    onClose={() => (linkTarget = null)}
+    onPick={onLinkPick}
+    onScanned={(r) => {
+      // A scan started from the modal refreshes the detection cards AND the
+      // orphan offers — otherwise a card would still say "never scanned" next
+      // to a modal that just found the folder.
+      report = r;
+      void refreshOrphanDetections([
+        ...new Set(cloudOrphans.map((o) => o.game_slug)),
+      ]);
     }}
   />
 

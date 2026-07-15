@@ -25,6 +25,10 @@ pub struct AppState {
     /// Live agent handle. Populated lazily by the agent bootstrapper; tests
     /// and the logged-out state both leave it `None`.
     pub agent: Mutex<Option<AgentHandle>>,
+    /// Presence heartbeater (Eye panel), spawned/torn down in lock-step with
+    /// the agent. Kept here so logout and app-exit can fire the final
+    /// `closing` beat that flips this device's dot to grey immediately.
+    pub presence: Mutex<Option<hoard_agent::presence::PresenceHandle>>,
     /// Cross-process "one agent per machine" lock, shared with the CLI daemon
     /// (`hoard_agent::instance`). Held while our agent is running so a `hoard
     /// sync` daemon won't also spin up and fight over saves / the Cloud refresh
@@ -82,6 +86,7 @@ impl AppState {
             cloud_account: Mutex::new(None),
             detection_cache,
             agent: Mutex::new(None),
+            presence: Mutex::new(None),
             agent_lock: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
             pending_login_state: Mutex::new(None),

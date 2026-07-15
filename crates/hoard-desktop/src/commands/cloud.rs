@@ -689,7 +689,7 @@ pub use hoard_agent::cloud_account::{
 
 /// Traduce un [`CloudError`] al `String` que la UI ya esperaba, reusando
 /// `format_http_error` para conservar el mapeo `i18n:<key>` intacto.
-fn cloud_err_to_string(e: CloudError) -> String {
+pub(crate) fn cloud_err_to_string(e: CloudError) -> String {
     match e {
         CloudError::Unauthorized => format_http_error(StatusCode::UNAUTHORIZED, ""),
         CloudError::Http { status, body } => {
@@ -821,19 +821,51 @@ pub async fn cloud_entitlements(app: AppHandle) -> Result<CloudEntitlements, Str
         return Err("Not signed in to Hoard Cloud.".into());
     };
     match cloud_account::entitlements(&creds.server_url, &creds.access_token).await {
-        Ok(ent) => Ok(ent),
+        Ok(ent) => {
+            tracing::info!(
+                target: "entitlements",
+                plan = %ent.plan,
+                screen = ?ent.features.screen,
+                wrapple = ?ent.features.wrapple,
+                "entitlements refresh ok",
+            );
+            Ok(ent)
+        }
         Err(CloudError::Unauthorized) => {
+            tracing::warn!(target: "entitlements", status = 401, "entitlements: 401, refreshing JWT");
             let fresh = refresh_active_session().await.map_err(|e| {
                 if is_session_expired(&e) {
                     handle_session_expired(&app);
                 }
                 prettify(e)
             })?;
-            cloud_account::entitlements(&fresh.server_url, &fresh.access_token)
-                .await
-                .map_err(cloud_err_to_string)
+            match cloud_account::entitlements(&fresh.server_url, &fresh.access_token).await {
+                Ok(ent) => {
+                    tracing::info!(
+                        target: "entitlements",
+                        plan = %ent.plan,
+                        screen = ?ent.features.screen,
+                        wrapple = ?ent.features.wrapple,
+                        retried_401 = true,
+                        "entitlements refresh ok after 401 retry",
+                    );
+                    Ok(ent)
+                }
+                Err(other) => {
+                    tracing::warn!(
+                        target: "entitlements",
+                        error = %other,
+                        retried_401 = true,
+                        "entitlements: failed after 401 retry",
+                    );
+                    Err(cloud_err_to_string(other))
+                }
+            }
         }
-        Err(other) => Err(cloud_err_to_string(other)),
+        Err(other) => {
+            tracing::warn!(target: "entitlements", error = %other, "entitlements: fetch failed");
+            Err(cloud_err_to_string(other))
+        }
     }
 }
 

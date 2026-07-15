@@ -7,7 +7,8 @@ use crate::cloud::{
     bandwidth, db, export, polar, r2,
     routes::{
         checkout, device as device_routes, entitlements as ent_routes, logs as log_routes, me,
-        playtime as playtime_routes, saves, sync as sync_routes,
+        notifications as notification_routes, playtime as playtime_routes, saves,
+        sync as sync_routes,
     },
     state::CloudState,
 };
@@ -178,7 +179,20 @@ pub async fn run(cfg: Config) -> Result<()> {
             get(me::get_export_status).post(me::create_export_job),
         )
         .route("/v1/devices", get(me::list_devices))
+        // Presence keepalive for the Eye panel. Lives off the `/devices/:id`
+        // param path on purpose: matchit 0.7 (axum 0.7) panics on a static
+        // segment colliding with a param at the same position — same caveat
+        // as `/saves/cas` below.
+        .route("/v1/presence/heartbeat", post(me::heartbeat))
         .route("/v1/devices/:id", axum::routing::delete(me::delete_device))
+        // Operator broadcasts for the bell panel. List is read-only; the
+        // dismiss endpoint records a per-user, cross-device dismissal (see
+        // cloud/routes/notifications.rs).
+        .route("/v1/notifications", get(notification_routes::list))
+        .route(
+            "/v1/notifications/:id/dismiss",
+            post(notification_routes::dismiss),
+        )
         .route("/v1/cloud/checkout", post(checkout::create_checkout))
         // Phone confirms a CLI pairing. Authed: mints a session for *this*
         // signed-in user and hands it to the waiting headless device.
@@ -195,7 +209,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         .route("/v1/cloud/cas/init", post(saves::cas_init))
         .route(
             "/v1/cloud/saves/:save_id",
-            axum::routing::delete(saves::delete_save),
+            axum::routing::delete(saves::delete_save).patch(saves::rename_save),
         )
         // "Caja negra": archive a game to free quota immediately (frozen,
         // downloadable for 7 days, then purged), and reactivate it (re-upload

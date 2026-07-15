@@ -8,11 +8,11 @@ use crate::cloud::quota;
 use crate::cloud::state::CloudState;
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::Json,
     Extension,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -449,7 +449,21 @@ async fn register_device(
     Ok(())
 }
 
-/// One row of the account page's device list.
+/// A device counts as online while its last heartbeat is younger than this.
+/// The agent beats every ~30s, so 90s = three missed beats before the dot
+/// goes grey — tight enough to feel live, loose enough to ride out a hiccup.
+const PRESENCE_ONLINE_WINDOW_SECS: i32 = 90;
+
+/// One game a device is running right now: `{ slug, since }`, `since` in
+/// RFC3339. Wire shape of both the `devices.playing` JSONB elements and the
+/// `DeviceOut.playing` entries — stored and served identically on purpose.
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub struct PlayingOut {
+    pub slug: String,
+    pub since: Option<String>,
+}
+
+/// One row of the account page's device list / the Eye panel.
 #[derive(Debug, Serialize)]
 pub struct DeviceOut {
     pub id: Uuid,
@@ -458,6 +472,15 @@ pub struct DeviceOut {
     pub os: Option<String>,
     pub last_seen_at: Option<String>,
     pub created_at: Option<String>,
+    /// Live presence: heartbeat fresh and no closing beat received.
+    pub online: bool,
+    /// Games the device is running right now, most recently started first.
+    /// Only ever populated while `online` — a stale "playing" on a dead
+    /// machine is worse than none. Empty = idle.
+    pub playing: Vec<PlayingOut>,
+    /// True for the row matching the caller's `x-hoard-device-fp`, so the UI
+    /// can split "this machine" from the rest without knowing its own UUID.
+    pub this_device: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,7 +493,18 @@ pub struct DeviceListOut {
 pub async fn list_devices(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
+    headers: HeaderMap,
 ) -> Result<Json<DeviceListOut>, CloudError> {
+    let caller_fp = headers
+        .get("x-hoard-device-fp")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+
+    // `online` is computed here, at read time, so a client that died without
+    // its closing beat ages out on its own. `playing` is masked for offline
+    // devices in the same breath. The JSONB comes out as text and is parsed
+    // in Rust — no sqlx `json` feature needed.
     let rows: Vec<(
         Uuid,
         String,
@@ -478,25 +512,52 @@ pub async fn list_devices(
         Option<String>,
         Option<time::OffsetDateTime>,
         Option<time::OffsetDateTime>,
+        bool,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
-        "SELECT id, device_name, device_kind, os, last_seen_at, created_at
+        "SELECT id, device_name, device_kind, os, last_seen_at, created_at,
+                (closed_at IS NULL
+                 AND last_seen_at > now() - make_interval(secs => $2)) AS online,
+                playing::text, fingerprint
            FROM devices WHERE user_id = $1
           ORDER BY last_seen_at DESC NULLS LAST",
     )
     .bind(user.user_id)
+    .bind(f64::from(PRESENCE_ONLINE_WINDOW_SECS))
     .fetch_all(&state.pool)
     .await?;
 
     let devices = rows
         .into_iter()
         .map(
-            |(id, device_name, device_kind, os, last_seen_at, created_at)| DeviceOut {
+            |(
+                id,
+                device_name,
+                device_kind,
+                os,
+                last_seen_at,
+                created_at,
+                online,
+                playing,
+                fingerprint,
+            )| DeviceOut {
                 id,
                 device_name,
                 device_kind,
                 os,
                 last_seen_at: last_seen_at.map(format_dt),
                 created_at: created_at.map(format_dt),
+                online,
+                playing: if online {
+                    playing
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str(j).ok())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                this_device: !caller_fp.is_empty() && fingerprint == caller_fp,
             },
         )
         .collect();
@@ -512,6 +573,7 @@ pub async fn delete_device(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
     Path(device_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<DeviceListOut>, CloudError> {
     sqlx::query("DELETE FROM devices WHERE id = $1 AND user_id = $2")
         .bind(device_id)
@@ -528,7 +590,140 @@ pub async fn delete_device(
     .execute(&state.pool)
     .await?;
 
-    list_devices(State(state), Extension(user)).await
+    list_devices(State(state), Extension(user), headers).await
+}
+
+/// One game in a heartbeat: slug + how long it's been running. A duration
+/// rather than a timestamp on purpose: the server anchors it to its own clock
+/// (`now() - secs`), so a client with a skewed clock can never report
+/// "playing since three minutes from now".
+#[derive(Debug, Deserialize)]
+pub struct PlayingIn {
+    pub slug: String,
+    #[serde(default)]
+    pub for_secs: Option<i64>,
+}
+
+/// Body of `POST /v1/presence/heartbeat`. Everything is optional so an idle
+/// keepalive is just `{}`.
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatIn {
+    /// Games running right now, most recently started first. Empty = idle.
+    #[serde(default)]
+    pub playing: Vec<PlayingIn>,
+    /// Final beat on graceful shutdown: marks the device offline immediately
+    /// instead of letting it age out of the 90s window.
+    #[serde(default)]
+    pub closing: bool,
+}
+
+/// Hard caps on what a beat may claim. Presence is cosmetic — shown only to
+/// the user's own other devices — so these just stop a rogue client from
+/// stuffing megabytes into the row.
+const MAX_PLAYING_GAMES: usize = 8;
+const MAX_SLUG_CHARS: usize = 128;
+
+/// POST /v1/presence/heartbeat — presence keepalive from the agent. Sent every
+/// ~30s while it runs, immediately on any game start/stop, and once with
+/// `closing: true` on quit. Bumps `last_seen_at` and the `playing` JSONB;
+/// `GET /v1/devices` turns that into the Eye panel's online dots. Best-effort
+/// by design: a client without a fingerprint header (older builds) is a
+/// no-op, never an error.
+pub async fn heartbeat(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+    headers: HeaderMap,
+    Json(body): Json<HeartbeatIn>,
+) -> Result<StatusCode, CloudError> {
+    let fp = match headers
+        .get("x-hoard-device-fp")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(fp) => fp.to_owned(),
+        None => return Ok(StatusCode::NO_CONTENT),
+    };
+
+    if body.closing {
+        sqlx::query(
+            "UPDATE devices
+                SET last_seen_at = now(), closed_at = now(), playing = NULL
+              WHERE user_id = $1 AND fingerprint = $2",
+        )
+        .bind(user.user_id)
+        .bind(&fp)
+        .execute(&state.pool)
+        .await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Each game's `since` is anchored once, on the beat where its slug first
+    // appears; keepalives for a game already in the stored array keep its
+    // stored `since`, so the elapsed time in the Eye panel doesn't jitter
+    // with every beat. Read-modify-write is race-free in practice: exactly
+    // one agent (and thus one presence task) runs per machine.
+    let stored: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT playing::text FROM devices WHERE user_id = $1 AND fingerprint = $2",
+    )
+    .bind(user.user_id)
+    .bind(&fp)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    // First beat from a machine the server has never met (e.g. a headless
+    // CLI that authenticated via device pairing and never hit `GET /v1/me`):
+    // register it the same way `/v1/me` would — name/os come from the same
+    // headers. The register path also keeps `profiles.devices_count` truthful.
+    if stored.is_none() {
+        register_device(&state, &user, &headers).await?;
+    }
+    let old: Vec<PlayingOut> = stored
+        .flatten()
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+
+    let now = time::OffsetDateTime::now_utc();
+    let playing: Vec<PlayingOut> = body
+        .playing
+        .iter()
+        .take(MAX_PLAYING_GAMES)
+        .filter(|g| !g.slug.trim().is_empty())
+        .map(|g| {
+            let slug: String = g.slug.trim().chars().take(MAX_SLUG_CHARS).collect();
+            let since = old
+                .iter()
+                .find(|o| o.slug == slug)
+                .and_then(|o| o.since.clone())
+                .unwrap_or_else(|| {
+                    let secs = g.for_secs.unwrap_or(0).clamp(0, 365 * 86_400);
+                    format_dt(now - time::Duration::seconds(secs))
+                });
+            PlayingOut {
+                slug,
+                since: Some(since),
+            }
+        })
+        .collect();
+    let playing_json = if playing.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&playing).ok()
+    };
+
+    sqlx::query(
+        "UPDATE devices
+            SET last_seen_at = now(), closed_at = NULL, playing = $3::jsonb
+          WHERE user_id = $1 AND fingerprint = $2",
+    )
+    .bind(user.user_id)
+    .bind(&fp)
+    .bind(&playing_json)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Serialize)]

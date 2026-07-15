@@ -56,15 +56,16 @@
       </span>
     </div>
 
-    <!-- Card -->
+    <!-- Card — frosted glass matching the app shell. The `card-glass` class
+         drops the blur on Linux (webkit2gtk black-rect bug). -->
     <div
-      class="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-8 shadow-xl backdrop-blur"
+      class="card-glass rounded-2xl border border-white/[0.08] bg-zinc-950/30 p-8 shadow-[0_1px_0_0_rgba(255,255,255,0.08)_inset,0_10px_40px_-12px_rgba(0,0,0,0.75)] backdrop-blur-xl"
     >
       {#if onBack}
         <button
           type="button"
           onclick={onBack}
-          class="mb-4 inline-flex items-center gap-1 text-sm text-zinc-400 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 rounded"
+          class="mb-4 inline-flex items-center gap-1 text-sm text-zinc-400 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]/50 rounded"
         >
           <ArrowLeft size={14} />
           {$_("common.back")}

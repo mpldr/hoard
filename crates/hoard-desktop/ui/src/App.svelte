@@ -1,6 +1,7 @@
 <script lang="ts">
   import Router, { push, replace, location } from "svelte-spa-router";
   import { onMount, onDestroy } from "svelte";
+  import { fly } from "svelte/transition";
   import {
     Archive,
     Library,
@@ -16,6 +17,8 @@
     ChevronDown,
     MonitorPlay,
     Lock,
+    Bell,
+    Eye,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
@@ -38,6 +41,11 @@
   import Toaster from "./lib/components/Toaster.svelte";
   import TourOverlay from "./lib/components/TourOverlay.svelte";
   import AccountDeletedModal from "./lib/components/AccountDeletedModal.svelte";
+  import EyePanel from "./lib/components/EyePanel.svelte";
+  import NotificationsPanel from "./lib/components/NotificationsPanel.svelte";
+  import { notifications as notifStore, initServerNotifications } from "./lib/stores/notifications";
+  import { glow } from "./lib/actions/glow";
+import { tilt } from "./lib/actions/tilt";
   import { loadTourSeen, markTourSeen } from "./lib/stores/onboarding";
   import { tourActive } from "./lib/stores/tour";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
@@ -120,6 +128,42 @@
   let booted = $state(false);
   let updateModalOpen = $state(false);
 
+  // Top-right overlay buttons: notifications (bell) + live status (eye).
+  // Fixed to the top-right of the app window, above the sidebar + content.
+  // The eye dropdown shows machines online + running games; the bell is a
+  // placeholder for a future notifications panel (empty for now).
+  let eyeOpen = $state(false);
+  let notifOpen = $state(false);
+  function toggleEye() {
+    eyeOpen = !eyeOpen;
+    if (eyeOpen) notifOpen = false;
+  }
+  function toggleNotif() {
+    notifOpen = !notifOpen;
+    if (notifOpen) eyeOpen = false;
+  }
+
+  // Ticking clock (1s) for the Eye panel's elapsed-time counter.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => {
+      if (!document.hidden) now = Date.now();
+    }, 1000);
+    return () => clearInterval(id);
+  });
+
+  // Responsive sidebar: collapse to an icon-rail on narrow windows (Steam
+  // Deck, half-width tiling). The aside swaps to `.is-narrow`, which CSS uses
+  // to hide labels and center icons — declarative, no per-element branching.
+  let narrow = $state(false);
+  $effect(() => {
+    const mq = window.matchMedia("(max-width: 760px)");
+    const sync = () => (narrow = mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
+  });
+
   // Guided app tour. Opens after onboarding whenever the *identity* you signed
   // in as differs from the one the tour was last shown for — so switching
   // accounts or self-hosting a different server replays it, while an ordinary
@@ -194,9 +238,31 @@
     });
   }
 
-  let automaticMode = $state(false);
+  // Route transition: a soft fade+rise on the content viewport whenever the
+  // URL changes (outside the tour, which runs its own zoom-settle). Reuses the
+  // same WAAPI surface as the tour — no library, no remount — so route state
+  // (scroll, focus, onMount fetches) survives.
+  $effect(() => {
+    $location;
+    if (!booted || showTour) return;
+    const reduce = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    if (reduce || !mainViewport) return;
+    mainViewport.animate(
+      [{ opacity: 0 }, { opacity: 1 }],
+      { duration: 220, easing: "ease-out" },
+    );
+  });
+
+  // Both sidebar toggles are derived from `$prefs` (not local state set once
+  // on mount) so they always reflect the source of truth — whether the change
+  // came from this sidebar's own button or from Settings' mode picker. Before,
+  // picking "Solo copia de seguridad" in Settings left the sidebar Sync button
+  // stuck "on" because nothing re-derived it from the updated prefs.
+  let automaticMode = $derived($prefs?.automatic_mode ?? false);
   let automaticBusy = $state(false);
-  let globalSync = $state(false);
+  let globalSync = $derived($prefs?.global_sync ?? false);
   let globalSyncBusy = $state(false);
 
   // Self-hosted reachability escape hatch.
@@ -367,8 +433,8 @@
     // values the moment the boot blank lifts. `hydratePrefs` swallows its
     // own errors and falls back to pessimistic defaults.
     await hydratePrefs();
-    automaticMode = $prefs?.automatic_mode ?? false;
-    globalSync = $prefs?.global_sync ?? false;
+    // `automaticMode` / `globalSync` are $derived from `$prefs` above, so they
+    // populate on their own once hydratePrefs resolves — no manual seed here.
 
     // No startup scan kicked from here anymore: Rust's `restart_if_enabled`
     // (run during Tauri `setup()`) fires the first scan immediately when the
@@ -382,6 +448,10 @@
     // component's onMount) means a panel toggle doesn't tear down or
     // re-arm the listener and miss events in the gap.
     void subscribeLive();
+
+    // Listen for server-pushed notifications (hoard://notification Tauri
+    // event). No-op in browser dev — the listener just doesn't attach.
+    void initServerNotifications();
 
     // Fire-and-forget update probe. The client-update check hits GitHub and
     // needs no session at all; the server half returns `null` when there's no
@@ -445,10 +515,9 @@
       const updated = await api.setAutomaticMode(next);
       // Fan the updated Prefs out to every subscriber (Settings.svelte
       // watches `$prefs.auto_restore`, which `set_automatic_mode` cascades
-      // to true). Without this, the Settings toggle lies until the user
-      // reloads the page.
+      // to true). `automaticMode` is $derived from `$prefs`, so it re-flows
+      // from this same set — no separate local assignment needed.
       prefs.set(updated);
-      automaticMode = updated.automatic_mode;
       if (automaticMode) {
         toastSuccess($_("automatic.toggled_on"));
         // The Rust scheduler (`set_automatic_mode` → `automatic::start`) fires
@@ -472,7 +541,6 @@
       const next = !globalSync;
       const updated = await api.setGlobalSync(next);
       prefs.set(updated);
-      globalSync = updated.global_sync;
       if (globalSync) {
         toastSuccess($_("sync.toggled_on"));
       } else {
@@ -643,11 +711,11 @@
 {:else if isAppRoute}
   <div class="flex h-full">
     <aside
-      class="sidebar-glass flex w-60 shrink-0 flex-col border-r border-white/[0.06] bg-gradient-to-b from-zinc-950/80 via-zinc-950/60 to-zinc-900/40 backdrop-blur-sm shadow-[inset_-1px_0_0_0_rgba(255,255,255,0.04)]"
+      class="sidebar-glass flex {narrow ? 'is-narrow' : 'w-60'} shrink-0 flex-col border-r border-white/[0.08] bg-gradient-to-b from-zinc-950/70 via-zinc-950/45 to-zinc-900/30 backdrop-blur-xl shadow-[inset_-1px_0_0_0_rgba(255,255,255,0.06)]"
     >
       <div class="flex items-center gap-2 px-4 py-4">
         <Logo size={36} class="shrink-0 rounded-lg" />
-        <div class="min-w-0 flex-1">
+        <div class="hide-narrow min-w-0 flex-1">
           <div class="font-display text-xl font-semibold leading-none text-zinc-50">
             Hoard
           </div>
@@ -668,7 +736,7 @@
           onclick={toggleActivityFeed}
           aria-label={$_("activity.toggle_label")}
           title={$_("activity.toggle_label")}
-          class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-colors {$prefs?.live_activity_visible ?? true
+          class="hide-narrow flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-colors {$prefs?.live_activity_visible ?? true
             ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
             : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-100'}"
         >
@@ -689,33 +757,33 @@
                   values: { latest: updates?.server?.latest ?? "?" },
                 })}
             aria-label={$_("updates.button_label")}
-            class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-300 transition-colors hover:bg-amber-500/20"
+            class="hide-narrow flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-300 transition-colors hover:bg-amber-500/20"
           >
             <AlertCircle size={14} />
           </button>
         {/if}
+
       </div>
 
       <!-- Shared button markup for top-level links and indented group
            children, so the two render paths can't drift apart. -->
-      {#snippet navLink(item: NavLink, indented: boolean)}
+{#snippet navLink(item: NavLink, indented: boolean)}
         {@const active = $location === item.route}
-        <button
-          type="button"
-          data-tour-route={item.route}
-          aria-label={$_(item.labelKey)}
-          aria-current={active ? "page" : undefined}
-          onclick={() => push(item.route)}
-          class="group flex w-full items-center gap-3 rounded-md border-l-2 py-2 text-sm transition-colors duration-150
-            {indented ? 'pl-9 pr-3' : 'px-3'}
-            {active
-            ? 'border-emerald-500 bg-zinc-800/50 text-zinc-50'
-            : 'border-transparent text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-100'}"
-        >
-          <item.icon size={indented ? 16 : 18} />
-          <span>{$_(item.labelKey)}</span>
-        </button>
-      {/snippet}
+          <button
+            type="button"
+            data-tour-route={item.route}
+            aria-label={$_(item.labelKey)}
+            title={$_(item.labelKey)}
+            aria-current={active ? "page" : undefined}
+            onclick={() => push(item.route)}
+            use:glow
+            use:tilt
+            class="glow tilt group flex w-full items-center gap-3 rounded-md border-l-2 py-2 text-sm transition-colors duration-150 {indented ? 'pl-9 pr-3' : 'px-3'} {active ? 'border-emerald-500 bg-zinc-800/50 text-zinc-50' : 'border-transparent text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-100'}"
+          >
+            <item.icon size={indented ? 16 : 18} />
+            <span class="hide-narrow">{$_(item.labelKey)}</span>
+          </button>
+{/snippet}
 
       <nav class="flex-1 space-y-1 px-3 py-2">
         {#each navEntries as entry (entry.kind === "group" ? entry.id : entry.route)}
@@ -736,12 +804,14 @@
                 aria-label={$_(entry.labelKey)}
                 aria-current={active ? "page" : undefined}
                 onclick={() => push(entry.route)}
+                use:glow
+                use:tilt
                 title={fs?.state === "trial"
                   ? $_("nav.trial_days_left", { values: { n: featureDaysLeft(fs) } })
                   : fs?.state === "trial_available"
                     ? $_("pro.trial_available", { values: { n: fs.days } })
                     : undefined}
-                class="group flex w-full items-center gap-3 rounded-md border-l-2 px-3 py-2 text-sm transition-colors duration-150
+                class="glow tilt group flex w-full items-center gap-3 rounded-md border-l-2 px-3 py-2 text-sm transition-colors duration-150
                   {active
                   ? 'border-emerald-500 bg-zinc-800/50 text-zinc-50'
                   : 'border-transparent text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-100'}"
@@ -780,13 +850,14 @@
               aria-expanded={open}
               aria-label={$_(entry.labelKey)}
               onclick={toggleSaves}
-              class="group flex w-full items-center gap-3 rounded-md border-l-2 border-transparent px-3 py-2 text-sm text-zinc-400 transition-colors duration-150 hover:bg-zinc-800/40 hover:text-zinc-100"
+              use:glow
+              class="glow group flex w-full items-center gap-3 rounded-md border-l-2 border-transparent px-3 py-2 text-sm text-zinc-400 transition-colors duration-150 hover:bg-zinc-800/40 hover:text-zinc-100"
             >
               <entry.icon size={18} />
-              <span class="flex-1 text-left">{$_(entry.labelKey)}</span>
+              <span class="hide-narrow flex-1 text-left">{$_(entry.labelKey)}</span>
               <ChevronDown
                 size={16}
-                class="shrink-0 transition-transform duration-150 {open
+                class="hide-narrow shrink-0 transition-transform duration-150 {open
                   ? ''
                   : '-rotate-90'}"
               />
@@ -809,17 +880,19 @@
       <div class="border-t border-zinc-800/60 px-3 py-3 space-y-3">
         <!-- Compact storage bar (same colour scale as the dashboard's
              QuotaBar). Hidden until auth hydrates. -->
-        <QuotaMini />
+        {#if !narrow}<QuotaMini />{/if}
         <!-- Cloud account chip: avatar + plan (+ "Mejorar plan" when on Free),
              routing to /account. The signed-out "Iniciar sesión" entry now
              lives at the top of the nav, so we only render this when signed
              in to avoid a duplicate button. -->
-        {#if $cloud.hydrated && $cloud.account}
+        {#if $cloud.hydrated && $cloud.account && !narrow}
             <div class="flex items-center gap-2">
               <button
                 type="button"
                 onclick={() => push("/account")}
-                class="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1.5 text-left transition-colors hover:border-zinc-700 hover:bg-zinc-800/60"
+                use:glow
+                use:tilt
+                class="glow tilt flex min-w-0 flex-1 items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1.5 text-left transition-colors hover:border-zinc-700 hover:bg-zinc-800/60"
                 title={$_("sidebar.account_tooltip")}
               >
                 {#if $cloud.account.avatar_url && !avatarFailed}
@@ -863,14 +936,16 @@
           type="button"
           onclick={toggleGlobalSync}
           disabled={globalSyncBusy}
-          class="flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors {globalSync
+          use:glow
+          use:tilt
+          class="glow tilt flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors {globalSync
             ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
             : 'border-rose-500/40 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25'} disabled:cursor-wait disabled:opacity-60"
           aria-label={$_("sync.aria_toggle")}
           title={$_("sync.help_tooltip")}
         >
           <RefreshCw size={16} class={globalSync ? "animate-pulse" : ""} />
-          <span>
+          <span class="hide-narrow">
             {$_("sync.title")} ·
             {globalSync ? $_("sync.on") : $_("sync.off")}
           </span>
@@ -880,7 +955,9 @@
           data-tour="automatic"
           onclick={toggleAutomatic}
           disabled={automaticBusy}
-          class="flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors {automaticMode
+          use:glow
+          use:tilt
+          class="glow tilt flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors {automaticMode
             ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
             : 'border-rose-500/40 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25'} disabled:cursor-wait disabled:opacity-60"
           aria-label={$_("automatic.aria_toggle")}
@@ -890,7 +967,7 @@
             size={16}
             class={$automaticState.kind === "idle" ? "" : "animate-pulse"}
           />
-          <span>
+          <span class="hide-narrow">
             {#if automaticPhaseLabel}
               {automaticPhaseLabel}
             {:else}
@@ -899,7 +976,7 @@
             {/if}
           </span>
         </button>
-        <p class="px-1 text-[11px] leading-tight text-zinc-500">
+        <p class="hide-narrow px-1 text-[11px] leading-tight text-zinc-500">
           {automaticMode
             ? $_("automatic.subtitle_on")
             : $_("automatic.subtitle_off")}
@@ -955,6 +1032,57 @@
       </div>
     </main>
   </div>
+
+  <!-- Top-right overlay: eye (live status) + bell (notifications), fixed to
+       the top-right corner of the app window. Above both the sidebar and the
+       content area. The eye opens a dropdown with machines + running games;
+       the bell opens the notifications panel (server + app messages). -->
+  <div class="pointer-events-none fixed right-8 top-3 z-[60] flex items-center gap-2">
+    <button
+      type="button"
+      onclick={toggleNotif}
+      aria-label={$_("notifications.title")}
+      title={$_("notifications.title")}
+      aria-expanded={notifOpen}
+      class="pointer-events-auto relative flex h-8 w-8 items-center justify-center rounded-lg border transition-colors {notifOpen
+        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+        : 'border-white/[0.08] bg-zinc-950/60 text-zinc-400 backdrop-blur-md hover:text-zinc-100'}"
+    >
+      <Bell size={15} />
+      {#if $notifStore.length > 0}
+        <span class="absolute -right-1 -top-1 flex h-3 min-w-3 items-center justify-center rounded-full bg-emerald-500 px-1 text-[9px] font-bold text-emerald-950 ring-2 ring-zinc-950">
+          {$notifStore.length}
+        </span>
+      {/if}
+    </button>
+    <button
+      type="button"
+      onclick={toggleEye}
+      aria-label={$_("eye.title")}
+      title={$_("eye.title")}
+      aria-expanded={eyeOpen}
+      class="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-lg border transition-colors {eyeOpen
+        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+        : 'border-white/[0.08] bg-zinc-950/60 text-zinc-400 backdrop-blur-md hover:text-zinc-100'}"
+    >
+      <Eye size={15} />
+    </button>
+  </div>
+
+  <!-- Eye dropdown — anchored below the eye button, top-right. -->
+  {#if eyeOpen}
+    <div
+      class="fixed right-8 top-14 z-[61] w-72 overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/95 shadow-xl backdrop-blur-xl"
+      transition:fly={{ y: -8, duration: 180 }}
+    >
+      <EyePanel {now} />
+    </div>
+  {/if}
+
+  <!-- Notifications dropdown — anchored below the bell, top-right. -->
+  {#if notifOpen}
+    <NotificationsPanel />
+  {/if}
 {:else}
   <!-- Wizard routes render full-screen, no sidebar. -->
   <div class="h-full overflow-y-auto">

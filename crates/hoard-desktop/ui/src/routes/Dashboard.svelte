@@ -8,6 +8,7 @@
    */
   import { onMount } from "svelte";
   import { push } from "svelte-spa-router";
+  import { tilt } from "../lib/actions/tilt";
   import {
     LogOut,
     PlayCircle,
@@ -101,12 +102,16 @@
           label: $_("dashboard.pill_saved_v", { values: { version: save.last_version_num } }),
           icon: Check,
           klass: "text-emerald-400",
+          rail: "bg-emerald-500",
+          tint: "bg-emerald-500/[0.04]",
         };
       }
       return {
         label: $_("dashboard.pill_no_backup"),
         icon: CircleDot,
         klass: "text-zinc-400",
+        rail: "bg-zinc-600",
+        tint: "",
       };
     }
     switch (a.state) {
@@ -115,6 +120,8 @@
           label: $_("dashboard.pill_running"),
           icon: PlayCircle,
           klass: "text-sky-400",
+          rail: "bg-sky-500",
+          tint: "bg-sky-500/[0.05]",
         };
       case "scheduled": {
         const secs = Math.max(
@@ -125,6 +132,8 @@
           label: $_("dashboard.pill_scheduled", { values: { seconds: secs } }),
           icon: Clock,
           klass: "text-amber-400",
+          rail: "bg-amber-500",
+          tint: "bg-amber-500/[0.04]",
         };
       }
       case "uploading":
@@ -132,6 +141,8 @@
           label: $_("dashboard.pill_uploading"),
           icon: UploadCloud,
           klass: "text-amber-400",
+          rail: "bg-amber-500",
+          tint: "bg-amber-500/[0.05]",
         };
       case "ok":
         return {
@@ -140,33 +151,42 @@
             : $_("dashboard.pill_saved"),
           icon: Check,
           klass: "text-emerald-400",
+          rail: "bg-emerald-500",
+          tint: "bg-emerald-500/[0.04]",
         };
       case "partial":
-        // Backed up, but the plan's per-save cap dropped older files. Amber
-        // (warning, not error) — sync works, the plan just isn't big enough.
         return {
           label: $_("dashboard.pill_partial"),
           icon: AlertTriangle,
           klass: "text-amber-400",
+          rail: "bg-amber-500",
+          tint: "bg-amber-500/[0.04]",
         };
       case "failed":
         return {
           label: a.will_retry ? $_("dashboard.pill_failed_retry") : $_("dashboard.pill_failed"),
           icon: AlertTriangle,
           klass: "text-red-400",
+          rail: "bg-red-500",
+          tint: "bg-red-500/[0.05]",
         };
       default:
-        // Same fallback as the no-activity branch: prefer a real "v3 saved"
-        // over "Inactivo" whenever the server already proved this save has
-        // backups. Keeps the Dashboard honest after a restart.
         if (save.last_version_num != null) {
           return {
             label: $_("dashboard.pill_saved_v", { values: { version: save.last_version_num } }),
             icon: Check,
             klass: "text-emerald-400",
+            rail: "bg-emerald-500",
+            tint: "bg-emerald-500/[0.04]",
           };
         }
-        return { label: $_("dashboard.pill_no_backup"), icon: CircleDot, klass: "text-zinc-400" };
+        return {
+          label: $_("dashboard.pill_no_backup"),
+          icon: CircleDot,
+          klass: "text-zinc-400",
+          rail: "bg-zinc-600",
+          tint: "",
+        };
     }
   }
 </script>
@@ -182,15 +202,15 @@
         {/if}
       </h1>
       <p class="mt-2 flex items-center gap-2.5 text-sm text-zinc-400">
-        <span class="relative inline-flex h-2.5 w-2.5 shrink-0">
+        <span class="relative inline-flex h-3 w-3 shrink-0">
           {#if $status.running}
             <span
-              class="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/60"
+              class="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/70"
             ></span>
           {/if}
           <span
-            class="relative inline-flex h-2.5 w-2.5 rounded-full {$status.running
-              ? 'bg-emerald-400'
+            class="relative inline-flex h-3 w-3 rounded-full {$status.running
+              ? 'bg-emerald-400 shadow-[0_0_8px_2px_rgba(16,185,129,0.5)]'
               : 'bg-zinc-600'}"
           ></span>
         </span>
@@ -222,7 +242,7 @@
 
   {#if loading}
     <Card>
-      <div class="py-12 text-center text-sm text-zinc-400">{$_("common.loading")}</div>
+      <div class="shimmer py-12 text-center text-sm text-zinc-400">{$_("common.loading")}</div>
     </Card>
   {:else if saves.length === 0}
     <Card>
@@ -245,13 +265,21 @@
       {#each saves as save (save.save_id)}
         {@const pill = pillFor(save)}
         <div
-          class="group relative flex items-center gap-4 rounded-xl border border-white/[0.06] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25 hover:bg-zinc-900/50"
+          class="tilt group relative flex items-center gap-4 overflow-hidden rounded-xl border border-white/[0.08] {pill.tint} p-4 pl-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+          use:tilt
         >
+          <!-- Status rail: a 3px vertical bar on the left edge, coloured by
+               the save's live state. Makes the list scanable at a glance —
+               green=ok, amber=scheduled, sky=running, red=failed. -->
+          <span
+            class="absolute inset-y-0 left-0 w-[3px] {pill.rail}"
+            aria-hidden="true"
+          ></span>
           <Cover
             slug={save.game_slug}
             name={save.game_slug}
-            class="h-11 w-11 shrink-0 rounded-xl"
-            initialClass="text-lg"
+            class="h-14 w-14 shrink-0 rounded-2xl"
+            initialClass="text-xl"
           />
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
@@ -272,14 +300,22 @@
               {/if}
             </div>
             <p
-              class="mt-1 truncate font-mono text-xs text-zinc-600"
+              class="mt-1 flex items-center gap-1.5 truncate text-xs text-zinc-600"
               title={save.local_path}
             >
-              {save.local_path}
+              <span class="inline-block h-1 w-1 shrink-0 rounded-full bg-zinc-700"></span>
+              <span class="truncate font-mono">{save.local_path}</span>
             </p>
           </div>
           <div class="flex shrink-0 items-center gap-1.5 text-xs font-medium {pill.klass}">
-            <pill.icon size={14} />
+            {#if pill.klass.includes("sky") || pill.klass.includes("amber")}
+              <span class="relative flex h-2 w-2">
+                <span class="absolute inline-flex h-full w-full animate-ping rounded-full {pill.rail} opacity-60"></span>
+                <span class="relative inline-flex h-2 w-2 rounded-full {pill.rail}"></span>
+              </span>
+            {:else}
+              <pill.icon size={14} />
+            {/if}
             <span class="whitespace-nowrap">{pill.label}</span>
           </div>
           <div class="flex shrink-0 items-center gap-1">

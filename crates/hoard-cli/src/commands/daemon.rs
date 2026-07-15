@@ -142,6 +142,11 @@ pub async fn run(backup_only: bool) -> Result<()> {
     // (shares the token via Arc, so the periodic refresh reaches both).
     let live_client = active.client.clone();
 
+    // Presence heartbeater (Eye panel): the daemon reports this machine as
+    // online + what it's playing, same as the desktop. Gates itself to Cloud
+    // internally; against self-hosted it stays silent.
+    let (presence, _presence_task) = hoard_agent::presence::spawn(live_client.clone());
+
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
     let (handle, _task) = agent::spawn(active.client, build_config(backup_only), saves, tx);
 
@@ -168,11 +173,24 @@ pub async fn run(backup_only: bool) -> Result<()> {
         tokio::select! {
             _ = shutdown_signal() => {
                 println!("\nstopping…");
+                // Final presence beat first (bounded wait inside): flips this
+                // device offline on the other machines' Eye panels right away.
+                presence.closing().await;
                 let _ = handle.shutdown().await;
                 break;
             }
             ev = rx.recv() => {
                 let Some(ev) = ev else { break };
+                // Presence: mirror game transitions to the heartbeater.
+                match &ev {
+                    AgentEvent::GameStarted { game_slug, .. } => {
+                        presence.game_started(game_slug.clone());
+                    }
+                    AgentEvent::GameStopped { game_slug, .. } => {
+                        presence.game_stopped(game_slug.clone());
+                    }
+                    _ => {}
+                }
                 if let Some(line) = render(&ev) {
                     println!("{line}");
                 }
@@ -246,7 +264,7 @@ type Setup = (Active, CliState, std::path::PathBuf, Vec<WatchedSave>);
 /// context) and fails early if there's no login or nothing tracked on this
 /// machine.
 async fn setup() -> Result<Setup> {
-    let active = session::resolve().await?;
+    let active = session::resolve_resilient().await?;
 
     let (state, state_path) = CliState::load_default()?;
     let saves = library::watched_saves_from_state(&state);
@@ -314,6 +332,9 @@ fn render(ev: &AgentEvent) -> Option<String> {
         } => format!("✗  {game_slug} auto-restore failed: {error}"),
         SaveConflictsBackedUp { .. } => {
             "⚠  conflict: local copy saved before applying the remote".to_string()
+        }
+        RestoreDeferred { game_slug, .. } => {
+            format!("⏸  {game_slug} update ready — waiting for the game to close")
         }
         _ => return None,
     })

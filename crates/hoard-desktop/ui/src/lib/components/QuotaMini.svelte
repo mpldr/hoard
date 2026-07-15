@@ -21,6 +21,9 @@
   import { _ } from "svelte-i18n";
   import { auth, refreshQuota } from "../stores/auth";
   import { cloud, refreshCloud } from "../stores/cloud";
+  import CountUp from "./CountUp.svelte";
+  import { glow } from "../actions/glow";
+  import { tilt } from "../actions/tilt";
 
   function fmtBytes(n: number): string {
     if (n < 1024) return `${n} B`;
@@ -102,7 +105,7 @@
 </script>
 
 {#if src.show}
-  <div class="space-y-1.5 px-1" title={$_("quota.label")}>
+  <div class="glow tilt space-y-1.5 rounded-md px-1 py-0.5" title={$_("quota.label")} use:glow use:tilt>
     <div class="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
       <span class="truncate">
         {#if capped}
@@ -115,7 +118,7 @@
       </span>
       {#if capped}
         <span class="shrink-0 font-semibold tabular-nums {pctClass}">
-          {pct.toFixed(1)}%
+          <CountUp value={pct} decimals={1} suffix="%" />
         </span>
       {/if}
     </div>

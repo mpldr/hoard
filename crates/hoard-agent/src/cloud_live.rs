@@ -47,6 +47,12 @@ const CONNECTION_MAX_SECS: u64 = 45 * 60;
 const BACKOFF_MIN_SECS: u64 = 2;
 const BACKOFF_MAX_SECS: u64 = 60;
 
+/// Cadencia del modo aparcado: sin sesión utilizable, el realtime solo relee el
+/// fichero de sesión esperando un login nuevo. Espeja el recheck del refresher
+/// periódico del daemon (session.rs::RELOGIN_RECHECK_EVERY) — mismo evento, no
+/// tiene sentido enterarse a ritmos distintos.
+const RELOGIN_RECHECK_SECS: u64 = 5 * 60;
+
 /// Ajustes del empuje Cloud.
 pub struct Config {
     /// Periodo del poll de respaldo a `/v1/cloud/sync`.
@@ -163,8 +169,13 @@ async fn run_pull(
     }
 }
 
-/// Bucle externo de reconexión del WebSocket. Sale solo si se pierde la sesión
-/// Cloud; cualquier otro fallo hace backoff y reintenta.
+/// Bucle externo de reconexión del WebSocket. Nunca termina por sí solo: si la
+/// sesión Cloud desaparece o GoTrue revoca la familia de tokens, en vez de
+/// morir se aparca vigilando el fichero de sesión (sin red) hasta que un
+/// `hoard login` — aquí o en el desktop, comparten fichero — deje una sesión
+/// nueva, y entonces reconecta. Antes retornaba: el refresher periódico sí
+/// readoptaba el re-login (Expired→Normal) pero el realtime ya no existía, y
+/// el daemon se quedaba en latencia de poll (≤60s) hasta reiniciarlo.
 async fn realtime_loop(kick_tx: mpsc::Sender<()>) {
     let mut backoff = BACKOFF_MIN_SECS;
     loop {
@@ -175,9 +186,23 @@ async fn realtime_loop(kick_tx: mpsc::Sender<()>) {
                 backoff = BACKOFF_MIN_SECS;
             }
             Ok(false) => {
-                // Sin sesión Cloud: nada que escuchar.
-                tracing::info!("cloud-live: realtime parado (sin sesión Cloud)");
-                return;
+                // Sin sesión utilizable (ausente o revocada). Vigila el disco
+                // sin tocar red: replayar un token revocado cada pocos minutos
+                // contra GoTrue es justo el ruido que se le quitó al refresher.
+                let dead = cloud_auth::load_session()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.refresh);
+                tracing::info!("cloud-live: realtime en pausa — esperando un login nuevo");
+                loop {
+                    sleep(Duration::from_secs(RELOGIN_RECHECK_SECS)).await;
+                    let disk = cloud_auth::load_session().ok().flatten();
+                    if session_renewed(dead.as_deref(), disk.as_ref()) {
+                        break;
+                    }
+                }
+                tracing::info!("cloud-live: sesión nueva en disco — realtime reconecta");
+                backoff = BACKOFF_MIN_SECS;
             }
             Err(e) => {
                 tracing::debug!(error = %format!("{e:#}"), "cloud-live: conexión realtime cortada, reintento");
@@ -188,9 +213,21 @@ async fn realtime_loop(kick_tx: mpsc::Sender<()>) {
     }
 }
 
+/// ¿Lo que hay en disco ya no es la sesión que murió? Solo entonces merece
+/// reconectar: un refresh token distinto (o una sesión donde no había ninguna)
+/// es un login nuevo; la misma sesión muerta seguiría rebotando en el join.
+fn session_renewed(dead: Option<&str>, disk: Option<&cloud_auth::Session>) -> bool {
+    let Some(s) = disk else { return false };
+    if s.refresh.trim().is_empty() {
+        return false;
+    }
+    dead != Some(s.refresh.as_str())
+}
+
 /// Un ciclo de conexión: conecta, se une al canal `saves` y bombea heartbeats y
 /// cambios hasta que el socket muere o vence el tope de vida. `Ok(true)` = fin
-/// limpio (reconecta), `Ok(false)` = sin sesión (para).
+/// limpio (reconecta), `Ok(false)` = sin sesión utilizable, ausente o revocada
+/// (el caller se aparca a esperar un login nuevo).
 async fn connect_once(kick_tx: &mpsc::Sender<()>) -> anyhow::Result<bool> {
     let sess = match cloud_auth::load_session()? {
         Some(s) => s,
@@ -274,11 +311,18 @@ async fn connect_once(kick_tx: &mpsc::Sender<()>) -> anyhow::Result<bool> {
                             // JWT rechazado al unirse: refresca (queda en disco) y
                             // reconecta con el token rotado. Si el refresh está
                             // terminalmente caducado, deja de intentar.
+                            //
+                            // Vía `refresh_freshest`, nunca con la `sess` de esta
+                            // conexión: se capturó al conectar y para cuando llega
+                            // un TokenError puede tener hasta CONNECTION_MAX_SECS,
+                            // tiempo de sobra para que el refresher periódico la
+                            // haya rotado. Replayarla sería reuse-detection, y GoTrue
+                            // responde revocando la familia entera de tokens.
                             tracing::debug!("cloud-live: token rechazado, refresco");
-                            match cloud_auth::refresh_and_store(&sess).await {
+                            match cloud_auth::refresh_freshest().await {
                                 Ok(_) => anyhow::bail!("refresh forzó reconexión"),
                                 Err(e) if e.downcast_ref::<cloud_auth::RefreshTokenStale>().is_some() => {
-                                    tracing::info!("cloud-live: refresh token revocado — realtime se detiene");
+                                    tracing::info!("cloud-live: refresh token revocado — realtime se aparca hasta un login nuevo");
                                     return Ok(false);
                                 }
                                 Err(_) => anyhow::bail!("refresh forzó reconexión"),
@@ -347,5 +391,41 @@ fn classify(txt: &str) -> Option<Action> {
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_auth::Session;
+
+    fn disk(refresh: &str) -> Session {
+        Session {
+            server_url: "https://api.hoard.services".into(),
+            access: "jwt".into(),
+            refresh: refresh.into(),
+        }
+    }
+
+    /// El aparcado solo despierta ante una sesión que NO sea la muerta: la
+    /// misma que reventó el join no puede hacer nada mejor la segunda vez.
+    #[test]
+    fn session_renewed_ignores_the_dead_session_and_wakes_on_a_new_one() {
+        // Sin nada en disco, o con un refresh vacío: sigue esperando.
+        assert!(!session_renewed(Some("rt-dead"), None));
+        assert!(!session_renewed(Some("rt-dead"), Some(&disk("  "))));
+        // La misma sesión muerta sigue en disco: sigue esperando.
+        assert!(!session_renewed(Some("rt-dead"), Some(&disk("rt-dead"))));
+        // Un login nuevo (refresh distinto) despierta.
+        assert!(session_renewed(Some("rt-dead"), Some(&disk("rt-new"))));
+    }
+
+    /// Caso "no había sesión al aparcar" (logout en caliente): cualquier
+    /// sesión con refresh no vacío cuenta como login nuevo.
+    #[test]
+    fn session_renewed_wakes_on_any_session_when_none_was_dead() {
+        assert!(!session_renewed(None, None));
+        assert!(!session_renewed(None, Some(&disk(""))));
+        assert!(session_renewed(None, Some(&disk("rt-fresh"))));
     }
 }

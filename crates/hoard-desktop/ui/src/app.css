@@ -1,14 +1,13 @@
 @import "tailwindcss";
 
-/* The Pro overlay UI (Screen / Overlay / Wrapped) is copied in from the private
-   hoard-pro repo at build time and lives under `src/lib/pro/`, which is
-   .gitignored. Tailwind v4's automatic content detection skips .gitignored
-   paths, so every class used ONLY by the Pro surfaces (the note's
-   `bg-amber-200/95`, the toolbar `z-[100000]` / shadow, the resize handle,
-   etc.) was being dropped from the bundle — making notes invisible and the
-   overlay toolbar render unstyled and un-clickable. Register the directory
-   explicitly so those classes are generated. In the community build the
-   directory doesn't exist; a glob that matches nothing is a harmless no-op. */
+/* The Pro overlay UI (Screen / Overlay / Wrapped) lives under `src/lib/pro/`
+   and is part of this repo. (It used to be copied in from a private hoard-pro
+   repo and was .gitignored — that's no longer the case; the directory is
+   tracked normally now.) Tailwind v4's automatic content detection picks it up
+   on its own; we register it explicitly anyway as belt-and-suspenders so any
+   class used ONLY by the Pro surfaces (the note's `bg-amber-200/95`, the
+   toolbar `z-[100000]` / shadow, the resize handle, etc.) is always generated.
+   A glob that matches nothing is a harmless no-op. */
 @source "./lib/pro/**/*.{svelte,ts}";
 
 /* ====================================================================== */
@@ -83,25 +82,13 @@ body,
 }
 
 /* ---- Base atmosphere ------------------------------------------------- */
-/* A static obsidian field with two faint emerald light sources, plus a
-   fine grain overlay. Depth + texture is what separates a designed dark
-   UI from the default "solid #18181b" look. */
+/* WOLED: a pure #000 canvas. No top glow — the accent (emerald) only shows on
+   real surfaces (buttons, borders, the gem), so the black stays truly off and
+   never blinks. The grain overlay adds a touch of paper tooth. */
 body {
   font-family: var(--font-sans);
   color: var(--color-fg);
-  background-color: oklch(0.155 0.006 165);
-  background-image:
-    radial-gradient(
-      120% 90% at 12% -8%,
-      oklch(0.62 0.13 162 / 14%) 0%,
-      transparent 55%
-    ),
-    radial-gradient(
-      90% 80% at 108% 8%,
-      oklch(0.55 0.1 200 / 10%) 0%,
-      transparent 50%
-    );
-  background-attachment: fixed;
+  background-color: oklch(0 0 0);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   font-feature-settings: "cv01", "cv03", "ss03";
@@ -169,6 +156,16 @@ html.is-linux .sidebar-glass {
   -webkit-backdrop-filter: none;
 }
 
+/* Same webkit2gtk black-rect bug as the sidebar: a `backdrop-filter` element
+   repainting over translucent layers (here the card surface over the Wrapped
+   surface) paints a black rectangle on hover. The cards use `backdrop-blur-xl`
+   via the `.card-glass` class, so drop it on Linux only — the semi-opaque
+   surface already reads as a panel there. WebView2 / WKWebView keep the frost. */
+html.is-linux .card-glass {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 /* ---- Motion --------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -177,4 +174,239 @@ html.is-linux .sidebar-glass {
     animation-duration: 0.001ms !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ====================================================================== */
+/*  Theme variants                                                        */
+/*  Themes re-point Tailwind's palette variables (zinc / white / emerald)  */
+/*  plus the custom --color-* tokens under a [data-theme] scope on <html>. */
+/*  Because every component uses raw Tailwind utilities (bg-zinc-950,      */
+/*  text-emerald-300, …) that read these variables, re-skinning the whole  */
+/*  app needs no markup edits — values just resolve differently per theme. */
+/*  Obsidian is the un-overridden default (Tailwind zinc + the body        */
+/*  atmosphere above). `:root[data-theme=…]` wins the specificity duel      */
+/*  against Tailwind's emitted `:root`.                                    */
+/* ====================================================================== */
+
+/* Quartz — light, frosted paper. The zinc scale is inverted to warm paper;
+   white → ink so opacity tints read as dark hairlines; emerald darkened for
+   contrast on light. Crucially zinc-950 (the card surface) is a mid-light tint
+   DARKER than the body bg, so translucent cards read as frosted glass with body
+   colour showing through — not a flat wash. */
+:root[data-theme="quartz"] {
+  color-scheme: light;
+  --color-bg: oklch(0.975 0.005 95);
+  --color-bg-elev: oklch(0.94 0.007 95);
+  --color-fg: oklch(0.2 0.012 95);
+  --color-fg-muted: oklch(0.48 0.012 95);
+  --color-border: oklch(0.2 0.012 95 / 12%);
+  --color-accent: oklch(0.48 0.15 162);
+  --color-accent-hover: oklch(0.42 0.14 162);
+  --color-zinc-50: oklch(0.2 0.012 95);
+  --color-zinc-100: oklch(0.28 0.012 95);
+  --color-zinc-200: oklch(0.36 0.012 95);
+  --color-zinc-300: oklch(0.44 0.012 95);
+  --color-zinc-400: oklch(0.52 0.012 95);
+  --color-zinc-500: oklch(0.6 0.011 95);
+  --color-zinc-600: oklch(0.7 0.01 95);
+  --color-zinc-700: oklch(0.8 0.009 95);
+  --color-zinc-800: oklch(0.88 0.008 95);
+  --color-zinc-900: oklch(0.92 0.007 95);
+  --color-zinc-950: oklch(0.9 0.007 95);
+  --color-white: oklch(0.2 0.012 95);
+  --color-emerald-50: oklch(0.985 0.01 160);
+  --color-emerald-300: oklch(0.4 0.13 162);
+  --color-emerald-400: oklch(0.44 0.14 162);
+  --color-emerald-500: oklch(0.5 0.15 162);
+  --color-emerald-600: oklch(0.48 0.15 162);
+  --color-emerald-700: oklch(0.42 0.14 162);
+}
+:root[data-theme="quartz"] body {
+  background-color: oklch(0.975 0.005 95);
+  background-image:
+    radial-gradient(120% 90% at 12% -8%, oklch(0.5 0.1 162 / 14%) 0%, transparent 55%),
+    radial-gradient(90% 80% at 108% 8%, oklch(0.72 0.07 95 / 12%) 0%, transparent 50%);
+}
+:root[data-theme="quartz"] select,
+:root[data-theme="quartz"] select option {
+  color: #1c1a17;
+  background-color: #f3f0ea;
+}
+
+/* ====================================================================== */
+/*  Motion & effects                                                        */
+/* ====================================================================== */
+
+/* Tilt 3D — the `.tilt` class consumes CSS vars set by the `tilt` action
+   (lib/actions/tilt.ts). The transform is kept here (not in JS) so teardown is
+   cheap and the transition survives re-renders. Glow uses the theme accent.
+   No `transform-style: preserve-3d` — it caused compositing issues on WebView2
+   (Windows) where the glow pseudo-element didn't render. No `mix-blend-mode`
+   for the same reason — a plain opacity fade is cross-platform safe. */
+.tilt {
+  transform: perspective(700px) rotateX(var(--tilt-rx, 0deg))
+    rotateY(var(--tilt-ry, 0deg));
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+.tilt::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 220ms ease;
+  background: radial-gradient(
+    140px circle at var(--tilt-glow-x, 50%) var(--tilt-glow-y, 50%),
+    var(--color-accent) 0%,
+    transparent 60%
+  );
+}
+.tilt:hover::after {
+  opacity: 0.18;
+}
+
+/* Glow-only — same cursor-following glow as .tilt but WITHOUT the 3D
+   rotation. Used by buttons and small interactive elements where a tilt
+   would feel wrong but the light-follow is still nice. The `glow` action
+   (lib/actions/glow.ts) sets the same --tilt-glow-x/y variables. */
+.glow {
+  position: relative;
+  overflow: hidden;
+}
+.glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease;
+  background: radial-gradient(
+    100px circle at var(--tilt-glow-x, 50%) var(--tilt-glow-y, 50%),
+    oklch(1 0 0 / 0.18) 0%,
+    transparent 60%
+  );
+}
+.glow:hover::after {
+  opacity: 1;
+}
+
+/* Ripple — host clips the spawned span to the button's rounded corners. */
+.ripple-host {
+  position: relative;
+  overflow: hidden;
+}
+.ripple {
+  position: absolute;
+  border-radius: 9999px;
+  background: oklch(1 0 0 / 0.22);
+  transform: scale(0);
+  animation: hoard-ripple 650ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  pointer-events: none;
+}
+@keyframes hoard-ripple {
+  to {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+
+/* Shimmer — skeleton sweep for loading placeholders. */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    oklch(1 0 0 / 0.06) 45%,
+    transparent 70%
+  );
+  background-size: 220% 100%;
+  animation: hoard-shimmer 1.5s linear infinite;
+}
+@keyframes hoard-shimmer {
+  from {
+    background-position: 220% 0;
+  }
+  to {
+    background-position: -220% 0;
+  }
+}
+
+/* Theme crossfade — toggled on <html> for ~300ms around a theme switch so the
+   palette swap reads as a fade rather than a hard cut. */
+:root.theme-anim,
+:root.theme-anim * {
+  transition: background-color 280ms ease, border-color 280ms ease,
+    color 280ms ease, fill 280ms ease, stroke 280ms ease;
+}
+
+/* Reduced motion already kills transitions/animations globally (above); the
+   .tilt transform is also flattened there via the wildcard rule. */
+
+/* Responsive sidebar — icon-rail on narrow windows (Steam Deck, tiling).
+   Hides `.hide-narrow` labels and centers the nav icons so the collapsed
+   rail reads as a stack of glyphs rather than a clipped sidebar. */
+.sidebar-glass.is-narrow {
+  width: 4.5rem;
+}
+.sidebar-glass.is-narrow .hide-narrow {
+  display: none;
+}
+.sidebar-glass.is-narrow > div:first-child {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+.sidebar-glass.is-narrow nav button {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* Hue picker — the accent slider's track is a full hue wheel so the user sees
+   the spectrum they're picking from; the thumb rides on top in the active
+   accent colour. Cross-platform track/thumb styling. */
+.hue-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.5rem;
+  border-radius: 9999px;
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    oklch(0.65 0.2 0),
+    oklch(0.7 0.2 60),
+    oklch(0.75 0.2 120),
+    oklch(0.75 0.2 180),
+    oklch(0.7 0.2 240),
+    oklch(0.65 0.2 300),
+    oklch(0.65 0.2 360)
+  );
+}
+.hue-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.5rem;
+  width: 0.5rem;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  border: 2px solid oklch(1 0 0 / 0.85);
+  box-shadow: 0 1px 4px oklch(0 0 0 / 0.5);
+  cursor: grab;
+}
+.hue-slider::-moz-range-thumb {
+  height: 1.5rem;
+  width: 0.5rem;
+  border: 2px solid oklch(1 0 0 / 0.85);
+  border-radius: 9999px;
+  background: var(--color-accent);
+  cursor: grab;
 }

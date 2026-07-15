@@ -13,7 +13,9 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { writable, type Readable } from "svelte/store";
+import { get, writable, type Readable } from "svelte/store";
+
+import { noteGateTransition } from "./live";
 
 /** One feature's resolved access. Tag matches the server enum. */
 export type FeatureState =
@@ -45,11 +47,72 @@ export async function refreshEntitlements(): Promise<Entitlements | null> {
   try {
     const ent = await invoke<Entitlements>("cloud_entitlements");
     internal.set(ent);
+    reevalGate(ent, null);
     return ent;
   } catch (e) {
     console.warn("cloud_entitlements failed:", e);
     internal.set(null);
+    reevalGate(null, e);
     return null;
+  }
+}
+
+// ---- gate transition logging + activity feed ----
+//
+// The user wants to know WHEN the Hoard-Screen candado flips and WHY. Three
+// surfaces, each with a different audience:
+//   - the Rust `cloud_entitlements` command logs to tracing (target
+//     "entitlements") — shipped by logship, the durable log;
+//   - `reevalGate` below logs every per-feature transition to the webview
+//     console with the exact cause (server snapshot or the invoke error);
+//   - `noteGateTransition` pushes an activity-feed row on a real
+//     locked↔unlocked flip so the cause is visible in-app without a log file.
+// We only log/print TRANSITIONS — a re-pull that reports the same state is a
+// no-op, so the backoff retry storm from App.svelte can't spam any surface.
+
+/** Previous per-feature gate state (true = unlocked). `null` = never
+ *  determined yet (before the first successful/failed fetch). */
+const prevGate: Record<FeatureKey, boolean | null> = {
+  screen: null,
+  wrapple: null,
+};
+
+/** i18n key naming the cause of a feature's current gate state, for the
+ *  activity-feed row. */
+function gateReasonKey(feature: FeatureKey, ent: Entitlements | null): string {
+  if (!ent) return "activity.gate_reason_fetch_failed";
+  const fs = ent.features[feature];
+  if (ent.plan === "pro" || fs.state === "entitled") {
+    return "activity.gate_reason_pro";
+  }
+  if (fs.state === "trial") return "activity.gate_reason_trial";
+  if (fs.state === "trial_expired") return "activity.gate_reason_trial_expired";
+  return "activity.gate_reason_plan_free";
+}
+
+/** Re-evaluate the gate for every feature against the latest snapshot (or
+ *  `null` on fetch failure) and log/feed only on transitions. `err` is the
+ *  exact invoke error when the fetch failed, so the console line carries the
+ *  real reason (network, 401, server 5xx, …). */
+function reevalGate(ent: Entitlements | null, err: unknown): void {
+  for (const f of ["screen", "wrapple"] as FeatureKey[]) {
+    const next = ent ? featureUnlocked(ent.features[f]) : false;
+    const prev = prevGate[f];
+    if (prev === next) continue;
+    const reasonKey = gateReasonKey(f, ent);
+    const cause = err
+      ? `fetch failed: ${err instanceof Error ? err.message : String(err)}`
+      : `plan=${ent?.plan ?? "?"}, state=${ent?.features[f].state ?? "?"}`;
+    const prevLabel = prev === null ? "unknown" : prev ? "unlocked" : "locked";
+    console.info(
+      `[entitlements] ${f}: ${prevLabel} → ${next ? "unlocked" : "locked"} (${cause})`,
+    );
+    // Feed row only on a real locked↔unlocked flip (both states known) — the
+    // initial boot determination is logged but not fed.
+    if (prev !== null && prev !== next) {
+      noteGateTransition(!next, reasonKey);
+    }
+    prevGate[f] = next;
   }
 }
 
@@ -67,6 +130,9 @@ export async function activateFeature(
     internal.update((ent) =>
       ent ? { ...ent, features: { ...ent.features, [feature]: fs } } : ent,
     );
+    // Starting a trial can flip the gate locked→unlocked — re-evaluate so the
+    // transition is logged and the activity feed reflects it.
+    reevalGate(get(internal), null);
     return fs;
   } catch (e) {
     console.warn("cloud_activate_feature failed:", e);

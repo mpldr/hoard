@@ -6,6 +6,7 @@
    * fetched at most once per session.
    */
   import { coverUrl, steamIdForSlug } from "../stores/covers";
+  import { tilt } from "../actions/tilt";
 
   let {
     appId = null,
@@ -48,7 +49,8 @@
 </script>
 
 <div
-  class={`relative shrink-0 overflow-hidden border border-white/[0.08] bg-zinc-800 ${klass}`}
+  class={`tilt relative shrink-0 overflow-hidden border border-white/[0.08] bg-zinc-800 ${klass}`}
+  use:tilt
 >
   {#if url}
     <img src={url} alt={name} class="h-full w-full object-cover" draggable="false" />

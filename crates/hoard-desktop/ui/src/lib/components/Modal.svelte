@@ -63,7 +63,7 @@
       aria-modal="true"
       aria-labelledby="modal-title"
       tabindex="-1"
-      class="mx-4 w-full max-w-lg rounded-xl border border-zinc-800 bg-zinc-900 shadow-xl"
+      class="mx-4 max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900 shadow-xl"
       onclick={(e) => e.stopPropagation()}
     >
       <header class="flex items-start justify-between gap-4 border-b border-zinc-800 px-5 py-4">

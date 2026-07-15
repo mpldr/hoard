@@ -142,9 +142,20 @@ pub fn start(app: &AppHandle, interval_secs: u32) {
         // zero-delay first tick of `tokio::time::interval` is the right
         // shape — we don't manually emit before the loop.
         let mut ticker = interval(period);
+        // Fallback refresh for the Eye-panel devices + bell feeds when the
+        // Realtime socket is down. Immediacy comes from Realtime; this only
+        // needs to keep them *eventually* honest, so it's throttled to at
+        // most once per `FALLBACK_MIN_SECS` even when the poll cadence is 5s.
+        // Initialized in the past so the first tick primes both feeds.
+        let mut last_feed = tokio::time::Instant::now()
+            - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
         loop {
             ticker.tick().await;
             guarded_pull(&app_for_task, &seen, &gate).await;
+            if last_feed.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS {
+                last_feed = tokio::time::Instant::now();
+                crate::commands::cloud_feed::kick_all(&app_for_task);
+            }
         }
     });
 

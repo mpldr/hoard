@@ -36,7 +36,7 @@
       <button
         type="button"
         onclick={chooseSelfHost}
-        class="flex flex-col items-start gap-3 rounded-xl border border-zinc-700 bg-black p-5 text-left transition hover:border-zinc-500 hover:bg-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400/50"
+        class="flex flex-col items-start gap-3 rounded-xl border border-zinc-700 bg-zinc-950/60 p-5 text-left transition hover:border-zinc-500 hover:bg-zinc-900/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400/50"
       >
         <span
           class="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-zinc-800 text-zinc-100"

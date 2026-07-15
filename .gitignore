@@ -81,5 +81,9 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # Idea del plugin de Decky para el CLI. Nota de trabajo local.
 /hoard-cli-deckyplugin.local.md
 
+# Prompt de handoff: fixes de sync en Windows. Nota de trabajo local.
+/hoard-cli-windows-sync-fixes.local.md
+
 # Lista de tareas del usuario (solo la escribe él). Nunca al repo.
 /rleeon.md
+/vista.md

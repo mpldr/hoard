@@ -3,6 +3,7 @@ pub mod device;
 pub mod entitlements;
 pub mod logs;
 pub mod me;
+pub mod notifications;
 pub mod playtime;
 pub mod saves;
 pub mod sync;

@@ -27,6 +27,8 @@
     Scissors,
     Trash2,
     AlertTriangle,
+    Lock,
+    LockOpen,
     X,
   } from "lucide-svelte";
 
@@ -56,6 +58,8 @@
     auto_restore_failed: XCircle,
     storage_purging: Trash2,
     storage_full: AlertTriangle,
+    gate_locked: Lock,
+    gate_unlocked: LockOpen,
   } as const;
 
   const TINTS = {
@@ -77,17 +81,20 @@
     auto_restore_failed: "text-rose-400",
     storage_purging: "text-amber-400",
     storage_full: "text-rose-400",
+    gate_locked: "text-rose-400",
+    gate_unlocked: "text-emerald-400",
   } as const;
 
   // Alert rows get a tinted "card" so plan-limit / storage-pressure events
   // read at a glance: amber for reversible pressure (trimming / purging),
   // red for a hard stop (over-cap upload, restore failure, storage full).
   const ROW_ACCENT: Partial<Record<FeedEntry["kind"], string>> = {
-    backup_too_large: "border-l-2 border-rose-500/70 bg-rose-500/10",
-    auto_restore_failed: "border-l-2 border-rose-500/70 bg-rose-500/10",
-    storage_full: "border-l-2 border-rose-500/70 bg-rose-500/10",
-    backup_trimmed: "border-l-2 border-amber-500/70 bg-amber-500/10",
-    storage_purging: "border-l-2 border-amber-500/70 bg-amber-500/10",
+    backup_too_large: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    auto_restore_failed:
+      "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    storage_full: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    backup_trimmed: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
+    storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
   };
 
   function relativeTime(at: number): string {
@@ -174,6 +181,18 @@
         return $_("activity.storage_purging");
       case "storage_full":
         return $_("activity.storage_full");
+      case "gate_locked":
+        return $_("activity.gate_locked", {
+          values: {
+            reason: $_(e.reason_key ?? "activity.gate_reason_fetch_failed"),
+          },
+        });
+      case "gate_unlocked":
+        return $_("activity.gate_unlocked", {
+          values: {
+            reason: $_(e.reason_key ?? "activity.gate_reason_pro"),
+          },
+        });
     }
   }
 

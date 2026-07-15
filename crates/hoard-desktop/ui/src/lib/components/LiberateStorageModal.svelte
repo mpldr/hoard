@@ -175,7 +175,7 @@
             <li
               class="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-sm {willArchive
                 ? 'border-rose-500/40 bg-rose-500/10'
-                : 'border-white/[0.06] bg-zinc-950/40'}"
+                : 'border-white/[0.08] bg-zinc-950/40'}"
             >
               <span class="flex min-w-0 flex-col">
                 <span class="truncate text-zinc-200">{gameName(g)}</span>

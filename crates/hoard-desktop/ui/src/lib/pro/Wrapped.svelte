@@ -121,6 +121,10 @@
   let daysByKey = $state<Record<string, number>>({});
   // Day whose detail panel is open (its `key`), or null when none.
   let selectedKey = $state<string | null>(null);
+  // Year filter — buttons for every year with any playtime, plus the current
+  // year (so a fresh account still sees its own year). Latest first.
+  let yearsAvailable = $state<number[]>([]);
+  let selectedYear = $state<number>(new Date().getFullYear());
 
   const DAY_MS = 86_400_000;
 
@@ -354,32 +358,67 @@
       appIdBySlug = {};
     }
 
-    // Build a 53-week grid ending today, starting on a Sunday.
+    // Years with any playtime, plus the current year (so a fresh account
+    // still shows its own year). Descending → latest first.
+    const yrs = new Set<number>();
+    for (const k of Object.keys(daysByKey)) {
+      const y = Number(k.slice(0, 4));
+      if (Number.isFinite(y)) yrs.add(y);
+    }
+    yrs.add(new Date().getFullYear());
+    yearsAvailable = [...yrs].sort((a, b) => b - a);
+    selectedYear = yearsAvailable[0];
+    buildGrid();
+    loading = false;
+  }
+
+  /** Rebuild the rolling 53-week grid ending today (today on the LEFT, reading
+   *  into the past rightward — the original GitHub-style order). The grid
+   *  always spans the last 365 days regardless of the selected year; the year
+   *  filter only controls `inRange`, so days outside the chosen year stay in
+   *  the bounding box (invisible, excluded from stats) but the layout never
+   *  jumps. Pinning the end to today means the current day is always visible.
+   *  When the selected year isn't the current one, we instead span that whole
+   *  calendar year Jan→Dec so past years show their full history. */
+  function buildGrid() {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const start = new Date(today.getTime() - 364 * DAY_MS);
-    start.setDate(start.getDate() - start.getDay()); // back up to Sunday
+    const isCurrentYear = selectedYear === today.getFullYear();
+    const end = isCurrentYear ? today : new Date(selectedYear, 11, 31);
+    // Rolling 365-day window for the current year; Jan 1 → Dec 31 for past
+    // years. Both back up to the Sunday on/before the start so columns align
+    // to ISO weeks.
+    const start = isCurrentYear
+      ? new Date(today.getTime() - 364 * DAY_MS)
+      : new Date(selectedYear, 0, 1);
+    start.setDate(start.getDate() - start.getDay());
 
     const grid: Day[][] = [];
     let cursor = new Date(start);
-    while (cursor <= today) {
+    while (cursor <= end) {
       const week: Day[] = [];
       for (let d = 0; d < 7; d++) {
         const key = dayKey(cursor);
+        const inYear = cursor.getFullYear() === selectedYear;
+        // For the current year the rolling window also caps at today; for
+        // past years the whole calendar year is in range.
+        const inWindow = isCurrentYear
+          ? inYear && cursor <= today
+          : inYear;
         week.push({
           key,
           date: new Date(cursor),
-          secs: days[key] || 0,
-          inRange: cursor >= start && cursor <= today,
+          secs: daysByKey[key] || 0,
+          inRange: inWindow,
         });
         cursor = new Date(cursor.getTime() + DAY_MS);
       }
       grid.push(week);
     }
-    // Newest week first (today on the LEFT), reading into the past rightward.
+    // Newest week first (today on the LEFT), reading into the past rightward —
+    // the original order.
     grid.reverse();
     weeks = grid;
-    loading = false;
   }
 
   onMount(build);
@@ -408,7 +447,7 @@
 
   <!-- identity card — masked by default, reveal like a password -->
   <div
-    class="relative overflow-hidden rounded-2xl border border-white/[0.06] bg-zinc-900/60 p-4"
+    class="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4"
   >
     <!-- Soft glow via a pre-blurred radial-gradient, not `filter: blur()`:
          WebKitGTK (Linux, inside Wrapple) paints a black rectangle when a
@@ -505,8 +544,8 @@
   </div>
 
   <!-- activity calendar -->
-  <div class="mt-4 rounded-2xl border border-white/[0.06] bg-zinc-900/60 p-4">
-    <div class="mb-3 flex items-end justify-between">
+  <div class="mt-4 rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4">
+    <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
       <div>
         <h2 class="text-sm font-semibold text-zinc-100">
           {tr({ es: "Horas jugadas", en: "Hours played" })}
@@ -518,12 +557,36 @@
           })}
         </p>
       </div>
-      <div class="text-right">
-        <div class="text-2xl font-bold text-emerald-300">
-          {Math.round(stats.totalSecs / 3600)}
-        </div>
-        <div class="text-[11px] uppercase tracking-wide text-zinc-500">
-          {tr({ es: "horas", en: "hours" })}
+      <div class="flex items-center gap-3">
+        <!-- Year filter — always visible (even with a single year) so the
+             user can tell which year they're looking at. GitHub-style. -->
+        <div
+          class="flex gap-1 rounded-lg border border-white/[0.08] bg-zinc-950/40 p-1"
+        >
+          {#each yearsAvailable as y (y)}
+            <button
+              type="button"
+              onclick={() => {
+                selectedYear = y;
+                selectedKey = null;
+                buildGrid();
+              }}
+              class="rounded-md px-2.5 py-1 text-xs font-medium transition {selectedYear ===
+              y
+                ? 'bg-emerald-600/20 text-emerald-300 ring-1 ring-inset ring-emerald-600/40'
+                : 'text-zinc-400 hover:text-zinc-200'}"
+              >
+                {y}
+              </button>
+            {/each}
+          </div>
+        <div class="text-right">
+          <div class="text-2xl font-bold text-emerald-300">
+            {Math.round(stats.totalSecs / 3600)}
+          </div>
+          <div class="text-[11px] uppercase tracking-wide text-zinc-500">
+            {tr({ es: "horas", en: "hours" })}
+          </div>
         </div>
       </div>
     </div>
@@ -634,7 +697,7 @@
     >
       <!-- header band -->
       <div
-        class="relative flex items-center justify-between gap-3 border-b border-white/[0.06] bg-gradient-to-r from-emerald-500/15 via-emerald-500/[0.04] to-transparent px-4 py-3"
+        class="relative flex items-center justify-between gap-3 border-b border-white/[0.08] bg-gradient-to-r from-emerald-500/15 via-emerald-500/[0.04] to-transparent px-4 py-3"
       >
         <div
           class="pointer-events-none absolute -left-10 -top-10 h-28 w-28 [background:radial-gradient(closest-side,rgba(16,185,129,0.12),transparent)]"

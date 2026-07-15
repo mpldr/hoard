@@ -52,6 +52,175 @@ pub fn expand_path(template: &str, os: Os) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Maximum number of directory entries to consider per glob segment.
+/// Caps the fan-out so a wildcard in a path like `<home>/Downloads/*/Saves`
+/// doesn't enumerate thousands of entries on a busy folder.
+const MAX_GLOB_FANOUT: usize = 64;
+
+/// True if `s` contains a glob wildcard (`*` or `?`).
+fn has_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?')
+}
+
+/// Match a single path segment against a simple glob pattern (`*` = any
+/// run of chars, `?` = exactly one char). No brace expansion, no `**`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p = pattern.as_bytes();
+    let n = name.as_bytes();
+    let (mut pi, mut ni) = (0, 0);
+    let (mut star_pi, mut star_ni): (Option<usize>, usize) = (None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Like [`expand_path`] but resolves `*`/`?` wildcards in the tail against
+/// the filesystem. Used by the catalog scan so templates like
+/// `<home>/AppData/*.savegame` (Ludusavi emits them for games whose save
+/// filenames aren't fixed ??? e.g. Twelve Minutes) produce real hits instead
+/// of a literal `*` that never stats true.
+///
+/// Returns **directory** candidates (the save folders to watch), never
+/// individual files:
+/// - Glob in the **last** segment (e.g. `.../Twelve Minutes/*.savegame`):
+///   the parent directory is returned, confirmed by a `read_dir` that at
+///   least one entry matches the pattern.
+/// - Glob in an **intermediate** segment (e.g. `.../Steam/*Saves/slot`):
+///   that segment is expanded via `read_dir` and the remaining tail is
+///   joined onto each match. Fan-out is capped at [`MAX_GLOB_FANOUT`].
+///
+/// When the tail has no glob the result is identical to [`expand_path`] ???
+/// no filesystem access, pure join.
+pub fn expand_path_globbed(template: &str, os: Os) -> Vec<PathBuf> {
+    let (placeholder, tail) = match split_placeholder(template) {
+        Some(parts) => parts,
+        None => {
+            if has_glob(template) {
+                // Literal path with a glob: use the filesystem root as base
+                // and the rest as tail so expand_glob_tail walks the segments.
+                let mut out = Vec::new();
+                let base = if template.starts_with('/') {
+                    PathBuf::from("/")
+                } else {
+                    PathBuf::from("")
+                };
+                let tail = template.trim_start_matches(['/', '\\']);
+                expand_glob_tail(&base, tail, &mut out);
+                return out;
+            }
+            return vec![PathBuf::from(template)];
+        }
+    };
+    let bases = expand_placeholder(&placeholder, os);
+    if bases.is_empty() {
+        return Vec::new();
+    }
+    let tail_clean = tail.trim_start_matches(['/', '\\']);
+    if !has_glob(tail_clean) {
+        return bases
+            .into_iter()
+            .map(|b| {
+                if tail_clean.is_empty() {
+                    b
+                } else {
+                    b.join(tail_clean)
+                }
+            })
+            .collect();
+    }
+    let mut out = Vec::new();
+    for base in bases {
+        expand_glob_tail(&base, tail_clean, &mut out);
+    }
+    out
+}
+
+/// Walk `tail` (a relative path with possible glob segments) starting from
+/// `base`, appending resolved directory candidates to `out`.
+fn expand_glob_tail(base: &Path, tail: &str, out: &mut Vec<PathBuf>) {
+    let tail = tail.trim_start_matches(['/', '\\']);
+    if tail.is_empty() {
+        out.push(base.to_path_buf());
+        return;
+    }
+    let (first, rest) = match tail.find(|c| c == '/' || c == '\\') {
+        Some(i) => (&tail[..i], &tail[i + 1..]),
+        None => (tail, ""),
+    };
+    let rest = rest.trim_start_matches(['/', '\\']);
+
+    if !has_glob(first) {
+        let next = base.join(first);
+        if rest.is_empty() {
+            out.push(next);
+        } else {
+            expand_glob_tail(&next, rest, out);
+        }
+        return;
+    }
+
+    if rest.is_empty() {
+        // Glob in the LAST segment: return the parent dir (`base`), but
+        // only if at least one entry in `base` matches the pattern.
+        if !base.is_dir() {
+            return;
+        }
+        if let Ok(rd) = std::fs::read_dir(base) {
+            for entry in rd.take(MAX_GLOB_FANOUT) {
+                if let Ok(e) = entry {
+                    if let Some(name) = e.file_name().to_str() {
+                        if glob_match(first, name) {
+                            out.push(base.to_path_buf());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Glob in an INTERMEDIATE segment: expand via read_dir, continue on
+    // each match. Capped at MAX_GLOB_FANOUT entries per segment.
+    if !base.is_dir() {
+        return;
+    }
+    if let Ok(rd) = std::fs::read_dir(base) {
+        let mut count = 0;
+        for entry in rd {
+            if count >= MAX_GLOB_FANOUT {
+                break;
+            }
+            let Ok(e) = entry else { continue };
+            let fname = e.file_name();
+            let Some(name) = fname.to_str() else { continue };
+            if !glob_match(first, name) {
+                continue;
+            }
+            count += 1;
+            let next = base.join(name);
+            expand_glob_tail(&next, rest, out);
+        }
+    }
+}
+
 /// Expand a Ludusavi Windows template against a Proton/Wine prefix root.
 ///
 /// `prefix` points at the `pfx/` directory of one Steam compatdata entry
@@ -661,6 +830,78 @@ mod tests {
             value: Some("SavePath".to_string()),
         };
         assert!(expand_registry_path(&reg).is_empty());
+    }
+
+    #[test]
+    fn glob_last_segment_returns_parent_dir() {
+        // Template like Twelve Minutes: `<home>/AppData/Nomada/Twelve Minutes/*.savegame`
+        // The candidate must be the parent dir, confirmed by a matching file.
+        let _guard = crate::test_lock::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("hoard-glob-last-{}", std::process::id()));
+        let save_dir = tmp.join("AppData/Nomada/Twelve Minutes");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::fs::write(save_dir.join("slot1.savegame"), b"x").unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+        let out = expand_path_globbed("<home>/AppData/Nomada/Twelve Minutes/*.savegame", Os::Linux);
+        assert_eq!(out, vec![save_dir.clone()]);
+        // No matching file -> no hit.
+        std::fs::remove_file(save_dir.join("slot1.savegame")).unwrap();
+        let out2 =
+            expand_path_globbed("<home>/AppData/Nomada/Twelve Minutes/*.savegame", Os::Linux);
+        assert!(out2.is_empty(), "should be empty with no matching file");
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn glob_intermediate_segment_expands() {
+        // Template like `<home>/Steam/*Saves/slot` ??? the `*Saves` segment
+        // is a glob in an intermediate position. Both `remoteSaves` and
+        // `cloudSaves` should expand; `other` should not.
+        let _guard = crate::test_lock::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("hoard-glob-mid-{}", std::process::id()));
+        for d in [
+            "Steam/remoteSaves/slot",
+            "Steam/cloudSaves/slot",
+            "Steam/other/slot",
+        ] {
+            std::fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+        let out = expand_path_globbed("<home>/Steam/*Saves/slot", Os::Linux);
+        assert!(
+            out.contains(&tmp.join("Steam/remoteSaves/slot")),
+            "got {out:?}"
+        );
+        assert!(
+            out.contains(&tmp.join("Steam/cloudSaves/slot")),
+            "got {out:?}"
+        );
+        assert!(!out.contains(&tmp.join("Steam/other/slot")), "got {out:?}");
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn glob_no_wildcard_delegates_to_expand_path() {
+        // No glob -> identical to expand_path, no FS access.
+        with_env(&[("HOME", Some("/home/test"))], || {
+            let a = expand_path("<home>/Saves/foo", Os::Linux);
+            let b = expand_path_globbed("<home>/Saves/foo", Os::Linux);
+            assert_eq!(a, b);
+        });
     }
 
     /// Reads a value the test itself writes to HKCU. Marked `#[ignore]`

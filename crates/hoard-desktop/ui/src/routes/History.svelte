@@ -626,7 +626,7 @@
           {@const isOpen = expanded[snap.version_num] ?? false}
           {@const isDeleted = !!snap.deleted_at}
           <li
-            class="group rounded-xl border border-white/[0.06] bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-emerald-500/25
+            class="group rounded-xl border border-white/[0.08] bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12]
               {isDeleted ? 'opacity-60' : ''}"
           >
             <div class="flex items-center gap-3 px-4 py-3">
@@ -718,7 +718,7 @@
             </div>
 
             {#if isOpen}
-              <div class="border-t border-white/[0.06] bg-black/20 px-4 py-3">
+              <div class="border-t border-white/[0.08] bg-zinc-950/20 px-4 py-3">
                 {#if detailCache[snap.version_num]}
                   {#if detailCache[snap.version_num].files.length === 0}
                     <p class="text-xs text-zinc-500">

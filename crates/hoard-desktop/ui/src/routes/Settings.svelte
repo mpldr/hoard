@@ -25,6 +25,7 @@
     RefreshCw,
     Database,
     Languages,
+    Palette,
     Activity,
     DownloadCloud,
     HardDrive,
@@ -37,6 +38,13 @@
   import Modal from "../lib/components/Modal.svelte";
   import SettingsRow from "../lib/components/SettingsRow.svelte";
   import { prefs, hydratePrefs, updatePrefs } from "../lib/stores/prefs";
+  import {
+    theme,
+    themes,
+    type ThemeId,
+    accentHue,
+    setAccentHue,
+  } from "../lib/stores/theme";
   import { auth, signOut } from "../lib/stores/auth";
   import { cloud, planLabel } from "../lib/stores/cloud";
   import { supportedLocales, setLocale } from "../lib/i18n";
@@ -57,6 +65,30 @@
   // the saved address + token (session.toml + keyring), which is what stops
   // the app reconnecting to a dead/abandoned self-hosted box on every launch.
   let forgetModalOpen = $state(false);
+
+  // Theme picker swatch previews. Each is a representative bg + accent dot so
+  // the user can tell the palettes apart without applying each one. "Auto"
+  // paints half-dark / half-light to signal it follows the OS scheme.
+  const swatchBg: Record<ThemeId, string> = {
+    obsidian: "linear-gradient(135deg, #0e1210, #141a17)",
+    quartz: "linear-gradient(135deg, #f3f0ea, #e7e3d9)",
+    auto: "linear-gradient(135deg, #0e1210 0 50%, #f3f0ea 50% 100%)",
+  };
+  const swatchAccent: Record<ThemeId, string> = {
+    obsidian: "#34d399",
+    quartz: "#10b981",
+    auto: "#34d399",
+  };
+
+  // Accent picker: repoints the "gem" hue live via CSS variables on <html>,
+  // compositing on top of whichever theme is active.
+  function onAccentInput(e: Event): void {
+    const v = Number((e.currentTarget as HTMLInputElement).value);
+    setAccentHue(Number.isFinite(v) ? v : null);
+  }
+  function resetAccent(): void {
+    setAccentHue(null);
+  }
 
   // The single user-facing operating mode, derived from the internal flags.
   const syncMode = $derived(
@@ -469,7 +501,7 @@
 
   {#if !$prefs}
     <Card>
-      <div class="py-12 text-center text-sm text-zinc-400">
+      <div class="shimmer py-12 text-center text-sm text-zinc-400">
         {$_("common.loading")}
       </div>
     </Card>
@@ -604,6 +636,88 @@
                 <option value={loc.code}>{loc.label}</option>
               {/each}
             </select>
+          </div>
+        </Card>
+      </section>
+
+      <section>
+        <h2
+          class="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500"
+        >
+          {$_("settings.section_themes")}
+        </h2>
+        <Card>
+          <div class="flex items-start gap-3 pb-4">
+            <Palette size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium text-zinc-100">
+                {$_("settings.themes_label")}
+              </p>
+              <p class="mt-0.5 text-xs text-zinc-500">
+                {$_("settings.themes_desc")}
+              </p>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            {#each themes as t (t.id)}
+              {@const active = $theme === t.id}
+              <button
+                type="button"
+                onclick={() => theme.set(t.id)}
+                aria-pressed={active}
+                class="group flex flex-col items-start gap-2 rounded-lg border p-2.5 text-left transition-colors {active
+                  ? 'border-emerald-500/60 bg-emerald-500/10'
+                  : 'border-white/[0.08] hover:bg-zinc-800/40'}"
+              >
+                <span
+                  class="relative flex h-12 w-full items-center justify-center overflow-hidden rounded-md border border-white/[0.08]"
+                  style="background: {swatchBg[t.id]};"
+                >
+                  <span
+                    class="absolute inset-x-0 bottom-0 h-1.5"
+                    style="background: {swatchAccent[t.id]};"
+                  ></span>
+                </span>
+                <span class="min-w-0 w-full">
+                  <span class="block text-sm font-medium text-zinc-100">
+                    {$_(t.labelKey)}
+                  </span>
+                  {#if t.id === "auto"}
+                    <span class="block text-[11px] text-zinc-500">
+                      {$_("settings.theme_auto_hint")}
+                    </span>
+                  {/if}
+                </span>
+              </button>
+            {/each}
+          </div>
+          <div class="mt-4 flex items-center gap-3 border-t border-white/[0.08] pt-4">
+            <Palette size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium text-zinc-100">
+                {$_("settings.accent_label")}
+              </p>
+              <p class="mt-0.5 text-xs text-zinc-500">
+                {$_("settings.accent_desc")}
+              </p>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="359"
+              step="1"
+              value={$accentHue ?? 160}
+              oninput={onAccentInput}
+              class="hue-slider w-40"
+              aria-label={$_("settings.accent_label")}
+            />
+            <button
+              type="button"
+              onclick={resetAccent}
+              class="shrink-0 rounded-md border border-white/[0.08] px-2 py-1 text-xs text-zinc-400 transition-colors hover:bg-zinc-800/40 hover:text-zinc-100"
+            >
+              {$_("settings.accent_reset")}
+            </button>
           </div>
         </Card>
       </section>

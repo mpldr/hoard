@@ -50,10 +50,10 @@
           onclick={() => pick(l.code)}
           disabled={busy}
           aria-pressed={$locale === l.code}
-          class="rounded-xl border px-4 py-3 text-left text-sm font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/50 disabled:opacity-60 {$locale ===
+          class="rounded-xl border px-4 py-3 text-left text-sm font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]/50 disabled:opacity-60 {$locale ===
           l.code
-            ? 'border-emerald-500 bg-emerald-600/15 text-emerald-50'
-            : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:border-zinc-500 hover:bg-zinc-800'}"
+            ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-zinc-50'
+            : 'border-white/[0.08] bg-zinc-950/40 text-zinc-200 hover:border-white/[0.14] hover:bg-zinc-900/50'}"
         >
           {l.label}
         </button>

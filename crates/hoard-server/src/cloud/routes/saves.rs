@@ -1493,6 +1493,109 @@ pub async fn delete_save(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Body for `PATCH /v1/cloud/saves/:save_id` ??? just the new label.
+#[derive(Debug, Deserialize)]
+pub struct RenameSaveRequest {
+    pub label: String,
+}
+
+/// Wire shape mirroring the agent's `Save` struct so the client can
+/// deserialize the rename response into the same type self-hosted uses.
+/// Omits the optional fields (`user_id`, `snapshot_count`,
+/// `total_size_bytes`) ??? the agent struct defaults them on absence.
+#[derive(Debug, Serialize)]
+pub struct SaveSummary {
+    pub id: String,
+    pub game_slug: String,
+    pub label: String,
+    pub latest_version_num: i64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+}
+
+/// `PATCH /v1/cloud/saves/:save_id` ??? rename a cloud save's label. The cloud
+/// analogue of the self-hosted `PATCH /v1/saves/:id`. Enforces
+/// `UNIQUE(user_id, game_slug, label)` -> 409 on collision. R2 keys are keyed
+/// by `save_id` + version (not by label), so no blob rename is needed ??? just
+/// the DB row.
+pub async fn rename_save(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+    Path(save_id): Path<String>,
+    Json(body): Json<RenameSaveRequest>,
+) -> Result<Json<SaveSummary>, CloudError> {
+    let new_label = body.label.trim();
+    if new_label.is_empty() {
+        return Err(CloudError::BadRequest("label can't be empty".to_string()));
+    }
+
+    // Owner check ??? never trust a save_id from the request.
+    let row: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT user_id, game_slug, label FROM saves WHERE id = $1")
+            .bind(&save_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((owner, game_slug, old_label)) = row else {
+        return Err(CloudError::NotFound("save not found"));
+    };
+    if owner != user.user_id {
+        return Err(CloudError::Forbidden("save belongs to a different user"));
+    }
+
+    if new_label == old_label {
+        // No-op: return the current state without touching the DB.
+        return fetch_save_summary(&state, &save_id, &game_slug).await;
+    }
+
+    // UPDATE with UNIQUE(user_id, game_slug, label) -> 409 on collision.
+    let result = sqlx::query(
+        "UPDATE saves SET label = $1, updated_at = now() WHERE id = $2 AND user_id = $3",
+    )
+    .bind(new_label)
+    .bind(&save_id)
+    .bind(user.user_id)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(_) => {}
+        Err(e) => {
+            if e.to_string().contains("unique") || e.to_string().contains("UNIQUE") {
+                return Err(CloudError::Conflict("label collision"));
+            }
+            return Err(CloudError::Db(e));
+        }
+    }
+
+    fetch_save_summary(&state, &save_id, &game_slug).await
+}
+
+/// Fetch the current state of a save row for the rename response.
+async fn fetch_save_summary(
+    state: &CloudState,
+    save_id: &str,
+    game_slug: &str,
+) -> Result<Json<SaveSummary>, CloudError> {
+    let (label, latest_version_num, created_at, updated_at): (
+        String, i64, time::OffsetDateTime, time::OffsetDateTime,
+    ) = sqlx::query_as(
+        "SELECT label, latest_version_num, created_at, updated_at FROM saves WHERE id = $1",
+    )
+    .bind(save_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(SaveSummary {
+        id: save_id.to_string(),
+        game_slug: game_slug.to_string(),
+        label,
+        latest_version_num,
+        created_at,
+        updated_at,
+    }))
+}
+
 /// Release `n` references from each blob, deleting the R2 object + row when a
 /// blob's refcount reaches zero (the cloud_blobs trigger credits the freed
 /// storage on the 0-transition). Best-effort: a failure here only leaks a blob,

@@ -60,7 +60,13 @@ export type FeedEntry = {
     // Account-wide storage pressure, driven off the cloud account's
     // `storage_status` (`purging` → amber, `full` → red).
     | "storage_purging"
-    | "storage_full";
+    | "storage_full"
+    // Pro-gate (Hoard-Screen) transitions — pushed from the entitlements store
+    // when the gate visibly flips between locked and unlocked, with the cause
+    // in `reason_key` (an i18n key). Lets the user see WHY the candado
+    // changed without opening a log file.
+    | "gate_locked"
+    | "gate_unlocked";
   /** Optional save_id / game_slug for renderers that want a hint. */
   save_id?: string;
   game_slug?: string;
@@ -74,6 +80,8 @@ export type FeedEntry = {
   error?: string;
   /** Per-save cap in bytes, for the `backup_too_large` row. */
   limit_bytes?: number;
+  /** i18n key for the cause of a `gate_locked`/`gate_unlocked` row. */
+  reason_key?: string;
 };
 
 const MAX_FEED_ENTRIES = 80;
@@ -389,6 +397,27 @@ export function noteStorageStatus(status: string | undefined | null) {
   else if (s === "full") pushEntry({ kind: "storage_full" });
 }
 
+/** Last gate state we pushed a feed row for, so a re-pull that reports the
+ *  same locked/unlocked state doesn't duplicate the row. */
+let lastGateState: "locked" | "unlocked" | null = null;
+
+/** Called by the entitlements store when the Hoard-Screen gate visibly flips
+ *  between locked and unlocked. `reasonKey` is an i18n key naming the cause
+ *  (fetch failed, Free plan, trial ended, Pro plan, …). Deduped on state so a
+ *  healthy re-poll never spams the panel. */
+export function noteGateTransition(
+  locked: boolean,
+  reasonKey: string,
+): void {
+  const state = locked ? "locked" : "unlocked";
+  if (state === lastGateState) return;
+  lastGateState = state;
+  pushEntry({
+    kind: locked ? "gate_locked" : "gate_unlocked",
+    reason_key: reasonKey,
+  });
+}
+
 export async function unsubscribeLive() {
   for (const u of unlisteners) {
     try {
@@ -407,6 +436,7 @@ export function resetLive() {
   cloudLoop.set({ status: "unknown", last_ok_at: null, retry_in: null });
   activityFeed.set([]);
   lastStorageStatus = null;
+  lastGateState = null;
 }
 
 /** Reset only the cloud-loop dot to its neutral baseline, leaving the local

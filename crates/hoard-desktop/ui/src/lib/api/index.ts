@@ -127,6 +127,29 @@ export type ScanProgress = {
   total: number;
 };
 
+/** One save folder detection found on THIS machine, with that path's own
+ *  confidence (not the game's rolled-up grade). */
+export type DetectedPath = {
+  path: string;
+  confidence: Confidence;
+};
+
+/** What local detection knows about one slug — the offer behind "Vincular a
+ *  esta máquina". */
+export type LocalDetection = {
+  game_slug: string;
+  /** Candidates, strongest-first. Exactly one means the match is unambiguous
+   *  and the orphan card can offer a direct "Vincular a <ruta>" button. */
+  paths: DetectedPath[];
+  /**
+   * When this machine last scanned, or `null` if it never did. `null` with
+   * empty `paths` means "unknown", not "nothing here" — offer a scan instead
+   * of only the folder picker, since users who never enabled Modo Automático
+   * land here with a cold cache.
+   */
+  scanned_at: string | null;
+};
+
 export type TrackedSave = {
   save_id: string;
   game_slug: string;
@@ -184,6 +207,16 @@ export function scanFolder(path: string): Promise<DetectedGame[]> {
 /** Return the previous scan if one is in memory, else null. */
 export function cachedDetection(): Promise<DetectionReport | null> {
   return invoke<DetectionReport | null>("cached_detection");
+}
+
+/** Save folders local detection already knows for a slug, read from the scan
+ *  cache. Cheap (in-memory lookup, no scan) — safe to call per orphan row. */
+export function detectedPathsForGame(
+  game_slug: string,
+): Promise<LocalDetection> {
+  return invoke<LocalDetection>("detected_paths_for_game", {
+    gameSlug: game_slug,
+  });
 }
 
 /** Begin tracking a detected game at the given path.

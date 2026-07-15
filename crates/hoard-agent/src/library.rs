@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use crate::agent::{dir_size_bytes, WatchedSave};
 use crate::api::ApiClient;
 use crate::config::CliConfig;
-use crate::detection::DetectionReport;
+use crate::detection::{Confidence, DetectionReport};
 use crate::manifest::Os;
 use crate::presets::{self, SavePolicy};
 use crate::state::{CliState, SaveState};
@@ -137,6 +137,85 @@ pub fn save_detection_to_disk_atomic(cached: &CachedDetection) -> Result<()> {
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+// ---- qué sabe la detección local de UN slug --------------------------------
+
+/// Una ruta de save que la detección encontró en ESTA máquina, con la
+/// confianza de esa ruta concreta (no la rolled-up del juego).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedPath {
+    pub path: PathBuf,
+    pub confidence: Confidence,
+}
+
+/// Lo que la detección local sabe de un slug, para vincular un save del cloud
+/// a esta máquina sin obligar al usuario a buscar la carpeta a mano.
+///
+/// `scanned_at` es `None` cuando no hay caché de detección. Distinguirlo de
+/// `paths` vacío es lo que deja al frontend ofrecer un escaneo en vez de
+/// afirmar "no hay nada": el usuario que nunca activó el Modo Automático llega
+/// aquí con la caché fría, y una lista vacía sin más sería mentira.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalDetection {
+    pub game_slug: String,
+    /// Candidatas ordenadas strongest-first (mismo orden que `found_paths`).
+    pub paths: Vec<DetectedPath>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub scanned_at: Option<OffsetDateTime>,
+}
+
+impl LocalDetection {
+    /// La ruta a vincular cuando la detección es **no ambigua**: exactamente
+    /// una candidata. Con dos o más el usuario tiene que elegir, y con cero no
+    /// hay nada que ofrecer.
+    pub fn unambiguous(&self) -> Option<&DetectedPath> {
+        match self.paths.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// Rutas de save detectadas para `game_slug` dentro de un report ya calculado.
+///
+/// Solo rutas de save: `found_paths` nunca contiene el directorio de instalación
+/// (eso es `install_dir`, y hacer backup del binario del juego sería un bug).
+pub fn detected_paths_in(report: &DetectionReport, game_slug: &str) -> Vec<DetectedPath> {
+    let Some(game) = report.games.iter().find(|g| g.slug == game_slug) else {
+        return Vec::new();
+    };
+    game.found_paths
+        .iter()
+        .enumerate()
+        .map(|(i, path)| DetectedPath {
+            path: path.clone(),
+            // `path_confidences` es `default` — una caché escrita por un build
+            // viejo la trae vacía. Caer a la confianza del juego conserva la
+            // ruta en vez de perderla por un campo ausente.
+            confidence: game
+                .path_confidences
+                .get(i)
+                .copied()
+                .unwrap_or(game.confidence),
+        })
+        .collect()
+}
+
+/// Lo que la detección local sabe de `game_slug` según una caché ya cargada.
+/// `cached` es `None` cuando nadie ha escaneado todavía en esta máquina.
+///
+/// El desktop pasa su caché en memoria (`AppState`) y la CLI la de disco
+/// ([`load_detection_from_disk`]); la regla de qué es una candidata vive aquí,
+/// una sola vez.
+pub fn local_detection(cached: Option<&CachedDetection>, game_slug: &str) -> LocalDetection {
+    LocalDetection {
+        game_slug: game_slug.to_string(),
+        paths: cached
+            .map(|c| detected_paths_in(&c.report, game_slug))
+            .unwrap_or_default(),
+        scanned_at: cached.map(|c| c.scanned_at),
+    }
 }
 
 // ---- hydrate (UNIFICADO: antes duplicado desktop/daemon) --------------------
@@ -887,4 +966,135 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
             Box::new(watched_from_snapshot(save_id.to_string(), &snapshot)),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detected_paths_in, local_detection, CachedDetection};
+    use crate::detection::{
+        Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
+    };
+    use std::path::PathBuf;
+    use time::OffsetDateTime;
+
+    fn game(
+        slug: &str,
+        paths: &[&str],
+        per_path: &[Confidence],
+        rolled: Confidence,
+    ) -> DetectedGame {
+        DetectedGame {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            found_paths: paths.iter().map(PathBuf::from).collect(),
+            confidence: rolled,
+            path_confidences: per_path.to_vec(),
+            source: DetectionSource::FilesystemHeuristic,
+            steam_app_id: None,
+            install_dir: None,
+        }
+    }
+
+    fn report(games: Vec<DetectedGame>) -> DetectionReport {
+        DetectionReport {
+            games,
+            catalog_size: 0,
+            steam_apps_found: 0,
+            scanned_at_ms: 0,
+            stats: DetectionStats::default(),
+        }
+    }
+
+    fn cached(games: Vec<DetectedGame>) -> CachedDetection {
+        CachedDetection {
+            report: report(games),
+            scanned_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn pairs_each_path_with_its_own_confidence() {
+        let r = report(vec![game(
+            "stardew-valley",
+            &["/saves/sdv", "/steam/cloud/sdv"],
+            &[Confidence::High, Confidence::Low],
+            Confidence::High,
+        )]);
+        let paths = detected_paths_in(&r, "stardew-valley");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].path, PathBuf::from("/saves/sdv"));
+        assert_eq!(paths[0].confidence, Confidence::High);
+        // El stub casi vacío de Steam Cloud NO hereda la High del juego.
+        assert_eq!(paths[1].confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn falls_back_to_rolled_up_confidence_on_old_caches() {
+        // Caché escrita por un build sin `path_confidences`: la ruta se
+        // conserva con la confianza del juego en vez de perderse.
+        let r = report(vec![game(
+            "hollow-knight",
+            &["/saves/hk"],
+            &[],
+            Confidence::Medium,
+        )]);
+        let paths = detected_paths_in(&r, "hollow-knight");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn unknown_slug_yields_nothing() {
+        let r = report(vec![game(
+            "celeste",
+            &["/saves/celeste"],
+            &[],
+            Confidence::High,
+        )]);
+        assert!(detected_paths_in(&r, "hades").is_empty());
+    }
+
+    #[test]
+    fn unambiguous_only_when_exactly_one_path() {
+        let one = cached(vec![game(
+            "celeste",
+            &["/saves/celeste"],
+            &[],
+            Confidence::High,
+        )]);
+        let d = local_detection(Some(&one), "celeste");
+        assert_eq!(
+            d.unambiguous().unwrap().path,
+            PathBuf::from("/saves/celeste")
+        );
+
+        let two = cached(vec![game(
+            "celeste",
+            &["/a", "/b"],
+            &[Confidence::High, Confidence::Medium],
+            Confidence::High,
+        )]);
+        // Dos candidatas: elige el usuario, la card no ofrece atajo.
+        assert!(local_detection(Some(&two), "celeste")
+            .unambiguous()
+            .is_none());
+
+        let none = cached(vec![game("celeste", &[], &[], Confidence::High)]);
+        assert!(local_detection(Some(&none), "celeste")
+            .unambiguous()
+            .is_none());
+    }
+
+    #[test]
+    fn never_scanned_is_distinct_from_scanned_and_empty() {
+        // Sin caché: no lo sabemos ⇒ el frontend ofrece escanear.
+        let cold = local_detection(None, "celeste");
+        assert!(cold.scanned_at.is_none());
+        assert!(cold.paths.is_empty());
+
+        // Con caché pero sin el slug: sí lo sabemos, y la respuesta es "nada".
+        let scanned = local_detection(Some(&cached(vec![])), "celeste");
+        assert!(scanned.scanned_at.is_some());
+        assert!(scanned.paths.is_empty());
+    }
 }

@@ -175,6 +175,7 @@ pub fn run() {
         .manage(AppState::from_disk())
         .manage(TrayController::default())
         .manage(AutomaticScheduler::default())
+        .manage(commands::cloud_feed::CloudFeed::default())
         .manage(commands::cloud_pull::CloudPullScheduler::default())
         .manage(commands::cloud_realtime::RealtimeScheduler::default())
         .manage(commands::selfhosted_events::SelfHostedEventsScheduler::default())
@@ -182,6 +183,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::misc::greet,
             commands::misc::open_external,
+            commands::cloud_feed::notifications_backlog,
+            commands::cloud_feed::devices_refresh,
+            commands::cloud_feed::notification_dismiss,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,
             commands::auth::health_check,
@@ -195,6 +199,7 @@ pub fn run() {
             commands::library::deep_scan_library,
             commands::library::scan_folder,
             commands::library::cached_detection,
+            commands::library::detected_paths_for_game,
             commands::library::add_game_to_tracking,
             commands::library::adopt_save,
             commands::library::list_tracked_saves,
@@ -421,6 +426,19 @@ pub fn run() {
         // already rotated server-side but we haven't persisted yet would orphan
         // the new token and sign the user out on next launch. Bounded wait.
         if let RunEvent::ExitRequested { .. } = event {
+            // Final presence beat before the process dies: flips this
+            // device's dot to grey on the other machines' Eye panels right
+            // away instead of after the 90s timeout. Bounded wait (3s) inside
+            // the handle, so quitting never hangs on a dead network.
+            let presence = app_handle
+                .state::<AppState>()
+                .presence
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(p) = presence {
+                tauri::async_runtime::block_on(p.closing());
+            }
             crate::commands::cloud::wait_for_refresh_quiescent_blocking();
             return;
         }

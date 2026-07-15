@@ -256,7 +256,7 @@ pub async fn logout() -> Result<()> {
 
 pub async fn whoami() -> Result<()> {
     if let Some(sess) = cloud_auth::load_session()? {
-        let tokens = cloud_auth::refresh_and_store(&sess).await?;
+        let tokens = cloud_auth::refresh_freshest().await?;
         let me = cloud_auth::fetch_me(&sess.server_url, &tokens.access).await?;
         println!(
             "Hoard Cloud\n  email:   {}\n  user_id: {}\n  plan:    {}\n  usage:   {} / {}",

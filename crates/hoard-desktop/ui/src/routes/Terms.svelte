@@ -67,12 +67,12 @@
     </div>
 
     <label
-      class="mt-6 flex cursor-pointer items-start gap-3 rounded-xl border border-zinc-700 bg-zinc-900 p-4 text-sm text-zinc-200"
+      class="mt-6 flex cursor-pointer items-start gap-3 rounded-xl border border-white/[0.08] bg-zinc-950/40 p-4 text-sm text-zinc-200"
     >
       <input
         type="checkbox"
         bind:checked={accepted}
-        class="mt-0.5 h-4 w-4 shrink-0 rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/50"
+        class="mt-0.5 h-4 w-4 shrink-0 rounded border-zinc-600 bg-zinc-800 text-[var(--color-accent)] focus:ring-[var(--color-accent)]/50"
       />
       <span>{$_("onboarding.terms_accept")}</span>
     </label>

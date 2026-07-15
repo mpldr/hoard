@@ -17,6 +17,7 @@
   import { HardDrive } from "lucide-svelte";
   import { _ } from "svelte-i18n";
   import type { UserInfo } from "../api";
+  import CountUp from "./CountUp.svelte";
 
   type Props = {
     user: UserInfo;
@@ -92,7 +93,7 @@
             ? 'text-amber-400'
             : 'text-zinc-300'}"
       >
-        {pct.toFixed(1)}%
+        <CountUp value={pct} decimals={1} suffix="%" />
       </span>
     {:else if user.is_local_server}
       <span class="text-xs text-zinc-500">{$_("quota.self_hosted")}</span>

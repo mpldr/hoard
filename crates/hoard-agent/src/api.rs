@@ -7,6 +7,11 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
+/// How long a snapshot download may go without a single byte arriving before we
+/// call it stalled. Not a budget for the transfer — it resets on every chunk —
+/// so it bounds a dead stream without capping a big, slow, healthy one.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("network error: {0}")]
@@ -189,15 +194,30 @@ pub struct ApiClient {
     /// lets the desktop's token-refresh path push a fresh JWT into the running
     /// agent's client via [`ApiClient::set_token`] without rebuilding it.
     token: Arc<RwLock<String>>,
+    /// Client for the small request/response JSON endpoints. Its 60 s total
+    /// timeout covers the whole request *including the body*, so nothing that
+    /// streams snapshot bytes may use it — see `upload_http` / `download_http`.
     http: Client,
-    /// Second client for snapshot uploads/downloads. Same headers as `http`
-    /// but with **no per-request total timeout** — a multi-GB save (Paradox
-    /// grand-strategy is the worst case) on a residential upload link blows
-    /// past any fixed timeout, which previously killed the request mid-flight
-    /// and silently hung the dashboard "Subiendo…" pill. A TCP keepalive
-    /// surfaces a genuinely dead connection; a slow-but-progressing upload is
-    /// left to finish.
+    /// Streaming client for snapshot **uploads** (`snapshot_upload`,
+    /// `put_presigned`). Same headers as `http` but with **no per-request total
+    /// timeout** — a multi-GB save (Paradox grand-strategy is the worst case)
+    /// on a residential upload link blows past any fixed timeout, which
+    /// previously killed the request mid-flight and silently hung the dashboard
+    /// "Subiendo…" pill. A TCP keepalive surfaces a genuinely dead connection;
+    /// a slow-but-progressing upload is left to finish.
     upload_http: Client,
+    /// Streaming client for snapshot **downloads** (`snapshot_download`,
+    /// `get_presigned`). Same no-total-timeout rationale as `upload_http`, plus
+    /// a `read_timeout` that bounds a genuine stall.
+    ///
+    /// The read timeout is deliberately *not* on `upload_http`: reqwest arms it
+    /// once when the request starts and polls it while waiting for the response
+    /// head, only handing it to the body (where it becomes per-read and resets
+    /// on progress) once the head arrives. A download's head lands immediately,
+    /// so the timeout only ever sees body reads; an upload's head arrives after
+    /// the whole body is sent, so the same setting would kill any upload slower
+    /// than the timeout — exactly the bug `upload_http` exists to avoid.
+    download_http: Client,
     /// Lazily-probed `/v1/health` `mode` (`Some("cloud")` on the SaaS
     /// deployment, `None`/absent self-hosted). Cached behind an `Arc` so the
     /// many `ApiClient` clones in flight share a single probe. Only cached on
@@ -222,11 +242,21 @@ impl ApiClient {
             .tcp_keepalive(Duration::from_secs(30))
             .pool_idle_timeout(None)
             .build()?;
+        let download_http = Client::builder()
+            .user_agent(concat!("hoard-agent/", env!("CARGO_PKG_VERSION")))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(None)
+            // Per-read, not total: it resets on every chunk that arrives, so a
+            // download stays alive as long as it progresses however long it
+            // takes, while one that truly stalls fails instead of hanging.
+            .read_timeout(STREAM_STALL_TIMEOUT)
+            .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: Arc::new(RwLock::new(token.into())),
             http,
             upload_http,
+            download_http,
             mode: Arc::new(OnceCell::new()),
         })
     }
@@ -337,7 +367,7 @@ impl ApiClient {
         let method = reqwest::Method::from_bytes(presigned.method.as_bytes())
             .unwrap_or(reqwest::Method::PUT);
         let resp = self
-            .http
+            .upload_http
             .request(method, &presigned.url)
             .header(reqwest::header::CONTENT_LENGTH, content_length)
             .body(body)
@@ -450,10 +480,19 @@ impl ApiClient {
 
     /// GET the bytes behind a presigned download URL as a streaming response.
     /// No auth header, same rationale as [`put_presigned`].
+    ///
+    /// Streams the body, so it belongs on `download_http`: on `http` the 60 s
+    /// total timeout also covered the streaming, and every Cloud restore of a
+    /// save too big to land inside a minute died mid-body with "operation timed
+    /// out" — forever, since the next attempt was no faster.
     pub async fn get_presigned(&self, presigned: &PresignedUrl) -> Result<reqwest::Response> {
         let method = reqwest::Method::from_bytes(presigned.method.as_bytes())
             .unwrap_or(reqwest::Method::GET);
-        let resp = self.http.request(method, &presigned.url).send().await?;
+        let resp = self
+            .download_http
+            .request(method, &presigned.url)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -517,6 +556,61 @@ impl ApiClient {
             .send()
             .await?;
         let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/presence/heartbeat` — latido de presencia (Cloud). Lleva los
+    /// mismos headers de identidad de device que `/v1/me`, porque el server
+    /// resuelve la fila de `devices` por `x-hoard-device-fp` (y puede hasta
+    /// registrarla si el primer contacto de una máquina es este latido — el
+    /// caso del daemon headless que nunca pasa por `/v1/me`).
+    pub async fn presence_heartbeat(&self, playing: &[PlayingBeat], closing: bool) -> Result<()> {
+        let body = serde_json::json!({ "closing": closing, "playing": playing });
+        let dev = crate::logship::device_identity();
+        let mut req = self
+            .http
+            .post(self.url("/v1/presence/heartbeat"))
+            .header("authorization", self.auth_header())
+            .header("x-hoard-device-fp", &dev.fingerprint)
+            .header("x-hoard-device-os", &dev.os)
+            .header("x-hoard-app-version", env!("CARGO_PKG_VERSION"));
+        if let Some(name) = dev.name.as_deref() {
+            req = req.header("x-hoard-device-name", name);
+        }
+        let resp = req.json(&body).send().await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// `GET /v1/devices` — los dispositivos de la cuenta con su presencia en
+    /// vivo (online, jugando qué, desde cuándo). El header de fingerprint va
+    /// para que el server marque `this_device` y la UI filtre sin conocer su
+    /// propio UUID.
+    pub async fn list_devices(&self) -> Result<DeviceListOut> {
+        let dev = crate::logship::device_identity();
+        let resp = self
+            .http
+            .get(self.url("/v1/devices"))
+            .header("authorization", self.auth_header())
+            .header("x-hoard-device-fp", &dev.fingerprint)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `GET /v1/notifications` — broadcasts del operador para la campana.
+    /// `since` es el cursor RFC3339 del cliente: solo vuelven filas
+    /// estrictamente posteriores, así nada se re-entrega tras un reinicio.
+    pub async fn list_notifications(&self, since: Option<&str>) -> Result<NotificationListOut> {
+        let mut req = self
+            .http
+            .get(self.url("/v1/notifications"))
+            .header("authorization", self.auth_header());
+        if let Some(s) = since {
+            req = req.query(&[("since", s)]);
+        }
+        let resp = Self::ok_or_err(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -618,6 +712,13 @@ impl ApiClient {
     }
 
     pub async fn delete_save(&self, save_id: &str) -> Result<()> {
+        // Cloud speaks a different namespace (`/v1/cloud/saves/*`); the
+        // self-hosted `DELETE /v1/saves/{id}` isn't mounted there and 404s,
+        // which the UI mistranslates as "save no longer exists" ??? leaving
+        // Cloud users unable to delete anything. Branch on the server mode.
+        if self.is_cloud().await {
+            return self.cloud_save_delete(save_id).await;
+        }
         let resp = self
             .http
             .delete(self.url(&format!("/v1/saves/{}", save_id)))
@@ -632,6 +733,11 @@ impl ApiClient {
     /// [`ApiError::Conflict`] so the UI can show a "label already exists"
     /// message instead of a generic server error.
     pub async fn rename_save_label(&self, save_id: &str, new_label: &str) -> Result<Save> {
+        // Same namespace split as `delete_save`: the self-hosted PATCH
+        // isn't mounted on Cloud. Branch so both paths work.
+        if self.is_cloud().await {
+            return self.cloud_rename_save_label(save_id, new_label).await;
+        }
         let body = serde_json::json!({ "label": new_label });
         let resp = self
             .http
@@ -641,6 +747,22 @@ impl ApiClient {
             .send()
             .await?;
         let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `PATCH /v1/cloud/saves/:save_id` ??? rename the label on a cloud save.
+    /// The cloud analogue of `rename_save_label`; the server enforces
+    /// `UNIQUE(user_id, game_slug, label)` and returns 409 on collision.
+    pub async fn cloud_rename_save_label(&self, save_id: &str, new_label: &str) -> Result<Save> {
+        let body = serde_json::json!({ "label": new_label });
+        let resp = self
+            .http
+            .patch(self.url(&format!("/v1/cloud/saves/{save_id}")))
+            .header("authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
         Ok(resp.json().await?)
     }
 
@@ -677,7 +799,7 @@ impl ApiClient {
         version: i64,
     ) -> Result<reqwest::Response> {
         let resp = self
-            .upload_http
+            .download_http
             .get(self.url(&format!(
                 "/v1/saves/{}/snapshots/{}/download",
                 save_id, version
@@ -1002,4 +1124,76 @@ pub struct CloudVersionManifestOut {
     pub content_addressed: bool,
     #[serde(default)]
     pub files: Vec<CloudManifestFile>,
+}
+
+/// Un juego en un latido de presencia: slug + segundos que lleva corriendo.
+/// Duración y no timestamp: el server la ancla a su propio reloj, inmune a
+/// relojes de cliente desviados.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayingBeat {
+    pub slug: String,
+    pub for_secs: u64,
+}
+
+/// Un juego corriendo en un device (`GET /v1/devices`): slug + RFC3339 del
+/// arranque de la sesión.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePlaying {
+    pub slug: String,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// Un dispositivo de la cuenta con su presencia en vivo (`GET /v1/devices`).
+/// Serialize además de Deserialize: el desktop lo reemite tal cual como
+/// payload del evento Tauri `hoard://devices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceOut {
+    pub id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Heartbeat fresco y sin beat de cierre.
+    #[serde(default)]
+    pub online: bool,
+    /// Juegos corriendo ahora mismo (el más reciente primero); solo viene si
+    /// `online`. Vacío = idle.
+    #[serde(default)]
+    pub playing: Vec<DevicePlaying>,
+    /// True en la fila que corresponde al fingerprint del caller.
+    #[serde(default)]
+    pub this_device: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceListOut {
+    pub devices: Vec<DeviceOut>,
+}
+
+/// Un broadcast del operador (`GET /v1/notifications`). Mismo shape que el
+/// `ServerNotification` que espera la UI (stores/notifications.ts) más
+/// `created_at` para el cursor del cliente.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationOut {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub action_url: Option<String>,
+    #[serde(default)]
+    pub action_label: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationListOut {
+    pub notifications: Vec<NotificationOut>,
 }

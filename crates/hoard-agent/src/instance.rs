@@ -75,14 +75,16 @@ fn alive(pid: u32) -> bool {
     // de Linux. Sin esto, un `agent.pid` obsoleto (desktop matado sin Drop
     // limpio) haría que el banner muestre "running" falso y que
     // `hoard sync start` se niegue a arrancar.
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    // sysinfo keys processes by its own `Pid` newtype, not a bare u32.
+    let target = Pid::from_u32(pid);
     let mut sys = System::new();
     sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
+        ProcessesToUpdate::Some(&[target]),
         true,
         ProcessRefreshKind::new(),
     );
-    sys.process(pid)
+    sys.process(target)
         .map(|p| p.name().to_string_lossy().to_lowercase().contains("hoard"))
         .unwrap_or(false)
 }

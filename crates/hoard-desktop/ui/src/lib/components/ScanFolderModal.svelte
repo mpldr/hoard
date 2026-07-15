@@ -81,7 +81,7 @@
       onAdded(saved);
       addedSlugs = [...addedSlugs, game.slug];
       toastSuccess(
-        $_("emulators.added", { values: { name: game.display_name } }),
+        $_("manual.added_game", { values: { name: game.display_name } }),
       );
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
@@ -112,7 +112,7 @@
   onClose={close}
 >
   <div class="space-y-4">
-    <div class="flex gap-2">
+    <div class="flex flex-wrap gap-2">
       <Button variant="secondary" onclick={pickFolder} loading={scanning}>
         <FolderOpen size={14} />
         {folder ? $_("scan_folder.change") : $_("scan_folder.pick")}

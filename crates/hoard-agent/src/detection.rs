@@ -43,7 +43,7 @@ use crate::correlation::{self, CorrelationStore};
 use crate::launchers::{self, LauncherApp};
 use crate::manifest::Os;
 use crate::pathexpand::{
-    expand_path, expand_path_in_prefix, expand_path_in_prefix_as_user, expand_registry_path,
+    expand_path_globbed, expand_path_in_prefix, expand_path_in_prefix_as_user, expand_registry_path,
 };
 use crate::roots;
 use crate::scoring;
@@ -355,7 +355,7 @@ where
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut root_matched = false;
             for tmpl in &templates {
-                let candidates = expand_path(tmpl, os);
+                let candidates = expand_path_globbed(tmpl, os);
                 if candidates.is_empty() {
                     // Unknown placeholder or unset env var — pathexpand
                     // already returns vec![] for those. Useful to log
@@ -1526,7 +1526,7 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
             kept: Vec::new(),
             dropped: Vec::new(),
         };
-        let candidates = expand_path(tmpl, os);
+        let candidates = expand_path_globbed(tmpl, os);
         if candidates.is_empty() {
             step.dropped.push(DroppedPath {
                 path: tmpl.clone(),

@@ -33,6 +33,7 @@ use tokio::time::{interval, sleep, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::commands::cloud;
+use crate::commands::cloud_feed;
 use crate::commands::cloud_pull;
 use crate::state::AppState;
 
@@ -151,9 +152,15 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
     let (ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
     let (mut write, mut read) = ws.split();
 
-    // Join the channel, subscribing to UPDATE/INSERT on public.saves. RLS on
-    // the authenticated token guarantees we only ever receive our own rows,
-    // so no client-side user_id filter is needed.
+    // Join the channel, subscribing to the three push sources. RLS on the
+    // authenticated token guarantees we only ever receive our own rows (for
+    // `notifications` — broadcasts — every authenticated user passes), so no
+    // client-side user_id filter is needed.
+    //
+    // - `saves` UPDATE/INSERT   → another device committed; kick a sync pull.
+    // - `devices` UPDATE/INSERT → a sibling's heartbeat / game change; kick
+    //   the Eye-panel devices feed.
+    // - `notifications` INSERT  → operator broadcast; kick the bell feed.
     let join = json!({
         "topic": "realtime:hoard",
         "event": "phx_join",
@@ -164,7 +171,10 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
                 "private": false,
                 "postgres_changes": [
                     { "event": "UPDATE", "schema": "public", "table": "saves" },
-                    { "event": "INSERT", "schema": "public", "table": "saves" }
+                    { "event": "INSERT", "schema": "public", "table": "saves" },
+                    { "event": "UPDATE", "schema": "public", "table": "devices" },
+                    { "event": "INSERT", "schema": "public", "table": "devices" },
+                    { "event": "INSERT", "schema": "public", "table": "notifications" }
                 ]
             },
             "access_token": creds.access_token
@@ -211,13 +221,24 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
                                     tracing::debug!("cloud-realtime: saves change pushed → kicking pull");
                                     cloud_pull::kick(app);
                                 }
+                                Action::DevicesChange => {
+                                    tracing::debug!("cloud-realtime: devices change pushed → kicking devices feed");
+                                    cloud_feed::kick_devices(app);
+                                }
+                                Action::NotificationsChange => {
+                                    tracing::debug!("cloud-realtime: notification pushed → kicking bell feed");
+                                    cloud_feed::kick_notifications(app);
+                                }
                                 Action::Resubscribed => {
                                     // Just (re)joined the channel. Anything that
                                     // changed while the socket was down produced
                                     // no `postgres_changes` for us, so kick one
-                                    // catch-up pull to close that gap.
+                                    // catch-up pull to close that gap — and prime
+                                    // both feeds so the Eye panel and the bell are
+                                    // fresh right from sign-in/boot.
                                     tracing::debug!("cloud-realtime: (re)subscribed → catch-up pull");
                                     cloud_pull::kick(app);
+                                    cloud_feed::kick_all(app);
                                 }
                                 Action::TokenError => {
                                     // The JWT was rejected on join. Refresh it
@@ -258,6 +279,11 @@ async fn sleep_until(deadline: Instant) {
 enum Action {
     /// A relevant `saves` row changed — refresh state.
     Change,
+    /// A `devices` row changed (heartbeat / game start / closing beat) —
+    /// refresh the Eye panel's devices feed.
+    DevicesChange,
+    /// A `notifications` row landed — an operator broadcast for the bell.
+    NotificationsChange,
     /// The channel join succeeded — (re)subscribed, trigger a catch-up pull.
     Resubscribed,
     /// The access token was rejected; refresh and reconnect.
@@ -277,10 +303,11 @@ fn classify(txt: &str) -> Option<Action> {
                 .pointer("/payload/data/table")
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            if table == "saves" {
-                Some(Action::Change)
-            } else {
-                None
+            match table {
+                "saves" => Some(Action::Change),
+                "devices" => Some(Action::DevicesChange),
+                "notifications" => Some(Action::NotificationsChange),
+                _ => None,
             }
         }
         // Join reply / system status. An error status here usually means the

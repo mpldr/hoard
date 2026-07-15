@@ -15,7 +15,8 @@
 //! para no pisar el cache de cuenta del desktop.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
@@ -564,29 +565,110 @@ fn jwt_sub(jwt: &str) -> Option<String> {
     v.get("sub")?.as_str().map(String::from)
 }
 
-/// Refresca la sesión y persiste el par rotado. Si GoTrue dice que el token ya
-/// estaba rotado ([`RefreshTokenStale`]), reintenta adoptando lo que otra
-/// ejecución (p.ej. el desktop) ya dejó en disco antes de rendirse.
-pub async fn refresh_and_store(sess: &Session) -> Result<Tokens> {
+// ---- refresh centralizado ---------------------------------------------
+
+/// Ventana en la que un refresh recién completado se reutiliza en vez de pedir
+/// otro. GoTrue rota el refresh token en cada uso y revoca el anterior, así que
+/// una ráfaga de llamantes (el refresher periódico y un token rechazado por el
+/// realtime, p.ej.) tiene que colapsar en un solo viaje: el segundo replay
+/// dispararía reuse-detection sobre un token ya rotado.
+const REFRESH_REUSE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Serializa **todos** los refresh del proceso y recuerda el último par rotado.
+fn refresh_gate() -> &'static tokio::sync::Mutex<Option<(Instant, Tokens)>> {
+    static GATE: OnceLock<tokio::sync::Mutex<Option<(Instant, Tokens)>>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Refresca la sesión Cloud con **el token más fresco que haya en disco** y
+/// persiste el par rotado. Único camino de refresh del proceso, a propósito.
+///
+/// El motivo de que no acepte una `Session`: cada llamante refrescaba antes con
+/// su propia copia en memoria, y una copia capturada minutos atrás (el realtime
+/// la toma al conectar y su conexión vive hasta `CONNECTION_MAX_SECS`) podía
+/// replayar un token que el refresher periódico ya había rotado. Fuera de la
+/// ventana de gracia de GoTrue eso no es un reintento sino reuse-detection, y
+/// la respuesta es revocar la **familia entera** de tokens: sesión muerta sin
+/// recuperación posible, ni siquiera reiniciando.
+///
+/// Tres capas: el mutex serializa los refresh concurrentes, la relectura de
+/// disco *dentro* del lock impide mandar una copia vieja, y
+/// [`REFRESH_REUSE_WINDOW`] colapsa las ráfagas. El heal cubre lo que queda
+/// fuera del proceso (el desktop comparte el mismo fichero de sesión): si GoTrue
+/// dice stale, se relee disco y se adopta la rotación ajena.
+pub async fn refresh_freshest() -> Result<Tokens> {
+    // Sostener el lock a través de la llamada de red es lo que serializa.
+    let mut last = refresh_gate().lock().await;
+
+    if let Some((at, tokens)) = last.as_ref() {
+        if at.elapsed() < REFRESH_REUSE_WINDOW {
+            return Ok(tokens.clone());
+        }
+    }
+
+    let Some(sess) = load_session()? else {
+        bail!("no hay sesión Cloud — vuelve a iniciar sesión");
+    };
     let attempted = sess.refresh.clone();
     match refresh(&sess.refresh).await {
         Ok(tokens) => {
             store_tokens(&tokens, &sess.server_url)?;
+            *last = Some((Instant::now(), tokens.clone()));
             Ok(tokens)
         }
         Err(e) if e.downcast_ref::<RefreshTokenStale>().is_some() => {
-            let healed = load_session()
-                .ok()
-                .flatten()
-                .filter(|s| !s.refresh.trim().is_empty() && s.refresh != attempted);
-            if let Some(s) = healed {
-                return Ok(Tokens {
-                    access: s.access,
-                    refresh: s.refresh,
-                });
+            match adoptable(&attempted, load_session().ok().flatten().as_ref()) {
+                Some(tokens) => {
+                    tracing::debug!("cloud: el refresh token lo rotó otra ejecución; adopto el de disco");
+                    *last = Some((Instant::now(), tokens.clone()));
+                    Ok(tokens)
+                }
+                None => Err(e.context("la sesión Cloud caducó — vuelve a iniciar sesión")),
             }
-            Err(e.context("la sesión Cloud caducó — vuelve a iniciar sesión"))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Decide si la sesión en disco sirve para sanar un [`RefreshTokenStale`]: solo
+/// si trae un refresh token no vacío y **distinto** del que se intentó. Si fuera
+/// el mismo, reintentarlo daría stale otra vez — no hay nada que adoptar.
+fn adoptable(attempted: &str, on_disk: Option<&Session>) -> Option<Tokens> {
+    let s = on_disk?;
+    (!s.refresh.trim().is_empty() && s.refresh != attempted).then(|| Tokens {
+        access: s.access.clone(),
+        refresh: s.refresh.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk(refresh: &str) -> Session {
+        Session {
+            server_url: "https://api.hoard.services".to_string(),
+            access: "fresh-jwt".to_string(),
+            refresh: refresh.to_string(),
+        }
+    }
+
+    #[test]
+    fn adopts_a_rotation_left_by_another_process() {
+        let got = adoptable("ours", Some(&disk("rotated-by-the-desktop"))).expect("adoptable");
+        assert_eq!(got.refresh, "rotated-by-the-desktop");
+        assert_eq!(got.access, "fresh-jwt");
+    }
+
+    #[test]
+    fn refuses_to_replay_the_token_that_just_failed() {
+        // Mismo token en disco: nadie rotó nada, la sesión está muerta de verdad.
+        assert!(adoptable("ours", Some(&disk("ours"))).is_none());
+    }
+
+    #[test]
+    fn ignores_an_empty_or_absent_session() {
+        assert!(adoptable("ours", Some(&disk("   "))).is_none());
+        assert!(adoptable("ours", None).is_none());
     }
 }

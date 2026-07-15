@@ -29,7 +29,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System, UpdateKind,
+};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -163,10 +165,32 @@ pub fn min_snapshot_interval_for(data_saving: f64) -> u64 {
 /// changes); `with_cpu` adds no per-process file read — utime/stime come from
 /// the same `/proc/<pid>/stat` already parsed for the name, plus a single
 /// global `/proc/stat` read per tick — so steady-state ticks stay cheap.
+///
+/// `Process::status()` (see [`is_defunct`]) needs no flag of its own and adds
+/// no cost: `ProcessRefreshKind` has no switch for it because sysinfo always
+/// populates it from the state field of that same already-parsed
+/// `/proc/<pid>/stat` (macOS/Windows fill it from the process snapshot they
+/// already walk). The zombie filter is free.
 fn proc_refresh_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::new()
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cpu()
+}
+
+/// Is this process listed by the OS but no longer able to run code? A zombie
+/// has already exited and only lingers because its parent hasn't reaped it —
+/// which under Proton is routine: the game quits, the wine supervisor leaves
+/// the .exe defunct, and the entry can sit there until the prefix tears down
+/// (on a Steam Deck, often not before the next reboot).
+///
+/// It matters because a defunct entry keeps its name and its exe path, so every
+/// strong matcher in [`process_poll`] (name, identity token, open handles,
+/// install dir) went on matching it and the slot stayed `is_running` for good.
+/// That pinned the mid-session veto open and a save pushed from another device
+/// never landed. A zombie cannot be writing a save file, so it cannot be
+/// evidence that the user is playing.
+fn is_defunct(status: ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::Zombie | ProcessStatus::Dead)
 }
 
 /// One save the agent is responsible for backing up.
@@ -370,6 +394,25 @@ pub enum AgentEvent {
         /// Process name, for the toast ("Detectado posible juego: …") and logs.
         name: String,
     },
+    /// An update from another device is ready to pull, but the save's
+    /// mid-session guards vetoed it: the game is still running, or the folder
+    /// has changes this device hasn't versioned yet. The agent remembers it
+    /// (`SaveSlot::pull_pending`) and pulls the moment the game closes.
+    ///
+    /// The wait is worth surfacing because it can be long and looks like
+    /// nothing happening: a Proton game that leaves its process behind holds
+    /// the veto until the leftover is reaped. "Waiting for the game to close"
+    /// is the difference between a user seeing sync work and a user reloading
+    /// Steam to force it.
+    ///
+    /// Emitted once per waiting update (the sweep re-checks every tick), and
+    /// again if a new session defers it anew.
+    RestoreDeferred {
+        save_id: String,
+        game_slug: String,
+        /// The guard that vetoed, straight from `mid_session_reason`.
+        reason: String,
+    },
 }
 
 /// Why we scheduled a backup. Useful in the UI to explain "the game just
@@ -386,6 +429,11 @@ pub enum BackupReason {
     /// backup there's no user-visible trigger, and N queued rows every hour
     /// would be noise — but the resulting upload still announces normally.
     SweepStaggered,
+    /// A previous attempt burned its whole retry budget and failed for real.
+    /// The upload is re-armed on a long backoff ([`BACKUP_RETRY_BACKOFF`]) so
+    /// there's a way back without waiting on a new fs event. See
+    /// [`AgentCommand::RetryBackupAfterFailure`].
+    RetryAfterFailure,
 }
 
 /// Per-slot diagnostic snapshot. Surfaced by the hidden Settings diagnostics
@@ -469,9 +517,10 @@ enum AgentCommand {
     /// bajarlo ya, saltándose el cooldown del sweep. Respeta el flag
     /// `restoring` (no solapa restores), el opt-out backup-only por preset y
     /// los guards de sesión viva (`is_running`/`has_pending`/actividad
-    /// reciente): con la partida abierta se difiere y el sweep lo recoge en
-    /// cuanto el save se asienta. El version-gate dentro de
-    /// `run_auto_restore` evita la descarga si ya estamos al día.
+    /// reciente): con la partida abierta el pull NO se descarta, se anota en
+    /// `SaveSlot::pull_pending` y se ejecuta al cerrarse el juego. El
+    /// version-gate dentro de `run_auto_restore` evita la descarga si ya
+    /// estamos al día.
     ForceRestore(String),
     /// DETECCIÓN (fase 3, ADR 0020): lista de carpetas candidatas detectadas
     /// pero AÚN NO rastreadas, que el escaneo del desktop quiere "sondear".
@@ -482,6 +531,16 @@ enum AgentCommand {
     /// rastreado deja por fin rastro, y el siguiente escaneo lo asciende a
     /// `High` y lo auto-rastrea. Reemplaza el set entero en cada llamada.
     SetProbeCandidates(Vec<PathBuf>),
+    /// Internal: a backup task exhausted its retry budget and failed for real.
+    /// Sent by `run_backup_with_retry` instead of just giving up, because
+    /// giving up wedged the slot: no `BackupDone` is emitted on this path (the
+    /// local changes are still un-versioned, so `has_pending` must stay set to
+    /// keep every restore off them) and `has_pending` is itself a
+    /// `mid_session_reason` veto — so the save could neither be uploaded nor
+    /// pulled until the user happened to write the folder again. The handler
+    /// re-arms the upload on [`BACKUP_RETRY_BACKOFF`], the recovery path that
+    /// doesn't depend on a new fs event.
+    RetryBackupAfterFailure(String),
     /// Latest known cloud version per save id, as last seen by the `cloud_pull`
     /// poller's manifest. The poller already fetches the full manifest once per
     /// tick, so it hands the map to the agent and the reconciliation sweep can
@@ -728,6 +787,29 @@ struct SaveSlot {
     /// (another device committed a higher version) still pulls; our own folder
     /// churn no longer does.
     known_version: Option<i64>,
+    /// A cross-device update is waiting to land in this slot, but a pull was
+    /// vetoed by [`mid_session_reason`]. Set instead of dropping the
+    /// `ForceRestore` outright: "the sweep re-runs every tick, so it lands as
+    /// soon as the session settles" assumed the session ends. On a Steam Deck it
+    /// often doesn't — suspend/resume keeps the game alive across days, and
+    /// Proton regularly leaves the process behind after the user quits — so the
+    /// veto held forever and a save made on another device only showed up after
+    /// a Steam restart. Consumed by the `GameStopped` transition (see
+    /// [`deferred_pull_ready`]), the first moment the folder is provably quiet.
+    pull_pending: bool,
+    /// The `GameStopped` final flush is in flight and owes this slot a deferred
+    /// pull once its `BackupDone` lands. A one-shot licence, consumed by the
+    /// next `BackupDone` whether or not the pull ends up firing: it scopes the
+    /// recency-guard skip to the stop transition, so no other backup (a
+    /// mid-session flush, a manual run) can license a pull into a folder that
+    /// was just written.
+    pull_after_flush: bool,
+    /// Has [`AgentEvent::RestoreDeferred`] already gone out for the update
+    /// currently waiting? The sweep re-evaluates the veto every tick, so without
+    /// this the feed would take one "waiting" line per save per tick. Cleared
+    /// when the game starts (a new session earns a new notice) and when the
+    /// deferred pull finally fires.
+    deferred_notified: bool,
 }
 
 async fn run_agent(
@@ -948,15 +1030,19 @@ async fn run_agent(
                         // last uploaded version over progress that hadn't been
                         // flushed yet — on a single device, the poller's echo
                         // of our own upload could erase a live session. Never
-                        // pull into a folder the user is actively playing in;
-                        // drop the command instead. Nothing is lost: un-flushed
-                        // local changes are uploaded immediately (below), and
-                        // the reconciliation sweep runs every tick with these
-                        // same guards and version-gates against the poller's
-                        // cache, so a remaining delta is picked up as soon as
-                        // the session settles (a genuinely newer remote head is
-                        // also reconciled by the 409 non-fast-forward path when
-                        // we upload first).
+                        // pull into a folder the user is actively playing in.
+                        //
+                        // Deferring it, however, is not the same as dropping it.
+                        // This used to drop the command on the theory that the
+                        // sweep re-runs every tick with the same guards and
+                        // would pick the delta up "as soon as the session
+                        // settles". On a Steam Deck the session doesn't settle:
+                        // suspend/resume keeps the process alive for days and
+                        // Proton leaves it behind after the user quits, so the
+                        // veto never lifted and the other device's save never
+                        // arrived (the user's fix was reloading Steam). We now
+                        // remember the pull and run it the moment the game
+                        // closes — see `SaveSlot::pull_pending`.
                         let mid_session = if eligible {
                             slots.get(&id).and_then(mid_session_reason)
                         } else {
@@ -967,7 +1053,7 @@ async fn run_agent(
                             // progress sitting un-versioned in the debounce /
                             // min-interval queue while the remote moves: flush
                             // it now. The upload either commits cleanly (this
-                            // device becomes head and the dropped pull turns
+                            // device becomes head and the deferred pull turns
                             // into a no-op) or hits the 409 non-fast-forward
                             // reconcile, which merges the newer remote head and
                             // versions both sides — either way the progress
@@ -976,6 +1062,22 @@ async fn run_agent(
                             // 2s mirrors the GameStopped final flush; skipping
                             // the ADR 0018 min-interval floor here is deliberate
                             // (correctness beats data saving under contention).
+                            //
+                            // The poller only sends this after confirming a
+                            // version bump, so an update really is waiting: mark
+                            // the slot and tell the user it's queued.
+                            let notify = slots
+                                .get_mut(&id)
+                                .is_some_and(note_deferred_pull);
+                            if notify {
+                                if let Some(slot) = slots.get(&id) {
+                                    let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
+                                        save_id: id.clone(),
+                                        game_slug: slot.save.game_slug.clone(),
+                                        reason: reason.to_string(),
+                                    });
+                                }
+                            }
                             let flush_pending =
                                 slots.get(&id).is_some_and(|s| s.has_pending);
                             if flush_pending {
@@ -993,7 +1095,7 @@ async fn run_agent(
                                 tracing::info!(
                                     save_id = %id,
                                     reason,
-                                    "agent: force-restore deferred — user is mid-session; the sweep will pull once the save settles"
+                                    "agent: force-restore deferred — user is mid-session; the pull runs when the game closes"
                                 );
                             }
                         } else if eligible {
@@ -1062,6 +1164,30 @@ async fn run_agent(
                             schedule_backup(
                                 &mut slots, &id, BackupReason::Manual,
                                 Duration::ZERO, &api, &events_tx, &config, &done_tx, &cmd_tx,
+                            );
+                        }
+                    }
+                    Some(AgentCommand::RetryBackupAfterFailure(id)) => {
+                        if slots.contains_key(&id) {
+                            // Clear the stale "a backup is queued" stamp before
+                            // re-arming. `done_rx` never ran for the attempt
+                            // that just died, so it still points at that dead
+                            // schedule — and `schedule_backup` reads it as "a
+                            // window is already open", takes the retry for a
+                            // debounce reset and stays silent. The user would
+                            // see the failure and no sign of the recovery.
+                            if let Some(slot) = slots.get_mut(&id) {
+                                slot.next_scheduled_backup_at = None;
+                            }
+                            tracing::info!(
+                                save_id = %id,
+                                backoff_secs = BACKUP_RETRY_BACKOFF.as_secs(),
+                                "agent: backup retries exhausted — re-arming on the long backoff"
+                            );
+                            schedule_backup(
+                                &mut slots, &id, BackupReason::RetryAfterFailure,
+                                BACKUP_RETRY_BACKOFF,
+                                &api, &events_tx, &config, &done_tx, &cmd_tx,
                             );
                         }
                     }
@@ -1185,6 +1311,7 @@ async fn run_agent(
                     &mut sys, &mut slots, &events_tx, &api, &config, &done_tx, &cmd_tx,
                     &mut playtime, playtime_path.as_deref(), &mut reported_heavy,
                     &corr_store, &steam_index, &mut prev_pids, &mut corr_running,
+                    &latest_versions,
                 );
                 // Watcher self-healing: a slot whose folder didn't exist when
                 // the game was tracked (freshly installed, save dir created on
@@ -1243,10 +1370,15 @@ async fn run_agent(
 
             // ----- Backup success notifications -----
             Some(done) = done_rx.recv() => {
+                // Was this the `GameStopped` final flush a deferred pull is
+                // waiting on? Taken here so the licence can't outlive the one
+                // backup it was granted for.
+                let mut owed_pull = false;
                 if let Some(slot) = slots.get_mut(&done.save_id) {
                     slot.has_pending = false;
                     slot.next_scheduled_backup_at = None;
                     slot.first_pending_event_at = None;
+                    owed_pull = std::mem::take(&mut slot.pull_after_flush);
                     // Advance the throttle anchor only on a real upload — a
                     // skip/empty must not push the next change a full
                     // min-interval into the future.
@@ -1261,6 +1393,17 @@ async fn run_agent(
                     if let Some(h) = done.new_set_hash {
                         slot.last_set_hash = Some(h);
                     }
+                }
+                // The exit save is versioned and the folder has gone quiet:
+                // run the pull the session deferred. A no-op unless the game
+                // really is closed and nothing else is pending — a relaunch
+                // during the flush's 2s window defers it again, and
+                // `pull_pending` keeps it owed until the next quiet moment.
+                if owed_pull {
+                    run_deferred_pull(
+                        &mut slots, &done.save_id, &api, &events_tx, &cmd_tx,
+                        &config, &latest_versions,
+                    );
                 }
             }
         }
@@ -1311,6 +1454,9 @@ fn handle_add(
         next_auto_restore_at: None,
         last_set_hash,
         known_version,
+        pull_pending: false,
+        pull_after_flush: false,
+        deferred_notified: false,
     };
     // Playtime-only entries exist purely to be matched by the process poll
     // so their hours accrue for the recap. They own no save folder, so we
@@ -1442,6 +1588,15 @@ fn maybe_schedule_initial_backup(
 /// available" — possible during a GC race) doesn't get hammered by the
 /// reconciliation sweep.
 const AUTO_RESTORE_COOLDOWN_SECS: u64 = 60;
+
+/// How long to wait before re-arming a backup whose in-task retry budget
+/// (`max_retries`, seconds-scale exponential backoff) is spent. Ten minutes is
+/// deliberately far slower than that budget: what survives it isn't a flaky
+/// packet but a real outage — server down, no network, disk unreadable, token
+/// expired — and those resolve on the scale of minutes to hours. Long enough
+/// that a dead backend isn't hammered (and the feed gets one row per ten
+/// minutes, not a scroll of red), short enough that recovery is unattended.
+const BACKUP_RETRY_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// Idle process-poll slowdown factor. When no tracked game is running the agent
 /// polls the process table every `poll_secs * IDLE_POLL_MULT` instead of every
@@ -1726,6 +1881,12 @@ fn sweep_for_auto_restore(
     latest_versions: &HashMap<String, i64>,
 ) {
     let now = TokioInstant::now();
+    // Slots the mid-session guards vetoed while the poller's cache says the
+    // cloud is ahead: an update really is waiting on them. Recorded here and
+    // applied after the scan (the filter only holds `&SaveSlot`), so the
+    // `GameStopped` transition can run the pull the moment the game closes
+    // instead of leaving it to a sweep that a stuck process may veto forever.
+    let mut deferred: Vec<(String, &'static str)> = Vec::new();
     // Collect candidate save_ids first to keep the borrow checker happy
     // (we mutate the slot afterwards, then spawn a task that holds a
     // clone of `WatchedSave`).
@@ -1760,17 +1921,34 @@ fn sweep_for_auto_restore(
             // bypass them ("pull en el momento, even mid-session"), which on
             // a single device let the pull race the user's own debounced
             // backup and re-apply the last uploaded version over un-flushed
-            // progress (REPO data-loss, 2026-07-05). Deferring costs nothing:
-            // this sweep re-runs every tick, so the pull lands as soon as the
-            // session settles, and the version-gate keeps every retry free.
+            // progress (REPO data-loss, 2026-07-05). The sweep re-runs every
+            // tick and the version-gate keeps every retry free — but a tick
+            // that keeps being vetoed never lands, so a veto with the cloud
+            // ahead is also recorded on the slot and honoured at `GameStopped`.
             if let Some(reason) = mid_session_reason(slot) {
                 tracing::debug!(save_id = %id, reason, "sweep: skipping — user is mid-session");
+                if cloud_ahead(slot, latest_versions) {
+                    deferred.push((id.to_string(), reason));
+                }
                 return false;
             }
             true
         })
         .map(|(id, slot)| (id.clone(), slot.save.clone()))
         .collect();
+
+    for (id, reason) in deferred {
+        let notify = slots.get_mut(&id).is_some_and(note_deferred_pull);
+        if notify {
+            if let Some(slot) = slots.get(&id) {
+                let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
+                    save_id: id.clone(),
+                    game_slug: slot.save.game_slug.clone(),
+                    reason: reason.to_string(),
+                });
+            }
+        }
+    }
 
     for (id, save) in candidates {
         let known_version = slots.get(&id).and_then(|s| s.known_version);
@@ -1832,6 +2010,124 @@ fn mid_session_reason(slot: &SaveSlot) -> Option<&'static str> {
         return Some("save folder touched recently");
     }
     None
+}
+
+/// Does the poller's version cache say this save moved past what this device
+/// last committed or restored? A cached version with no `known_version` counts
+/// as ahead: this device has never synced the save, so whatever the cloud holds
+/// is news. No cache entry means we simply don't know (self-hosted, headless
+/// CLI, or the poller hasn't reported yet) — never claim ahead on a guess, the
+/// callers use this to decide whether an update is *waiting*, and the pull
+/// itself re-checks the real head anyway.
+fn cloud_ahead(slot: &SaveSlot, latest_versions: &HashMap<String, i64>) -> bool {
+    match latest_versions.get(&slot.save.save_id) {
+        Some(latest) => slot.known_version.is_none_or(|known| *latest > known),
+        None => false,
+    }
+}
+
+/// Remember that a pull for this slot was vetoed mid-session so the
+/// `GameStopped` transition can honour it once the folder goes quiet. Returns
+/// `true` when the caller should emit [`AgentEvent::RestoreDeferred`] — once
+/// per waiting update, not once per sweep tick.
+fn note_deferred_pull(slot: &mut SaveSlot) -> bool {
+    slot.pull_pending = true;
+    let first = !slot.deferred_notified;
+    slot.deferred_notified = true;
+    first
+}
+
+/// May the pull deferred by a mid-session veto run now? Asked only from the
+/// `GameStopped` transition — either straight away, or once the final flush's
+/// `BackupDone` lands (`SaveSlot::pull_after_flush`).
+///
+/// This path drops **only** the recency guards of [`mid_session_reason`]
+/// (`last_fs_event_at` and the disk-mtime fallback). Both are guaranteed to
+/// trip here and both are describing the same write: the save the game made on
+/// its way out, which the final flush has just uploaded. Waiting out their
+/// 5-minute grace is what left the update stranded — nothing re-fires once it
+/// expires except the sweep, and on a Deck the sweep is usually still vetoed by
+/// a leftover Proton process. The restore is conflict-aware by design
+/// (local-newer files win, conflicts are backed up), so the exiting write can't
+/// be lost even if the grace was hiding a real race.
+///
+/// The live-session guards stay exactly as they were (REPO data-loss,
+/// 2026-07-05): `is_running` means the user is playing *right now*,
+/// `has_pending` means local changes aren't versioned yet, and `restoring`
+/// means a pull is already writing into the folder. Any of them defers again —
+/// `pull_pending` survives, so the next quiet moment gets another chance.
+fn deferred_pull_ready(
+    slot: &SaveSlot,
+    config: &AgentConfig,
+    latest_versions: &HashMap<String, i64>,
+) -> bool {
+    // Playtime-only entries have no save folder to pull into.
+    if slot.save.track_only {
+        return false;
+    }
+    // Nothing is waiting: no veto recorded one, and the poller's cache doesn't
+    // show the cloud ahead of us either.
+    if !slot.pull_pending && !cloud_ahead(slot, latest_versions) {
+        return false;
+    }
+    // Per-save preset can opt out of restore (backup-only) or opt in when the
+    // global default is off; `global_sync` counts as a global opt-in.
+    if !slot
+        .save
+        .policy
+        .auto_restore
+        .unwrap_or(config.auto_restore || config.global_sync)
+    {
+        return false;
+    }
+    !(slot.is_running || slot.has_pending || slot.restoring)
+}
+
+/// Run the pull a mid-session veto deferred, if the slot is finally ready for
+/// it. Called from the `GameStopped` transition and from the `BackupDone` of
+/// its final flush; a no-op for every slot with nothing waiting.
+fn run_deferred_pull(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    config: &AgentConfig,
+    latest_versions: &HashMap<String, i64>,
+) {
+    let Some(slot) = slots.get(id) else {
+        return;
+    };
+    if !deferred_pull_ready(slot, config, latest_versions) {
+        return;
+    }
+    let save = slot.save.clone();
+    let known_version = slot.known_version;
+    if let Some(slot) = slots.get_mut(id) {
+        slot.pull_pending = false;
+        slot.deferred_notified = false;
+        slot.restoring = true;
+        slot.next_auto_restore_at =
+            Some(TokioInstant::now() + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS));
+    }
+    tracing::info!(
+        save_id = %id,
+        "agent: game closed — running the pull that was deferred mid-session"
+    );
+    spawn_auto_restore(
+        save,
+        api.clone(),
+        events_tx.clone(),
+        cmd_tx.clone(),
+        config.conflict_root.clone(),
+        config.conflict_retention_days,
+        known_version,
+        // Authoritative, like the force/barrier paths: this is the user's
+        // cross-device hand-off finally landing, so fetch the real head instead
+        // of trusting a cache that may be a tick stale. The version-gate inside
+        // still makes it free when we're already current.
+        None,
+    );
 }
 
 /// True if `path` exists and has been modified within `grace`. Conservative
@@ -3344,6 +3640,18 @@ async fn run_backup_with_retry(
                             will_retry,
                         })
                         .await;
+                    // Out of retries, but the slot must not be left wedged. We
+                    // deliberately send no `BackupDone`: the local changes never
+                    // made it to a version, so `has_pending` has to stay set or
+                    // a later restore would overwrite them. That also means the
+                    // slot is now vetoed from every pull *and* has nothing left
+                    // that would re-fire the upload — until this returned, only
+                    // a fresh fs event could break the deadlock, so a save whose
+                    // game was already closed just sat there. Hand the retry
+                    // back to the agent loop instead.
+                    let _ = cmd_tx
+                        .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                        .await;
                     return;
                 }
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
@@ -3530,6 +3838,10 @@ fn process_poll(
     steam_index: &crate::playtime_index::SteamPlaytimeIndex,
     prev_pids: &mut HashSet<Pid>,
     corr_running: &mut HashMap<String, (Pid, u64)>,
+    // Poller's per-save cloud version cache. Read only on the `GameStopped`
+    // transition, to spot a save the cloud has moved past while the user was
+    // playing (see `run_deferred_pull`).
+    latest_versions: &HashMap<String, i64>,
 ) -> bool {
     // Refresh every process. The `true` flag asks sysinfo to remove
     // entries for processes that have exited since the last refresh,
@@ -3643,8 +3955,10 @@ fn process_poll(
 
     // Señales FUERTES: el proceso lleva el nombre/identidad del juego, corre
     // desde su carpeta de instalación o tiene un fichero de su save abierto.
-    // Todas exigen que el ejecutable real del juego EXISTA ahora mismo, así que
-    // no pueden mantener "corriendo" un juego ya cerrado.
+    // Todas exigen que el ejecutable real del juego EXISTA ahora mismo y que el
+    // proceso siga VIVO (`is_defunct`): que exista el exe no bastaba — un juego
+    // de Proton que muere mal deja un zombi con su mismo nombre y exe, y eso
+    // mantenía el juego "corriendo" indefinidamente.
     let mut running: HashSet<String> = HashSet::new();
     // Señales DÉBILES (correlación carpeta→proceso): no exigen el exe real del
     // juego, solo que "algún proceso de juego" tocara su carpeta alguna vez. Un
@@ -3658,9 +3972,15 @@ fn process_poll(
     let mut steam_running: HashSet<String> = HashSet::new();
     for (pid, proc) in sys.processes() {
         let name = proc.name().to_string_lossy().to_lowercase();
+        // Un proceso difunto conserva nombre y exe, así que casaría con las
+        // señales FUERTES igual que uno vivo y mantendría el slot "corriendo"
+        // para siempre (ver `is_defunct`). No puede estar escribiendo un save:
+        // queda fuera de las cuatro. Las DÉBILES no lo necesitan — sólo
+        // arrancan con un PID que NACE, y un zombi ya nació y murió.
+        let defunct = is_defunct(proc.status());
         // Name match — works on every storefront on Windows, and on
         // Proton/Wine where the wineprefix process keeps the .exe name.
-        if !name_index.is_empty() {
+        if !defunct && !name_index.is_empty() {
             if let Some(ids) = name_index.get(&name) {
                 running.extend(ids.iter().map(|id| id.to_string()));
             }
@@ -3670,7 +3990,8 @@ fn process_poll(
         // igualdad exacta con el slug/nombre del juego es señal fuerte por sí
         // sola, y así un juego pausado (menús de Paradox, a 0% de CPU) sigue
         // contando como "corriendo". `is_game_like` descarta sistema/launchers.
-        if !token_index.is_empty() && crate::correlation::is_game_like(&name, proc.exe()) {
+        if !defunct && !token_index.is_empty() && crate::correlation::is_game_like(&name, proc.exe())
+        {
             for cand in process_identity_candidates(&name, proc.exe()) {
                 if let Some(ids) = token_index.get(&cand) {
                     running.extend(ids.iter().map(|id| id.to_string()));
@@ -3683,7 +4004,10 @@ fn process_poll(
         // (EU5 → `eu5.exe`) que ni el nombre ni la carpeta delatan, sin catálogo
         // ni Steam. Sólo para procesos con pinta de juego, para acotar el coste
         // de leer `/proc/<pid>/fd`.
-        if !save_folders.is_empty() && crate::correlation::is_game_like(&name, proc.exe()) {
+        if !defunct
+            && !save_folders.is_empty()
+            && crate::correlation::is_game_like(&name, proc.exe())
+        {
             for id in open_paths_matching(*pid, &save_folders) {
                 running.insert(id);
             }
@@ -3720,7 +4044,7 @@ fn process_poll(
             }
         }
         // Legacy install-dir fallback for slots without process names.
-        if !dir_slots.is_empty() {
+        if !defunct && !dir_slots.is_empty() {
             if let Some(exe) = proc.exe() {
                 for (id, dir) in &dir_slots {
                     if exe.starts_with(dir) {
@@ -3948,6 +4272,11 @@ fn process_poll(
 
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = true;
+                // A new session earns a new "update waiting" notice if a pull
+                // gets deferred again. `pull_pending` itself survives: an
+                // update that arrived while the game was closed but couldn't
+                // land (a restore in flight, un-flushed changes) is still owed.
+                slot.deferred_notified = false;
             }
             tracing::info!(
                 save_id = %id,
@@ -4018,11 +4347,22 @@ fn process_poll(
                     done_tx,
                     cmd_tx,
                 );
+                // Any pull deferred during the session waits for this flush's
+                // `BackupDone`: pulling now would fight the upload over the
+                // same files, and `has_pending` would veto it anyway. The
+                // licence is one-shot — `done_rx` takes it whether or not the
+                // pull fires.
+                if let Some(slot) = slots.get_mut(&id) {
+                    slot.pull_after_flush = true;
+                }
             } else {
                 tracing::debug!(
                     save_id = %id,
                     "agent: GameStopped with no pending changes; skipping backup"
                 );
+                // Nothing to flush, so the folder is already quiet: an update
+                // that arrived mid-session can land right now.
+                run_deferred_pull(slots, &id, api, events_tx, cmd_tx, config, latest_versions);
             }
         }
     }
@@ -4243,6 +4583,9 @@ mod tests {
                 next_auto_restore_at: None,
                 last_set_hash: None,
                 known_version: None,
+                pull_pending: false,
+                pull_after_flush: false,
+                deferred_notified: false,
             },
         );
 
@@ -4291,6 +4634,9 @@ mod tests {
             next_auto_restore_at: None,
             last_set_hash: None,
             known_version: None,
+            pull_pending: false,
+            pull_after_flush: false,
+            deferred_notified: false,
         }
     }
 
@@ -4335,6 +4681,165 @@ mod tests {
             mid_session_reason(&slot),
             None,
             "an hour-old fs event is outside the grace window"
+        );
+    }
+
+    /// A Proton game that dies badly leaves its .exe defunct, keeping the name
+    /// and exe path every strong matcher keys on. Nothing about a zombie says
+    /// "the user is playing" — it can't write a save file — so it must never
+    /// hold a slot `is_running`, which is what pinned the mid-session veto open
+    /// and stranded cross-device updates on the Deck.
+    #[test]
+    fn defunct_processes_are_not_evidence_of_a_live_session() {
+        assert!(is_defunct(ProcessStatus::Zombie), "exited, not yet reaped");
+        assert!(is_defunct(ProcessStatus::Dead));
+
+        assert!(!is_defunct(ProcessStatus::Run));
+        assert!(!is_defunct(ProcessStatus::Sleep));
+        // A Paradox game sitting in a menu burns no CPU and reads as Idle —
+        // very much a live session.
+        assert!(!is_defunct(ProcessStatus::Idle));
+        // SIGSTOP'd (or suspended): it can resume and write at any moment.
+        assert!(!is_defunct(ProcessStatus::Stop));
+    }
+
+    /// Pins the assumption `is_defunct` rests on: our minimal
+    /// `proc_refresh_kind` really does populate `status()`, and a genuine
+    /// unreaped child really does read as defunct through it. If sysinfo ever
+    /// puts `status` behind a refresh flag, the zombie filter would silently
+    /// go back to matching leftovers — this fails instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysinfo_reports_an_unreaped_child_as_defunct() {
+        // Exits immediately; we're its parent and don't reap until the end, so
+        // it lingers in the process table exactly like Proton's leftovers.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = Pid::from_u32(child.id());
+        let mut sys =
+            System::new_with_specifics(RefreshKind::new().with_processes(proc_refresh_kind()));
+
+        let mut saw_defunct = false;
+        for _ in 0..50 {
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh_kind());
+            if let Some(p) = sys.process(pid) {
+                if is_defunct(p.status()) {
+                    saw_defunct = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.wait();
+        assert!(
+            saw_defunct,
+            "an unreaped exited child must read as defunct through the agent's refresh kind"
+        );
+    }
+
+    /// Restore-enabled config, matching a device with sync global on.
+    fn restore_config() -> AgentConfig {
+        AgentConfig {
+            auto_restore: true,
+            ..Default::default()
+        }
+    }
+
+    /// The Steam Deck bug (a save from device A never appearing on device B):
+    /// a pull vetoed mid-session must be remembered, must stay vetoed while the
+    /// user is actually playing, and must land the moment the game closes —
+    /// without waiting out the recency guards, which the exiting save's own
+    /// write always trips.
+    #[test]
+    fn deferred_pull_survives_the_veto_and_lands_when_the_game_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = restore_config();
+        let latest = HashMap::new();
+        let mut slot = quiet_slot(tmp.path());
+
+        // The poller confirmed a bump while the game is running: veto, and
+        // remember it instead of dropping it.
+        slot.is_running = true;
+        assert!(
+            mid_session_reason(&slot).is_some(),
+            "a live game must veto the pull"
+        );
+        assert!(note_deferred_pull(&mut slot), "the first veto notifies");
+        assert!(
+            !note_deferred_pull(&mut slot),
+            "later ticks must not re-notify — the sweep re-checks every tick"
+        );
+        assert!(slot.pull_pending);
+        assert!(
+            !deferred_pull_ready(&slot, &config, &latest),
+            "never pull into a folder the user is playing in"
+        );
+
+        // The game closed but its final flush is still queued: the changes
+        // aren't versioned yet, so a pull could still overwrite them.
+        slot.is_running = false;
+        slot.has_pending = true;
+        assert!(!deferred_pull_ready(&slot, &config, &latest));
+
+        // Flush landed. The fs event and the folder's mtime are seconds old —
+        // that write *is* the exit save, already uploaded, and skipping those
+        // two guards here is the whole point: nothing else would re-fire.
+        slot.has_pending = false;
+        slot.last_fs_event_at = Some(OffsetDateTime::now_utc());
+        assert!(
+            mid_session_reason(&slot).is_some(),
+            "the recency guards still veto the sweep"
+        );
+        assert!(
+            deferred_pull_ready(&slot, &config, &latest),
+            "the stop transition pulls anyway"
+        );
+
+        // A restore already writing into the folder defers again.
+        slot.restoring = true;
+        assert!(!deferred_pull_ready(&slot, &config, &latest));
+        slot.restoring = false;
+
+        // Nothing waiting, nothing to do.
+        slot.pull_pending = false;
+        assert!(!deferred_pull_ready(&slot, &config, &latest));
+    }
+
+    /// Two more ways in: the poller's cache showing the cloud ahead arms the
+    /// stop transition on its own (no veto need have been recorded), and a
+    /// backup-only save never pulls no matter what's waiting.
+    #[test]
+    fn deferred_pull_reads_the_version_cache_and_honours_backup_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = restore_config();
+        let mut slot = quiet_slot(tmp.path());
+        let id = slot.save.save_id.clone();
+        slot.known_version = Some(4);
+
+        let mut latest = HashMap::new();
+        assert!(
+            !deferred_pull_ready(&slot, &config, &latest),
+            "no cache entry is not evidence the cloud moved"
+        );
+
+        latest.insert(id.clone(), 4);
+        assert!(
+            !deferred_pull_ready(&slot, &config, &latest),
+            "same version — nothing to pull"
+        );
+
+        latest.insert(id, 5);
+        assert!(
+            deferred_pull_ready(&slot, &config, &latest),
+            "another device committed v5 while we sat at v4"
+        );
+
+        slot.save.policy.auto_restore = Some(false);
+        assert!(
+            !deferred_pull_ready(&slot, &config, &latest),
+            "a backup-only save must never be pulled into"
         );
     }
 
@@ -4420,6 +4925,67 @@ mod tests {
             "timed out waiting for BackupScheduled — the fs watcher never armed for an idle save",
         );
         assert_eq!(save_id, "watcher-bug-1");
+    }
+
+    /// A backup that burns its whole retry budget used to leave the slot in a
+    /// corner it could never climb out of: no `BackupDone` (correctly — the
+    /// changes never reached a version, so `has_pending` must stay set to keep
+    /// restores off them), but also nothing that would ever try the upload
+    /// again. `has_pending` is itself a mid-session veto, so the save could
+    /// neither be pushed nor pulled until the user happened to write the folder
+    /// again. The task must hand a retry back to the agent loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exhausted_backup_retries_hand_back_a_retry_and_keep_changes_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("save.dat"), b"unversioned progress");
+
+        // Port 1 refuses instantly: a real failure, not a throttle or a 413.
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+        let (done_tx, mut done_rx) = mpsc::channel::<BackupDone>(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(8);
+
+        let save = WatchedSave {
+            save_id: "wedged-1".into(),
+            game_slug: "fake-game".into(),
+            display_name: "Fake Game".into(),
+            label: "main".into(),
+            local_path: tmp.path().to_path_buf(),
+            steam_install_dir: None,
+            processes: vec![],
+            policy: Default::default(),
+            known_version: None,
+            set_hash: None,
+            track_only: false,
+        };
+
+        // `max_retries: 0` → the first failure is already the last.
+        run_backup_with_retry(
+            api, save, None, None, events_tx, done_tx, cmd_tx, 0, false, None, 14,
+        )
+        .await;
+
+        let mut failed = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let AgentEvent::BackupFailed { will_retry, .. } = ev {
+                assert!(!will_retry, "the budget is spent");
+                failed = true;
+            }
+        }
+        assert!(failed, "a real failure must reach the feed");
+
+        assert!(
+            done_rx.try_recv().is_err(),
+            "no BackupDone: clearing has_pending would let a restore overwrite \
+             changes that were never versioned"
+        );
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(AgentCommand::RetryBackupAfterFailure(id)) if id == "wedged-1"
+            ),
+            "the slot must get a retry path that doesn't depend on a new fs event"
+        );
     }
 
     /// Helper for the diff-restore tests: write `contents` to `path`

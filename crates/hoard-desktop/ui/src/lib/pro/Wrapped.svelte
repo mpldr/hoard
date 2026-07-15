@@ -13,6 +13,7 @@
   // DEVICE-MERGED aggregate — so the recap reflects every machine you sign in
   // from, not just this one. Signed out / offline it falls back to local data.
   import { onMount } from "svelte";
+  import { tilt } from "../actions/tilt";
   import {
     currentUser,
     listTrackedSaves,
@@ -447,7 +448,8 @@
 
   <!-- identity card — masked by default, reveal like a password -->
   <div
-    class="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4"
+    class="tilt relative overflow-hidden rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4"
+    use:tilt
   >
     <!-- Soft glow via a pre-blurred radial-gradient, not `filter: blur()`:
          WebKitGTK (Linux, inside Wrapple) paints a black rectangle when a

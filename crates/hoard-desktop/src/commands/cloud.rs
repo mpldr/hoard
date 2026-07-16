@@ -454,14 +454,49 @@ pub fn wait_for_refresh_quiescent_blocking() {
 pub async fn cloud_login_url(app: AppHandle) -> String {
     let base = std::env::var("HOARD_CLOUD_PUBLIC_URL")
         .unwrap_or_else(|_| "https://hoard.services".to_string());
+    // Reuse the in-flight attempt while its loopback listener is still alive.
+    // A second "Sign in" click (impatient user, browser slow to raise) used to
+    // mint a fresh nonce that clobbered the previous one — so whichever tab
+    // the user actually finished the OAuth in, `cloud_complete_login` held the
+    // *other* attempt's nonce and rejected the login as a state mismatch.
+    // Handing every click the same nonce + port makes any open tab complete
+    // the same attempt.
+    let app_state = app.state::<AppState>();
+    {
+        let pending = app_state.pending_login.lock().unwrap();
+        if let Some(p) = pending.as_ref() {
+            if p.started.elapsed() < crate::commands::loopback::LISTEN_TIMEOUT {
+                return match p.port {
+                    Some(port) => {
+                        format!("{base}/login?desktop=1&port={port}&state={}", p.nonce)
+                    }
+                    None => format!("{base}/login?desktop=1&state={}", p.nonce),
+                };
+            }
+        }
+    }
     // Mint a fresh single-use CSRF nonce and remember it as the in-progress
     // login. Both handoff paths (loopback and the hoard:// fallback) echo it
     // back, and `cloud_complete_login` re-checks it before accepting tokens —
     // so a spontaneous deep link carrying attacker tokens has no match.
+    // Registered BEFORE the listener bind so a concurrent second call already
+    // sees (and reuses) this attempt instead of racing it.
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    *app.state::<AppState>().pending_login_state.lock().unwrap() = Some(nonce.clone());
+    *app_state.pending_login.lock().unwrap() = Some(crate::state::PendingLogin {
+        nonce: nonce.clone(),
+        port: None,
+        started: Instant::now(),
+    });
     match crate::commands::loopback::start(app.clone(), nonce.clone()).await {
-        Ok(port) => format!("{base}/login?desktop=1&port={port}&state={nonce}"),
+        Ok(port) => {
+            let mut pending = app_state.pending_login.lock().unwrap();
+            if let Some(p) = pending.as_mut() {
+                if p.nonce == nonce {
+                    p.port = Some(port);
+                }
+            }
+            format!("{base}/login?desktop=1&port={port}&state={nonce}")
+        }
         Err(e) => {
             tracing::warn!(error = %e, "loopback listener failed; using hoard:// scheme");
             format!("{base}/login?desktop=1&state={nonce}")
@@ -486,26 +521,35 @@ pub async fn cloud_complete_login(
         return Err("Missing access token from auth callback.".into());
     }
 
-    // CSRF guard: the callback must echo the single-use nonce minted by
-    // `cloud_login_url`. Take it (one-shot) and fail closed on any mismatch or
-    // when no login is in progress — this is what stops a forged
+    // CSRF guard: the callback must echo the nonce minted by `cloud_login_url`
+    // for the login in progress. Fail closed on any mismatch or when no login
+    // is in progress — this is what stops a forged
     // `hoard://auth/callback?access_token=…` from silently logging the app into
-    // an attacker's account.
-    let expected = state.pending_login_state.lock().unwrap().take();
+    // an attacker's account. Verified WITHOUT consuming: a stale or forged
+    // callback must not burn the nonce and dead-end the genuine tab still in
+    // flight (rejection used to `take()` it, so one bad callback made every
+    // later good one fail too). The nonce is retired below once this login
+    // actually succeeds; abandoned attempts expire with the loopback listener.
     let echoed = callback_state.trim();
-    match expected {
-        Some(nonce) if !nonce.is_empty() && nonce == echoed => {}
-        _ => {
-            tracing::warn!(
-                "cloud login: rejected auth callback with missing/mismatched state nonce"
-            );
-            return Err("auth callback state mismatch".into());
-        }
+    let nonce_ok = {
+        let pending = state.pending_login.lock().unwrap();
+        pending.as_ref().is_some_and(|p| {
+            !p.nonce.is_empty()
+                && p.nonce == echoed
+                && p.started.elapsed() < crate::commands::loopback::LISTEN_TIMEOUT
+        })
+    };
+    if !nonce_ok {
+        tracing::warn!("cloud login: rejected auth callback with missing/mismatched state nonce");
+        return Err("auth callback state mismatch".into());
     }
     let base = cloud_base_url();
     let me = fetch_me(&base, &access).await.map_err(prettify)?;
     save_creds(&access, &refresh, &base, &me).map_err(|e| format!("Couldn't save session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
+    // The attempt completed: retire its nonce so the callback can't be
+    // replayed into a new login later.
+    *state.pending_login.lock().unwrap() = None;
 
     // Switch the active sync context to this account. Each account/self-hosted
     // server keeps its `saves` map (save_id → server version cursor) in its own

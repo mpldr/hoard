@@ -149,7 +149,11 @@ pub fn run() {
             // already running so its listener is up: emit, and also buffer it
             // so a not-yet-mounted webview still drains it on mount.
             if let Some(url) = first_hoard_url(argv.iter().cloned()) {
-                tracing::info!(url = %url, "deep link via single-instance argv");
+                // Log the scheme+path only: the OAuth callback's query string
+                // carries the access and refresh tokens in plaintext, and this
+                // file both persists on disk and ships through logship.
+                let redacted = url.split('?').next().unwrap_or(&url);
+                tracing::info!(url = %redacted, "deep link via single-instance argv");
                 capture_deep_link(app, url, true);
             }
         }))
@@ -380,7 +384,8 @@ pub fn run() {
             let dl_handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
-                    tracing::info!(url = %url, "deep link opened (on_open_url)");
+                    // Path only — the callback query carries live tokens.
+                    tracing::info!(url = %format!("{}://{}{}", url.scheme(), url.host_str().unwrap_or(""), url.path()), "deep link opened (on_open_url)");
                     if let Some(window) = dl_handle.get_webview_window("main") {
                         let _ = window.unminimize();
                         let _ = window.show();
@@ -398,7 +403,9 @@ pub fn run() {
             // mounts. Scan argv ourselves and buffer the URL; the frontend
             // drains it on mount. Don't emit — no listener exists yet.
             if let Some(url) = first_hoard_url(std::env::args()) {
-                tracing::info!(url = %url, "deep link via launch argv (cold start)");
+                // Path only — the callback query carries live tokens.
+                let redacted = url.split('?').next().unwrap_or(&url);
+                tracing::info!(url = %redacted, "deep link via launch argv (cold start)");
                 capture_deep_link(app.handle(), url, false);
             }
 

@@ -40,12 +40,26 @@ pub struct AppState {
     /// after it mounts). The frontend drains this on mount via
     /// `cloud_take_pending_deep_link`. Cleared on a successful login.
     pub pending_deep_link: Mutex<Option<String>>,
-    /// CSRF `state` nonce for the in-progress cloud login. Minted by
-    /// `cloud_login_url` (and echoed through both the loopback and the
-    /// `hoard://` fallback handoffs), validated one-shot by
-    /// `cloud_complete_login`. `None` means "no login in progress", so a
-    /// spontaneous deep link with attacker tokens can never match.
-    pub pending_login_state: Mutex<Option<String>>,
+    /// The in-progress cloud login handoff. Minted by `cloud_login_url` —
+    /// which reuses a still-live attempt instead of clobbering it when the
+    /// user clicks "Sign in" again — and validated by `cloud_complete_login`,
+    /// which clears it only on success. `None` means "no login in progress",
+    /// so a spontaneous deep link with attacker tokens can never match.
+    pub pending_login: Mutex<Option<PendingLogin>>,
+}
+
+/// One in-progress cloud login attempt (see `cloud_login_url`).
+pub struct PendingLogin {
+    /// CSRF `state` nonce echoed through both handoff paths (loopback and the
+    /// `hoard://` fallback) and re-checked by `cloud_complete_login`.
+    pub nonce: String,
+    /// Loopback port this attempt's listener bound, `None` when the bind
+    /// failed and the attempt rides the `hoard://` scheme only.
+    pub port: Option<u16>,
+    /// When the attempt started. It expires after the loopback listener's
+    /// window (`loopback::LISTEN_TIMEOUT`) so an abandoned nonce can't be
+    /// completed hours later.
+    pub started: std::time::Instant,
 }
 
 impl AppState {
@@ -89,7 +103,7 @@ impl AppState {
             presence: Mutex::new(None),
             agent_lock: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
-            pending_login_state: Mutex::new(None),
+            pending_login: Mutex::new(None),
         };
         crate::commands::cloud::rehydrate(&state);
         // Install the active sync context from the restored session BEFORE any

@@ -69,10 +69,16 @@ pub async fn open_external(url: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        // `start` is a cmd builtin; the empty "" is the window-title arg it
-        // otherwise steals from the URL.
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", &url]);
+        // Do NOT route through `cmd /C start`: cmd re-parses its command line
+        // and treats every `&` in the URL as a command separator, so an OAuth
+        // sign-in URL like `.../login?desktop=1&port=65491&state=<nonce>` was
+        // truncated at the first `&` — the browser only ever received
+        // `?desktop=1`, dropping the loopback port and the CSRF nonce. The
+        // callback then reached the app with no `state`, and every desktop
+        // sign-in failed with "auth callback state mismatch". rundll32 is not a
+        // shell: it hands the URL to the registered protocol handler verbatim.
+        let mut c = Command::new("rundll32.exe");
+        c.args(["url.dll,FileProtocolHandler", &url]);
         c
     };
 

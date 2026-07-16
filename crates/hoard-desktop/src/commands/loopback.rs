@@ -19,8 +19,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// How long the listener waits for the browser to come back before giving up
 /// and freeing the port. Generous — the user may have to pick an account or
-/// approve a provider consent screen first.
-const LISTEN_TIMEOUT: Duration = Duration::from_secs(300);
+/// approve a provider consent screen first. Also bounds how long
+/// `cloud_login_url` keeps reusing the same in-flight attempt (nonce + port):
+/// past this window the listener is gone, so a fresh attempt is minted.
+pub(crate) const LISTEN_TIMEOUT: Duration = Duration::from_secs(300);
 
 const OK_PAGE: &str = "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">\
 <title>Hoard</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\

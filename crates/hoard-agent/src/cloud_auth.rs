@@ -491,9 +491,25 @@ pub fn load_session() -> Result<Option<Session>> {
     let Some(file) = read_session_file()? else {
         return Ok(None);
     };
+    // El keyring puede fallar por algo REPARABLE (bloqueado, sin D-Bus en una
+    // sesión headless): eso no es "no hay sesión". Tragarse el `Err` como si
+    // fuese `NoEntry` caía al fichero, que con keyring sano lleva `auth = None`
+    // (ver `store_tokens`) → `load_session` devolvía `Ok(None)` y el usuario
+    // aparecía deslogueado con sus tokens intactos en el llavero. Sólo `NoEntry`
+    // cae al fichero en silencio; un error real se propaga si el fichero
+    // tampoco tiene tokens que ofrecer.
     let auth = match keyring_get() {
         Ok(Some(a)) => Some(a),
-        _ => file.auth.clone(),
+        Ok(None) => file.auth.clone(),
+        Err(e) => match file.auth.clone() {
+            Some(a) => {
+                tracing::debug!(error = %e, "keyring ilegible; usando los tokens del fichero");
+                Some(a)
+            }
+            None => {
+                return Err(e.context("leyendo la sesión Cloud del keyring"));
+            }
+        },
     };
     let Some(auth) = auth else {
         return Ok(None);

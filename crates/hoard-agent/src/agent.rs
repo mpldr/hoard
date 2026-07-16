@@ -353,12 +353,54 @@ pub enum AgentEvent {
     /// Auto-restore was attempted but failed (network error, sha mismatch,
     /// permission denied writing to the local path). Surfaced separately
     /// from `BackupFailed` because the user-visible message is different:
-    /// the save is left untouched, no retry is scheduled, and we want
-    /// the UI to suggest "restore manually" rather than "we'll try again".
+    /// the save is left untouched and we want the UI to suggest "restore
+    /// manually" rather than "we'll try again".
+    ///
+    /// A retry *is* scheduled (the reconciliation sweep re-fires once the
+    /// slot's backoff elapses) — the doc here used to claim otherwise, which
+    /// was wrong in a load-bearing way: it made the every-minute retry loop
+    /// look intentional. Each occurrence is a transient toast; a save that
+    /// keeps failing escalates to [`AgentEvent::SaveAutoRestoreStuck`].
     SaveAutoRestoreFailed {
         save_id: String,
         game_slug: String,
         error: String,
+    },
+    /// Auto-restore has failed [`AUTO_RESTORE_STUCK_AFTER`] times in a row on
+    /// the same cloud version: this save is not syncing and won't fix itself.
+    ///
+    /// Exists because the July-2026 re-download incident was *silent*. Every
+    /// individual failure emitted `SaveAutoRestoreFailed`, which the desktop
+    /// renders as a toast — a notification the user dismisses, or never sees
+    /// because it appeared while they were in-game. Eight days of a save
+    /// silently not syncing (and re-downloading gigabytes to fail again) is
+    /// the thing a toast structurally cannot tell you. This event is what the
+    /// frontends turn into a *persistent* state: it stays on the save's card
+    /// until the save actually recovers.
+    ///
+    /// One-shot per (save, version), throttled the way `RestoreDeferred` is:
+    /// the sweep keeps retrying and keeps failing, but the user is told once.
+    /// Cleared — and followed by [`AgentEvent::SaveAutoRestoreRecovered`] — on
+    /// a successful attempt or when the cloud version changes.
+    SaveAutoRestoreStuck {
+        save_id: String,
+        game_slug: String,
+        /// Consecutive failures on this version at the moment we gave up
+        /// treating it as transient. Shown to the user ("3×") so the state
+        /// reads as a pattern rather than a one-off.
+        failures: u32,
+        /// The last error chain, so the card/log line says *why* rather than
+        /// just "it's broken".
+        error: String,
+    },
+    /// A save that had emitted [`AgentEvent::SaveAutoRestoreStuck`] restored
+    /// successfully (or the cloud moved to a new version, giving it a fresh
+    /// reason to try). Lets the frontends drop the persistent warning instead
+    /// of leaving a stale "this is broken" badge on a save that now works —
+    /// a warning that can't clear itself trains the user to ignore warnings.
+    SaveAutoRestoreRecovered {
+        save_id: String,
+        game_slug: String,
     },
     /// A scheduled backup landed but the local folder was empty (or gone)
     /// at upload time. We deliberately do **not** push an empty snapshot —
@@ -452,6 +494,35 @@ pub struct AgentSlotStatus {
     pub next_scheduled_backup_at: Option<OffsetDateTime>,
 }
 
+/// How a spawned auto-restore attempt ended. Drives how the slot's
+/// `next_auto_restore_at` is re-armed and whether the consecutive-failure
+/// counter moves, so the three error classes stay visibly distinct:
+/// a 404 is permanent-ish, a 401 isn't the save's fault, and everything else
+/// is the transient-or-chronic case the escalating backoff exists for.
+#[derive(Debug, Clone)]
+enum AutoRestoreDisposition {
+    /// The attempt finished without error (restored, or nothing to pull).
+    /// Resets the failure counter and any stuck state.
+    Ok,
+    /// 404: the save has no record/snapshot on the backend we're talking to
+    /// (carried over from another account, stale state, remote purged). Parks
+    /// the slot on the long not-found backoff. Not a "failure" for backoff
+    /// purposes — retrying can't conjure a snapshot that doesn't exist, and
+    /// this arm already paces itself.
+    NotOnServer,
+    /// 401: session-wide, not this save's problem — the stored cloud JWT is
+    /// expired and the refresh hasn't landed in this client yet. Swallowed and
+    /// left on the normal short cooldown so it retries as soon as the token is
+    /// back. Deliberately does *not* touch the failure counter: counting a
+    /// token blip toward "this save is stuck" would let one expired session
+    /// mark every tracked save as broken.
+    Unauthorized,
+    /// Any other error (network, sha mismatch, permission denied, timeout).
+    /// Carries the formatted error chain for the event. Escalates the
+    /// consecutive-failure counter and the backoff.
+    Failed(String),
+}
+
 /// Commands the host (Tauri command handlers, tests) sends to the agent.
 enum AgentCommand {
     // Boxed: `WatchedSave` is much larger than the other variants, so keeping
@@ -480,14 +551,11 @@ enum AgentCommand {
     RearmWatcher(String),
     /// Internal: a spawned auto-restore task finished (success or failure).
     /// Clears `slot.restoring` so the reconciliation sweep can try again
-    /// next tick. `not_on_server` is set when the restore failed with a 404
-    /// (the save has no record/snapshot on the backend we're talking to) —
-    /// the handler then parks the slot on a long backoff so the sweep stops
-    /// hammering it every cooldown (saves tracked locally but absent from the
-    /// current cloud account otherwise spam the log forever).
+    /// next tick. `outcome` decides how the slot is re-armed — see
+    /// [`AutoRestoreDisposition`].
     AutoRestoreFinished {
         id: String,
-        not_on_server: bool,
+        disposition: AutoRestoreDisposition,
         /// The cloud version this slot is now synced to (the latest the restore
         /// observed), so the slot can remember it and the reconciliation sweep
         /// skips re-downloading the same version next tick. `None` when the
@@ -769,8 +837,22 @@ struct SaveSlot {
     /// Earliest moment the reconciliation sweep is allowed to fire
     /// another auto-restore for this slot. Used as a 60-second cooldown
     /// after a failed attempt so a misbehaving server doesn't burn rate
-    /// limits in a tight loop. `None` means "no cooldown active".
+    /// limits in a tight loop, and stretched by `auto_restore_failures`
+    /// once a save keeps failing. `None` means "no cooldown active".
     next_auto_restore_at: Option<TokioInstant>,
+    /// Consecutive auto-restore failures and the cloud version they're counted
+    /// against (the "every other error" arm only — 404 and 401 don't count; see
+    /// [`AutoRestoreDisposition`]). Drives [`auto_restore_backoff`], so the
+    /// retry pacing escalates instead of re-downloading a multi-GB save every
+    /// 60 s forever, and gates the one-shot stuck event.
+    ///
+    /// The counter is per *version*, not per save: a new version on the server
+    /// is genuinely new content and a fresh reason to try now, so it resets the
+    /// escalation rather than inheriting the old version's penalty. Comparing
+    /// versions rather than elapsed time is what keeps that honest — a save
+    /// stuck on v7 for an hour is still stuck on v7, no matter how long it's
+    /// been.
+    restore_failures: AutoRestoreFailures,
     /// Skip-by-set-hash signature of the last successful upload this session
     /// (ADR 0019). Compared against the freshly-walked signature before each
     /// backup; an unchanged signature means the watcher fired on a no-op
@@ -936,12 +1018,15 @@ async fn run_agent(
                             arm_watcher(slot, &fs_tx);
                         }
                     }
-                    Some(AgentCommand::AutoRestoreFinished { id, not_on_server, synced_version, post_restore_set_hash }) => {
+                    Some(AgentCommand::AutoRestoreFinished { id, disposition, synced_version, post_restore_set_hash }) => {
                         // The background restore task signalled completion
                         // (success or failure). Clear the in-flight flag so
                         // the reconciliation sweep can try again once the
                         // cooldown expires — `next_auto_restore_at` was set
                         // when we spawned, so we don't reset it here…
+                        let latest = latest_versions.get(&id).copied();
+                        let mut stuck: Option<(String, u32, String)> = None;
+                        let mut recovered: Option<(String, String)> = None;
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.restoring = false;
                             // Remember the version we just synced to so the next
@@ -956,16 +1041,80 @@ async fn run_agent(
                             if let Some(h) = post_restore_set_hash {
                                 slot.last_set_hash = Some(h);
                             }
-                            // …unless the save simply isn't on the server
-                            // (404). Retrying every 60s can't conjure a
-                            // snapshot that doesn't exist; park it on a long
-                            // backoff so we check ~hourly instead of spamming.
-                            if not_on_server {
-                                slot.next_auto_restore_at = Some(
-                                    TokioInstant::now()
-                                        + Duration::from_secs(AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS),
-                                );
+                            match disposition {
+                                // …unless the save simply isn't on the server
+                                // (404). Retrying every 60s can't conjure a
+                                // snapshot that doesn't exist; park it on a long
+                                // backoff so we check ~hourly instead of spamming.
+                                AutoRestoreDisposition::NotOnServer => {
+                                    slot.next_auto_restore_at = Some(
+                                        TokioInstant::now()
+                                            + Duration::from_secs(
+                                                AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS,
+                                            ),
+                                    );
+                                }
+                                // A token blip isn't this save's fault: leave the
+                                // failure state untouched (neither escalate nor
+                                // reset) and let the short cooldown retry once the
+                                // refresh lands.
+                                AutoRestoreDisposition::Unauthorized => {}
+                                AutoRestoreDisposition::Ok => {
+                                    // The save works. Drop the escalation so the
+                                    // next hiccup starts from 60s again, and take
+                                    // down any persistent warning we raised.
+                                    if slot.restore_failures.clear() {
+                                        recovered =
+                                            Some((id.clone(), slot.save.game_slug.clone()));
+                                    }
+                                }
+                                AutoRestoreDisposition::Failed(err) => {
+                                    let (delay, emit_stuck) =
+                                        slot.restore_failures.record_failure(latest);
+                                    slot.next_auto_restore_at = Some(TokioInstant::now() + delay);
+                                    tracing::debug!(
+                                        save_id = %id,
+                                        failures = slot.restore_failures.consecutive,
+                                        version = ?latest,
+                                        backoff_secs = delay.as_secs(),
+                                        "agent: auto-restore failed — escalating backoff"
+                                    );
+                                    // Escalation alone would make a chronically
+                                    // broken save *quieter* over time. Surface it
+                                    // once instead, so backing off doesn't turn
+                                    // into hiding.
+                                    if emit_stuck {
+                                        stuck = Some((
+                                            slot.save.game_slug.clone(),
+                                            slot.restore_failures.consecutive,
+                                            err,
+                                        ));
+                                    }
+                                }
                             }
+                        }
+                        if let Some((game_slug, failures, error)) = stuck {
+                            tracing::warn!(
+                                save_id = %id,
+                                game_slug = %game_slug,
+                                failures,
+                                error = %error,
+                                "agent: auto-restore stuck — repeated failures on the same version"
+                            );
+                            let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreStuck {
+                                save_id: id.clone(),
+                                game_slug,
+                                failures,
+                                error,
+                            });
+                        }
+                        if let Some((save_id, game_slug)) = recovered {
+                            tracing::info!(
+                                save_id = %save_id,
+                                "agent: auto-restore recovered after repeated failures"
+                            );
+                            let _ = events_tx
+                                .try_send(AgentEvent::SaveAutoRestoreRecovered { save_id, game_slug });
                         }
                         // Restore has settled: if the slot still has no baseline
                         // (server was empty / 404 and the local folder holds
@@ -1015,7 +1164,42 @@ async fn run_agent(
                         // backup-only opt-out and the in-flight guard, but
                         // ignore the cooldown — the poller already confirmed a
                         // version bump, so this is never spurious.
-                        let eligible = slots.get(&id).is_some_and(|slot| {
+                        //
+                        // The *failure* backoff is different from the cooldown and
+                        // is not bypassed. "The poller confirmed a bump" is only a
+                        // reason to skip pacing if the bump is news to us: the
+                        // poller re-reports the same latest version every tick, so
+                        // a save failing on v7 would get a fresh kick every poll
+                        // interval, which is exactly the every-minute multi-GB
+                        // retry loop the backoff exists to stop — the kick would
+                        // walk straight around it. So a kick for the version that
+                        // keeps failing waits out the backoff, while a kick for a
+                        // newer version resets it and proceeds (the reset happens
+                        // in `SetCloudVersions`, which both pollers send *before*
+                        // this command, so by the time we get here `failing_version`
+                        // is already cleared for a genuine bump).
+                        //
+                        // Only an equal, *known* version blocks: when we have no
+                        // cloud version for the save (self-hosted SSE, which sends
+                        // `ForceRestore` without populating the cache, or the window
+                        // before the first poll) `failing_version` is `None` and we
+                        // can't prove the kick is a repeat — let it through, since
+                        // the kick is itself evidence something changed.
+                        let backoff_held = slots.get(&id).is_some_and(|slot| {
+                            slot.restore_failures.version.is_some()
+                                && slot.restore_failures.version == latest_versions.get(&id).copied()
+                                && slot
+                                    .next_auto_restore_at
+                                    .is_some_and(|t| TokioInstant::now() < t)
+                        });
+                        if backoff_held {
+                            tracing::debug!(
+                                save_id = %id,
+                                version = ?latest_versions.get(&id).copied(),
+                                "agent: force-restore ignored — same version is on the failure backoff"
+                            );
+                        }
+                        let eligible = !backoff_held && slots.get(&id).is_some_and(|slot| {
                             !slot.save.track_only
                                 && slot
                                     .save
@@ -1135,6 +1319,37 @@ async fn run_agent(
                             count = map.len(),
                             "agent: cloud version cache updated from poller"
                         );
+                        // A save parked on the escalating failure backoff must not
+                        // sit out a *new* version: the backoff is a statement about
+                        // the version that kept failing, and the server just moved
+                        // past it. Clear the escalation here — the single place the
+                        // agent learns the cloud advanced — so the next sweep tick
+                        // retries immediately instead of honouring a penalty of up
+                        // to an hour that no longer applies to anything. Without
+                        // this, only the sync-global `ForceRestore` kick would
+                        // notice, and a save with restore-on/sync-global-off would
+                        // stay stale for the rest of the backoff.
+                        let mut recovered: Vec<(String, String)> = Vec::new();
+                        for (id, slot) in slots.iter_mut() {
+                            if !slot.restore_failures.is_active() {
+                                continue;
+                            }
+                            if slot.restore_failures.version == map.get(id).copied() {
+                                continue;
+                            }
+                            if slot.restore_failures.clear() {
+                                recovered.push((id.clone(), slot.save.game_slug.clone()));
+                            }
+                            slot.next_auto_restore_at = None;
+                        }
+                        for (save_id, game_slug) in recovered {
+                            tracing::info!(
+                                save_id = %save_id,
+                                "agent: cloud version advanced past the failing one — clearing stuck state"
+                            );
+                            let _ = events_tx
+                                .try_send(AgentEvent::SaveAutoRestoreRecovered { save_id, game_slug });
+                        }
                         latest_versions = map;
                     }
                     Some(AgentCommand::SetProbeCandidates(dirs)) => {
@@ -1452,6 +1667,7 @@ fn handle_add(
         last_backup_at: None,
         restoring: false,
         next_auto_restore_at: None,
+        restore_failures: AutoRestoreFailures::default(),
         last_set_hash,
         known_version,
         pull_pending: false,
@@ -1589,6 +1805,109 @@ fn maybe_schedule_initial_backup(
 /// reconciliation sweep.
 const AUTO_RESTORE_COOLDOWN_SECS: u64 = 60;
 
+/// Escalating pacing for an auto-restore that keeps failing on the *same*
+/// cloud version: 60 s → 5 min → 15 min → 60 min, then 60 min forever.
+///
+/// The flat 60 s cooldown above is right for a one-off failure and wrong for a
+/// chronic one. A restore that fails is not free: it fails *after* pulling the
+/// snapshot, so each retry costs a full download. A Windows client hit exactly
+/// this in July 2026 — auto-restores failing on the pre-1.0.3 60 s download
+/// timeout, a failed restore recording no synced version, and the sweep
+/// retrying at full download cost every minute. It re-downloaded the same 13
+/// saves (~3.7 GB a burst) for eight days, ~60 GB/day, and nothing stopped it:
+/// the bandwidth quota was working as designed (each burst fit inside the
+/// window) and the only user-visible trace was a transient error toast.
+///
+/// Escalating cuts the steady-state cost by ~60× (1440 attempts/day → 24)
+/// without dulling the common case: the first retry is still at 60 s, so a
+/// transient blip recovers exactly as fast as it did before. We only slow down
+/// once the save has *proved* that retrying doesn't work. The 60 min cap is
+/// deliberately not the hour-scale parking of `AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS`:
+/// a 404 is a statement of fact ("this isn't here"), while these errors are
+/// usually environmental (network, disk, permissions) and do fix themselves, so
+/// the ceiling stays inside a typical play session and repair stays unattended.
+const AUTO_RESTORE_FAILURE_BACKOFF_SECS: [u64; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
+
+/// Consecutive failures on the same version before the agent stops treating the
+/// problem as transient and emits [`AgentEvent::SaveAutoRestoreStuck`].
+///
+/// Three is the point where the escalation has already spent 60 s + 5 min and is
+/// about to stretch to 15 min and beyond: the retries have gone from "you won't
+/// notice" to "this save is effectively not syncing", which is precisely when a
+/// toast the user may have missed stops being adequate and the state has to
+/// become persistent.
+const AUTO_RESTORE_STUCK_AFTER: u32 = 3;
+
+/// How long to wait before the next auto-restore attempt, given how many
+/// consecutive failures this save has hit on the current cloud version.
+///
+/// `failures` is 1-based (1 = the attempt that just failed). Saturates at the
+/// last step of [`AUTO_RESTORE_FAILURE_BACKOFF_SECS`] rather than growing
+/// without bound — an unbounded backoff eventually parks a recoverable save for
+/// days, which is the opposite failure of the one we're fixing.
+fn auto_restore_backoff(failures: u32) -> Duration {
+    let idx = (failures.max(1) as usize - 1).min(AUTO_RESTORE_FAILURE_BACKOFF_SECS.len() - 1);
+    Duration::from_secs(AUTO_RESTORE_FAILURE_BACKOFF_SECS[idx])
+}
+
+/// Per-save auto-restore failure state: how many consecutive failures, on which
+/// cloud version, and whether the user has already been told.
+///
+/// Kept as its own type rather than three loose fields on [`SaveSlot`] because
+/// the three only make sense together — a count without the version it counts
+/// for is what made the original bug possible ("retry forever" is what you get
+/// when nothing remembers *what* kept failing). Bundling them also makes the
+/// state machine unit-testable without standing up an agent loop.
+#[derive(Debug, Default, Clone)]
+struct AutoRestoreFailures {
+    /// Consecutive failures against `version`.
+    consecutive: u32,
+    /// The cloud version those failures are counted for. `None` = unknown
+    /// (self-hosted, or before the first poll).
+    version: Option<i64>,
+    /// Whether `SaveAutoRestoreStuck` has already been emitted for
+    /// (this save, `version`).
+    stuck_notified: bool,
+}
+
+impl AutoRestoreFailures {
+    /// Record one failed attempt against the cloud's current `latest` version.
+    ///
+    /// Returns the delay to re-arm `next_auto_restore_at` with, and whether the
+    /// caller should emit [`AgentEvent::SaveAutoRestoreStuck`] — true exactly
+    /// once per (save, version), on the [`AUTO_RESTORE_STUCK_AFTER`]th failure.
+    fn record_failure(&mut self, latest: Option<i64>) -> (Duration, bool) {
+        // A different version is a fresh reason to try: start the escalation
+        // over instead of inheriting the old version's penalty.
+        if self.version != latest {
+            self.version = latest;
+            self.consecutive = 0;
+            self.stuck_notified = false;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        let emit_stuck = self.consecutive >= AUTO_RESTORE_STUCK_AFTER && !self.stuck_notified;
+        if emit_stuck {
+            self.stuck_notified = true;
+        }
+        (auto_restore_backoff(self.consecutive), emit_stuck)
+    }
+
+    /// Clear the failure state after a successful attempt. Returns whether a
+    /// persistent warning was up (so the caller emits `...Recovered` and the UI
+    /// can drop the badge).
+    fn clear(&mut self) -> bool {
+        let was_stuck = self.stuck_notified;
+        *self = Self::default();
+        was_stuck
+    }
+
+    /// Whether this save is currently carrying failure state worth clearing
+    /// when the cloud version moves on.
+    fn is_active(&self) -> bool {
+        self.consecutive > 0 || self.stuck_notified
+    }
+}
+
 /// How long to wait before re-arming a backup whose in-task retry budget
 /// (`max_retries`, seconds-scale exponential backoff) is spent. Ten minutes is
 /// deliberately far slower than that budget: what survives it isn't a flaky
@@ -1700,7 +2019,7 @@ fn spawn_auto_restore(
             "agent: auto-restore diff — checking server snapshot against local"
         );
         let retention = Duration::from_secs(u64::from(conflict_retention_days) * 86_400);
-        let mut not_on_server = false;
+        let mut disposition = AutoRestoreDisposition::Ok;
         let mut synced_version: Option<i64> = None;
         // Adopted as the slot's `last_set_hash` only when the merge left the
         // tree equal to head (no divergence), so the writes the merge made
@@ -1790,7 +2109,7 @@ fn spawn_auto_restore(
                 // raise it to the user as an error and don't keep retrying on
                 // the short cooldown; park it on a long backoff (below).
                 let api_err = e.downcast_ref::<ApiError>();
-                not_on_server = matches!(api_err, Some(ApiError::NotFound));
+                let not_on_server = matches!(api_err, Some(ApiError::NotFound));
                 // A 401 is session-wide, not per-save: at launch the stored
                 // cloud JWT can be expired and the desktop's refresh path
                 // hasn't pushed a fresh token into this client yet, so the
@@ -1801,11 +2120,13 @@ fn spawn_auto_restore(
                 // short cooldown retry once the token is refreshed.
                 let unauthorized = matches!(api_err, Some(ApiError::Unauthorized));
                 if not_on_server {
+                    disposition = AutoRestoreDisposition::NotOnServer;
                     tracing::debug!(
                         save_id = %save.save_id,
                         "agent: auto-restore — save not on server (404); backing off"
                     );
                 } else if unauthorized {
+                    disposition = AutoRestoreDisposition::Unauthorized;
                     tracing::debug!(
                         save_id = %save.save_id,
                         "agent: auto-restore deferred — session unauthorized (token refresh pending)"
@@ -1821,19 +2142,22 @@ fn spawn_auto_restore(
                         .send(AgentEvent::SaveAutoRestoreFailed {
                             save_id: save.save_id.clone(),
                             game_slug: save.game_slug.clone(),
-                            error: chain,
+                            error: chain.clone(),
                         })
                         .await;
+                    disposition = AutoRestoreDisposition::Failed(chain);
                 }
             }
         }
         // Always clear the slot's `restoring` flag, even on failure — the
         // reconciliation sweep is responsible for retrying once the
-        // cooldown expires; we just need to mark this attempt as done.
+        // cooldown (or, on repeated failures, the escalating backoff the
+        // handler arms from `outcome`) expires; we just need to mark this
+        // attempt as done.
         let _ = cmd_tx
             .send(AgentCommand::AutoRestoreFinished {
                 id: save.save_id.clone(),
-                not_on_server,
+                disposition,
                 synced_version,
                 post_restore_set_hash,
             })
@@ -3406,7 +3730,7 @@ async fn run_backup_with_retry(
                                 let _ = cmd_tx
                                     .send(AgentCommand::AutoRestoreFinished {
                                         id: save.save_id.clone(),
-                                        not_on_server: false,
+                                        disposition: AutoRestoreDisposition::Ok,
                                         synced_version: Some(outcome.version_num),
                                         post_restore_set_hash: outcome.disk_set_hash.clone(),
                                     })
@@ -3431,7 +3755,7 @@ async fn run_backup_with_retry(
                             let _ = cmd_tx
                                 .send(AgentCommand::AutoRestoreFinished {
                                     id: save.save_id.clone(),
-                                    not_on_server: false,
+                                    disposition: AutoRestoreDisposition::Ok,
                                     synced_version: Some(outcome.version_num),
                                     post_restore_set_hash: None,
                                 })
@@ -3972,11 +4296,15 @@ fn process_poll(
     let mut steam_running: HashSet<String> = HashSet::new();
     for (pid, proc) in sys.processes() {
         let name = proc.name().to_string_lossy().to_lowercase();
-        // Un proceso difunto conserva nombre y exe, así que casaría con las
-        // señales FUERTES igual que uno vivo y mantendría el slot "corriendo"
-        // para siempre (ver `is_defunct`). No puede estar escribiendo un save:
-        // queda fuera de las cuatro. Las DÉBILES no lo necesitan — sólo
-        // arrancan con un PID que NACE, y un zombi ya nació y murió.
+        // Un proceso difunto conserva nombre, exe y `start_time`, así que casaría
+        // con las señales FUERTES igual que uno vivo y mantendría el slot
+        // "corriendo" para siempre (ver `is_defunct`). No puede estar escribiendo
+        // un save: queda fuera de las cuatro. La DÉBIL tampoco lo quiere: aunque
+        // sólo ARRANCA con un PID que nace, su arm de "mismo PID sigue vivo"
+        // aceptaba al zombi tick tras tick (un juego Proton que muere mal deja el
+        // zombi con el mismo `rpid`/`rst`), y el slot no salía de "corriendo"
+        // hasta el reboot — al zombi no se le puede matar y el force quit no
+        // genera transición. Ver incidente PoP 2008 jul-2026.
         let defunct = is_defunct(proc.status());
         // Name match — works on every storefront on Windows, and on
         // Proton/Wine where the wineprefix process keeps the .exe name.
@@ -4022,7 +4350,7 @@ fn process_poll(
         // "aparece", así que ningún pico de CPU puede dispararlo. Va a
         // `weak_running`; el guard "un juego a la vez" aún lo descarta si otro
         // juego corre por señal fuerte (ver más abajo).
-        if !corr_index.is_empty() {
+        if !defunct && !corr_index.is_empty() {
             if let Some(ids) = corr_index.get(&name) {
                 let st = proc.start_time();
                 for id in ids {
@@ -4387,6 +4715,134 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// The escalation the July-2026 incident needed: 60s → 5min → 15min → 60min,
+    /// then flat. The first step must stay at the old flat cooldown so a
+    /// one-off blip recovers exactly as fast as it did before.
+    #[test]
+    fn auto_restore_backoff_escalates_then_caps() {
+        assert_eq!(auto_restore_backoff(1), Duration::from_secs(60));
+        assert_eq!(auto_restore_backoff(2), Duration::from_secs(5 * 60));
+        assert_eq!(auto_restore_backoff(3), Duration::from_secs(15 * 60));
+        assert_eq!(auto_restore_backoff(4), Duration::from_secs(60 * 60));
+        // Capped, not unbounded: a save that fails all day is retried hourly,
+        // never parked for days.
+        assert_eq!(auto_restore_backoff(5), Duration::from_secs(60 * 60));
+        assert_eq!(auto_restore_backoff(99), Duration::from_secs(60 * 60));
+        // 0 shouldn't happen (the counter is 1-based) but must not panic on
+        // the index maths.
+        assert_eq!(auto_restore_backoff(0), Duration::from_secs(60));
+    }
+
+    /// The whole point of the fix: repeated failures on the same version pace
+    /// themselves instead of re-downloading gigabytes every minute forever.
+    #[test]
+    fn record_failure_escalates_on_same_version() {
+        let mut f = AutoRestoreFailures::default();
+        let delays: Vec<u64> = (0..5)
+            .map(|_| f.record_failure(Some(7)).0.as_secs())
+            .collect();
+        assert_eq!(delays, vec![60, 300, 900, 3600, 3600]);
+        assert_eq!(f.consecutive, 5);
+        assert_eq!(f.version, Some(7));
+    }
+
+    /// A successful attempt wipes the slate: the next unrelated hiccup starts
+    /// from 60s again rather than inheriting an hour-long penalty.
+    #[test]
+    fn success_resets_the_escalation() {
+        let mut f = AutoRestoreFailures::default();
+        f.record_failure(Some(7));
+        f.record_failure(Some(7));
+        assert_eq!(f.consecutive, 2);
+
+        assert!(!f.clear(), "no warning was up, so nothing to recover from");
+        assert_eq!(f.consecutive, 0);
+        assert_eq!(f.version, None);
+        assert!(!f.is_active());
+
+        // Back to the bottom of the ladder.
+        assert_eq!(f.record_failure(Some(7)).0, Duration::from_secs(60));
+    }
+
+    /// A new cloud version is a fresh reason to try now: it must not inherit the
+    /// old version's backoff. This is compared by *version*, not elapsed time —
+    /// a save stuck on v7 is still stuck on v7 an hour later.
+    #[test]
+    fn new_version_resets_the_escalation() {
+        let mut f = AutoRestoreFailures::default();
+        for _ in 0..4 {
+            f.record_failure(Some(7));
+        }
+        assert_eq!(f.consecutive, 4);
+
+        // v8 landed: start over at 60s instead of the 60min v7 had earned.
+        let (delay, _) = f.record_failure(Some(8));
+        assert_eq!(delay, Duration::from_secs(60));
+        assert_eq!(f.consecutive, 1);
+        assert_eq!(f.version, Some(8));
+    }
+
+    /// The stuck warning fires once per (save, version) — the sweep keeps
+    /// retrying and re-failing, but the user is told a single time. A warning
+    /// re-emitted on every retry is just the toast spam this replaces.
+    #[test]
+    fn stuck_event_is_one_shot_per_version() {
+        let mut f = AutoRestoreFailures::default();
+        // Below the threshold: still plausibly transient, stay quiet.
+        assert!(!f.record_failure(Some(7)).1);
+        assert!(!f.record_failure(Some(7)).1);
+        // Third strike on the same version: surface it.
+        assert!(f.record_failure(Some(7)).1);
+        // …and never again for this version, however long it keeps failing.
+        for _ in 0..10 {
+            assert!(!f.record_failure(Some(7)).1);
+        }
+        assert!(f.stuck_notified);
+    }
+
+    /// A new version re-arms the one-shot: if v8 also fails three times, that's
+    /// a new fact about a new version and worth saying again.
+    #[test]
+    fn stuck_event_rearms_on_new_version() {
+        let mut f = AutoRestoreFailures::default();
+        for _ in 0..3 {
+            f.record_failure(Some(7));
+        }
+        assert!(f.stuck_notified);
+
+        // v8: the warning clears and the count restarts.
+        assert!(!f.record_failure(Some(8)).1);
+        assert!(!f.stuck_notified);
+        assert!(!f.record_failure(Some(8)).1);
+        assert!(f.record_failure(Some(8)).1);
+    }
+
+    /// Recovering from a stuck state reports it, so the frontends can drop the
+    /// persistent badge. A warning that can't clear itself trains users to
+    /// ignore warnings.
+    #[test]
+    fn clear_reports_whether_a_warning_was_up() {
+        let mut f = AutoRestoreFailures::default();
+        for _ in 0..AUTO_RESTORE_STUCK_AFTER {
+            f.record_failure(Some(7));
+        }
+        assert!(f.is_active());
+        assert!(f.clear(), "was stuck → the UI has a badge to take down");
+        assert!(!f.is_active());
+        assert!(!f.clear(), "already clean → nothing to announce");
+    }
+
+    /// Self-hosted (and the window before the first poll) has no cloud version
+    /// cache, so every attempt reports `None`. That must still escalate — the
+    /// unknown version is a stable key, not a reason to reset every time.
+    #[test]
+    fn unknown_version_still_escalates() {
+        let mut f = AutoRestoreFailures::default();
+        assert_eq!(f.record_failure(None).0, Duration::from_secs(60));
+        assert_eq!(f.record_failure(None).0, Duration::from_secs(300));
+        assert_eq!(f.consecutive, 2);
+    }
+
     #[test]
     fn canon_token_unifies_slug_name_and_exe() {
         // Las tres formas del mismo juego colapsan a un token.
@@ -4583,6 +5039,7 @@ mod tests {
                 last_backup_at: None,
                 restoring: false,
                 next_auto_restore_at: None,
+                restore_failures: AutoRestoreFailures::default(),
                 last_set_hash: None,
                 known_version: None,
                 pull_pending: false,
@@ -4634,6 +5091,7 @@ mod tests {
             last_backup_at: None,
             restoring: false,
             next_auto_restore_at: None,
+            restore_failures: AutoRestoreFailures::default(),
             last_set_hash: None,
             known_version: None,
             pull_pending: false,

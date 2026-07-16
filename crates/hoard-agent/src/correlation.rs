@@ -88,6 +88,13 @@ const NON_GAME_PROCESS: &[&str] = &[
     "eadesktop",
     "ubisoftconnect",
     "uplay",
+    // El cliente Ubisoft real que los juegos Ubisoft-en-Steam lanzan dentro del
+    // prefijo: ni "ubisoftconnect" ni "uplay" son substring de
+    // `UbisoftGameLauncher.exe` / `UbisoftGameLauncher64.exe` (el `upc.exe`
+    // hermano va en la lista EXACTA). Reescribe `.../Ubisoft Game
+    // Launcher/savegames/...` con su propio cloud sync y sobrevive al cierre del
+    // juego → correlación eterna. Ver incidente PoP 2008 jul-2026.
+    "ubisoftgamelauncher",
     // Infraestructura Wine/Proton/Steam-runtime en Linux: envuelve al juego
     // pero no es el juego. Sin esto la atribución `.first()` se queda con un
     // wrapper (`reaper`, `proton`, `wineserver`) en vez del ejecutable real.
@@ -148,7 +155,10 @@ const NON_GAME_PROCESS: &[&str] = &[
 /// match por substring sin falsos positivos (`"code"` colisionaba con
 /// `codename.exe`, `decode.exe`). Se aplica como match EXACTO (case-
 /// insensitive) del basename del proceso y del exe.
-const NON_GAME_PROCESS_EXACT: &[&str] = &["code", "code.exe"];
+///
+/// `"upc"` es el cliente Ubisoft (hermano de `UbisoftGameLauncher.exe`, que sí va
+/// por substring); como substring pescaría exes legítimos tipo `upcoming.exe`.
+const NON_GAME_PROCESS_EXACT: &[&str] = &["code", "code.exe", "upc", "upc.exe"];
 
 /// Un proceso nacido dentro de esta ventana tras el arranque del SISTEMA es
 /// infraestructura de autostart (Discord, trays, overlays de GPU, daemons de
@@ -625,22 +635,52 @@ mod tests {
         // Substring matches that look like "code" but aren't exact still pass.
         assert!(is_game_like("codename.exe", None));
         assert!(is_game_like("decode.exe", None));
-        // Via exe basename too.
+        // Por basename del exe también, que es el caso que el basename existe
+        // para tapar: nombre de hilo genérico (no delata) + exe FUERA de una
+        // ruta de sistema (VSCode instalado en el home, que `SYSTEM_EXE_PREFIXES`
+        // no alcanza). Ojo al escribir estos pins: con `/usr/...` manda la regla
+        // de ruta y con `C:\...` manda el nombre — ninguno llega al basename, así
+        // que ambos pasarían con el bloque de basename borrado.
         assert!(!is_game_like(
             "ThreadPoolForeg",
-            Some(Path::new("/usr/share/code/code"))
+            Some(Path::new("/home/u/.local/share/apps/vscode/code"))
         ));
-        assert!(!is_game_like(
-            "Code",
+        // Un juego cuyo basename NO es "code" sigue pasando desde la misma ruta.
+        assert!(is_game_like(
+            "ThreadPoolForeg",
             Some(Path::new(
-                "C:\\Users\\dev\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
+                "/home/u/.local/share/apps/eldenring/eldenring.exe"
             ))
         ));
-        // A real game whose exe basename is NOT "code" still passes.
-        assert!(is_game_like(
-            "eldenring.exe",
-            Some(Path::new("D:\\Steam\\eldenring.exe"))
+    }
+
+    #[test]
+    fn is_game_like_rejects_ubisoft_client() {
+        // El cliente que los juegos Ubisoft-en-Steam lanzan dentro del prefijo:
+        // reescribe la carpeta de save con su propio cloud sync y sobrevive al
+        // cierre del juego (incidente PoP 2008 jul-2026).
+        assert!(!is_game_like("upc.exe", None));
+        assert!(!is_game_like("UPC.exe", None));
+        assert!(!is_game_like("upc", None));
+        assert!(!is_game_like("UbisoftGameLauncher.exe", None));
+        assert!(!is_game_like("UbisoftGameLauncher64.exe", None));
+        // Por basename del exe también (el nombre puede ser un hilo genérico).
+        // Ruta tal y como la ve el agente en el prefijo Proton de la Deck: el
+        // basename sólo se extrae con separador nativo, así que el path Windows
+        // "Z:\..." no serviría de pin aquí.
+        let prefix = "/home/deck/.steam/steam/steamapps/compatdata/19900/pfx/drive_c\
+            /Program Files (x86)/Ubisoft/Ubisoft Game Launcher";
+        assert!(!is_game_like(
+            "ThreadPoolForeg",
+            Some(&Path::new(prefix).join("upc.exe"))
         ));
+        assert!(!is_game_like(
+            "ThreadPoolForeg",
+            Some(&Path::new(prefix).join("UbisoftGameLauncher64.exe"))
+        ));
+        // "upc" va en la lista EXACTA justo por esto: como substring se comería
+        // exes legítimos.
+        assert!(is_game_like("upcoming.exe", None));
     }
 
     #[test]

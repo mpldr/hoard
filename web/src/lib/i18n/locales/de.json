@@ -247,6 +247,7 @@
   "login.email_resend": "E-Mail erneut senden",
   "login.email_resend_wait": "Erneut senden in {secs}s",
   "login.error_rate_limit": "Die E-Mail-Anmeldung ist serverseitig limitiert und hat gerade ihr Limit erreicht. Versuche es stattdessen mit \"Mit Google fortfahren\", oder warte ein paar Minuten und versuche es per E-Mail erneut.",
+  "login.captcha_required": "Bitte schließe das Captcha ab.",
   "login.use_another_email": "Andere E-Mail verwenden",
   "login.signed_in_as": "Angemeldet als",
   "login.connect_app": "Dieses Konto verbinden",

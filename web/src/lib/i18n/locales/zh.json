@@ -247,6 +247,7 @@
   "login.email_resend": "重新发送邮件",
   "login.email_resend_wait": "{secs}秒后可重发",
   "login.error_rate_limit": "邮箱登录在服务器端有请求限制，目前已达到上限。请改用\"用 Google 继续\"，或等待几分钟后再用邮箱重试。",
+  "login.captcha_required": "请完成人机验证。",
   "login.use_another_email": "使用其他邮箱",
   "login.signed_in_as": "已登录为",
   "login.connect_app": "连接此账户",

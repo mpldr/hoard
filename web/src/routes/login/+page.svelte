@@ -5,10 +5,25 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { auth } from '$lib/auth';
+  import { config } from '$lib/config';
   import { safeNext } from '$lib/safeNext';
   import { session } from '$lib/stores/session';
   import Button from '$lib/components/Button.svelte';
   import LogoMark from '$lib/components/LogoMark.svelte';
+  import Turnstile from '$lib/components/Turnstile.svelte';
+
+  // Cloudflare Turnstile. Empty site key => captcha disabled, and the email
+  // form behaves exactly as before (no widget, no token gating).
+  const captchaSiteKey = config.turnstile.siteKey;
+  const captchaEnabled = !!captchaSiteKey;
+  let captchaToken = $state('');
+  let turnstile = $state<Turnstile | null>(null);
+  // Turnstile tokens are single-use: after a submit consumes one we must fetch
+  // a fresh challenge before the next email/resend attempt.
+  function refreshCaptcha() {
+    captchaToken = '';
+    turnstile?.reset();
+  }
 
   let email = $state('');
   let sent = $state(false);
@@ -141,31 +156,42 @@
   async function withEmail(e: SubmitEvent) {
     e.preventDefault();
     if (!email) return;
+    if (captchaEnabled && !captchaToken) {
+      error = $_('login.captcha_required');
+      return;
+    }
     error = null;
     busy = true;
     try {
-      await auth.signInWithEmail(email, redirectTo);
+      await auth.signInWithEmail(email, redirectTo, captchaToken || undefined);
       sent = true;
       startCooldown();
     } catch (err) {
       error = describeAuthError(err);
     } finally {
       busy = false;
+      // The token was consumed (or the attempt failed); force a new challenge.
+      if (captchaEnabled) refreshCaptcha();
     }
   }
 
   // Re-send the magic link to the same address. Gated behind the cooldown.
   async function resend() {
     if (busy || cooldown > 0 || !email) return;
+    if (captchaEnabled && !captchaToken) {
+      error = $_('login.captcha_required');
+      return;
+    }
     error = null;
     busy = true;
     try {
-      await auth.signInWithEmail(email, redirectTo);
+      await auth.signInWithEmail(email, redirectTo, captchaToken || undefined);
       startCooldown();
     } catch (err) {
       error = describeAuthError(err);
     } finally {
       busy = false;
+      if (captchaEnabled) refreshCaptcha();
     }
   }
 
@@ -269,11 +295,18 @@
           {$_('login.email_sent_desktop_note')}
         </div>
       {/if}
+      {#if captchaEnabled}
+        <Turnstile
+          bind:this={turnstile}
+          siteKey={captchaSiteKey}
+          onToken={(t) => (captchaToken = t)}
+        />
+      {/if}
       <div class="flex flex-col gap-2">
         <button
           class="ring-focus w-full rounded-lg border border-line px-4 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-bg disabled:opacity-50"
           onclick={resend}
-          disabled={busy || cooldown > 0}
+          disabled={busy || cooldown > 0 || (captchaEnabled && !captchaToken)}
         >
           {cooldown > 0
             ? $_('login.email_resend_wait', { values: { secs: cooldown } })
@@ -295,7 +328,20 @@
           placeholder={$_('login.email_placeholder')}
           class="ring-focus w-full rounded-lg border border-line bg-surface px-4 py-2.5 text-sm text-ink placeholder:text-ink-faint transition-colors focus:border-accent focus:outline-none"
         />
-        <Button type="submit" variant="primary" full disabled={busy} loading={busy}>
+        {#if captchaEnabled}
+          <Turnstile
+            bind:this={turnstile}
+            siteKey={captchaSiteKey}
+            onToken={(t) => (captchaToken = t)}
+          />
+        {/if}
+        <Button
+          type="submit"
+          variant="primary"
+          full
+          disabled={busy || (captchaEnabled && !captchaToken)}
+          loading={busy}
+        >
           {$_('login.email_cta')}
         </Button>
       </form>

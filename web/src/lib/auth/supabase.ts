@@ -84,10 +84,15 @@ export const supabaseAuth: AuthProvider = {
     if (error) throw error;
   },
 
-  async signInWithEmail(email, redirectTo) {
+  async signInWithEmail(email, redirectTo, captchaToken) {
     const { error } = await supabase.auth.signInWithOtp({
       email,
-      options: { emailRedirectTo: redirectTo }
+      options: {
+        emailRedirectTo: redirectTo,
+        // Only sent when Turnstile is configured; GoTrue ignores it when
+        // captcha protection is off, and requires it when it's on.
+        ...(captchaToken ? { captchaToken } : {})
+      }
     });
     if (error) throw error;
   },

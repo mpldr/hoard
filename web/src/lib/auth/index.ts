@@ -10,7 +10,7 @@ export interface AuthProvider {
   onAuthChange(cb: (session: AccountSession | null) => void): () => void;
   signInWithGoogle(redirectTo: string): Promise<void>;
   signInWithGithub(redirectTo: string): Promise<void>;
-  signInWithEmail(email: string, redirectTo: string): Promise<void>;
+  signInWithEmail(email: string, redirectTo: string, captchaToken?: string): Promise<void>;
   signOut(): Promise<void>;
   getAccessToken(): Promise<string | null>;
 }

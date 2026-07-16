@@ -12,6 +12,13 @@ export const config = {
     url: env.PUBLIC_SUPABASE_URL ?? '',
     anonKey: env.PUBLIC_SUPABASE_ANON_KEY ?? ''
   },
+  // Cloudflare Turnstile site key (public). When empty the captcha is disabled
+  // and the login flow behaves exactly as before — no widget, no captchaToken.
+  // Set this only after enabling Turnstile in Supabase → Auth → Attack
+  // Protection, or GoTrue will reject every OTP request for a missing token.
+  turnstile: {
+    siteKey: env.PUBLIC_TURNSTILE_SITE_KEY ?? ''
+  },
   api: {
     baseUrl: env.PUBLIC_API_URL ?? 'https://api.hoard.services'
   },

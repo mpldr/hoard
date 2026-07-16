@@ -247,6 +247,7 @@
   "login.email_resend": "Renvoyer l’e-mail",
   "login.email_resend_wait": "Renvoyer dans {secs}s",
   "login.error_rate_limit": "La connexion par e-mail est limitée côté serveur et vient d’atteindre sa limite. Essaie plutôt \"Continuer avec Google\", ou attends quelques minutes avant de réessayer par e-mail.",
+  "login.captcha_required": "Veuillez compléter le captcha.",
   "login.use_another_email": "Utiliser une autre adresse",
   "login.signed_in_as": "Connecté en tant que",
   "login.connect_app": "Connecter ce compte",

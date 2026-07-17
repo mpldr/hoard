@@ -6,12 +6,12 @@
 
 | Service | Free tier user | Pro user (100 GB) |
 |---------|----------------|-------------------|
-| **Supabase** (DB + auth + realtime) | ~$0.01 | ~$0.10 |
-| **Fly,io** (server hosting) | ~$0.01 | ~$0.05 |
+| **Supabase** (DB + auth + realtime) | ~$0.10 | ~$0.10 |
+| **Fly,io** (server hosting) | ~$0.05 | ~$0.05 |
 | **Cloudflare R2** (storage) | **$0.03** | **$1.50** |
-| **Total/user** | **~$0.05** | **~$1.65** |
+| **Total/user** | **~$0.18** | **~$1.65** |
 
-> Supabase/Fly.io are estimates — they charge by usage (requests, CPU, bandwidth), not per user. Cloudflare R2 is the only predictable cost.
+> Supabase/Fly.io are estimates — they charge by usage (requests, CPU, bandwidth), not per user. Cloudflare R2 is the only predictable cost, thats mean if you play alot, im need pay more infraestructure.
 
 Pro subscriptions (1.99 €/month) are meant to cover their own costs and **subsidize free tier** users. Right now there are no Pro users, so the free tier runs at a loss.
 

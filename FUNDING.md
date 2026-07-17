@@ -35,5 +35,6 @@ Stripe fee: ~0.5 € per Pro subscription. A Pro user can consume up to ~$1.65 i
 
 Hoard is free and open-source. Your support helps cover server costs and funds development.
 
-[Pay Pro](https://hoard.services/pricing)
-[Or Sponsor on GitHub](https://github.com/sponsors/rleeon)
+[Pay Pro](https://hoard.services/pricing) 
+ Or 
+ [Sponsor on GitHub](https://github.com/sponsors/rleeon)

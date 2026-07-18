@@ -795,6 +795,14 @@ struct SaveSlot {
     /// Currently-running guess from the last process poll. Drives
     /// GameStarted/Stopped transitions.
     is_running: bool,
+    /// La sesión en curso arrancó SOLO por señal débil (correlación
+    /// carpeta→proceso) y ninguna señal fuerte la ha corroborado después. Si
+    /// además termina sin una sola escritura en la carpeta, fue una sesión
+    /// fantasma: el proceso correlacionado no era el juego, y se le pasa un
+    /// strike a la observación ([`CorrelationStore::strike_phantom`]) para que
+    /// una atribución envenenada (task horario, residente) se auto-descarte en
+    /// vez de vetar el sync "mid-session" para siempre (caso MOUSE jul-2026).
+    weak_session: bool,
     /// Last poll at which this slot's process was seen running. Powers the
     /// stop-debounce (`RUNNING_STICKY_SECS`): a correlation match is CPU-gated,
     /// so a Paradox game idling in a menu or on a loading screen can dip below
@@ -1525,8 +1533,8 @@ async fn run_agent(
                 let any_running = process_poll(
                     &mut sys, &mut slots, &events_tx, &api, &config, &done_tx, &cmd_tx,
                     &mut playtime, playtime_path.as_deref(), &mut reported_heavy,
-                    &corr_store, &steam_index, &mut prev_pids, &mut corr_running,
-                    &latest_versions,
+                    &mut corr_store, corr_path.as_deref(), &steam_index, &mut prev_pids,
+                    &mut corr_running, &latest_versions,
                 );
                 // Watcher self-healing: a slot whose folder didn't exist when
                 // the game was tracked (freshly installed, save dir created on
@@ -1659,6 +1667,7 @@ fn handle_add(
         watcher: None,
         pending: None,
         is_running: false,
+        weak_session: false,
         last_running_seen: None,
         has_pending: false,
         last_fs_event_at: None,
@@ -4044,14 +4053,69 @@ fn canon_token(s: &str) -> String {
     out
 }
 
+/// Tokens VETADOS en el match genérico de identidad: componentes del perfil de
+/// usuario y de la fontanería de instalación. Un slug degenerado igual a uno de
+/// estos convierte procesos cualesquiera en señal fuerte de "estás jugando" —
+/// caso real jul-2026: el save de `GSE Saves` quedó rastreado con slug =
+/// nombre de usuario de Windows ("jacka"), y como el username es componente de
+/// ruta de TODO exe bajo `C:\Users\<user>\...`, cualquier app del perfil
+/// disparaba GameStarted (y el guard "un juego a la vez" apagaba de rebote los
+/// juegos reales). La lista estática cubre la fontanería común; los
+/// componentes del home real (username incluido) se añaden dinámicamente.
+fn is_generic_identity_token(tok: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "users",
+        "home",
+        "appdata",
+        "roaming",
+        "local",
+        "locallow",
+        "documents",
+        "savedgames",
+        "mygames",
+        "saves",
+        "games",
+        "programfiles",
+        "programfilesx86",
+        "steamapps",
+        "common",
+        "compatdata",
+        "drivec",
+        "windows",
+        "desktop",
+        "downloads",
+    ];
+    static HOME_TOKENS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let home = HOME_TOKENS.get_or_init(|| {
+        directories::UserDirs::new()
+            .map(|u| {
+                u.home_dir()
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(s) => s.to_str().map(canon_token),
+                        _ => None,
+                    })
+                    .filter(|t| t.len() >= MIN_IDENTITY_TOKEN_LEN)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    GENERIC.contains(&tok) || home.iter().any(|h| h == tok)
+}
+
 /// Tokens de identidad de un save rastreado, derivados de datos que ya tenemos
 /// (slug + nombre visible) — SIN lista curada. Son las claves contra las que se
-/// compara cada proceso vivo.
+/// compara cada proceso vivo. Los tokens genéricos/de perfil se vetan
+/// ([`is_generic_identity_token`]): un juego así de mal nombrado pierde el
+/// match por token (le quedan las otras señales) antes que casar con todo.
 fn game_identity_tokens(slug: &str, display: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::with_capacity(2);
     for raw in [slug, display] {
         let t = canon_token(raw);
-        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !v.contains(&t) {
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN
+            && !is_generic_identity_token(&t)
+            && !v.contains(&t)
+        {
             v.push(t);
         }
     }
@@ -4070,7 +4134,10 @@ fn process_identity_candidates(name: &str, exe: Option<&Path>) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     let push = |s: &str, v: &mut Vec<String>| {
         let t = canon_token(s);
-        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !v.contains(&t) {
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN
+            && !is_generic_identity_token(&t)
+            && !v.contains(&t)
+        {
             v.push(t);
         }
     };
@@ -4158,7 +4225,10 @@ fn process_poll(
     playtime: &mut crate::playtime::PlaytimeStore,
     playtime_path: Option<&std::path::Path>,
     reported_heavy: &mut HashSet<Pid>,
-    corr_store: &crate::correlation::CorrelationStore,
+    // Mutable: las transiciones de parada pasan strikes de sesión fantasma a
+    // las observaciones de correlación (y las descartan al llegar al tope).
+    corr_store: &mut crate::correlation::CorrelationStore,
+    corr_path: Option<&std::path::Path>,
     steam_index: &crate::playtime_index::SteamPlaytimeIndex,
     prev_pids: &mut HashSet<Pid>,
     corr_running: &mut HashMap<String, (Pid, u64)>,
@@ -4444,9 +4514,14 @@ fn process_poll(
     for id in running.iter() {
         if let Some(slot) = slots.get_mut(id) {
             slot.last_running_seen = Some(now_inst);
+            // Una señal fuerte corrobora la sesión: ya no es "solo débil".
+            slot.weak_session = false;
         }
     }
-    let live_now: HashSet<&str> = running.iter().map(|s| s.as_str()).collect();
+    // Foto de los ids con señal FUERTE este tick, ANTES de mezclar débiles y
+    // sticky: las transiciones de abajo la usan para saber si un arranque fue
+    // solo-correlación (candidato a sesión fantasma).
+    let strong_now: HashSet<String> = running.iter().cloned().collect();
     let sticky = Duration::from_secs(
         config
             .poll_secs
@@ -4457,7 +4532,7 @@ fn process_poll(
         .iter()
         .filter(|(id, slot)| {
             slot.is_running
-                && !live_now.contains(id.as_str())
+                && !strong_now.contains(id.as_str())
                 && slot
                     .last_running_seen
                     .is_some_and(|seen| now_inst.duration_since(seen) < sticky)
@@ -4600,18 +4675,32 @@ fn process_poll(
                 })
             };
 
+            // ¿Arranque solo-débil? Ninguna señal fuerte lo corrobora este
+            // tick: candidato a sesión fantasma (ver `SaveSlot::weak_session`).
+            let weak_start = !strong_now.contains(id.as_str());
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = true;
+                slot.weak_session = weak_start;
                 // A new session earns a new "update waiting" notice if a pull
                 // gets deferred again. `pull_pending` itself survives: an
                 // update that arrived while the game was closed but couldn't
                 // land (a restore in flight, un-flushed changes) is still owed.
                 slot.deferred_notified = false;
             }
+            // El nombre del proceso correlacionado va al log: sin él, un
+            // GameStarted fantasma es indiagnosticable (caso MOUSE jul-2026:
+            // días de arranques horarios sin saber qué proceso los causaba).
+            let corr_process = if weak_start {
+                corr_store.attributed_name(&local_path)
+            } else {
+                None
+            };
             tracing::info!(
                 save_id = %id,
                 game_slug = %game_slug,
                 path = %local_path.display(),
+                signal = if weak_start { "correlation" } else { "strong" },
+                corr_process = %corr_process.as_deref().unwrap_or("-"),
                 "agent: GameStarted"
             );
             let _ = events_tx.try_send(AgentEvent::GameStarted {
@@ -4649,8 +4738,47 @@ fn process_poll(
                 );
             }
         } else {
+            let was_weak_session = slots
+                .get(&id)
+                .map(|s| s.weak_session)
+                .unwrap_or(false);
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = false;
+                slot.weak_session = false;
+            }
+            // Sesión fantasma: arrancó solo por correlación y murió sin UNA
+            // escritura en la carpeta. Un juego real escribe al jugar (y cada
+            // escritura re-graba la observación y la absuelve), así que esto
+            // solo acumula sobre atribuciones envenenadas — el task horario
+            // que tuvo a MOUSE "mid-session" durante días. Al segundo strike
+            // la observación cae y la señal débil muere con ella.
+            if was_weak_session && !had_pending {
+                match corr_store.strike_phantom(&local_path) {
+                    Some(true) => {
+                        tracing::warn!(
+                            save_id = %id,
+                            game_slug = %game_slug,
+                            "agent: observación de correlación descartada — \
+                             sesiones fantasma repetidas sin escrituras"
+                        );
+                        if let Some(p) = corr_path {
+                            if let Err(e) = corr_store.save(p) {
+                                tracing::debug!(error = %e, "agent: failed to persist correlation store");
+                            }
+                        }
+                    }
+                    Some(false) => {
+                        tracing::info!(
+                            save_id = %id,
+                            game_slug = %game_slug,
+                            "agent: sesión fantasma (correlación sin escrituras) — strike a la observación"
+                        );
+                    }
+                    None => {}
+                }
+            } else if had_pending {
+                // La sesión escribió: la atribución es legítima; borra strikes.
+                corr_store.absolve(&local_path);
             }
             tracing::info!(
                 save_id = %id,
@@ -4916,6 +5044,38 @@ mod tests {
     }
 
     #[test]
+    fn generic_and_profile_tokens_are_vetoed() {
+        // Caso real jul-2026: un save quedó rastreado con slug = username de
+        // Windows ("jacka"). El username es componente de ruta de TODO exe del
+        // perfil, así que cualquier app disparaba "estás jugando". Los tokens
+        // de fontanería no pueden ser identidad ni de juego ni de proceso.
+        for t in ["users", "appdata", "roaming", "locallow", "savedgames", "games"] {
+            assert!(is_generic_identity_token(t), "{t} debería vetarse");
+        }
+        assert!(!is_generic_identity_token("eldenring"));
+        assert!(!is_generic_identity_token("mousepiforhire"));
+        // Del lado del juego: un slug degenerado no produce tokens…
+        assert!(game_identity_tokens("games", "Saved Games").is_empty());
+        // …y del lado del proceso, los componentes del perfil no salen como
+        // candidatos (el exe y su carpeta de instalación sí). Ruta con
+        // separador nativo: los componentes sólo se extraen así.
+        let cands = process_identity_candidates(
+            "game.exe",
+            Some(Path::new("/Users/bob/AppData/Roaming/GSE Saves/game.exe")),
+        );
+        assert!(!cands.iter().any(|c| c == "users" || c == "appdata" || c == "roaming"));
+        assert!(cands.contains(&"gsesaves".to_string()));
+        // Un juego normal conserva su identidad por carpeta de instalación.
+        let cands = process_identity_candidates(
+            "witcher3",
+            Some(Path::new(
+                "/games/GOG Games/The Witcher 3 Wild Hunt/bin/x64/witcher3.exe",
+            )),
+        );
+        assert!(cands.contains(&canon_token("the-witcher-3-wild-hunt")));
+    }
+
+    #[test]
     fn config_defaults_are_sane() {
         let c = AgentConfig::default();
         assert!(c.debounce_secs >= 5, "too eager");
@@ -5031,6 +5191,7 @@ mod tests {
                 watcher: None,
                 pending: None,
                 is_running: false,
+                weak_session: false,
                 last_running_seen: None,
                 has_pending: false,
                 last_fs_event_at: None,
@@ -5083,6 +5244,7 @@ mod tests {
             watcher: None,
             pending: None,
             is_running: false,
+            weak_session: false,
             last_running_seen: None,
             has_pending: false,
             last_fs_event_at: None,

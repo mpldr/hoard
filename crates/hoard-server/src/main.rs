@@ -95,20 +95,41 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
     let pool = db::connect(&cfg.database.url, cfg.database.max_connections).await?;
     db::run_migrations(&pool).await?;
 
+    // Blob/chunk storage backend (ADR 0020): local disk or S3-compatible.
+    // For s3 this probes the bucket (write+delete) and fails fast on a bad
+    // endpoint before we accept any traffic.
+    let store = hoard_server::store::build_store(&cfg).await?;
+
     // One-time migration of legacy folder snapshots into the blob store
     // (ADR 0018, eje C). No-op on fresh installs and once already migrated.
-    hoard_server::blobs::backfill_from_folders(&pool, &cfg.storage.data_dir).await?;
+    // Local-layout only — skip it on the s3 backend (there are no legacy
+    // on-disk `v<n>/` folders to migrate when blobs never lived on disk).
+    if cfg.storage.backend == hoard_server::config::StorageBackend::Local {
+        hoard_server::blobs::backfill_from_folders(&pool, &cfg.storage.data_dir).await?;
+    }
+
+    // Guard against flipping `[storage] backend` without migrating: if the DB
+    // references objects the active store doesn't have, refuse to boot with a
+    // pointer to `hoard-admin storage migrate` (ADR 0020, phase 2).
+    hoard_server::store::sanity_check(&pool, &store).await?;
 
     let state = Arc::new(health::ServerState {
         pool: pool.clone(),
         config: cfg.clone(),
         start_time: Instant::now(),
         events: Default::default(),
+        store: store.clone(),
     });
 
     // Routes that require auth
     let authed = Router::new()
         .route("/v1/auth/whoami", get(auth_routes::whoami))
+        // Per-user cap on stored versions per save. Same path shape as the
+        // cloud router so the agent hits one URL for both modes.
+        .route(
+            "/v1/me/max-versions",
+            axum::routing::put(auth_routes::set_max_versions),
+        )
         // Server→app push: long-lived SSE stream of this user's save changes
         // so other devices pull within ~1s instead of waiting for the sweep.
         .route("/v1/events", get(event_routes::stream))
@@ -169,6 +190,7 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
     // Spawn periodic cleanup task
     let cleanup_pool = pool.clone();
     let cleanup_data = cfg.storage.data_dir.clone();
+    let cleanup_store = store.clone();
     let cleanup_tmp_h = cfg.retention.tmp_cleanup_hours;
     let cleanup_trash_d = cfg.retention.trash_retention_days;
     // Age-weighted snapshot pruning policy (ADR 0018). `None` disables it.
@@ -183,6 +205,7 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         cleanup::run_periodic(
             cleanup_pool,
             cleanup_data,
+            cleanup_store,
             cleanup_tmp_h,
             cleanup_trash_d,
             prune_policy,

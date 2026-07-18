@@ -3,15 +3,18 @@
 
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
 use crate::retention::{plan_prune, RetentionPolicy, SnapshotMeta};
+use crate::store::BlobStore;
 
 pub async fn run_periodic(
     pool: SqlitePool,
     data_dir: PathBuf,
+    store: Arc<dyn BlobStore>,
     tmp_cleanup_hours: u64,
     trash_retention_days: u64,
     prune_policy: Option<RetentionPolicy>,
@@ -25,6 +28,7 @@ pub async fn run_periodic(
         if let Err(e) = run_once(
             &pool,
             &data_dir,
+            &store,
             tmp_cleanup_hours,
             trash_retention_days,
             prune_policy.as_ref(),
@@ -39,6 +43,7 @@ pub async fn run_periodic(
 pub async fn run_once(
     pool: &SqlitePool,
     data_dir: &Path,
+    store: &Arc<dyn BlobStore>,
     tmp_cleanup_hours: u64,
     trash_retention_days: u64,
     prune_policy: Option<&RetentionPolicy>,
@@ -51,7 +56,7 @@ pub async fn run_once(
         }
     }
     purge_tmp(data_dir, tmp_cleanup_hours).await?;
-    purge_trash(pool, data_dir, trash_retention_days).await?;
+    purge_trash(pool, data_dir, store, trash_retention_days).await?;
     purge_client_logs(pool, CLIENT_LOG_RETENTION_DAYS).await?;
     Ok(())
 }
@@ -210,15 +215,16 @@ async fn purge_tmp(data_dir: &Path, max_age_hours: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A content-addressed object scheduled for file removal after the purge tx
+/// A content-addressed object scheduled for removal after the purge tx
 /// commits. We keep the table + sha so we can re-check the refcount just before
 /// unlinking: a concurrent upload may have re-referenced (and re-created) the
-/// row in the gap between commit and `remove_file`, in which case deleting the
-/// file would corrupt a live blob/chunk.
+/// row in the gap between commit and the store delete, in which case removing
+/// the object would corrupt a live blob/chunk. `key` is the storage-backend
+/// key (same for local disk and S3, ADR 0020).
 struct GcTarget {
     is_chunk: bool,
     sha: String,
-    path: PathBuf,
+    key: String,
 }
 
 /// Permanently delete snapshots that have outlived the trash window. With the
@@ -228,6 +234,7 @@ struct GcTarget {
 async fn purge_trash(
     pool: &SqlitePool,
     data_dir: &Path,
+    store: &Arc<dyn BlobStore>,
     retention_days: u64,
 ) -> anyhow::Result<()> {
     let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days as i64);
@@ -310,7 +317,7 @@ async fn purge_trash(
                     gc_paths.push(GcTarget {
                         is_chunk: false,
                         sha: sha.clone(),
-                        path: crate::blobs::blob_path(data_dir, &user_id, sha),
+                        key: crate::store::blob_key(&user_id, sha),
                     });
                 }
             }
@@ -349,7 +356,7 @@ async fn purge_trash(
                     gc_paths.push(GcTarget {
                         is_chunk: true,
                         sha: sha.clone(),
-                        path: crate::chunking::chunk_path(data_dir, &user_id, sha),
+                        key: crate::store::chunk_key(&user_id, sha),
                     });
                 }
             }
@@ -373,11 +380,11 @@ async fn purge_trash(
 
         tx.commit().await?;
 
-        // GC blob/chunk files only after the DB committed their removal — and
+        // GC blob/chunk objects only after the DB committed their removal — and
         // only if the row is still gone. A concurrent upload can re-reference an
-        // object in the window between commit and unlink, re-creating its row
-        // (refcount > 0) and re-writing the file; deleting it here would corrupt
-        // that live object. Re-check per target and skip any that came back.
+        // object in the window between commit and delete, re-creating its row
+        // (refcount > 0) and re-writing the object; deleting it here would
+        // corrupt that live object. Re-check per target and skip any revived.
         for t in gc_paths {
             let table = if t.is_chunk { "chunks" } else { "blobs" };
             let q = format!("SELECT refcount FROM {table} WHERE user_id = ? AND sha256 = ?");
@@ -391,7 +398,9 @@ async fn purge_trash(
             if revived {
                 continue;
             }
-            let _ = tokio::fs::remove_file(&t.path).await;
+            if let Err(e) = store.delete(&t.key).await {
+                warn!(key = %t.key, error = %e, "blob GC delete failed");
+            }
         }
         // Legacy: drop any pre-migration trash folder if it still exists.
         let _ = tokio::fs::remove_dir_all(data_dir.join("trash").join(&snap_id)).await;
@@ -487,7 +496,8 @@ mod tests {
             write_blob(data_dir, "u1", sha, b"data").await;
         }
 
-        purge_trash(&pool, data_dir, 0).await.unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
+        purge_trash(&pool, data_dir, &store, 0).await.unwrap();
 
         // s1 gone (cascade removed its files); s2 intact.
         let s1: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE id='s1'")
@@ -600,7 +610,8 @@ mod tests {
             write_chunk(data_dir, "u1", sha, b"data").await;
         }
 
-        purge_trash(&pool, data_dir, 0).await.unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
+        purge_trash(&pool, data_dir, &store, 0).await.unwrap();
 
         // s1 gone (cascade removed its files + chunk refs); s2 intact.
         let s1: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE id='s1'")

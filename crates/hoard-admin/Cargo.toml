@@ -27,3 +27,7 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 serde_yaml = { workspace = true }
 indicatif = { workspace = true }
+# `storage` subcommand: hash verification + bounded-concurrency migration.
+sha2 = { workspace = true }
+hex = { workspace = true }
+futures = { workspace = true }

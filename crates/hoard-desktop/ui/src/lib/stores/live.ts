@@ -57,6 +57,11 @@ export type FeedEntry = {
     | "backup_too_large"
     | "backup_trimmed"
     | "auto_restore_failed"
+    // Auto-restore has failed repeatedly on the same cloud version. Distinct
+    // from `auto_restore_failed` (one row per attempt): this is the "it's been
+    // failing and it won't fix itself" row, pushed once per (save, version).
+    | "auto_restore_stuck"
+    | "auto_restore_recovered"
     // Account-wide storage pressure, driven off the cloud account's
     // `storage_status` (`purging` → amber, `full` → red).
     | "storage_purging"
@@ -80,6 +85,8 @@ export type FeedEntry = {
   error?: string;
   /** Per-save cap in bytes, for the `backup_too_large` row. */
   limit_bytes?: number;
+  /** Consecutive failures, for the `auto_restore_stuck` row. */
+  failures?: number;
   /** i18n key for the cause of a `gate_locked`/`gate_unlocked` row. */
   reason_key?: string;
 };
@@ -377,6 +384,32 @@ export async function subscribeLive() {
         save_id: p.save_id,
         game_slug: p.game_slug,
         error: p.error,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://save-auto-restore-stuck", (e) => {
+      const p = e.payload;
+      if (p.type !== "save_auto_restore_stuck") return;
+      pushEntry({
+        kind: "auto_restore_stuck",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        failures: p.failures,
+        error: p.error,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://save-auto-restore-recovered", (e) => {
+      const p = e.payload;
+      if (p.type !== "save_auto_restore_recovered") return;
+      pushEntry({
+        kind: "auto_restore_recovered",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
       });
     }),
   );

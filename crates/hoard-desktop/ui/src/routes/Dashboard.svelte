@@ -20,12 +20,15 @@
     RefreshCw,
     History,
     PauseCircle,
+    Cloud,
+    Layers,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
   import Card from "../lib/components/Card.svelte";
   import Cover from "../lib/components/Cover.svelte";
+  import Modal from "../lib/components/Modal.svelte";
   import QuotaBar from "../lib/components/QuotaBar.svelte";
   import * as api from "../lib/api";
   import type { TrackedSave } from "../lib/api";
@@ -37,6 +40,92 @@
   let loading = $state(true);
   let signingOut = $state(false);
   let now = $state(Date.now());
+
+  // Panel ordering. "recent" (default) = newest last backup first;
+  // "size" = biggest cloud footprint first. Every size in this view is the
+  // SERVER-side one (`total_size_bytes`) — the panel never shows local sizes,
+  // that's the Library's job.
+  let sortBy = $state<"recent" | "size">("recent");
+
+  const sortedSaves = $derived.by(() => {
+    const arr = [...saves];
+    if (sortBy === "size") {
+      arr.sort((a, b) => (b.total_size_bytes ?? 0) - (a.total_size_bytes ?? 0));
+    } else {
+      const t = (s: TrackedSave) =>
+        s.last_backup_at ? new Date(s.last_backup_at).getTime() : 0;
+      arr.sort((a, b) => t(b) - t(a));
+    }
+    return arr;
+  });
+
+  // Per-user "max versions per save" cap. `null` = unlimited. Edited right
+  // here in the panel (explicit user request: not in Settings). A numeric
+  // input's bind:value yields `undefined` while empty/invalid, so normalise
+  // through `?? null` everywhere.
+  let maxVersions = $state<number | null>(null);
+  let maxVersionsInput = $state<number | null>(null);
+  let savingMaxVersions = $state(false);
+
+  const maxVersionsDirty = $derived((maxVersionsInput ?? null) !== maxVersions);
+
+  // When applying a cap would delete versions, we stop and ask first. Set to
+  // the pending {cap, count} while the confirmation modal is open.
+  let confirmPrune = $state<{ cap: number; count: number } | null>(null);
+
+  async function applyMaxVersions() {
+    const next = maxVersionsInput ?? null;
+    if (next != null && (!Number.isInteger(next) || next < 1 || next > 10000)) {
+      toastError($_("dashboard.max_versions_invalid"));
+      return;
+    }
+    savingMaxVersions = true;
+    try {
+      if (next != null) {
+        // Dry-run first: if this cap would prune stored versions, ask before
+        // touching anything. Clearing the cap never prunes — no dialog.
+        const count = await api.previewMaxVersions(next);
+        if (count > 0) {
+          confirmPrune = { cap: next, count };
+          return;
+        }
+      }
+      await commitMaxVersions(next);
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      savingMaxVersions = false;
+    }
+  }
+
+  async function confirmPruneAndApply() {
+    if (!confirmPrune) return;
+    const cap = confirmPrune.cap;
+    savingMaxVersions = true;
+    try {
+      await commitMaxVersions(cap);
+      confirmPrune = null;
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      savingMaxVersions = false;
+    }
+  }
+
+  async function commitMaxVersions(next: number | null) {
+    await api.setMaxVersions(next);
+    maxVersions = next;
+    toastSuccess($_("dashboard.max_versions_saved"));
+    // Pruning frees server space right away — reflect it on the bar.
+    refreshQuota().catch(() => {});
+  }
+
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
 
   // Tick once a second so "next backup in 28s" countdowns animate. Skip the
   // state write while the window is hidden (minimised / in the tray): nobody
@@ -60,6 +149,13 @@
   });
 
   onMount(async () => {
+    api
+      .getMaxVersions()
+      .then((n) => {
+        maxVersions = n;
+        maxVersionsInput = n;
+      })
+      .catch(() => {});
     try {
       saves = await api.listTrackedSaves();
     } catch (e) {
@@ -240,6 +336,52 @@
     </div>
   {/if}
 
+  {#if !loading && saves.length > 0}
+    <div
+      class="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2"
+    >
+      <label class="flex items-center gap-2 text-xs text-zinc-400">
+        <span class="text-zinc-500">{$_("dashboard.sort_label")}</span>
+        <select
+          class="rounded-md border border-white/[0.08] bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200 focus:border-emerald-500/40 focus:outline-none"
+          bind:value={sortBy}
+        >
+          <option value="recent">{$_("dashboard.sort_recent")}</option>
+          <option value="size">{$_("dashboard.sort_size")}</option>
+        </select>
+      </label>
+
+      <!-- Max stored versions per game. Server-side, per-user; lowering it
+           prunes the oldest versions immediately. -->
+      <label
+        class="flex items-center gap-2 text-xs text-zinc-400"
+        title={$_("dashboard.max_versions_hint")}
+      >
+        <Layers size={13} class="text-zinc-500" />
+        <span class="text-zinc-500">{$_("dashboard.max_versions_label")}</span>
+        <input
+          type="number"
+          min="1"
+          max="10000"
+          placeholder="∞"
+          bind:value={maxVersionsInput}
+          disabled={savingMaxVersions}
+          class="w-16 rounded-md border border-white/[0.08] bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200 [appearance:textfield] focus:border-emerald-500/40 focus:outline-none disabled:opacity-50 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        />
+        {#if maxVersionsDirty}
+          <Button
+            variant="secondary"
+            class="!px-2.5 !py-1.5 !text-xs"
+            onclick={applyMaxVersions}
+            loading={savingMaxVersions}
+          >
+            {$_("dashboard.max_versions_apply")}
+          </Button>
+        {/if}
+      </label>
+    </div>
+  {/if}
+
   {#if loading}
     <Card>
       <div class="shimmer py-12 text-center text-sm text-zinc-400">{$_("common.loading")}</div>
@@ -262,7 +404,7 @@
     </Card>
   {:else}
     <div class="space-y-2.5">
-      {#each saves as save (save.save_id)}
+      {#each sortedSaves as save (save.save_id)}
         {@const pill = pillFor(save)}
         <div
           class="tilt group relative flex items-center gap-4 overflow-hidden rounded-xl border border-white/[0.08] {pill.tint} p-4 pl-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
@@ -307,6 +449,16 @@
               <span class="truncate font-mono">{save.local_path}</span>
             </p>
           </div>
+          {#if save.total_size_bytes > 0}
+            <!-- Cloud footprint only — the panel never shows local sizes. -->
+            <span
+              class="inline-flex shrink-0 items-center gap-1 rounded-md bg-white/[0.04] px-2 py-1 text-[11px] tabular-nums text-zinc-300 ring-1 ring-inset ring-white/[0.06]"
+              title={$_("dashboard.cloud_size_title")}
+            >
+              <Cloud size={11} class="text-zinc-500" />
+              {fmtBytes(save.total_size_bytes)}
+            </span>
+          {/if}
           <div class="flex shrink-0 items-center gap-1.5 text-xs font-medium {pill.klass}">
             {#if pill.klass.includes("sky") || pill.klass.includes("amber")}
               <span class="relative flex h-2 w-2">
@@ -349,3 +501,47 @@
     </div>
   {/if}
 </div>
+
+<!-- Lowering the cap below the stored history is destructive — the server
+     prunes immediately. The dry-run count feeds this confirmation, so the
+     user sees exactly how many versions are about to go. -->
+<Modal
+  open={!!confirmPrune}
+  title={$_("dashboard.max_versions_confirm_title")}
+  dismissible={!savingMaxVersions}
+  onClose={() => {
+    if (!savingMaxVersions) confirmPrune = null;
+  }}
+>
+  {#if confirmPrune}
+    <div class="space-y-3 text-sm text-zinc-300">
+      <p>
+        {$_("dashboard.max_versions_confirm_body", {
+          values: { cap: confirmPrune.cap, count: confirmPrune.count },
+        })}
+      </p>
+      <div
+        class="flex items-start gap-2 rounded-md border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-200"
+      >
+        <AlertTriangle size={14} class="mt-0.5 shrink-0" />
+        <span>{$_("dashboard.max_versions_confirm_note")}</span>
+      </div>
+    </div>
+  {/if}
+  {#snippet footer()}
+    <Button
+      variant="secondary"
+      onclick={() => (confirmPrune = null)}
+      disabled={savingMaxVersions}
+    >
+      {$_("common.cancel")}
+    </Button>
+    <Button
+      variant="danger"
+      onclick={confirmPruneAndApply}
+      loading={savingMaxVersions}
+    >
+      {$_("dashboard.max_versions_confirm_apply")}
+    </Button>
+  {/snippet}
+</Modal>

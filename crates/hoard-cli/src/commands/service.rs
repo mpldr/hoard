@@ -363,20 +363,124 @@ async fn task_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Escape a value for XML character data / attribute content.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The Task Scheduler XML for `HoardSync`: run `hoard sync run` at `user`'s
+/// logon, as `user`, unelevated. `schtasks /Create /SC ONLOGON` needs an
+/// elevated console even with `/RL LIMITED`, but registering this XML — whose
+/// trigger and principal are scoped to the caller's own account — does not.
+/// (Both verified against a real Windows box, filtered token: ONLOGON →
+/// "Access denied", this XML → task created.)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn task_xml(exe: &str, user: &str) -> String {
+    let exe = xml_escape(exe);
+    let user = xml_escape(user);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+         \x20 <Triggers>\n\
+         \x20   <LogonTrigger>\n\
+         \x20     <UserId>{user}</UserId>\n\
+         \x20   </LogonTrigger>\n\
+         \x20 </Triggers>\n\
+         \x20 <Principals>\n\
+         \x20   <Principal id=\"Author\">\n\
+         \x20     <UserId>{user}</UserId>\n\
+         \x20     <LogonType>InteractiveToken</LogonType>\n\
+         \x20     <RunLevel>LeastPrivilege</RunLevel>\n\
+         \x20   </Principal>\n\
+         \x20 </Principals>\n\
+         \x20 <Settings>\n\
+         \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+         \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+         \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+         \x20   <StartWhenAvailable>true</StartWhenAvailable>\n\
+         \x20   <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+         \x20 </Settings>\n\
+         \x20 <Actions Context=\"Author\">\n\
+         \x20   <Exec>\n\
+         \x20     <Command>{exe}</Command>\n\
+         \x20     <Arguments>sync run</Arguments>\n\
+         \x20   </Exec>\n\
+         \x20 </Actions>\n\
+         </Task>\n",
+    )
+}
+
+/// Task Scheduler only reliably ingests the XML as UTF-16 LE with a BOM —
+/// a UTF-8 file (with a matching declaration) dies inside `schtasks /Create
+/// /XML` with "unable to switch the encoding", verified against a real
+/// Windows box. The declaration in [`task_xml`] says UTF-16 to match.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn to_utf16le_with_bom(s: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// The caller's account as `DOMAIN\user` — what the trigger and principal are
+/// scoped to. A bare `USERNAME` is fine when there's no domain (Task Scheduler
+/// resolves it against the local machine).
+#[cfg(target_os = "windows")]
+fn current_account() -> Result<String> {
+    let user = std::env::var("USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("no USERNAME in the environment")?;
+    let domain = std::env::var("USERDOMAIN").ok().filter(|s| !s.is_empty());
+    Ok(match domain {
+        Some(d) => format!("{d}\\{user}"),
+        None => user,
+    })
+}
+
 #[cfg(target_os = "windows")]
 async fn start() -> Result<()> {
     let exe = exe()?;
-    // `/TR` takes a single string; quote the exe so a spaced path survives.
-    let tr = format!("\"{}\" sync run", exe.display());
-    if !run_status(
+    let account = current_account()?;
+    let xml = task_xml(&exe.to_string_lossy(), &account);
+
+    // `/XML` reads the definition from a file; keep it next to the other
+    // per-run temporaries and take the pid so two shells don't collide.
+    let path = std::env::temp_dir().join(format!("hoard-sync-{}.xml", std::process::id()));
+    std::fs::write(&path, to_utf16le_with_bom(&xml))
+        .with_context(|| format!("writing {}", path.display()))?;
+    let created = run_status(
         "schtasks",
         &[
-            "/Create", "/TN", TASK, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", &tr,
+            "/Create",
+            "/TN",
+            TASK,
+            "/XML",
+            &path.to_string_lossy(),
+            "/F",
         ],
     )
-    .await?
-    {
-        bail!("`schtasks /Create` failed");
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    if !created? {
+        bail!(
+            "`schtasks /Create` failed. Re-run `hoard sync start` from an elevated \
+             PowerShell (right-click → \"Run as administrator\")."
+        );
     }
     // Start it now too, not just at next logon.
     let _ = run_quiet("schtasks", &["/Run", "/TN", TASK]).await;
@@ -478,4 +582,50 @@ async fn status() -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn logs() -> Result<()> {
     bail!("no service backend for this OS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_the_five_xml_metacharacters() {
+        assert_eq!(
+            xml_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        assert_eq!(
+            xml_escape(r"C:\Program Files\hoard.exe"),
+            r"C:\Program Files\hoard.exe"
+        );
+    }
+
+    #[test]
+    fn task_xml_scopes_the_trigger_and_principal_to_the_account() {
+        let xml = task_xml(r"C:\Program Files\Hoard\hoard.exe", r"CORP\ada");
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
+        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(xml.contains("<LogonTrigger>\n      <UserId>CORP\\ada</UserId>"));
+        assert!(xml.contains("<Principal id=\"Author\">\n      <UserId>CORP\\ada</UserId>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+    }
+
+    #[test]
+    fn task_xml_carries_the_escaped_exe_and_the_sync_run_arguments() {
+        let xml = task_xml(r"C:\R&D\hoard.exe", "ada");
+        assert!(xml.contains("<Command>C:\\R&amp;D\\hoard.exe</Command>"));
+        assert!(xml.contains("<Arguments>sync run</Arguments>"));
+    }
+
+    #[test]
+    fn utf16le_bom_encoding_round_trips() {
+        let bytes = to_utf16le_with_bom("<a>ñ</a>");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "BOM must lead the file");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16 LE is an even byte count");
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "<a>ñ</a>");
+    }
 }

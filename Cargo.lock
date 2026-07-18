@@ -3089,10 +3089,12 @@ dependencies = [
 
 [[package]]
 name = "hoard-admin"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "hex",
  "hoard-core",
  "hoard-server",
  "indicatif",
@@ -3102,6 +3104,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "sqlx",
  "time",
  "tokio",
@@ -3111,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-agent"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3147,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3165,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3180,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-desktop"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "futures",
@@ -3215,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-manifest"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "directories",
  "serde",
@@ -3229,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-screen"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "ashpd",
  "cocoa",
@@ -3248,10 +3251,11 @@ dependencies = [
 
 [[package]]
 name = "hoard-server"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "async-compression",
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -3291,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-watcher"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "notify",
  "notify-debouncer-mini",
@@ -3302,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "hoard-wrapple"
-version = "1.0.3"
+version = "1.0.4"
 
 [[package]]
 name = "home"

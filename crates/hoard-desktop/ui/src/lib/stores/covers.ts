@@ -8,11 +8,16 @@
  * URL and memoise the result so a given app id is fetched/decoded at most once
  * per session. A `null` entry marks a permanent miss (no art / offline first
  * run) so callers fall back to the initial-letter placeholder without retrying.
+ *
+ * Users can override a game's cover with a custom image stored locally.
+ * Custom covers are stored as `{app_id}_custom.{ext}` in the same cache dir
+ * and take priority over the Steam capsule.
  */
 import { invoke } from "@tauri-apps/api/core";
 
 const cache = new Map<number, string | null>();
 const inflight = new Map<number, Promise<string | null>>();
+const customCoverCache = new Map<number, boolean>();
 
 /** Resolve an app id to a usable `<img src>` object URL, or `null` if there's
  *  no cover to show. Safe to call repeatedly — memoised + de-duplicated. */
@@ -37,6 +42,37 @@ export function coverUrl(appId: number): Promise<string | null> {
   })();
   inflight.set(appId, p);
   return p;
+}
+
+/** Check if a game has a user-set custom cover on disk. */
+export function hasCustomCover(appId: number): Promise<boolean> {
+  const hit = customCoverCache.get(appId);
+  if (hit !== undefined) return Promise.resolve(hit);
+  return invoke<boolean>("has_custom_cover", { appId }).then((v) => {
+    customCoverCache.set(appId, v);
+    return v;
+  });
+}
+
+/** Set a custom cover for a game from a local file path. Invalidates the
+ *  cover cache so the next `coverUrl()` call loads the new image. */
+export async function setCustomCover(
+  appId: number,
+  sourcePath: string,
+): Promise<void> {
+  await invoke("set_custom_cover", { appId, sourcePath });
+  // Invalidate caches so the cover reloads.
+  cache.delete(appId);
+  inflight.delete(appId);
+  customCoverCache.set(appId, true);
+}
+
+/** Remove a game's custom cover, reverting to the Steam capsule. */
+export async function removeCustomCover(appId: number): Promise<void> {
+  await invoke("remove_custom_cover", { appId });
+  cache.delete(appId);
+  inflight.delete(appId);
+  customCoverCache.set(appId, false);
 }
 
 /** Synchronous peek for already-resolved covers (used by the canvas loop,

@@ -2,14 +2,17 @@
 //!
 //! Pairs with `commands::automatic`. The automatic scheduler does the heavy
 //! lifting (scan-library + backup-stale sweep) on the hourly scale; this
-//! poller hits `/v1/cloud/sync` every `prefs.cloud_poll_interval_secs`
-//! (default 10 s) so the LiveStatus widget feels instant and ActivityFeed
-//! shows real-time pull events the moment another device uploads.
+//! poller hits `/v1/cloud/sync` every [`CLOUD_POLL_INTERVAL_SECS`] as the
+//! airbag for the Supabase Realtime push (`cloud_realtime`), which is the
+//! primary near-instant trigger. Immediacy comes from `kick()`; the timed
+//! tick only catches a missed push.
 //!
 //! Decoupling the two cadences was an ADR-0016 call. The manifest endpoint
 //! returns <5 KB and is explicitly excluded from the bandwidth quota
-//! (`hoard-server::cloud::routes::sync` — no `bandwidth::check` call), so a
-//! 10-second cadence is free in money and bytes.
+//! (`hoard-server::cloud::routes::sync` — no `bandwidth::check` call). The
+//! cadence itself stopped being a pref: it has no user-visible effect with
+//! Realtime as the primary trigger, and the old knob let a hand-edited
+//! `prefs.json` hammer the server.
 //!
 //! What this poller deliberately does **not** do: it never overwrites a
 //! local save file. The "remote is newer, pull it" pathway still goes
@@ -38,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
@@ -117,10 +121,10 @@ struct QuotaReached {
 }
 
 /// Cancel any in-flight poller and start a fresh one ticking every
-/// `interval_secs`. Safe to call repeatedly. The poller reads the cloud
-/// session from disk on each tick (cheap) so a logout / login round-trip
-/// without a restart picks up the new token transparently.
-pub fn start(app: &AppHandle, interval_secs: u32) {
+/// [`CLOUD_POLL_INTERVAL_SECS`]. Safe to call repeatedly. The poller reads
+/// the cloud session from disk on each tick (cheap) so a logout / login
+/// round-trip without a restart picks up the new token transparently.
+pub fn start(app: &AppHandle) {
     let scheduler = app.state::<CloudPullScheduler>();
     {
         let mut slot = scheduler.handle.lock().unwrap();
@@ -129,7 +133,7 @@ pub fn start(app: &AppHandle, interval_secs: u32) {
         }
     }
 
-    let secs = interval_secs.clamp(5, 300) as u64;
+    let secs = CLOUD_POLL_INTERVAL_SECS as u64;
     let period = Duration::from_secs(secs);
     let app_for_task = app.clone();
     let seen = scheduler.seen.clone();
@@ -138,14 +142,14 @@ pub fn start(app: &AppHandle, interval_secs: u32) {
         tracing::info!(interval_secs = secs, "cloud-pull poller: started");
 
         // First tick fires immediately so the user sees activity on
-        // sign-in without waiting `interval_secs`. The built-in
+        // sign-in without waiting a full interval. The built-in
         // zero-delay first tick of `tokio::time::interval` is the right
         // shape — we don't manually emit before the loop.
         let mut ticker = interval(period);
         // Fallback refresh for the Eye-panel devices + bell feeds when the
         // Realtime socket is down. Immediacy comes from Realtime; this only
         // needs to keep them *eventually* honest, so it's throttled to at
-        // most once per `FALLBACK_MIN_SECS` even when the poll cadence is 5s.
+        // most once per `FALLBACK_MIN_SECS`.
         // Initialized in the past so the first tick primes both feeds.
         let mut last_feed = tokio::time::Instant::now()
             - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
@@ -167,7 +171,7 @@ pub fn start(app: &AppHandle, interval_secs: u32) {
 ///
 /// Used by the Realtime push (`cloud_realtime`): when another device commits
 /// a new save version, Supabase pushes a `saves` UPDATE and we refresh state
-/// in ~1 s instead of waiting for the next `interval_secs` tick. Reuses the
+/// in ~1 s instead of waiting for the next timed tick. Reuses the
 /// scheduler's `seen` map so delta detection stays consistent with the timed
 /// poll. No-op when signed out (`run_one_pull` bails on missing creds).
 pub fn kick(app: &AppHandle) {
@@ -226,22 +230,8 @@ pub fn stop(app: &AppHandle) {
     scheduler.seen.lock().unwrap().clear();
 }
 
-/// Restart the poller if a cloud session exists. Used by
-/// `set_cloud_poll_interval` and by `cloud_complete_login` so the cadence
-/// adjusts live. No-op when the user is signed out.
-pub fn restart_if_signed_in(app: &AppHandle, interval_secs: u32) {
-    let signed_in = {
-        let st = app.state::<crate::state::AppState>();
-        let has = st.cloud_account.lock().unwrap().is_some();
-        has
-    };
-    if signed_in {
-        start(app, interval_secs);
-    }
-}
-
 /// Boot-time rehydration: if a cloud session is present on disk, start
-/// the poller using the saved interval. Called from `lib.rs::setup`.
+/// the poller. Called from `lib.rs::setup`.
 pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
     let signed_in = {
         let st = app.state::<crate::state::AppState>();
@@ -251,8 +241,7 @@ pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
     if !signed_in {
         return Ok(());
     }
-    let (prefs, _) = hoard_agent::prefs::Prefs::load_default()?;
-    start(app, prefs.cloud_poll_interval_secs);
+    start(app);
     Ok(())
 }
 

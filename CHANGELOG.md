@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-07-18
+
+### Added
+- **Sort the panel.** Order the dashboard's games by last backup (new
+  default) or by cloud size. Cloud saves now carry their real "last backup"
+  time, so the recency sort works on Hoard Cloud too.
+- **Cloud size at a glance.** Every game row in the panel shows the space it
+  occupies in the cloud (and only in the cloud — local footprints live in
+  the Library, clearly labelled as such).
+- **Bulk-delete versions.** History grew a checkbox per version plus
+  select-all: tick as many as you want and delete them in one confirmed go
+  instead of one dialog per version.
+- **Max versions per game.** A per-account cap on stored versions, set right
+  in the panel (empty = unlimited, like before). The server enforces it after
+  every backup and prunes immediately when you lower it — oldest versions go
+  first; pinned versions and the newest one are never touched. If the new cap
+  would delete anything, a confirmation dialog first tells you exactly how
+  many versions are about to go (server-side dry-run, so the number is real).
+  Works on Cloud and self-hosted (`hoard snapshots max-versions` in the CLI,
+  same preview + `[y/N]` prompt, `--yes` to skip).
+
+### Changed
+- **Local vs. server sizes, labelled.** The Library's tracked-games header
+  (local, this machine) and each card's size pill (server-side) now carry
+  icons and tooltips saying which is which, so the two totals can no longer
+  be confused.
+- **Cloud poll cadence is now fixed (60 s).** The `/v1/cloud/sync` fallback
+  poll is no longer a preference — Realtime push already delivers changes
+  instantly, so a faster poll bought nothing and a hand-edited `prefs.json`
+  could hammer the server. Existing prefs files keep loading; the old key is
+  simply ignored.
+- **Server: internal storage maintenance.** Background housekeeping of how
+  the cloud tier stores snapshot data internally. No user-facing changes:
+  quotas, sizes shown in the app and download behavior are identical.
+- **Server: per-device rate limit on polling endpoints.** `/v1/cloud/sync`,
+  `/v1/devices`, `/v1/notifications` and `/v1/presence/heartbeat` are now
+  capped per (user, device, endpoint) — 10 requests/minute by default
+  (`[server.rate_limit] poll_per_minute`, cloud mode). The official client
+  polls each at most twice a minute, so only modified or misconfigured
+  clients ever see the 429 (which carries `Retry-After`). The client now
+  sends its device fingerprint on sync/notifications so the cap is truly
+  per machine, and the devices-feed refresh floor went from 2 s to 10 s so
+  many-device accounts stay well under the cap.
+
 ## [1.0.3] — 2026-07-15
 
 Sync you can trust, and an app that feels alive. Three deep fixes end the

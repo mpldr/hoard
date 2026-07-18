@@ -419,12 +419,15 @@ impl ApiClient {
 
     /// `GET /v1/cloud/sync` — the manifest of the user's saves (latest
     /// version of each). The cloud analogue of `list_saves`; excludes
-    /// `backup_only` saves.
+    /// `backup_only` saves. Sends the device fingerprint so the server's
+    /// poll guard can rate-limit per machine instead of per account.
     pub async fn cloud_sync(&self) -> Result<CloudManifest> {
+        let dev = crate::logship::device_identity();
         let resp = self
             .http
             .get(self.url("/v1/cloud/sync"))
             .header("authorization", self.auth_header())
+            .header("x-hoard-device-fp", &dev.fingerprint)
             .send()
             .await?;
         let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
@@ -462,6 +465,60 @@ impl ApiClient {
             .await?;
         Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
         Ok(())
+    }
+
+    /// Current "max versions per save" cap for the logged-in user. `None` =
+    /// unlimited. Self-hosted reads it off `whoami`; cloud reads the
+    /// `max_versions` field of `/v1/me` (other fields ignored).
+    pub async fn get_max_versions(&self) -> Result<Option<i64>> {
+        if self.is_cloud().await {
+            #[derive(Deserialize)]
+            struct MeMaxVersions {
+                #[serde(default)]
+                max_versions: Option<i64>,
+            }
+            let resp = self.http_get("/v1/me").await?;
+            let me: MeMaxVersions = resp.json().await?;
+            return Ok(me.max_versions);
+        }
+        Ok(self.whoami().await?.max_versions)
+    }
+
+    /// `PUT /v1/me/max-versions` — set (`Some(n)`) or clear (`None`) the
+    /// per-user cap on stored versions per save. Both server modes mount the
+    /// same path; both prune immediately, so the freed space is visible on
+    /// the next quota poll.
+    pub async fn set_max_versions(&self, max_versions: Option<i64>) -> Result<()> {
+        let resp = self
+            .http
+            .put(self.url("/v1/me/max-versions"))
+            .header("authorization", self.auth_header())
+            .json(&serde_json::json!({ "max_versions": max_versions }))
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// Dry-run of [`set_max_versions`]: how many stored versions a cap of
+    /// `max_versions` would delete right now. Nothing is written. Frontends
+    /// call this first and ask for confirmation when the count is > 0.
+    pub async fn preview_max_versions(&self, max_versions: i64) -> Result<i64> {
+        #[derive(Deserialize)]
+        struct Out {
+            #[serde(default)]
+            pruned: i64,
+        }
+        let resp = self
+            .http
+            .put(self.url("/v1/me/max-versions"))
+            .header("authorization", self.auth_header())
+            .json(&serde_json::json!({ "max_versions": max_versions, "dry_run": true }))
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        let out: Out = resp.json().await?;
+        Ok(out.pruned)
     }
 
     /// `DELETE /v1/cloud/saves/:save_id` — remove a cloud save and all of its
@@ -602,11 +659,15 @@ impl ApiClient {
     /// `GET /v1/notifications` — broadcasts del operador para la campana.
     /// `since` es el cursor RFC3339 del cliente: solo vuelven filas
     /// estrictamente posteriores, así nada se re-entrega tras un reinicio.
+    /// El fingerprint va para que el poll guard del server limite por
+    /// máquina y no por cuenta.
     pub async fn list_notifications(&self, since: Option<&str>) -> Result<NotificationListOut> {
+        let dev = crate::logship::device_identity();
         let mut req = self
             .http
             .get(self.url("/v1/notifications"))
-            .header("authorization", self.auth_header());
+            .header("authorization", self.auth_header())
+            .header("x-hoard-device-fp", &dev.fingerprint);
         if let Some(s) = since {
             req = req.query(&[("since", s)]);
         }
@@ -875,6 +936,10 @@ pub struct Whoami {
     /// reads this as "quota unknown" and falls back to MB display).
     #[serde(default)]
     pub storage_quota_bytes: i64,
+    /// Per-user cap on stored versions per save. `None` = unlimited (and
+    /// what a pre-cap server reports).
+    #[serde(default)]
+    pub max_versions: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

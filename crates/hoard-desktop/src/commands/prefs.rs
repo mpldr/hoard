@@ -14,7 +14,6 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::automatic;
-use crate::commands::cloud_pull;
 use crate::commands::error::AppError;
 use crate::state::AppState;
 use crate::tray::{TrayController, TrayState};
@@ -336,33 +335,6 @@ pub async fn set_backup_interval(app: AppHandle, secs: u64) -> Result<Prefs, App
         );
     }
 
-    Ok(prefs)
-}
-
-/// Persist a new cloud-pull interval (in seconds) for the live manifest
-/// poller. Range 5..=300 s. If a cloud session exists, restart the poller
-/// so the new cadence takes effect immediately. No-op otherwise — the
-/// next login will start the poller with the new value.
-#[tauri::command]
-pub async fn set_cloud_poll_interval(app: AppHandle, secs: u32) -> Result<Prefs, AppError> {
-    // Floor is 2s: Pro accounts are allowed the snappy 2–3s cadence (the UI
-    // only exposes that low end to them). 1s would hammer the server with no
-    // perceptible gain over 2s, so we stop there. Free accounts are kept to
-    // ≥5s by the slider min, and the server's bandwidth window is the real
-    // backstop against saturation regardless of this knob.
-    if !(2..=300).contains(&secs) {
-        return Err(AppError::plain(format!(
-            "cloud poll interval out of range: {secs} (expected 2..=300)"
-        )));
-    }
-    let path = Prefs::default_path().map_err(|e| AppError::plain(e.to_string()))?;
-    let mut prefs = Prefs::load(&path).map_err(|e| AppError::plain(e.to_string()))?;
-    prefs.cloud_poll_interval_secs = secs;
-    prefs
-        .save(&path)
-        .map_err(|e| AppError::plain(e.to_string()))?;
-
-    cloud_pull::restart_if_signed_in(&app, secs);
     Ok(prefs)
 }
 

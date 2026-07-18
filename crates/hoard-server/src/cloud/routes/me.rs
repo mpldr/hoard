@@ -76,6 +76,10 @@ pub struct Me {
     /// RFC3339 instant the account is hard-purged if not reactivated
     /// (`deleted_at` + 30 days). `null` for live accounts.
     pub purges_at: Option<String>,
+    /// User-chosen cap on stored versions per save. `null` = unlimited.
+    /// Enforced server-side after every commit (oldest non-pinned versions
+    /// beyond the cap are deleted). Set via `PUT /v1/me/max-versions`.
+    pub max_versions: Option<i64>,
 }
 
 /// Derive the storage gauge state from the deduped footprint vs. the plan's
@@ -127,8 +131,9 @@ pub async fn get_me(
         Option<i64>,
         Option<time::OffsetDateTime>,
         Option<time::OffsetDateTime>,
+        Option<i32>,
     ) = sqlx::query_as(
-        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at, deleted_at
+        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at, deleted_at, max_versions
            FROM profiles WHERE user_id = $1",
     )
     .bind(user.user_id)
@@ -246,6 +251,70 @@ pub async fn get_me(
         storage_limit_change_at: pending_change_at.map(format_dt),
         deleted_at: deleted_at.map(format_dt),
         purges_at: purges_at.map(format_dt),
+        max_versions: row.12.map(|n| n as i64),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MaxVersionsBody {
+    /// `null` clears the cap (unlimited).
+    pub max_versions: Option<i64>,
+    /// When true, nothing is written or deleted: `pruned` reports how many
+    /// versions the given cap WOULD delete. The client shows that number in
+    /// a confirmation dialog before committing the real call.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MaxVersionsOut {
+    pub max_versions: Option<i64>,
+    /// Versions deleted right away because they were over the new cap (or,
+    /// on `dry_run`, how many would be).
+    pub pruned: usize,
+}
+
+/// `PUT /v1/me/max-versions` — set (or clear, with `null`) the per-user cap
+/// on stored versions per save, then prune immediately so the effect (and
+/// the freed storage) is visible without waiting for the next backup. With
+/// `dry_run: true` it only previews the prune count.
+pub async fn set_max_versions(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+    Json(body): Json<MaxVersionsBody>,
+) -> Result<Json<MaxVersionsOut>, CloudError> {
+    if let Some(n) = body.max_versions {
+        if !(1..=10_000).contains(&n) {
+            return Err(CloudError::BadRequest(
+                "max_versions must be between 1 and 10000".into(),
+            ));
+        }
+    }
+
+    if body.dry_run {
+        // Clearing the cap never prunes; only a concrete number needs a count.
+        let pruned = match body.max_versions {
+            Some(n) => {
+                crate::cloud::purge::count_version_cap_excess(&state, user.user_id, n).await?
+            }
+            None => 0,
+        };
+        return Ok(Json(MaxVersionsOut {
+            max_versions: body.max_versions,
+            pruned: pruned.max(0) as usize,
+        }));
+    }
+
+    sqlx::query("UPDATE profiles SET max_versions = $1, updated_at = now() WHERE user_id = $2")
+        .bind(body.max_versions.map(|n| n as i32))
+        .bind(user.user_id)
+        .execute(&state.pool)
+        .await?;
+
+    let pruned = crate::cloud::purge::prune_version_caps(&state, user.user_id).await?;
+    Ok(Json(MaxVersionsOut {
+        max_versions: body.max_versions,
+        pruned,
     }))
 }
 

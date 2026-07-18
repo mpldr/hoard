@@ -15,6 +15,9 @@ public_url = "https://api.hoard.services"
 enabled = true
 per_second = 20
 burst = 60
+# Per-device cap on the polling endpoints (sync/devices/notifications/
+# heartbeat), requests per minute per (user, device, endpoint). 0 disables.
+poll_per_minute = 10
 
 [storage]
 # Not used in cloud mode (snapshots live in R2), but the field is required

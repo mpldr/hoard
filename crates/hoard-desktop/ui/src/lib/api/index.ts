@@ -476,6 +476,24 @@ export type AgentEvent =
       type: "backup_skipped_empty";
       save_id: string;
       game_slug: string;
+    }
+  | {
+      /** Auto-restore has failed repeatedly on the same cloud version: the
+       *  save is not syncing and won't fix itself. Unlike
+       *  `save_auto_restore_failed` (transient, one per attempt), this is a
+       *  persistent state the Library card shows until it recovers. */
+      type: "save_auto_restore_stuck";
+      save_id: string;
+      game_slug: string;
+      failures: number;
+      error: string;
+    }
+  | {
+      /** The stuck save restored successfully (or the cloud moved to a new
+       *  version): drop the persistent warning. */
+      type: "save_auto_restore_recovered";
+      save_id: string;
+      game_slug: string;
     };
 
 /** Boot the live agent and start emitting `agent://*` events. */
@@ -570,12 +588,6 @@ export type Prefs = {
    *  confused users, and the flag was never actually consumed by the agent.
    *  Kept in the struct so the pref file stays stable; do not surface it. */
   cloud_savings_mode: boolean;
-  /** Seconds between manifest polls on the live cloud-pull loop.
-   *  Range 5..=300; default 10. Independent from
-   *  `automatic_backup_interval_secs` — that one re-hashes save bytes,
-   *  this one only emits `agent://cloud-pull-*` events so the LiveStatus
-   *  widget reflects server state. */
-  cloud_poll_interval_secs: number;
   /** Whether the floating ActivityFeed panel is visible. Defaults to
    *  true; the user can hide it from the sidebar toggle. */
   live_activity_visible: boolean;
@@ -661,13 +673,6 @@ export function setBackupInterval(secs: number): Promise<Prefs> {
  *  backups. Picked up by the agent on its next auto-restore sweep. */
 export function setConflictRetention(days: number): Promise<Prefs> {
   return invoke<Prefs>("set_conflict_retention", { days });
-}
-
-/** Persist a new cloud-pull interval (seconds, 5..=300). If a cloud
- *  session is active the poller restarts so the new cadence kicks in
- *  immediately. */
-export function setCloudPollInterval(secs: number): Promise<Prefs> {
-  return invoke<Prefs>("set_cloud_poll_interval", { secs });
 }
 
 /** Toggle whether the floating ActivityFeed panel renders. */
@@ -774,6 +779,23 @@ export function undeleteSnapshot(
   version: number,
 ): Promise<void> {
   return invoke<void>("undelete_snapshot", { saveId, version });
+}
+
+/** Per-user cap on stored versions per save. `null` = unlimited. */
+export function getMaxVersions(): Promise<number | null> {
+  return invoke<number | null>("get_max_versions");
+}
+
+/** Dry-run: how many stored versions a cap of `maxVersions` would delete
+ *  right now. Nothing is written — used for the confirmation dialog. */
+export function previewMaxVersions(maxVersions: number): Promise<number> {
+  return invoke<number>("preview_max_versions", { maxVersions });
+}
+
+/** Set (or clear, with `null`) the max-versions cap. The server prunes the
+ *  excess immediately, so refresh History / quota afterwards. */
+export function setMaxVersions(maxVersions: number | null): Promise<void> {
+  return invoke<void>("set_max_versions", { maxVersions });
 }
 
 export function restoreSnapshot(args: {

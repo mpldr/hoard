@@ -1,4 +1,5 @@
 /target
+.venv*/
 *.db
 *.db-wal
 *.db-shm
@@ -87,3 +88,8 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # Lista de tareas del usuario (solo la escribe él). Nunca al repo.
 /rleeon.md
 /vista.md
+
+# Bot de estado de Discord (infra local, secretos). Nunca al repo.
+/deploy/.env.discord-bot
+/deploy/scripts/discord-status-bot.py
+/deploy/systemd/hoard-discord-bot.service

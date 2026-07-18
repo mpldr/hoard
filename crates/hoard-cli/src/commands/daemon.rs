@@ -154,14 +154,13 @@ pub async fn run(backup_only: bool) -> Result<()> {
     // desktop app: pulls from the cloud in ~1s instead of waiting for the sweep.
     // Cloud only and with full sync (backup_only never writes).
     let _live = if active.is_cloud && !backup_only {
-        let poll_secs = hoard_agent::prefs::Prefs::load_default()
-            .map(|(p, _)| p.cloud_poll_interval_secs as u64)
-            .unwrap_or(60);
         Some(cloud_live::spawn(
             live_client,
             handle.clone(),
             cloud_live::Config {
-                poll_interval: Duration::from_secs(poll_secs),
+                poll_interval: Duration::from_secs(
+                    hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS as u64,
+                ),
                 global_sync: true,
             },
         ))
@@ -335,6 +334,15 @@ fn render(ev: &AgentEvent) -> Option<String> {
         }
         RestoreDeferred { game_slug, .. } => {
             format!("⏸  {game_slug} update ready — waiting for the game to close")
+        }
+        SaveAutoRestoreStuck {
+            game_slug,
+            failures,
+            error,
+            ..
+        } => format!("⚠  {game_slug}: cloud restore failing repeatedly ({failures}×) — {error}"),
+        SaveAutoRestoreRecovered { game_slug, .. } => {
+            format!("✓  {game_slug}: cloud restore working again")
         }
         _ => return None,
     })

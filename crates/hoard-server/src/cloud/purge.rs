@@ -249,6 +249,106 @@ async fn load_candidates(
         .collect())
 }
 
+/// Count how many versions a hypothetical cap of `cap` would delete for this
+/// user, without touching anything. Same predicate as
+/// [`prune_version_caps`]; powers the confirmation dialog the panel shows
+/// before lowering the cap.
+pub async fn count_version_cap_excess(
+    state: &CloudState,
+    user_id: Uuid,
+    cap: i64,
+) -> Result<i64, CloudError> {
+    let cap = cap.max(1);
+    let n: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM save_versions v
+          JOIN saves s ON s.id = v.save_id
+         WHERE s.user_id = $1
+           AND v.sha256 <> ''
+           AND v.deleted_at IS NULL
+           AND v.is_pinned = FALSE
+           AND v.version_num <> s.latest_version_num
+           AND (SELECT COUNT(*) FROM save_versions w
+                 WHERE w.save_id = v.save_id
+                   AND w.sha256 <> ''
+                   AND w.deleted_at IS NULL
+                   AND w.version_num > v.version_num) >= $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(cap)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(n.max(0))
+}
+
+/// Enforce the user's own "max versions per save" cap (`profiles.max_versions`,
+/// NULL = unlimited). Unlike the quota purge this is user-opt-in and
+/// unconditional: for every save, the oldest committed live versions beyond
+/// the newest `cap` are deleted — never the head, never pinned ones. Handles
+/// both content-addressed versions (blob release, like [`purge_one`]) and
+/// legacy whole-archive ones (R2 object drop, like the manual delete route).
+/// Returns how many versions were deleted.
+pub async fn prune_version_caps(state: &CloudState, user_id: Uuid) -> Result<usize, CloudError> {
+    let cap: Option<Option<i32>> =
+        sqlx::query_scalar("SELECT max_versions FROM profiles WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some(Some(cap)) = cap else { return Ok(0) };
+    let cap = i64::from(cap).max(1);
+
+    // Victims: live committed versions with `cap`-or-more newer live committed
+    // siblings (i.e. outside the newest-`cap` window), excluding pinned rows
+    // and the head. The head is always inside the window since cap >= 1, but
+    // the explicit guard keeps that invariant even if a stale
+    // `latest_version_num` points elsewhere.
+    let victims: Vec<(String, i64, bool, String)> = sqlx::query_as(
+        r#"
+        SELECT v.save_id, v.version_num, v.content_addressed, v.r2_key
+          FROM save_versions v
+          JOIN saves s ON s.id = v.save_id
+         WHERE s.user_id = $1
+           AND v.sha256 <> ''
+           AND v.deleted_at IS NULL
+           AND v.is_pinned = FALSE
+           AND v.version_num <> s.latest_version_num
+           AND (SELECT COUNT(*) FROM save_versions w
+                 WHERE w.save_id = v.save_id
+                   AND w.sha256 <> ''
+                   AND w.deleted_at IS NULL
+                   AND w.version_num > v.version_num) >= $2
+      ORDER BY v.save_id, v.version_num ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(cap)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut deleted = 0usize;
+    for (save_id, version, content_addressed, r2_key) in victims {
+        if content_addressed {
+            purge_one(state, user_id, &save_id, version).await?;
+        } else {
+            if let Err(e) = state.r2.delete_object(&r2_key).await {
+                tracing::warn!(error = %e, r2_key = %r2_key, "version cap: R2 object delete failed");
+            }
+            sqlx::query("DELETE FROM save_versions WHERE save_id = $1 AND version_num = $2")
+                .bind(&save_id)
+                .bind(version)
+                .execute(&state.pool)
+                .await?;
+        }
+        deleted += 1;
+    }
+
+    if deleted > 0 {
+        tracing::info!(user_id = %user_id, deleted, cap, "version cap: pruned versions over max_versions");
+    }
+    Ok(deleted)
+}
+
 /// Delete one content-addressed version (same path as the manual
 /// `delete_version` handler's CA branch), releasing its blob references. We
 /// never purge a head, so there's no head to repoint.

@@ -167,6 +167,15 @@ enum SnapshotCommand {
     },
     /// Restore a soft-deleted snapshot back to active state
     Undelete { save_id: String, version: i64 },
+    /// Show or set your cap on stored versions per save. No value = show;
+    /// a number = set; `off` = unlimited. The server prunes immediately.
+    MaxVersions {
+        /// New cap (1–10000), or `off` to remove the cap
+        value: Option<String>,
+        /// Skip the confirmation when the new cap would delete versions
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -308,6 +317,46 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
         SnapshotCommand::Undelete { save_id, version } => {
             client.snapshot_restore(&save_id, version).await?;
             println!("undeleted v{} of save {}", version, save_id);
+            Ok(())
+        }
+        SnapshotCommand::MaxVersions { value, yes } => {
+            match value.as_deref() {
+                None => match client.get_max_versions().await? {
+                    Some(n) => println!("max versions per save: {n}"),
+                    None => println!("max versions per save: unlimited"),
+                },
+                Some("off") => {
+                    client.set_max_versions(None).await?;
+                    println!("max versions per save: unlimited");
+                }
+                Some(raw) => {
+                    let n: i64 = raw
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("expected a number or `off`, got {raw:?}"))?;
+                    // Dry-run first: if the cap would delete stored versions,
+                    // confirm before the server prunes them.
+                    let would_prune = client.preview_max_versions(n).await?;
+                    if would_prune > 0 && !yes {
+                        use std::io::Write;
+                        print!(
+                            "a cap of {n} will delete the {would_prune} oldest stored version(s); continue? [y/N] "
+                        );
+                        std::io::stdout().flush()?;
+                        let mut buf = String::new();
+                        std::io::stdin().read_line(&mut buf)?;
+                        if !matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                            println!("aborted");
+                            return Ok(());
+                        }
+                    }
+                    client.set_max_versions(Some(n)).await?;
+                    if would_prune > 0 {
+                        println!("max versions per save: {n} ({would_prune} old versions pruned)");
+                    } else {
+                        println!("max versions per save: {n}");
+                    }
+                }
+            }
             Ok(())
         }
     }

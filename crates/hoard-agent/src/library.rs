@@ -697,7 +697,9 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 label: st.label.clone(),
                 local_path: st.local_path.to_string_lossy().into_owned(),
                 last_version_num: entry.map(|e| e.latest_version_num),
-                last_backup_at: None,
+                // Manifest `updated_at` bumps on every committed upload, so it
+                // doubles as "last backup" for cloud rows (the panel sorts on it).
+                last_backup_at: entry.map(|e| e.updated_at.clone()),
                 paused: st.paused,
                 total_size_bytes: entry.map(|e| e.latest_size_bytes).unwrap_or(0),
                 orphan: false,
@@ -719,7 +721,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 label: entry.label.clone(),
                 local_path: String::new(),
                 last_version_num: Some(entry.latest_version_num),
-                last_backup_at: None,
+                last_backup_at: Some(entry.updated_at.clone()),
                 total_size_bytes: entry.latest_size_bytes,
                 paused: false,
                 orphan: true,

@@ -34,8 +34,11 @@ use tokio::time::Instant;
 
 /// Spacing floor between fetches of the same feed. Keepalive heartbeats
 /// arrive every ~30s per sibling device, each one pushing a `devices` UPDATE
-/// through Realtime; without a floor every beat would cost one GET.
-const SPACING_SECS: u64 = 2;
+/// through Realtime; without a floor every beat would cost one GET. 10s
+/// keeps a many-device account at ≤6 GETs/min — safely under the server's
+/// per-device poll guard (10/min) — and beats still land within one beat
+/// interval of each other.
+const SPACING_SECS: u64 = 10;
 
 /// The timed poller may tick as fast as every 5s; the fallback feed refresh
 /// doesn't need that — Realtime covers immediacy. Cap it to once a minute.

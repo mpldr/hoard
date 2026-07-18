@@ -45,7 +45,8 @@ ignore = [
     "RUSTSEC-2025-0098", # unic-ucd-version
     "RUSTSEC-2025-0100", # unic-ucd-ident
     # rustls-webpki 0.101.7 advisories. All three share one root: this old
-    # webpki is pulled transitively ONLY under `--features cloud`, via
+    # webpki is pulled transitively wherever the aws-sdk-s3 stack builds —
+    # `--features cloud` and the default `s3-backend` (ADR 0020) — via
     # aws-sdk-s3 → aws-smithy-http-client → rustls 0.21 → rustls-webpki 0.101.
     # rustls 0.21 pins webpki ^0.101, so there's no in-line upgrade without
     # bumping the aws-sdk majors (a separate, larger change). The TLS we do

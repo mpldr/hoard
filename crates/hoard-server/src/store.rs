@@ -1,0 +1,371 @@
+//! Blob/chunk storage backend abstraction (ADR 0020).
+//!
+//! Self-hosted `hoard-server` keeps its content-addressed bytes either on local
+//! disk (the default, unchanged) or on any S3-compatible endpoint, selected by
+//! `[storage] backend`. Everything else — the SQLite index, auth, dedup and
+//! refcounts, retention, the client API — is identical between the two: the
+//! bucket only ever holds opaque zstd blob/chunk bytes, addressed by the same
+//! per-user, sha-sharded key scheme the on-disk layout uses.
+//!
+//! The one key scheme (`blobs/<user>/<ab>/<sha>` and `chunks/<user>/<ab>/<sha>`)
+//! mirrors `blobs::blob_path` / `chunking::chunk_path`, so `LocalFs` maps a key
+//! straight onto `data_dir/<key>` — byte-identical to the pre-abstraction
+//! layout — and `S3Store` uses it verbatim as the object key (optionally under
+//! a `key_prefix`).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+
+/// Object key for a whole-file blob. First two hex chars of the sha shard the
+/// keyspace so one user's blobs spread across 256 folders/prefixes.
+pub fn blob_key(user_id: &str, sha256: &str) -> String {
+    let shard = if sha256.len() >= 2 { &sha256[..2] } else { "00" };
+    format!("blobs/{user_id}/{shard}/{sha256}")
+}
+
+/// Object key for a content-defined chunk (ADR 0019). Same sharding as blobs
+/// under a distinct `chunks/` prefix.
+pub fn chunk_key(user_id: &str, sha256: &str) -> String {
+    let shard = if sha256.len() >= 2 { &sha256[..2] } else { "00" };
+    format!("chunks/{user_id}/{shard}/{sha256}")
+}
+
+/// A local filesystem path from which an object's bytes can be read directly.
+/// For the local backend this is the object's real path (`cleanup = false`,
+/// zero-copy). For a remote backend the object has been streamed into a spool
+/// file the caller must delete once done (`cleanup = true`).
+pub struct LocalRef {
+    pub path: PathBuf,
+    pub cleanup: bool,
+}
+
+/// A place to store and retrieve content-addressed blob/chunk bytes. Keys come
+/// from [`blob_key`] / [`chunk_key`]; the store is agnostic to which is which.
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    /// Finalize an upload: move the staged file at `local_path` into the store
+    /// under `key`. Consumes the staged file. The local backend renames it
+    /// (same filesystem — `tmp/` and the blob store share `data_dir`) with a
+    /// copy fallback on EXDEV; the S3 backend streams it to the bucket.
+    async fn put_from_file(&self, key: &str, local_path: &Path) -> Result<()>;
+
+    /// Whether an object exists. Used as a HEAD fallback only; the snapshot
+    /// path prefers the `blobs`/`chunks` tables as the source of truth.
+    async fn exists(&self, key: &str) -> Result<bool>;
+
+    /// Object size in bytes, or `None` if absent. A cheap stat/HEAD (no
+    /// download) — migration uses it to skip keys the destination already has
+    /// at the right size.
+    async fn size(&self, key: &str) -> Result<Option<i64>>;
+
+    /// Remove an object. A missing object is not an error (GC and rollback both
+    /// tolerate a double-delete).
+    async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Resolve `key` to a readable local path, spooling remote bytes into
+    /// `spool_dir` if the backend isn't local. Never buffers the whole object
+    /// in RAM. The caller deletes the returned path iff `cleanup` is set.
+    async fn local_ref(&self, key: &str, spool_dir: &Path) -> Result<LocalRef>;
+}
+
+// ─── Local filesystem backend ───────────────────────────────────────────────
+
+/// Stores objects under `data_dir/<key>`, byte-identical to the historical
+/// on-disk layout. This is the default and the only backend when built with
+/// `--no-default-features`.
+pub struct LocalFs {
+    data_dir: PathBuf,
+}
+
+impl LocalFs {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+
+    fn resolve(&self, key: &str) -> PathBuf {
+        self.data_dir.join(key)
+    }
+}
+
+#[async_trait]
+impl BlobStore for LocalFs {
+    async fn put_from_file(&self, key: &str, local_path: &Path) -> Result<()> {
+        let dst = self.resolve(key);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        // Same filesystem (tmp + blobs share data_dir) → rename; fall back to
+        // copy on the off chance of EXDEV, then drop the staged source.
+        match tokio::fs::rename(local_path, &dst).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                tokio::fs::copy(local_path, &dst)
+                    .await
+                    .with_context(|| format!("copy blob into {}", dst.display()))?;
+                let _ = tokio::fs::remove_file(local_path).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.resolve(key).exists())
+    }
+
+    async fn size(&self, key: &str) -> Result<Option<i64>> {
+        match tokio::fs::metadata(self.resolve(key)).await {
+            Ok(m) => Ok(Some(m.len() as i64)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("stat {key}")),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match tokio::fs::remove_file(self.resolve(key)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("delete {key}")),
+        }
+    }
+
+    async fn local_ref(&self, key: &str, _spool_dir: &Path) -> Result<LocalRef> {
+        Ok(LocalRef {
+            path: self.resolve(key),
+            cleanup: false,
+        })
+    }
+}
+
+// ─── S3-compatible backend ──────────────────────────────────────────────────
+
+#[cfg(feature = "s3-backend")]
+pub struct S3Store {
+    inner: crate::s3::S3,
+    /// Optional prefix prepended to every key (lets one bucket host several
+    /// deployments). Empty by default.
+    prefix: String,
+}
+
+#[cfg(feature = "s3-backend")]
+impl S3Store {
+    pub async fn connect(cfg: &crate::config::S3StorageConfig) -> Result<Self> {
+        let inner = crate::s3::S3::connect(crate::s3::S3Params {
+            endpoint: cfg.endpoint.clone(),
+            bucket: cfg.bucket.clone(),
+            region: cfg.region.clone(),
+            access_key_id: cfg.access_key_id.clone(),
+            secret_access_key: cfg.secret_access_key.clone(),
+            force_path_style: cfg.force_path_style,
+        })
+        .await?;
+        Ok(Self {
+            inner,
+            prefix: cfg.key_prefix.trim_matches('/').to_string(),
+        })
+    }
+
+    fn full_key(&self, key: &str) -> String {
+        if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.prefix, key)
+        }
+    }
+
+    /// Fail-fast reachability/writability check: PUT then DELETE a tiny probe
+    /// object. Run once at startup so a misconfigured bucket surfaces before
+    /// the first user upload rather than as a 500 mid-sync.
+    pub async fn probe(&self) -> Result<()> {
+        let key = self.full_key(".hoard_write_probe");
+        self.inner
+            .put_object(&key, b"ok".to_vec())
+            .await
+            .context("probe write failed")?;
+        self.inner
+            .delete(&key)
+            .await
+            .context("probe delete failed")?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "s3-backend")]
+#[async_trait]
+impl BlobStore for S3Store {
+    async fn put_from_file(&self, key: &str, local_path: &Path) -> Result<()> {
+        self.inner.put_file(&self.full_key(key), local_path).await?;
+        // The staged source is the caller's tmp file; remove it so the S3 path
+        // matches the local path's move-semantics (staging is cleaned anyway).
+        let _ = tokio::fs::remove_file(local_path).await;
+        Ok(())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.inner.head(&self.full_key(key)).await?.is_some())
+    }
+
+    async fn size(&self, key: &str) -> Result<Option<i64>> {
+        self.inner.head(&self.full_key(key)).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(&self.full_key(key)).await
+    }
+
+    async fn local_ref(&self, key: &str, spool_dir: &Path) -> Result<LocalRef> {
+        let dest = spool_dir.join(uuid::Uuid::new_v4().to_string());
+        self.inner.get_to_file(&self.full_key(key), &dest).await?;
+        Ok(LocalRef {
+            path: dest,
+            cleanup: true,
+        })
+    }
+}
+
+// ─── Factory ────────────────────────────────────────────────────────────────
+
+/// Build a specific storage backend from config, independent of which one is
+/// active. `hoard-admin storage migrate` uses this to hold source and
+/// destination stores at once. Async because the S3 backend probes the bucket
+/// (write+delete) to fail fast on a bad endpoint; local construction is
+/// infallible.
+pub async fn build_backend(
+    cfg: &crate::config::Config,
+    backend: crate::config::StorageBackend,
+) -> Result<Arc<dyn BlobStore>> {
+    use crate::config::StorageBackend;
+    match backend {
+        StorageBackend::Local => Ok(Arc::new(LocalFs::new(cfg.storage.data_dir.clone()))),
+        StorageBackend::S3 => {
+            #[cfg(feature = "s3-backend")]
+            {
+                let s3cfg = cfg.storage.s3.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the s3 backend requires an [storage.s3] section in config"
+                    )
+                })?;
+                let store = S3Store::connect(s3cfg)
+                    .await
+                    .context("connecting to S3-compatible endpoint")?;
+                store
+                    .probe()
+                    .await
+                    .context("S3 bucket is not reachable/writable (check endpoint, bucket, credentials)")?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "s3-backend"))]
+            {
+                anyhow::bail!(
+                    "the s3 backend requires building with --features s3-backend"
+                )
+            }
+        }
+    }
+}
+
+/// Build the *active* backend (`cfg.storage.backend`). Returns a trait object
+/// so the rest of the server is backend-agnostic.
+pub async fn build_store(cfg: &crate::config::Config) -> Result<Arc<dyn BlobStore>> {
+    build_backend(cfg, cfg.storage.backend).await
+}
+
+/// Startup guard (self-host): if the DB references content-addressed objects
+/// but the active store holds none of a random sample, the operator almost
+/// certainly flipped `[storage] backend` without running the migration. Fail
+/// loudly at boot rather than serving a 500 on the first restore. A fresh DB
+/// with nothing stored yet passes (no sample to check).
+pub async fn sanity_check(pool: &sqlx::SqlitePool, store: &Arc<dyn BlobStore>) -> Result<()> {
+    use sqlx::Row;
+
+    // Sample live keys — blobs first, then chunks if the user only has chunked
+    // saves. `refcount > 0` = still referenced (live or trashed).
+    let mut keys: Vec<String> = sqlx::query(
+        "SELECT user_id, sha256 FROM blobs WHERE refcount > 0 ORDER BY RANDOM() LIMIT 8",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| blob_key(&r.get::<String, _>("user_id"), &r.get::<String, _>("sha256")))
+    .collect();
+
+    if keys.is_empty() {
+        keys = sqlx::query(
+            "SELECT user_id, sha256 FROM chunks WHERE refcount > 0 ORDER BY RANDOM() LIMIT 8",
+        )
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| chunk_key(&r.get::<String, _>("user_id"), &r.get::<String, _>("sha256")))
+        .collect();
+    }
+
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    for k in &keys {
+        if store.exists(k).await.unwrap_or(false) {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "storage backend has no data for this database — did you run \
+         `hoard-admin storage migrate`?"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_scheme_matches_disk_layout() {
+        let uid = "user-1";
+        let sha = "abcd".to_string() + &"0".repeat(60);
+        // The local path is exactly data_dir joined with the key, so the S3
+        // key and the on-disk layout can never drift.
+        let data_dir = Path::new("/var/lib/hoard");
+        assert_eq!(
+            LocalFs::new(data_dir.to_path_buf()).resolve(&blob_key(uid, &sha)),
+            crate::blobs::blob_path(data_dir, uid, &sha)
+        );
+        assert_eq!(
+            LocalFs::new(data_dir.to_path_buf()).resolve(&chunk_key(uid, &sha)),
+            crate::chunking::chunk_path(data_dir, uid, &sha)
+        );
+    }
+
+    /// LocalFs round-trips a staged file: put moves it in, local_ref points at
+    /// the real path (no copy), delete removes it, a missing delete is a no-op.
+    #[tokio::test]
+    async fn local_fs_put_ref_delete() {
+        let root = std::env::temp_dir().join(format!("hoard-store-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let store = LocalFs::new(root.clone());
+
+        let staged = root.join("staged.bin");
+        tokio::fs::write(&staged, b"hello").await.unwrap();
+        let key = blob_key("u1", &("aa".to_string() + &"0".repeat(62)));
+
+        store.put_from_file(&key, &staged).await.unwrap();
+        assert!(!staged.exists(), "staged file was moved, not copied");
+        assert!(store.exists(&key).await.unwrap());
+
+        let r = store.local_ref(&key, &root).await.unwrap();
+        assert!(!r.cleanup, "local backend never spools");
+        assert_eq!(tokio::fs::read(&r.path).await.unwrap(), b"hello");
+
+        store.delete(&key).await.unwrap();
+        assert!(!store.exists(&key).await.unwrap());
+        // Double-delete is tolerated.
+        store.delete(&key).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

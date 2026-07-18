@@ -147,6 +147,24 @@ const NON_GAME_PROCESS: &[&str] = &[
     "onedrive",
     "xbox",
     "gamingservices",
+    "gamebar",
+    // Herramientas de escritorio observadas disparando "heavy untracked
+    // game-like process" en producción (log jul-2026): launchers/managers,
+    // scripting, ofimática, editores y utilidades. Viven fuera de rutas de
+    // sistema, así que hay que nombrarlas.
+    "playnite",
+    "autohotkey",
+    "mspaint",
+    "topaz",
+    "winrar",
+    "quicklook",
+    "microsoft.media.player",
+    "sdxhelper",
+    "devenv",
+    "winword",
+    "crossdeviceservice",
+    "logipluginservice",
+    "generate_emu_config",
     // El propio Hoard.
     "hoard",
 ];
@@ -158,7 +176,19 @@ const NON_GAME_PROCESS: &[&str] = &[
 ///
 /// `"upc"` es el cliente Ubisoft (hermano de `UbisoftGameLauncher.exe`, que sí va
 /// por substring); como substring pescaría exes legítimos tipo `upcoming.exe`.
-const NON_GAME_PROCESS_EXACT: &[&str] = &["code", "code.exe", "upc", "upc.exe"];
+/// `"setup"` son instaladores (como substring pescaría juegos con "setup" en la
+/// carpeta); `"achievements"` es el watcher de logros de GSE/Goldberg, que corre
+/// JUNTO al juego emulado pero no es el juego.
+const NON_GAME_PROCESS_EXACT: &[&str] = &[
+    "code",
+    "code.exe",
+    "upc",
+    "upc.exe",
+    "setup",
+    "setup.exe",
+    "achievements",
+    "achievements.exe",
+];
 
 /// Un proceso nacido dentro de esta ventana tras el arranque del SISTEMA es
 /// infraestructura de autostart (Discord, trays, overlays de GPU, daemons de
@@ -174,6 +204,23 @@ const BOOT_AUTOSTART_GRACE_SECS: u64 = 120;
 /// last-writer-wins: un solo tick desafortunado (Discord primario mientras Steam
 /// Cloud reescribe el save) machacaba al exe real del juego.
 const ATTRIBUTION_SWITCH_STREAK: u32 = 3;
+
+/// CPU mínima para que un proceso cuente como FUENTE de una correlación. El que
+/// escribió la carpeta estaba ejecutando; un residente a ~0% no pudo ser — y
+/// justo así se envenenaba el store: la carpeta la reescribía otro (Steam
+/// Cloud, GSE) sin el juego vivo, y la atribución caía en el primer proceso
+/// "con pinta de juego" del sistema aunque llevara horas dormido (el caso
+/// MOUSE: un task horario heredó la carpeta y disparó GameStarted cada hora
+/// durante días). Umbral bajo a propósito: el muestreo llega justo tras la
+/// escritura, cuando el escritor real siempre marca algo de CPU.
+const CORRELATION_SOURCE_MIN_CPU_PCT: f32 = 0.5;
+
+/// Sesiones fantasma seguidas (arrancó/paró por señal débil sin UNA SOLA
+/// escritura en la carpeta) que tumban la observación. Un juego de verdad
+/// escribe su save al jugar — y cada escritura re-graba la observación y resetea
+/// los strikes ([`CorrelationStore::record`]) — así que sólo una atribución
+/// envenenada acumula. Ver [`CorrelationStore::strike_phantom`].
+pub const PHANTOM_SESSION_STRIKES: u32 = 2;
 
 /// Un proceso vivo candidato a juego.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -269,6 +316,12 @@ pub fn sample_game_processes(sys: &System) -> Vec<GameProcess> {
         if proc.start_time().saturating_sub(boot) < BOOT_AUTOSTART_GRACE_SECS {
             continue;
         }
+        // Veto de residente dormido: el escritor de la carpeta estaba
+        // ejecutando, así que marca CPU en el intervalo del muestreo. Un
+        // proceso a ~0% no escribió nada — atribuirle el save es el veneno.
+        if proc.cpu_usage() < CORRELATION_SOURCE_MIN_CPU_PCT {
+            continue;
+        }
         let name = proc.name().to_string_lossy().to_string();
         if is_game_like(&name, Some(&exe)) {
             scored.push((
@@ -304,6 +357,13 @@ pub struct WriteObservation {
     challenger: Option<GameProcess>,
     #[serde(default)]
     challenger_streak: u32,
+    /// Sesiones fantasma acumuladas: el proceso atribuido "arrancó" y "paró"
+    /// sin que la carpeta recibiera una sola escritura. A
+    /// [`PHANTOM_SESSION_STRIKES`] la observación se descarta (atribución
+    /// envenenada). Cualquier escritura real ([`CorrelationStore::record`])
+    /// resetea el contador. `default` para leer stores antiguos.
+    #[serde(default)]
+    phantom_strikes: u32,
 }
 
 /// Store persistido de correlaciones, indexado por dir observado.
@@ -384,9 +444,13 @@ impl CorrelationStore {
                 hits: 0,
                 challenger: None,
                 challenger_streak: 0,
+                phantom_strikes: 0,
             });
         entry.observed_at_ms = now_ms();
         entry.hits = entry.hits.saturating_add(1);
+        // Una escritura real absuelve: la carpeta está viva, la atribución se
+        // está re-ganando ahora mismo.
+        entry.phantom_strikes = 0;
 
         if primary.name == entry.process_name {
             // Confirma la atribución vigente; refresca el exe y borra retador.
@@ -418,14 +482,50 @@ impl CorrelationStore {
     /// cualquier dir observado que sea `dir` o un ancestro suyo (el watcher
     /// es recursivo, así que la escritura puede registrarse en un padre).
     pub fn signal_for(&self, dir: &Path) -> Option<&WriteObservation> {
+        self.observed_key(dir)
+            .and_then(|k| self.observations.get(&k))
+    }
+
+    /// Clave real del store que corrobora `dir` (la misma resolución por
+    /// ancestros de [`signal_for`], pero devolviendo la clave para mutar).
+    fn observed_key(&self, dir: &Path) -> Option<PathBuf> {
         let mut cur = Some(dir);
         while let Some(d) = cur {
-            if let Some(o) = self.observations.get(d) {
-                return Some(o);
+            if self.observations.contains_key(d) {
+                return Some(d.to_path_buf());
             }
             cur = d.parent();
         }
         None
+    }
+
+    /// Registra una sesión fantasma sobre la observación que corrobora `dir`:
+    /// su proceso atribuido nació y murió sin una sola escritura en la
+    /// carpeta. Un juego de verdad escribe al jugar, así que sólo una
+    /// atribución envenenada (un task horario, un residente) acumula strikes;
+    /// a [`PHANTOM_SESSION_STRIKES`] la observación se descarta y la señal
+    /// débil muere con ella (se re-aprende sola en la próxima sesión real).
+    /// Devuelve `Some(true)` si la observación cayó, `Some(false)` si sumó
+    /// strike y sobrevive, `None` si `dir` no tenía observación.
+    pub fn strike_phantom(&mut self, dir: &Path) -> Option<bool> {
+        let key = self.observed_key(dir)?;
+        let obs = self.observations.get_mut(&key)?;
+        obs.phantom_strikes = obs.phantom_strikes.saturating_add(1);
+        if obs.phantom_strikes >= PHANTOM_SESSION_STRIKES {
+            self.observations.remove(&key);
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    /// Borra los strikes de la observación que corrobora `dir` — la sesión
+    /// que acaba de cerrar SÍ escribió la carpeta, la atribución es legítima.
+    pub fn absolve(&mut self, dir: &Path) {
+        if let Some(key) = self.observed_key(dir) {
+            if let Some(obs) = self.observations.get_mut(&key) {
+                obs.phantom_strikes = 0;
+            }
+        }
     }
 
     /// Nombre de proceso atribuido a `dir`, sin la extensión `.exe`. Útil
@@ -733,6 +833,84 @@ mod tests {
             store.record(&dir, std::slice::from_ref(&intruder));
         }
         assert_eq!(store.attributed_name(&dir).as_deref(), Some("discord"));
+    }
+
+    #[test]
+    fn is_game_like_rejects_desktop_tools_and_managers() {
+        // Herramientas reales del log jul-2026 que pasaban el filtro y
+        // disparaban "heavy untracked game-like process" (o peor: quedaban
+        // como fuente de correlación).
+        for n in [
+            "Playnite.DesktopApp.exe",
+            "AutoHotkey64.exe",
+            "mspaint.exe",
+            "Topaz Photo AI.exe",
+            "WinRAR.exe",
+            "QuickLook.exe",
+            "Microsoft.Media.Player.exe",
+            "GameBar.exe",
+            "GameBarFTServer.exe",
+            "sdxhelper.exe",
+            "devenv.exe",
+            "WINWORD.EXE",
+            "CrossDeviceService.exe",
+            "LogiPluginService.exe",
+            "generate_emu_config.exe",
+            "setup.exe",
+            "achievements.exe",
+        ] {
+            assert!(!is_game_like(n, None), "{n} debería filtrarse");
+        }
+        // "setup"/"achievements" van por match EXACTO: no se comen legítimos.
+        assert!(is_game_like("setupgame.exe", None));
+        assert!(is_game_like("myachievements2.exe", None));
+        // Juegos reales siguen pasando.
+        assert!(is_game_like("eldenring.exe", None));
+        assert!(is_game_like("doomx64.exe", None));
+    }
+
+    #[test]
+    fn phantom_strikes_drop_poisoned_observation() {
+        let mut store = CorrelationStore::default();
+        let dir = PathBuf::from("/home/u/AppData/LocalLow/Fumi Games/MOUSE/Save");
+        let task = GameProcess {
+            name: "hourlytask.exe".into(),
+            exe: Some(PathBuf::from("/apps/hourlytask.exe")),
+        };
+        store.record(&dir, std::slice::from_ref(&task));
+        // Primera sesión fantasma: strike, pero la observación sobrevive.
+        assert_eq!(store.strike_phantom(&dir), Some(false));
+        assert!(store.signal_for(&dir).is_some());
+        // Segunda seguida: cae. La señal débil muere con ella.
+        assert_eq!(store.strike_phantom(&dir), Some(true));
+        assert!(store.signal_for(&dir).is_none());
+        // Sin observación, el strike es un no-op.
+        assert_eq!(store.strike_phantom(&dir), None);
+    }
+
+    #[test]
+    fn real_write_resets_phantom_strikes() {
+        let mut store = CorrelationStore::default();
+        let dir = PathBuf::from("/home/u/.local/share/EU5/save games");
+        let game = GameProcess {
+            name: "eu5.exe".into(),
+            exe: Some(PathBuf::from("/games/eu5.exe")),
+        };
+        store.record(&dir, std::slice::from_ref(&game));
+        assert_eq!(store.strike_phantom(&dir), Some(false));
+        // Una escritura real (record) absuelve; el siguiente strike vuelve a
+        // ser el primero y la observación sobrevive.
+        store.record(&dir, std::slice::from_ref(&game));
+        assert_eq!(store.strike_phantom(&dir), Some(false));
+        assert!(store.signal_for(&dir).is_some());
+        // `absolve` explícito también resetea (sesión con had_pending).
+        store.absolve(&dir);
+        assert_eq!(store.strike_phantom(&dir), Some(false));
+        assert!(store.signal_for(&dir).is_some());
+        // El strike resuelve por ancestro igual que `signal_for` (watcher
+        // recursivo: la observación puede vivir en un padre).
+        assert_eq!(store.strike_phantom(&dir.join("slot1")), Some(true));
+        assert!(store.signal_for(&dir).is_none());
     }
 
     #[test]

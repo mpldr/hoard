@@ -11,12 +11,33 @@
 //!
 //! A missing app id, a 404, or being offline surfaces as an `Err`, which the
 //! JS side catches and falls back to the initial-letter placeholder.
+//!
+//! Users can override a game's cover with a custom image stored locally.
+//! Custom covers are saved as `{app_id}_custom.{ext}` in the same cache dir
+//! and take priority over the Steam capsule.
+
+use std::path::PathBuf;
 
 use tauri::ipc::Response;
 use tauri::Manager;
 
-/// Returns the JPEG bytes of a game's Steam header capsule, reading from the
-/// on-disk cache when present and downloading + persisting on first miss.
+const CUSTOM_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif"];
+
+/// Find a custom cover file for the given app id, returning its path if it
+/// exists. Checks multiple image extensions since the user can pick any format.
+fn find_custom_cover(dir: &std::path::Path, app_id: u32) -> Option<PathBuf> {
+    for ext in CUSTOM_EXTENSIONS {
+        let path = dir.join(format!("{app_id}_custom.{ext}"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Returns the bytes of a game's cover image, reading from the on-disk cache.
+/// Custom user covers (`{app_id}_custom.*`) take priority over the Steam
+/// capsule. On miss the Steam header is downloaded and persisted.
 #[tauri::command]
 pub async fn cover_bytes(app: tauri::AppHandle, app_id: u32) -> Result<Response, String> {
     let dir = app
@@ -24,9 +45,24 @@ pub async fn cover_bytes(app: tauri::AppHandle, app_id: u32) -> Result<Response,
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("covers");
-    let path = dir.join(format!("{app_id}.jpg"));
 
-    // Fast path: already on disk.
+    // Fast path 1: user has set a custom cover for this game.
+    if let Some(custom) = tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        move || find_custom_cover(&dir, app_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        if let Ok(bytes) = tokio::fs::read(&custom).await {
+            if !bytes.is_empty() {
+                return Ok(Response::new(bytes));
+            }
+        }
+    }
+
+    // Fast path 2: Steam capsule already on disk.
+    let path = dir.join(format!("{app_id}.jpg"));
     if let Ok(bytes) = tokio::fs::read(&path).await {
         if !bytes.is_empty() {
             return Ok(Response::new(bytes));
@@ -56,6 +92,76 @@ pub async fn cover_bytes(app: tauri::AppHandle, app_id: u32) -> Result<Response,
     let _ = tokio::fs::create_dir_all(&dir).await;
     let _ = tokio::fs::write(&path, &bytes).await;
     Ok(Response::new(bytes))
+}
+
+/// Returns `true` if the game has a user-set custom cover on disk.
+#[tauri::command]
+pub async fn has_custom_cover(app: tauri::AppHandle, app_id: u32) -> Result<bool, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("covers");
+    Ok(tokio::task::spawn_blocking(move || find_custom_cover(&dir, app_id).is_some())
+        .await
+        .map_err(|e| e.to_string())?)
+}
+
+/// Copy a user-selected image into the cover cache as a custom cover for the
+/// given game. The file is stored as `{app_id}_custom.{ext}` preserving the
+/// original extension. Any previous custom cover for this app id is replaced.
+#[tauri::command]
+pub async fn set_custom_cover(
+    app: tauri::AppHandle,
+    app_id: u32,
+    source_path: String,
+) -> Result<(), String> {
+    let src = std::path::Path::new(&source_path);
+    if !src.exists() {
+        return Err(format!("source file does not exist: {source_path}"));
+    }
+
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_lowercase();
+
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("covers");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Remove any previous custom cover (different extension).
+    for old_ext in CUSTOM_EXTENSIONS {
+        let old = dir.join(format!("{app_id}_custom.{old_ext}"));
+        let _ = tokio::fs::remove_file(&old).await;
+    }
+
+    let dest = dir.join(format!("{app_id}_custom.{ext}"));
+    tokio::fs::copy(src, &dest)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Delete a user's custom cover, reverting to the Steam capsule.
+#[tauri::command]
+pub async fn remove_custom_cover(app: tauri::AppHandle, app_id: u32) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("covers");
+    for ext in CUSTOM_EXTENSIONS {
+        let path = dir.join(format!("{app_id}_custom.{ext}"));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    Ok(())
 }
 
 /// GET an image URL, returning its bytes on a 2xx with a non-empty body.

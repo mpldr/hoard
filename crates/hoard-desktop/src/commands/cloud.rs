@@ -588,12 +588,8 @@ pub async fn cloud_complete_login(
     }
 
     // Boot the cloud-pull poller so LiveStatus has fresh manifest data
-    // within `prefs.cloud_poll_interval_secs`. Read the interval from
-    // disk so the just-logged-in session honours the user's last choice.
-    let secs = hoard_agent::prefs::Prefs::load_default()
-        .map(|(p, _)| p.cloud_poll_interval_secs)
-        .unwrap_or(10);
-    cloud_pull::start(&app, secs);
+    // within one poll interval.
+    cloud_pull::start(&app);
     // Realtime push for near-instant cross-device sync; rides alongside the
     // poller (which stays as the fallback).
     crate::commands::cloud_realtime::start(&app);

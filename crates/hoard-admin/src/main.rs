@@ -47,6 +47,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::manifest::ManifestCommand,
     },
+    /// Storage backend migrate / verify / status (ADR 0020)
+    Storage {
+        #[command(subcommand)]
+        action: commands::storage::StorageCommand,
+    },
     /// Refresh the games catalog from upstream Ludusavi.
     ///
     /// One-shot convenience for ops: equivalent to
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
         Commands::Token { action } => commands::token::run(action, &cfg).await,
         Commands::Game { action } => commands::game::run(action, &cfg).await,
         Commands::Manifest { action } => commands::manifest::run(action, &cfg).await,
+        Commands::Storage { action } => commands::storage::run(action, &cfg).await,
         Commands::Update { dry_run } => {
             // Delegate to `manifest import` with the no-fuss defaults.
             commands::manifest::run(

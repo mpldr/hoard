@@ -73,6 +73,37 @@ fn internal() -> (StatusCode, Json<serde_json::Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
+/// Is this whole-file blob already stored for the user? The `blobs` table is
+/// the source of truth (a row exists iff the object is stored and refcounted),
+/// so dedup/quota consult it instead of a per-key HEAD against the store —
+/// which on the S3 backend would be one network round-trip per file.
+async fn blob_in_db(pool: &sqlx::SqlitePool, user_id: &str, sha: &str) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM blobs WHERE user_id=? AND sha256=? LIMIT 1")
+            .bind(user_id)
+            .bind(sha)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Chunk-store analogue of [`blob_in_db`] (ADR 0019 chunk table).
+async fn chunk_in_db(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    sha: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM chunks WHERE user_id=? AND sha256=? LIMIT 1")
+            .bind(user_id)
+            .bind(sha)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
 /// Validate that a relative path stays inside its parent directory.
 /// Rejects: absolute paths, "..", empty components, drive prefixes.
 fn is_safe_relative_path(p: &str) -> bool {
@@ -373,7 +404,6 @@ pub async fn create(
     // (ADR 0018, eje C). Identical files across versions share one blob; the
     // version is just its list of `snapshot_files` rows. Quota counts unique
     // blob bytes, so only the genuinely-new bytes of this upload are charged.
-    let data_dir = state.config.storage.data_dir.clone();
     let _ = &game_slug; // path components no longer used for storage layout
     let _ = &label;
 
@@ -401,8 +431,12 @@ pub async fn create(
     }
 
     // New bytes = distinct content (whole-file blobs for small files, per-chunk
-    // for chunked ones) not already on disk for this user. Both stores are
+    // for chunked ones) not already stored for this user. `new_blobs`/`new_chunks`
+    // collect exactly the shas needing a physical upload, so the placement pass
+    // below stores each once and skips anything already present. Both stores are
     // counted so dedup across versions is reflected in quota exactly once.
+    let mut new_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut newly_stored_bytes: i64 = 0;
@@ -410,14 +444,24 @@ pub async fn create(
         if let Some(plan) = chunk_plans.get(&i) {
             for c in plan {
                 if seen_chunks.insert(c.sha256.clone())
-                    && !crate::chunking::chunk_path(&data_dir, &user_id, &c.sha256).exists()
+                    && !chunk_in_db(&state.pool, &user_id, &c.sha256)
+                        .await
+                        .map_err(|_| {
+                            cleanup_tmp();
+                            internal()
+                        })?
                 {
+                    new_chunks.insert(c.sha256.clone());
                     newly_stored_bytes += c.len as i64;
                 }
             }
         } else if seen_blobs.insert(sha.clone())
-            && !crate::blobs::blob_path(&data_dir, &user_id, sha).exists()
+            && !blob_in_db(&state.pool, &user_id, sha).await.map_err(|_| {
+                cleanup_tmp();
+                internal()
+            })?
         {
+            new_blobs.insert(sha.clone());
             newly_stored_bytes += size;
         }
     }
@@ -485,16 +529,24 @@ pub async fn create(
         internal()
     })?;
 
-    // Blobs we physically placed this request, so we can roll them back if the
-    // transaction fails to commit.
-    let mut created_blobs: Vec<PathBuf> = Vec::new();
-    let rollback_blobs = |blobs: &[PathBuf]| {
-        let blobs: Vec<PathBuf> = blobs.to_vec();
-        tokio::spawn(async move {
-            for p in blobs {
-                let _ = tokio::fs::remove_file(&p).await;
-            }
-        });
+    // Storage-backend keys we physically placed this request, so we can roll
+    // them back (delete from the store) if the transaction fails to commit.
+    let store = state.store.clone();
+    let mut created_blobs: Vec<String> = Vec::new();
+    // Within-request dedup: a sha appearing in several files is placed once.
+    let mut placed_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut placed_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let rollback_blobs = {
+        let store = store.clone();
+        move |keys: &[String]| {
+            let keys: Vec<String> = keys.to_vec();
+            let store = store.clone();
+            tokio::spawn(async move {
+                for k in keys {
+                    let _ = store.delete(&k).await;
+                }
+            });
+        }
     };
 
     for (i, (rel_path, size, sha)) in files.iter().enumerate() {
@@ -558,18 +610,24 @@ pub async fn create(
                     cleanup_tmp();
                     return Err(internal());
                 }
-                let dst = crate::chunking::chunk_path(&data_dir, &user_id, &c.sha256);
-                if !dst.exists() {
-                    if crate::chunking::place_chunk(&src, c.offset, c.len, &dst)
+                // Place a chunk that's genuinely new (not already stored) once.
+                // We can't rename a byte range, so extract it to a staging file
+                // under tmp/ first, then hand it to the storage backend (a
+                // same-filesystem rename for local, an upload for S3).
+                if new_chunks.contains(&c.sha256) && placed_chunks.insert(c.sha256.clone()) {
+                    let key = crate::store::chunk_key(&user_id, &c.sha256);
+                    let stage = tmp_root.join("_stage").join(&c.sha256);
+                    if crate::chunking::place_chunk(&src, c.offset, c.len, &stage)
                         .await
                         .is_err()
+                        || store.put_from_file(&key, &stage).await.is_err()
                     {
                         warn!(sha = %c.sha256, "chunk placement failed");
                         rollback_blobs(&created_blobs);
                         cleanup_tmp();
                         return Err(internal());
                     }
-                    created_blobs.push(dst);
+                    created_blobs.push(key);
                 }
             }
             // tmp source is left for cleanup_tmp; chunks were copied out.
@@ -594,30 +652,19 @@ pub async fn create(
             return Err(internal());
         }
 
-        // Place the bytes on disk exactly once.
-        let dst = crate::blobs::blob_path(&data_dir, &user_id, sha);
-        if !dst.exists() {
-            if let Some(parent) = dst.parent() {
-                if tokio::fs::create_dir_all(parent).await.is_err() {
-                    rollback_blobs(&created_blobs);
-                    cleanup_tmp();
-                    return Err(internal());
-                }
-            }
+        // Place the bytes exactly once via the storage backend. `put_from_file`
+        // keeps the local fast path (same-filesystem rename from tmp/) and
+        // streams to the bucket on S3.
+        if new_blobs.contains(sha) && placed_blobs.insert(sha.clone()) {
+            let key = crate::store::blob_key(&user_id, sha);
             let src = tmp_root.join(rel_path);
-            // Same filesystem (tmp + blobs share data_dir) → rename; fall back
-            // to copy on the off chance of EXDEV.
-            let placed = match tokio::fs::rename(&src, &dst).await {
-                Ok(_) => true,
-                Err(_) => tokio::fs::copy(&src, &dst).await.is_ok(),
-            };
-            if !placed {
+            if store.put_from_file(&key, &src).await.is_err() {
                 warn!(sha = %sha, "blob placement failed");
                 rollback_blobs(&created_blobs);
                 cleanup_tmp();
                 return Err(internal());
             }
-            created_blobs.push(dst);
+            created_blobs.push(key);
         }
     }
 
@@ -691,6 +738,20 @@ pub async fn create(
         bytes = total_size,
         "snapshot created"
     );
+
+    // Enforce the user's own "max versions per save" cap: trash the oldest
+    // non-pinned snapshots beyond it. Off the response path — a failed prune
+    // must not fail an upload that already committed.
+    {
+        let pool = state.pool.clone();
+        let uid = user_id.clone();
+        let sid = save_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = prune_over_version_cap(&pool, &uid, Some(&sid)).await {
+                warn!(error = %e, save_id = %sid, "version-cap prune after commit failed");
+            }
+        });
+    }
 
     // Push the new version to any of this user's other devices listening on
     // `/v1/events`, so they pull within ~1s instead of waiting for the agent's
@@ -883,13 +944,13 @@ pub async fn download(
     .await
     .map_err(|_| internal())?;
 
-    let data_dir = state.config.storage.data_dir.clone();
     let uid = user_id.clone();
 
-    // How to source one entry's bytes when building the tar.
+    // How to source one entry's bytes when building the tar, as storage-backend
+    // keys (resolved to readable local paths inside the tar-builder task).
     enum DlSource {
-        Blob(PathBuf),
-        Chunks { paths: Vec<PathBuf>, size: u64 },
+        Blob(String),
+        Chunks { keys: Vec<String>, size: u64 },
     }
 
     let mut entries: Vec<(String, DlSource)> = Vec::with_capacity(file_rows.len());
@@ -909,27 +970,36 @@ pub async fn download(
         .map_err(|_| internal())?;
 
         if chunk_rows.is_empty() {
-            entries.push((
-                rel,
-                DlSource::Blob(crate::blobs::blob_path(&data_dir, &uid, &sha)),
-            ));
+            entries.push((rel, DlSource::Blob(crate::store::blob_key(&uid, &sha))));
         } else {
-            let paths = chunk_rows
+            let keys = chunk_rows
                 .iter()
                 .map(|c| {
                     let csha: String = c.get("chunk_sha256");
-                    crate::chunking::chunk_path(&data_dir, &uid, &csha)
+                    crate::store::chunk_key(&uid, &csha)
                 })
                 .collect();
             entries.push((
                 rel,
                 DlSource::Chunks {
-                    paths,
+                    keys,
                     size: size as u64,
                 },
             ));
         }
     }
+
+    // A remote backend streams each needed blob/chunk into this per-download
+    // spool dir under tmp/ (bounded memory — never the whole save in RAM); the
+    // local backend returns the real blob path and spools nothing. Cleaned up
+    // when the tar is done either way.
+    let store = state.store.clone();
+    let spool_dir = state
+        .config
+        .storage
+        .data_dir
+        .join("tmp")
+        .join(format!("dl-{}", Uuid::new_v4()));
 
     // Build a tar.zst stream in a background task and pipe it to the response body.
     let (tx_bytes, rx_bytes) =
@@ -983,14 +1053,50 @@ pub async fn download(
         let zstd = ZstdEncoder::new(writer);
         let mut tar = tokio_tar::Builder::new(zstd);
 
+        // Spool files created for a remote backend; removed after the tar is
+        // built (or on error). Local refs have cleanup=false and never land here.
+        let mut spooled: Vec<PathBuf> = Vec::new();
+
+        // Resolve a storage key to a readable local path (spooling if remote),
+        // recording temporaries for cleanup. On error, emit it and unwind.
+        macro_rules! resolve {
+            ($key:expr) => {
+                match store.local_ref($key, &spool_dir).await {
+                    Ok(r) => {
+                        if r.cleanup {
+                            spooled.push(r.path.clone());
+                        }
+                        r.path
+                    }
+                    Err(e) => {
+                        warn!(error=%e, key=%$key, "blob fetch error");
+                        let io = std::io::Error::other(e.to_string());
+                        let _ = tx_bytes.send(Err(io)).await;
+                        for p in &spooled {
+                            let _ = tokio::fs::remove_file(p).await;
+                        }
+                        let _ = tokio::fs::remove_dir_all(&spool_dir).await;
+                        return;
+                    }
+                }
+            };
+        }
+
         for (rel, source) in &entries {
             let res = match source {
-                DlSource::Blob(blob) => tar.append_path_with_name(blob, rel).await,
-                DlSource::Chunks { paths, size } => {
+                DlSource::Blob(key) => {
+                    let path = resolve!(key);
+                    tar.append_path_with_name(&path, rel).await
+                }
+                DlSource::Chunks { keys, size } => {
                     // Concatenate the chunk files into one tar entry. Each chunk
                     // is ≤ MAX_CHUNK (a few MiB), so streaming them one at a time
                     // never buffers the whole file in RAM.
-                    let stream = futures::stream::iter(paths.clone())
+                    let mut paths: Vec<PathBuf> = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        paths.push(resolve!(k));
+                    }
+                    let stream = futures::stream::iter(paths)
                         .then(|p| async move { tokio::fs::read(&p).await.map(bytes::Bytes::from) })
                         .boxed();
                     let reader = tokio_util::io::StreamReader::new(stream);
@@ -1005,6 +1111,10 @@ pub async fn download(
             if let Err(e) = res {
                 warn!(error=%e, path=%rel, "tar build error");
                 let _ = tx_bytes.send(Err(e)).await;
+                for p in &spooled {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+                let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                 return;
             }
         }
@@ -1014,6 +1124,10 @@ pub async fn download(
             Ok(w) => w,
             Err(e) => {
                 let _ = tx_bytes.send(Err(e)).await;
+                for p in &spooled {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+                let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                 return;
             }
         };
@@ -1021,6 +1135,12 @@ pub async fn download(
         if let Err(e) = tokio::io::AsyncWriteExt::shutdown(&mut zstd_w).await {
             let _ = tx_bytes.send(Err(e)).await;
         }
+
+        // Drop spool files now that the tar has consumed them.
+        for p in &spooled {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&spool_dir).await;
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx_bytes);
@@ -1161,6 +1281,116 @@ pub async fn restore(
     tx.commit().await.map_err(|_| internal())?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Count how many snapshots a hypothetical cap of `cap` would trash for this
+/// user, without touching anything. Same predicate as
+/// [`prune_over_version_cap`]: live, not pinned, with `cap`-or-more newer
+/// live siblings in the same save. Powers the "are you sure?" preview the
+/// panel shows before lowering the cap.
+pub(crate) async fn count_over_version_cap(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    cap: i64,
+) -> anyhow::Result<u64> {
+    let cap = cap.max(1);
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM snapshots s
+          JOIN saves sv ON sv.id = s.save_id
+         WHERE sv.user_id = ?1 AND s.deleted_at IS NULL AND s.is_pinned = 0
+           AND (SELECT COUNT(*) FROM snapshots w
+                 WHERE w.save_id = s.save_id AND w.deleted_at IS NULL
+                   AND w.version_num > s.version_num) >= ?2",
+    )
+    .bind(user_id)
+    .bind(cap)
+    .fetch_one(pool)
+    .await?;
+    Ok(n.max(0) as u64)
+}
+
+/// Enforce the user's "max versions per save" cap (`users.max_versions`,
+/// NULL = unlimited): soft-delete the oldest non-pinned live snapshots so at
+/// most `cap` live ones remain per save. Same trash semantics as a manual
+/// delete — recoverable until `purge_trash` GCs the blobs. `only_save`
+/// narrows the pass to one save (the post-commit hook); `None` sweeps every
+/// save of the user (after lowering the cap). Runtime queries (not the
+/// `query!` macro) so the new column doesn't require regenerating the
+/// offline sqlx cache. Returns how many snapshots were trashed.
+pub(crate) async fn prune_over_version_cap(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    only_save: Option<&str>,
+) -> anyhow::Result<u64> {
+    let cap: Option<i64> = sqlx::query("SELECT max_versions FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .and_then(|r| r.get::<Option<i64>, _>("max_versions"));
+    let Some(cap) = cap else { return Ok(0) };
+    let cap = cap.max(1);
+
+    let save_ids: Vec<String> = match only_save {
+        Some(id) => vec![id.to_string()],
+        None => sqlx::query("SELECT id FROM saves WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("id"))
+            .collect(),
+    };
+
+    let mut pruned = 0u64;
+    for save_id in save_ids {
+        // Victims: live, not pinned, and not among the newest `cap` live
+        // snapshots (the latest is always inside that window, so it never
+        // gets trashed here).
+        let victims: Vec<String> = sqlx::query(
+            "SELECT id FROM snapshots
+             WHERE save_id = ?1 AND deleted_at IS NULL AND is_pinned = 0
+               AND version_num NOT IN (
+                   SELECT version_num FROM snapshots
+                   WHERE save_id = ?1 AND deleted_at IS NULL
+                   ORDER BY version_num DESC LIMIT ?2
+               )",
+        )
+        .bind(&save_id)
+        .bind(cap)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("id"))
+        .collect();
+
+        for snap_id in victims {
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "UPDATE snapshots SET deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&snap_id)
+            .execute(&mut *tx)
+            .await?;
+            let audit_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO audit_log (id, user_id, event_type, entity_id)
+                 VALUES (?,?,'snapshot.pruned',?)",
+            )
+            .bind(&audit_id)
+            .bind(user_id)
+            .bind(&snap_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            pruned += 1;
+        }
+    }
+
+    if pruned > 0 {
+        info!(user = %user_id, pruned, "version cap: trashed snapshots over max_versions");
+    }
+    Ok(pruned)
 }
 
 /// Reduce an arbitrary download filename to a header-safe form. HTTP header

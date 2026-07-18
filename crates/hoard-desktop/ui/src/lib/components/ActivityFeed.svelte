@@ -56,6 +56,8 @@
     backup_too_large: XCircle,
     backup_trimmed: Scissors,
     auto_restore_failed: XCircle,
+    auto_restore_stuck: AlertTriangle,
+    auto_restore_recovered: CheckCircle2,
     storage_purging: Trash2,
     storage_full: AlertTriangle,
     gate_locked: Lock,
@@ -79,6 +81,8 @@
     backup_too_large: "text-rose-400",
     backup_trimmed: "text-amber-300",
     auto_restore_failed: "text-rose-400",
+    auto_restore_stuck: "text-amber-400",
+    auto_restore_recovered: "text-emerald-400",
     storage_purging: "text-amber-400",
     storage_full: "text-rose-400",
     gate_locked: "text-rose-400",
@@ -92,6 +96,10 @@
     backup_too_large: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     auto_restore_failed:
       "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    // Amber, not red: the save still syncs once the cause clears, and the
+    // agent keeps retrying on the escalating backoff.
+    auto_restore_stuck:
+      "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_full: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     backup_trimmed: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
@@ -177,6 +185,12 @@
         return $_("activity.auto_restore_failed", {
           values: { name, error: e.error ?? "" },
         });
+      case "auto_restore_stuck":
+        return $_("activity.auto_restore_stuck", {
+          values: { name, count: e.failures ?? 0, error: e.error ?? "" },
+        });
+      case "auto_restore_recovered":
+        return $_("activity.auto_restore_recovered", { values: { name } });
       case "storage_purging":
         return $_("activity.storage_purging");
       case "storage_full":

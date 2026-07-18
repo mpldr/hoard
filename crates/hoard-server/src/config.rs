@@ -58,6 +58,16 @@ pub struct RateLimitConfig {
     /// sustained rate kicks in.
     #[serde(default = "default_rate_limit_burst")]
     pub burst: u32,
+    /// Per-device cap on the cheap polling endpoints (`/v1/cloud/sync`,
+    /// `/v1/devices`, `/v1/notifications`, `/v1/presence/heartbeat`), in
+    /// requests per minute per (user, device, endpoint). The official client
+    /// polls each at most 1-2×/min, so this only bites modified or
+    /// misconfigured clients hammering the server. `0` disables the guard.
+    /// Separate from the per-IP limit above: that one is loose enough
+    /// (50/s on Fly) to let a whole re-sync burst through, which a single
+    /// runaway poller also fits under.
+    #[serde(default = "default_rate_limit_poll_per_minute")]
+    pub poll_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -66,6 +76,7 @@ impl Default for RateLimitConfig {
             enabled: default_rate_limit_enabled(),
             per_second: default_rate_limit_per_second(),
             burst: default_rate_limit_burst(),
+            poll_per_minute: default_rate_limit_poll_per_minute(),
         }
     }
 }
@@ -79,12 +90,66 @@ fn default_rate_limit_per_second() -> u64 {
 fn default_rate_limit_burst() -> u32 {
     60
 }
+fn default_rate_limit_poll_per_minute() -> u32 {
+    10
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
     pub data_dir: PathBuf,
     pub max_snapshot_size_mb: u64,
     pub upload_timeout_secs: u64,
+    /// Where blob/chunk bytes live: local disk (`"local"`, the default and the
+    /// zero-config upgrade path) or an S3-compatible bucket (`"s3"`, ADR 0020).
+    /// The SQLite index, `tmp/` upload staging and the upgrade marker always
+    /// stay on local disk regardless.
+    #[serde(default)]
+    pub backend: StorageBackend,
+    /// S3 endpoint settings. Required when `backend = "s3"`, ignored otherwise.
+    #[serde(default)]
+    pub s3: Option<S3StorageConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    #[default]
+    Local,
+    S3,
+}
+
+/// Self-hosted S3-compatible storage (MinIO, Backblaze B2, R2, Garage, Wasabi,
+/// or `rclone serve s3` fronting Mega/Dropbox/Drive). Distinct from the
+/// cloud-mode `[cloud.r2]` block — this is for a self-hosted server that wants
+/// its blobs off local disk. Secrets can come from `HOARD__STORAGE__S3__*`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct S3StorageConfig {
+    /// Full endpoint URL, e.g. `http://localhost:9000` (MinIO) or
+    /// `https://s3.us-west-002.backblazeb2.com`.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub bucket: String,
+    /// Some services ignore region; leave empty to default to `auto`.
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    /// Optional prefix prepended to every object key (share one bucket across
+    /// deployments). Empty by default.
+    #[serde(default)]
+    pub key_prefix: String,
+    /// Path-style addressing (`endpoint/bucket/key`). Default true — MinIO,
+    /// Garage and `rclone serve s3` require it; leave true unless your provider
+    /// mandates virtual-host style.
+    #[serde(default = "default_force_path_style")]
+    pub force_path_style: bool,
+}
+
+fn default_force_path_style() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -208,6 +273,76 @@ pub struct CloudConfig {
     /// ZIP surfaced in-app — it just skips the email leg.
     #[serde(default)]
     pub email: EmailConfig,
+    /// At-rest zstd compression of content-addressed blobs (cost saver:
+    /// R2 bills physical bytes, quota keeps charging raw bytes). Off by
+    /// default; enable in dev first. Fields from `HOARD__CLOUD__COMPRESSION__*`.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+}
+
+/// Background blob-compression sweep settings. Purely server-side: clients
+/// keep uploading raw bytes to presigned PUTs and keep receiving raw bytes
+/// on download (compressed blobs are served through the decompressing
+/// `/v1/cloud/blob/:token` proxy instead of a direct presigned GET).
+/// Deliberately undocumented in the example config — it's internal storage
+/// maintenance, not an operator feature; override via
+/// `HOARD__CLOUD__COMPRESSION__*` env vars if ever needed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompressionConfig {
+    /// Master switch. On by default: steady state is "every blob older than
+    /// `min_age_hours` is compressed".
+    #[serde(default = "default_compression_enabled")]
+    pub enabled: bool,
+    /// Only compress blobs at least this old. New blobs are the ones a
+    /// freshly-synced device is most likely to pull; leave them on the
+    /// direct presigned path for a while.
+    #[serde(default = "default_compression_min_age_hours")]
+    pub min_age_hours: u64,
+    /// Skip blobs that had a download URL minted within this window, so an
+    /// in-flight direct GET can never race the object overwrite.
+    #[serde(default = "default_compression_idle_hours")]
+    pub idle_hours: u64,
+    /// Blobs compressed per sweep tick.
+    #[serde(default = "default_compression_batch")]
+    pub batch: u32,
+    /// Seconds between sweep ticks.
+    #[serde(default = "default_compression_sweep_secs")]
+    pub sweep_secs: u64,
+    /// zstd level (1-21). 9 is a good size/CPU balance for a background job.
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_compression_enabled(),
+            min_age_hours: default_compression_min_age_hours(),
+            idle_hours: default_compression_idle_hours(),
+            batch: default_compression_batch(),
+            sweep_secs: default_compression_sweep_secs(),
+            level: default_compression_level(),
+        }
+    }
+}
+
+fn default_compression_enabled() -> bool {
+    true
+}
+fn default_compression_min_age_hours() -> u64 {
+    72
+}
+fn default_compression_idle_hours() -> u64 {
+    24
+}
+fn default_compression_batch() -> u32 {
+    50
+}
+fn default_compression_sweep_secs() -> u64 {
+    300
+}
+fn default_compression_level() -> i32 {
+    9
 }
 
 /// Resend transactional-email settings. Fields usually come from
@@ -452,7 +587,10 @@ impl Config {
                         self.storage.data_dir.display()
                     );
                 }
-                // Check write permission by attempting to create a temp file
+                // Check write permission by attempting to create a temp file.
+                // `data_dir` is still required for the s3 backend — tmp upload
+                // staging, the SQLite DB and the upgrade marker live here — so
+                // this applies regardless of `storage.backend`.
                 let probe = self.storage.data_dir.join(".hoard_write_probe");
                 std::fs::write(&probe, b"").with_context(|| {
                     format!(
@@ -461,6 +599,29 @@ impl Config {
                     )
                 })?;
                 std::fs::remove_file(&probe).ok();
+
+                // S3 blob backend (ADR 0020): validate config shape here; the
+                // async reachability probe (bucket write+delete) runs at
+                // startup in `store::build_store`.
+                if self.storage.backend == StorageBackend::S3 {
+                    #[cfg(not(feature = "s3-backend"))]
+                    anyhow::bail!(
+                        "storage.backend = \"s3\" requires building with --features s3-backend"
+                    );
+                    #[cfg(feature = "s3-backend")]
+                    {
+                        let s3 = self.storage.s3.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "storage.backend = \"s3\" requires an [storage.s3] section in config"
+                            )
+                        })?;
+                        if s3.endpoint.is_empty() || s3.bucket.is_empty() {
+                            anyhow::bail!(
+                                "storage.s3.endpoint and storage.s3.bucket are required for the s3 backend"
+                            );
+                        }
+                    }
+                }
             }
             DbBackend::Postgres => {
                 // Cloud mode: storage is R2, not disk. data_dir may still be

@@ -407,12 +407,16 @@ pub async fn commit_upload(
     }
 
     // Reclaim space if over the plan threshold (purges old content-addressed
-    // versions; off the response path).
+    // versions; off the response path). Then enforce the user's own
+    // max-versions cap on the fresh history.
     let st = state.clone();
     let uid = user.user_id;
     tokio::spawn(async move {
         if let Err(e) = crate::cloud::purge::maybe_purge(&st, uid).await {
             tracing::warn!(error = ?e, user_id = %uid, "quota purge after commit failed");
+        }
+        if let Err(e) = crate::cloud::purge::prune_version_caps(&st, uid).await {
+            tracing::warn!(error = ?e, user_id = %uid, "version-cap prune after commit failed");
         }
     });
 
@@ -992,11 +996,15 @@ pub async fn cas_commit(
 
     // Reclaim space if this commit pushed the user over their plan threshold.
     // Off the response path: a slow R2 delete sweep mustn't delay the client.
+    // Then enforce the user's own max-versions cap on the fresh history.
     let st = state.clone();
     let uid = user.user_id;
     tokio::spawn(async move {
         if let Err(e) = crate::cloud::purge::maybe_purge(&st, uid).await {
             tracing::warn!(error = ?e, user_id = %uid, "quota purge after commit failed");
+        }
+        if let Err(e) = crate::cloud::purge::prune_version_caps(&st, uid).await {
+            tracing::warn!(error = ?e, user_id = %uid, "version-cap prune after commit failed");
         }
     });
 
@@ -1047,9 +1055,9 @@ pub async fn version_manifest(
     Path((save_id, version)): Path<(String, i64)>,
     axum::extract::Query(q): axum::extract::Query<ManifestQuery>,
 ) -> Result<Response, CloudError> {
-    let vrow: Option<(Uuid, bool)> = sqlx::query_as(
+    let vrow: Option<(Uuid, String, bool)> = sqlx::query_as(
         r#"
-        SELECT s.user_id, sv.content_addressed
+        SELECT s.user_id, s.game_slug, sv.content_addressed
           FROM save_versions sv
           JOIN saves s ON s.id = sv.save_id
          WHERE sv.save_id = $1 AND sv.version_num = $2
@@ -1059,7 +1067,7 @@ pub async fn version_manifest(
     .bind(version)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((owner, content_addressed)) = vrow else {
+    let Some((owner, game_slug, content_addressed)) = vrow else {
         return Err(CloudError::NotFound("version not found"));
     };
     if owner != user.user_id {
@@ -1119,16 +1127,61 @@ pub async fn version_manifest(
         return Ok(resp);
     }
 
+    // Blobs the compression sweep claimed are served through the
+    // decompressing proxy instead of a direct presigned GET (the object may
+    // hold zstd bytes; the client must keep receiving raw). Everything else
+    // stays on the presigned path.
+    let shas: Vec<String> = unique_size.keys().cloned().collect();
+    let compressed: std::collections::BTreeSet<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT sha256 FROM cloud_blobs
+            WHERE user_id = $1 AND sha256 = ANY($2) AND encoding = 'zstd'",
+    )
+    .bind(user.user_id)
+    .bind(&shas)
+    .fetch_all(&state.pool)
+    .await?
+    .into_iter()
+    .map(|(s,)| s)
+    .collect();
+
+    let ttl_secs = state
+        .config
+        .cloud
+        .as_ref()
+        .map(|c| c.r2.presign_ttl_secs)
+        .unwrap_or(3600);
+    let public_base = state.config.server.public_url.trim_end_matches('/');
+
     let mut url_for: BTreeMap<String, r2::PresignedUrl> = BTreeMap::new();
     for sha in unique_size.keys() {
-        let key = r2::key_for_blob(user.user_id, sha);
-        let presigned = state
-            .r2
-            .presign_get(&key, None)
-            .await
-            .map_err(CloudError::Internal)?;
+        let presigned = if compressed.contains(sha) {
+            let token = super::blob_proxy::mint_token(&state, user.user_id, sha, ttl_secs);
+            r2::PresignedUrl {
+                method: "GET".to_string(),
+                url: format!("{public_base}/v1/cloud/blob/{token}"),
+                expires_in_secs: ttl_secs,
+            }
+        } else {
+            let key = r2::key_for_blob(user.user_id, sha);
+            state
+                .r2
+                .presign_get(&key, None)
+                .await
+                .map_err(CloudError::Internal)?
+        };
         url_for.insert(sha.clone(), presigned);
     }
+
+    // Stamp the download so the sweep won't overwrite an object while a
+    // just-minted direct URL might still be in flight.
+    sqlx::query(
+        "UPDATE cloud_blobs SET last_presigned_at = now()
+            WHERE user_id = $1 AND sha256 = ANY($2)",
+    )
+    .bind(user.user_id)
+    .bind(&shas)
+    .execute(&state.pool)
+    .await?;
 
     sqlx::query(
         "INSERT INTO sync_log (user_id, save_id, version_num, kind, bytes)
@@ -1140,6 +1193,7 @@ pub async fn version_manifest(
     .bind(download_bytes as i64)
     .execute(&state.pool)
     .await?;
+    warn_on_repeat_download(&state, user.user_id, &save_id, &game_slug, version).await;
     if let Err(e) = bandwidth::record(&state.pool, user.user_id, download_bytes).await {
         tracing::warn!(error = %e, user_id = %user.user_id, "bandwidth: record failed on cas manifest");
     }
@@ -1177,9 +1231,9 @@ pub async fn download(
     Extension(user): Extension<CloudUser>,
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Response, CloudError> {
-    let row: Option<(Uuid, String, String, i64, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, String, String, String, i64, bool)> = sqlx::query_as(
         r#"
-        SELECT s.user_id, sv.r2_key, sv.sha256, sv.size_bytes, sv.content_addressed
+        SELECT s.user_id, s.game_slug, sv.r2_key, sv.sha256, sv.size_bytes, sv.content_addressed
           FROM save_versions sv
           JOIN saves s ON s.id = sv.save_id
          WHERE sv.save_id = $1 AND sv.version_num = $2
@@ -1190,7 +1244,7 @@ pub async fn download(
     .bind(version)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((owner, r2_key, sha256, size, content_addressed)) = row else {
+    let Some((owner, game_slug, r2_key, sha256, size, content_addressed)) = row else {
         return Err(CloudError::NotFound("version not found"));
     };
     if owner != user.user_id {
@@ -1232,6 +1286,7 @@ pub async fn download(
     .bind(size)
     .execute(&state.pool)
     .await?;
+    warn_on_repeat_download(&state, user.user_id, &save_id, &game_slug, version).await;
 
     if let Err(e) = bandwidth::record(&state.pool, user.user_id, size.max(0) as u64).await {
         tracing::warn!(error = %e, user_id = %user.user_id, "bandwidth: record failed on download");
@@ -1671,6 +1726,78 @@ async fn log_sync_block(
     .await
     {
         tracing::warn!(error = %e, %user_id, %kind, "failed to record sync block in sync_log");
+    }
+}
+
+/// How many downloads of the *same* (user, save, version) inside 24h stop
+/// looking like a user and start looking like a loop.
+///
+/// Deliberately lax, because it's allowed to be: this only writes a log line.
+/// Re-restoring one version two or three times in a day is ordinary — testing a
+/// save, hopping between machines, undoing a bad session. By five there's no
+/// benign reading left. A false positive costs one WARN; a false negative cost
+/// us eight days and ~60 GB/day of the July-2026 incident, so if this number is
+/// wrong it's wrong on the high side.
+///
+/// Note the interaction with the client-side escalating backoff (hoard-agent's
+/// `AUTO_RESTORE_FAILURE_BACKOFF_SECS`): a *fixed* client now retries ~24×/day
+/// at worst, not ~1440×, so reaching 5 takes far longer than it did during the
+/// incident. That's the point — the threshold still trips, but tripping now
+/// means "this has been broken for a while", which is exactly the signal an
+/// operator wants. An old or third-party client with no backoff still trips it
+/// within minutes.
+const REPEAT_DOWNLOAD_WARN_THRESHOLD: i64 = 5;
+
+/// Emit an operator signal when the same save version is downloaded over and
+/// over by the same user inside 24h.
+///
+/// Deliberately *only* a log line: no 429, no block. A user may legitimately
+/// re-restore, and the failure mode we're guarding against (a client stuck in a
+/// retry loop) is the client's bug to fix — the server's job here is to stop it
+/// being invisible. Logs are the operator's alerting surface today.
+///
+/// Best-effort by construction: if the count query hiccups we log at debug and
+/// move on. Failing a paid download because an observability query timed out
+/// would be a worse bug than the one this detects.
+async fn warn_on_repeat_download(
+    state: &CloudState,
+    user_id: Uuid,
+    save_id: &str,
+    game_slug: &str,
+    version: i64,
+) {
+    // Counts the row the caller just inserted, so `n` is "including this one".
+    // Backed by idx_sync_log_repeat_download (migration 0034).
+    let row: Result<(i64,), _> = sqlx::query_as(
+        "SELECT count(*) FROM sync_log
+             WHERE user_id = $1 AND save_id = $2 AND version_num = $3
+               AND kind = 'download' AND at > now() - interval '24 hours'",
+    )
+    .bind(user_id)
+    .bind(save_id)
+    .bind(version)
+    .fetch_one(&state.pool)
+    .await;
+    match row {
+        Ok((n,)) if n >= REPEAT_DOWNLOAD_WARN_THRESHOLD => {
+            tracing::warn!(
+                %user_id,
+                %save_id,
+                %game_slug,
+                version_num = version,
+                downloads_24h = n,
+                "cloud: repeated downloads of the same save version — possible client restore loop"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                %user_id,
+                %save_id,
+                "cloud: repeat-download counter query failed; ignoring"
+            );
+        }
     }
 }
 

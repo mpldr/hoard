@@ -1,3 +1,4 @@
+pub mod blob_proxy;
 pub mod checkout;
 pub mod device;
 pub mod entitlements;

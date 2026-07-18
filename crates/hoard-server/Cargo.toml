@@ -14,17 +14,27 @@ name = "hoard-server"
 path = "src/main.rs"
 
 [features]
-# `cloud` toggles SaaS mode: Postgres backend, Supabase JWT auth,
-# Cloudflare R2 storage, Lemon Squeezy webhooks. With the feature OFF
-# the binary stays 100% self-hosted (SQLite + bearer tokens + disk
-# storage) and none of the cloud deps compile.
-default = []
-cloud = [
-    "sqlx/postgres",
+# `s3-backend` lets a *self-hosted* server store its blob/chunk bytes on any
+# S3-compatible endpoint (MinIO, B2, R2, Garage, Wasabi, or `rclone serve s3`)
+# instead of local disk, selected via `[storage] backend = "s3"`. It pulls in
+# the (heavy) aws-sdk-s3 stack, so it's a feature — on in `default` for release
+# builds, off under `--no-default-features` for a lean disk-only binary. It
+# provides the shared S3 client that `cloud` also builds on.
+#
+# `cloud` toggles SaaS mode: Postgres backend, Supabase JWT auth, Cloudflare R2
+# storage, Polar webhooks. With BOTH features OFF the binary stays 100%
+# self-hosted (SQLite + bearer tokens + disk storage) and none of the aws deps
+# compile.
+default = ["s3-backend"]
+s3-backend = [
     "dep:aws-sdk-s3",
     "dep:aws-config",
     "dep:aws-credential-types",
     "dep:aws-smithy-runtime-api",
+]
+cloud = [
+    "s3-backend",
+    "sqlx/postgres",
     "dep:jsonwebtoken",
     "dep:hmac",
     "dep:base64",
@@ -64,6 +74,10 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+# Object-safe async trait for the `BlobStore` abstraction (local disk vs S3).
+# Already in the tree transitively (aws-sdk-s3, sqlx); naming it directly just
+# lets us derive `#[async_trait]` on our own trait.
+async-trait = { workspace = true }
 
 # Release signature verification for `hoard-server upgrade`. Pure-Rust
 # Ed25519 minisign verifier — no libsodium link. See ADR 0017.
@@ -97,3 +111,7 @@ ignored = ["aws-smithy-runtime-api"]
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# Used by the S3 backend integration test (tests/s3_backend.rs).
+uuid = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }

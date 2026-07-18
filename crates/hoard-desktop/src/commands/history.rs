@@ -177,6 +177,43 @@ pub async fn delete_snapshot(
         .map_err(pretty_error)
 }
 
+/// Current per-user "max versions per save" cap. `None` = unlimited.
+#[tauri::command]
+pub async fn get_max_versions(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    let client = current_client(&state)?;
+    client.get_max_versions().await.map_err(pretty_error)
+}
+
+/// Dry-run: how many stored versions a cap of `max_versions` would delete
+/// right now. The panel shows this in a confirmation dialog before applying
+/// a cap that would actually prune something.
+#[tauri::command]
+pub async fn preview_max_versions(
+    max_versions: i64,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let client = current_client(&state)?;
+    client
+        .preview_max_versions(max_versions)
+        .await
+        .map_err(pretty_error)
+}
+
+/// Set (`Some(n)`) or clear (`None`) the per-user cap on stored versions per
+/// save. The server prunes immediately, so History and the quota bar reflect
+/// the change on their next refresh.
+#[tauri::command]
+pub async fn set_max_versions(
+    max_versions: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let client = current_client(&state)?;
+    client
+        .set_max_versions(max_versions)
+        .await
+        .map_err(pretty_error)
+}
+
 /// Pull a snapshot back out of the trash. Inverse of `delete_snapshot`.
 #[tauri::command]
 pub async fn undelete_snapshot(

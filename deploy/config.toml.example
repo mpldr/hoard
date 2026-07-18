@@ -34,13 +34,33 @@ per_second = 20
 burst = 60
 
 [storage]
-# Directory where all user data, temp uploads and trash are stored.
-# Must be writable by the hoard user.
+# Directory where the SQLite DB, temp upload staging and (with the default
+# local backend) all blob/chunk bytes are stored. Must be writable by the
+# hoard user. The DB, tmp/ staging and the upgrade marker ALWAYS live here,
+# even when blobs go to S3.
 data_dir = "/var/lib/hoard"
 # Maximum size of a single snapshot upload in megabytes.
 max_snapshot_size_mb = 1024
 # How long in seconds a client has to finish an upload.
 upload_timeout_secs = 600
+# Where blob/chunk bytes live: "local" (default — on disk under data_dir) or
+# "s3" (any S3-compatible endpoint, see [storage.s3] below). Existing installs
+# upgrade with zero changes: omit this and you stay on local disk.
+# backend = "local"
+
+# External S3-compatible object storage (MinIO, Backblaze B2, Cloudflare R2,
+# Garage, Wasabi, or `rclone serve s3` fronting Mega/Dropbox/Drive). Only read
+# when backend = "s3". The server stays mandatory: it keeps the SQLite index,
+# auth and deduplication — the bucket only holds opaque zstd blob/chunk bytes
+# and is NOT restorable on its own without the server's database.
+# [storage.s3]
+# endpoint = "http://127.0.0.1:9000"        # MinIO example
+# bucket = "hoard"
+# region = ""                                # blank → "auto" (most ignore it)
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+# key_prefix = ""                            # optional prefix on every object
+# force_path_style = true                    # MinIO/Garage/rclone need true
 
 [database]
 # SQLite database URL. Use an absolute path.

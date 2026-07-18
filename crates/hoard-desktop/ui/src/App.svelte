@@ -75,6 +75,7 @@ import { tilt } from "./lib/actions/tilt";
   } from "./lib/stores/automatic";
   import { toastInfo, toastSuccess } from "./lib/stores/toasts";
   import { prefs, hydratePrefs } from "./lib/stores/prefs";
+  import { hydrateCardSizes } from "./lib/stores/cardSizes.svelte";
   import {
     entitlements,
     refreshEntitlements,
@@ -433,6 +434,7 @@ import { tilt } from "./lib/actions/tilt";
     // values the moment the boot blank lifts. `hydratePrefs` swallows its
     // own errors and falls back to pessimistic defaults.
     await hydratePrefs();
+    await hydrateCardSizes();
     // `automaticMode` / `globalSync` are $derived from `$prefs` above, so they
     // populate on their own once hydratePrefs resolves — no manual seed here.
 

@@ -259,6 +259,10 @@ pub async fn start_agent(
                 AgentEvent::HeavyProcessDetected { .. } => "agent://heavy-process-detected",
                 // Emitted for parity with the CLI feed; no UI listens yet.
                 AgentEvent::RestoreDeferred { .. } => "agent://restore-deferred",
+                AgentEvent::SaveAutoRestoreStuck { .. } => "agent://save-auto-restore-stuck",
+                AgentEvent::SaveAutoRestoreRecovered { .. } => {
+                    "agent://save-auto-restore-recovered"
+                }
             };
             let _ = app_for_emit.emit(topic, &ev);
 

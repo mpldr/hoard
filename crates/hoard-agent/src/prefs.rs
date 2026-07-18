@@ -18,6 +18,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Fixed cadence for the `/v1/cloud/sync` airbag poll (desktop poller and
+/// CLI daemon). Deliberately **not** a pref: Realtime push is the primary
+/// trigger and the poll only catches the rare missed push, so there's no
+/// user-visible gain in going faster — but a hand-edited `prefs.json`
+/// could hammer the server (2 s ≈ 43k req/day per client). Server cost is
+/// not a user knob. Was `cloud_poll_interval_secs` in prefs; old files
+/// keep loading because serde ignores unknown keys.
+pub const CLOUD_POLL_INTERVAL_SECS: u32 = 60;
+
 /// Persisted user preferences. New fields default to safe values so older
 /// `prefs.json` files keep loading after an upgrade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,18 +179,6 @@ pub struct Prefs {
     #[serde(default)]
     pub cloud_savings_mode: bool,
 
-    /// How often the desktop pulls `/v1/cloud/sync` to learn what other
-    /// devices have uploaded. Cheap call (<5 KB manifest, not counted
-    /// against the bandwidth quota). Since 2.4.0 this is the relaxed *backup*
-    /// ("airbag") cadence: the Supabase Realtime push (`cloud_realtime`) is the
-    /// primary near-instant trigger, so the poll only has to catch the rare
-    /// missed push, hence a 60 s default instead of the old 10 s. Range
-    /// 5..=300 s; the Settings slider in Cloud section persists this. Decoupled
-    /// from the `automatic_backup_interval_secs` sweep because that one
-    /// re-hashes save bytes and only makes sense at the hourly scale.
-    #[serde(default = "default_cloud_poll_interval_secs")]
-    pub cloud_poll_interval_secs: u32,
-
     /// When `true`, the floating ActivityFeed panel is rendered next to
     /// the sidebar so the user sees a live stream of upload / pull /
     /// throttle events. Default `true` — it's the most useful first
@@ -217,10 +214,6 @@ fn default_conflict_retention_days() -> u32 {
     14
 }
 
-fn default_cloud_poll_interval_secs() -> u32 {
-    60
-}
-
 fn default_data_saving() -> f64 {
     0.3
 }
@@ -254,7 +247,6 @@ impl Default for Prefs {
             automatic_backup_interval_secs: default_backup_interval_secs(),
             conflict_retention_days: default_conflict_retention_days(),
             cloud_savings_mode: false,
-            cloud_poll_interval_secs: default_cloud_poll_interval_secs(),
             live_activity_visible: true,
             data_saving: default_data_saving(),
         }
@@ -411,9 +403,8 @@ mod tests {
         assert_eq!(p.automatic_backup_interval_secs, 3600);
         // 1.5.5: conflict backups retained for 14 days by default.
         assert_eq!(p.conflict_retention_days, 14);
-        // 1.7.0: cloud-pull poller on by default; activity feed on. 2.4.0:
-        // relaxed 10 s → 60 s now that Realtime push is the primary trigger.
-        assert_eq!(p.cloud_poll_interval_secs, 60);
+        // 1.7.0: cloud-pull poller on by default; activity feed on. The poll
+        // cadence stopped being a pref (fixed CLOUD_POLL_INTERVAL_SECS).
         assert!(p.live_activity_visible);
         // Storage-efficiency: "ahorro de datos" defaults to 0.3 (ADR 0018).
         assert_eq!(p.data_saving, 0.3);

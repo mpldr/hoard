@@ -80,6 +80,67 @@
   let deleteTarget = $state<SnapshotEntry | null>(null);
   let deleting = $state(false);
 
+  // Multi-select for bulk deletion. Keys are version numbers; only live
+  // (non-trashed) rows are selectable. Cleared on every hydrate so a stale
+  // selection can never reference versions that no longer exist.
+  let selected = $state<Set<number>>(new Set());
+  let bulkConfirm = $state(false);
+  let bulkDeleting = $state(false);
+
+  const selectableVersions = $derived(
+    snapshots.filter((s) => !s.deleted_at).map((s) => s.version_num),
+  );
+  const allSelected = $derived(
+    selectableVersions.length > 0 &&
+      selectableVersions.every((v) => selected.has(v)),
+  );
+
+  function toggleSelected(version: number) {
+    const next = new Set(selected);
+    if (next.has(version)) next.delete(version);
+    else next.add(version);
+    selected = next;
+  }
+
+  function toggleSelectAll() {
+    selected = allSelected ? new Set() : new Set(selectableVersions);
+  }
+
+  async function confirmBulkDelete() {
+    if (selected.size === 0) return;
+    bulkDeleting = true;
+    // Oldest first, so a mid-loop failure leaves the newest history intact.
+    const versions = [...selected].sort((a, b) => a - b);
+    let failed = 0;
+    try {
+      for (const version of versions) {
+        try {
+          await api.deleteSnapshot(saveId, version);
+        } catch (e) {
+          failed += 1;
+          console.warn(`bulk delete: v${version} failed:`, e);
+        }
+      }
+      if (failed > 0) {
+        toastError(
+          $_("history.bulk_delete_partial", {
+            values: { done: versions.length - failed, failed },
+          }),
+        );
+      } else {
+        toastSuccess(
+          $_("history.bulk_deleted_toast", {
+            values: { count: versions.length },
+          }),
+        );
+      }
+      bulkConfirm = false;
+      await hydrate();
+    } finally {
+      bulkDeleting = false;
+    }
+  }
+
   let editingPath = $state(false);
   let newPath = $state("");
   let savingPath = $state(false);
@@ -122,6 +183,7 @@
 
   async function hydrate() {
     loading = true;
+    selected = new Set();
     try {
       const [tracked, snaps] = await Promise.all([
         api.listTrackedSaves(),
@@ -592,22 +654,65 @@
       {/if}
     </header>
 
-    <section class="mb-3 flex items-center justify-between">
+    <section class="mb-3 flex flex-wrap items-center justify-between gap-2">
       <h2 class="flex items-center gap-2 text-sm font-medium text-zinc-300">
         <HistoryIcon size={14} class="text-zinc-500" />
         {$_("history.versions")}
       </h2>
-      <label class="flex items-center gap-2 text-xs text-zinc-400">
-        <input
-          type="checkbox"
-          class="h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
-          checked={includeDeleted}
-          onchange={(e) =>
-            (includeDeleted = (e.currentTarget as HTMLInputElement).checked)}
-        />
-        {$_("history.show_recoverable")}
-      </label>
+      <div class="flex items-center gap-4">
+        {#if selectableVersions.length > 0}
+          <label class="flex items-center gap-2 text-xs text-zinc-400">
+            <input
+              type="checkbox"
+              class="h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+              checked={allSelected}
+              onchange={toggleSelectAll}
+            />
+            {$_("history.select_all")}
+          </label>
+        {/if}
+        <label class="flex items-center gap-2 text-xs text-zinc-400">
+          <input
+            type="checkbox"
+            class="h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+            checked={includeDeleted}
+            onchange={(e) =>
+              (includeDeleted = (e.currentTarget as HTMLInputElement).checked)}
+          />
+          {$_("history.show_recoverable")}
+        </label>
+      </div>
     </section>
+
+    {#if selected.size > 0}
+      <!-- Bulk action bar: appears as soon as one version is ticked. -->
+      <div
+        class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-rose-500/25 bg-rose-500/[0.06] px-3 py-2"
+      >
+        <span class="text-xs text-rose-200">
+          {$_("history.selected_count", { values: { count: selected.size } })}
+        </span>
+        <div class="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="md"
+            onclick={() => (selected = new Set())}
+            disabled={bulkDeleting}
+          >
+            {$_("common.cancel")}
+          </Button>
+          <Button
+            variant="danger"
+            size="md"
+            onclick={() => (bulkConfirm = true)}
+            loading={bulkDeleting}
+          >
+            <Trash2 size={12} />
+            {$_("history.delete_selected")}
+          </Button>
+        </div>
+      </div>
+    {/if}
 
     {#if snapshots.length === 0}
       <Card>
@@ -630,6 +735,17 @@
               {isDeleted ? 'opacity-60' : ''}"
           >
             <div class="flex items-center gap-3 px-4 py-3">
+              {#if !isDeleted}
+                <input
+                  type="checkbox"
+                  class="h-3.5 w-3.5 shrink-0 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+                  checked={selected.has(snap.version_num)}
+                  onchange={() => toggleSelected(snap.version_num)}
+                  aria-label={$_("history.select_version", {
+                    values: { version: snap.version_num },
+                  })}
+                />
+              {/if}
               <button
                 type="button"
                 onclick={() => toggleExpanded(snap.version_num)}
@@ -906,6 +1022,46 @@
       variant={$isCloudLoggedIn ? "danger" : "primary"}
       onclick={confirmDelete}
       loading={deleting}
+    >
+      {$isCloudLoggedIn
+        ? $_("history.cloud_delete_confirm")
+        : $_("history.send_to_trash")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<!-- Bulk delete confirmation -->
+<Modal
+  open={bulkConfirm}
+  title={$_("history.bulk_delete_title", {
+    values: { count: selected.size },
+  })}
+  description={$isCloudLoggedIn
+    ? $_("history.cloud_delete_description")
+    : $_("history.delete_description")}
+  dismissible={!bulkDeleting}
+  onClose={() => {
+    if (!bulkDeleting) bulkConfirm = false;
+  }}
+>
+  <p class="text-sm text-zinc-300">
+    {$_("history.bulk_delete_body", { values: { count: selected.size } })}
+    {$isCloudLoggedIn
+      ? $_("history.cloud_delete_body")
+      : $_("history.delete_body")}
+  </p>
+  {#snippet footer()}
+    <Button
+      variant="secondary"
+      onclick={() => (bulkConfirm = false)}
+      disabled={bulkDeleting}
+    >
+      {$_("common.cancel")}
+    </Button>
+    <Button
+      variant={$isCloudLoggedIn ? "danger" : "primary"}
+      onclick={confirmBulkDelete}
+      loading={bulkDeleting}
     >
       {$isCloudLoggedIn
         ? $_("history.cloud_delete_confirm")

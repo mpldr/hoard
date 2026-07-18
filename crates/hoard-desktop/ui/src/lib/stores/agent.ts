@@ -64,6 +64,26 @@ export type SaveActivity = {
 type ActivityMap = Record<string, SaveActivity>;
 
 export const activity: Writable<ActivityMap> = writable({});
+
+/** A save whose cloud auto-restore keeps failing on the same version. */
+export type StuckRestore = {
+  /** Consecutive failures, so the badge can say "3×" and read as a pattern. */
+  failures: number;
+  /** Last error chain — the badge's tooltip, so the user sees *why*. */
+  error: string;
+};
+
+/** Saves currently stuck on a failing cloud restore, keyed by `save_id`.
+ *
+ * Deliberately separate from `activity`: that map tracks the *current* backup
+ * lifecycle and gets overwritten by the next event, whereas this is a sticky
+ * condition that must outlive unrelated activity. It's the persistent half of
+ * the July-2026 fix — the transient toast is what let a save silently fail to
+ * sync for eight days. Cleared only by a recovery (success or a new cloud
+ * version), never by time passing. */
+export const restoreStuck: Writable<Record<string, StuckRestore>> = writable(
+  {},
+);
 export const status: Writable<AgentStatus> = writable({
   running: false,
   watched_count: 0,
@@ -202,6 +222,37 @@ function applyEvent(ev: AgentEvent) {
       // source; genuine per-save failures still land in the feed.
       break;
     }
+    case "save_auto_restore_stuck": {
+      // The agent only sends this once per (save, version), after repeated
+      // failures — so it's rare enough to deserve a notification, and the
+      // Library card keeps an amber badge until it recovers.
+      restoreStuck.update((m) => ({
+        ...m,
+        [ev.save_id]: { failures: ev.failures, error: ev.error },
+      }));
+      // Honour the same pref as backup failures: the card badge is the part
+      // the user can't miss, so a silenced notification loses nothing.
+      const $prefs = get(prefs);
+      if ($prefs?.notify_on_failure) {
+        const t = get(i18n);
+        notify(
+          t("library.restore_stuck_notify_title"),
+          t("library.restore_stuck_notify_body", {
+            values: { name: ev.game_slug, count: ev.failures },
+          }),
+        );
+      }
+      break;
+    }
+    case "save_auto_restore_recovered": {
+      restoreStuck.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const next = { ...m };
+        delete next[ev.save_id];
+        return next;
+      });
+      break;
+    }
     case "backup_too_large": {
       // The save is bigger than the plan's per-save cap, so it can never
       // upload as-is. Not a transient failure and not "retrying" — show an
@@ -279,6 +330,8 @@ export async function subscribeAgent() {
     "agent://backup-trimmed",
     "agent://save-auto-restored",
     "agent://save-auto-restore-failed",
+    "agent://save-auto-restore-stuck",
+    "agent://save-auto-restore-recovered",
     "agent://backup-skipped-empty",
   ];
   unlisteners = await Promise.all(

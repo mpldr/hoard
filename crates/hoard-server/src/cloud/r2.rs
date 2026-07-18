@@ -1,8 +1,9 @@
 //! Cloudflare R2 client (S3-compatible).
 //!
 //! R2 speaks the S3 API with a custom endpoint and inline access-key creds.
-//! We use `aws-sdk-s3` and force the endpoint to R2's URL. The bucket lives
-//! in `cfg.cloud.r2.bucket`.
+//! The object plumbing (put/get/head/delete + streaming) lives in the shared
+//! [`crate::s3`] module — this wrapper adds only the R2-specific extras:
+//! presigned URLs and the cloud key builders.
 //!
 //! Why presigned URLs: snapshots can be 50+ MB. Funneling those bytes
 //! through Fly.io's machines wastes egress (cheap with R2 but not free for
@@ -11,17 +12,13 @@
 //! endpoint that records the version.
 
 use anyhow::{Context, Result};
-use aws_credential_types::Credentials;
-use aws_sdk_s3::{
-    config::{BehaviorVersion, Region},
-    presigning::PresigningConfig,
-    Client,
-};
+use aws_sdk_s3::presigning::PresigningConfig;
 use std::time::Duration;
 
+use crate::s3::{S3, S3Params};
+
 pub struct R2Store {
-    client: Client,
-    bucket: String,
+    inner: S3,
     default_presign_ttl: Duration,
 }
 
@@ -32,34 +29,18 @@ impl R2Store {
         if cfg.endpoint.is_empty() || cfg.bucket.is_empty() {
             anyhow::bail!("cloud.r2.endpoint and cloud.r2.bucket are required");
         }
-        let creds = Credentials::new(
-            cfg.access_key_id.clone(),
-            cfg.secret_access_key.clone(),
-            None,
-            None,
-            "hoard-r2-static",
-        );
-        let region = if cfg.region.is_empty() {
-            // R2 ignores region for the most part but the SDK requires one.
-            "auto".to_string()
-        } else {
-            cfg.region.clone()
-        };
-        let sdk_conf = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(region))
-            .credentials_provider(creds)
-            .endpoint_url(cfg.endpoint.clone())
-            .load()
-            .await;
-
-        let s3_conf = aws_sdk_s3::config::Builder::from(&sdk_conf)
-            .force_path_style(true)
-            .build();
-        let client = Client::from_conf(s3_conf);
-
-        Ok(Self {
-            client,
+        let inner = S3::connect(S3Params {
+            endpoint: cfg.endpoint.clone(),
             bucket: cfg.bucket.clone(),
+            region: cfg.region.clone(),
+            access_key_id: cfg.access_key_id.clone(),
+            secret_access_key: cfg.secret_access_key.clone(),
+            // R2 requires path-style addressing.
+            force_path_style: true,
+        })
+        .await?;
+        Ok(Self {
+            inner,
             default_presign_ttl: Duration::from_secs(cfg.presign_ttl_secs.max(60)),
         })
     }
@@ -68,97 +49,52 @@ impl R2Store {
     /// server constructs itself. For user-uploaded snapshots, prefer
     /// `presign_put`.
     pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(body.into())
-            .send()
-            .await
-            .with_context(|| format!("r2 put_object {key}"))?;
-        Ok(())
+        self.inner.put_object(key, body).await
     }
 
     /// Streaming PUT from a file on disk. Used for account-export ZIPs, which
     /// can be hundreds of MB — streaming keeps the archive off the heap
     /// (unlike `put_object`, which buffers the whole body in a `Vec<u8>`).
     pub async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
-            .await
-            .with_context(|| format!("r2 put_file open {}", path.display()))?;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("r2 put_file {key}"))?;
-        Ok(())
+        self.inner.put_file(key, path).await
     }
 
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
-        let out = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| format!("r2 get_object {key}"))?;
-        let bytes = out
-            .body
-            .collect()
-            .await
-            .with_context(|| format!("r2 read body {key}"))?
-            .into_bytes()
-            .to_vec();
-        Ok(bytes)
+        self.inner.get_object(key).await
+    }
+
+    /// Bounded-memory async reader over the object body. For streaming a
+    /// blob through the decompressing download proxy or the compression
+    /// sweep without ever holding it whole in RAM.
+    pub async fn get_reader(&self, key: &str) -> Result<impl tokio::io::AsyncBufRead + Unpin> {
+        self.inner.get_reader(key).await
+    }
+
+    /// Streaming multipart PUT from a reader (atomic: the old object keeps
+    /// serving until the multipart completes). Returns bytes written.
+    pub async fn put_from_reader<R>(&self, key: &str, reader: R) -> Result<i64>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        self.inner.put_from_reader(key, reader).await
     }
 
     pub async fn delete_object(&self, key: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| format!("r2 delete_object {key}"))?;
-        Ok(())
+        self.inner.delete(key).await
     }
 
     /// Returns `Some(size)` if the object exists, `None` if it doesn't.
     pub async fn head(&self, key: &str) -> Result<Option<i64>> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => Ok(out.content_length()),
-            Err(e) => {
-                // 404 → not found is the expected miss path. Anything else
-                // bubbles up — we'd rather surface a real error than treat
-                // a transient outage as "object doesn't exist" and silently
-                // re-create something the user already has.
-                if e.to_string().contains("NotFound") || e.to_string().contains("status code: 404")
-                {
-                    Ok(None)
-                } else {
-                    Err(e).context("r2 head_object")
-                }
-            }
-        }
+        self.inner.head(key).await
     }
 
     pub async fn presign_put(&self, key: &str, ttl: Option<Duration>) -> Result<PresignedUrl> {
         let cfg = PresigningConfig::expires_in(ttl.unwrap_or(self.default_presign_ttl))?;
         let req = self
-            .client
+            .inner
+            .client()
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(self.inner.bucket())
             .key(key)
             .presigned(cfg)
             .await
@@ -173,9 +109,10 @@ impl R2Store {
     pub async fn presign_get(&self, key: &str, ttl: Option<Duration>) -> Result<PresignedUrl> {
         let cfg = PresigningConfig::expires_in(ttl.unwrap_or(self.default_presign_ttl))?;
         let req = self
-            .client
+            .inner
+            .client()
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(self.inner.bucket())
             .key(key)
             .presigned(cfg)
             .await
@@ -188,7 +125,7 @@ impl R2Store {
     }
 
     pub fn bucket(&self) -> &str {
-        &self.bucket
+        self.inner.bucket()
     }
 }
 

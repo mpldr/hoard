@@ -217,6 +217,20 @@ async fn build_export_zip(
                         continue;
                     }
                 };
+                // The export must contain the RAW file: undo the at-rest
+                // zstd rewrite when (and only when) it completed — same
+                // rule as the blob proxy (`stored_bytes` set).
+                let bytes = if blob_is_compressed(state, user_id, &sha).await {
+                    match zstd_decode(&bytes).await {
+                        Ok(raw) => raw,
+                        Err(e) => {
+                            tracing::warn!(%save_id, rel, error = %e, "export skipped undecodable blob");
+                            continue;
+                        }
+                    }
+                } else {
+                    bytes
+                };
                 let name = format!("{dir}/{}", sanitize_rel(&rel));
                 zip.start_file(name, opts)?;
                 zip.write_all(&bytes)?;
@@ -310,6 +324,36 @@ async fn expire_due(state: &CloudState) -> Result<(), sqlx::Error> {
 
 /// Directory prefix for a save's entries. `default` labels collapse to just the
 /// game slug so the common single-slot case doesn't nest a redundant folder.
+/// Whether the at-rest compression rewrite completed for this blob — the
+/// only state where the stored object is zstd instead of raw (same rule as
+/// `routes::blob_proxy`). Errors and missing rows read as "raw": worst case
+/// the ZIP carries the object as-is instead of failing the whole export.
+async fn blob_is_compressed(state: &CloudState, user_id: Uuid, sha: &str) -> bool {
+    sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+        "SELECT encoding, stored_bytes FROM cloud_blobs
+            WHERE user_id = $1 AND sha256 = $2",
+    )
+    .bind(user_id)
+    .bind(sha)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|(enc, stored)| enc.as_deref() == Some("zstd") && stored.is_some())
+    .unwrap_or(false)
+}
+
+/// Decode a zstd frame held in memory. Export blobs are already buffered
+/// whole (`get_object`), so the in-memory decode matches the existing
+/// footprint.
+async fn zstd_decode(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut dec = async_compression::tokio::bufread::ZstdDecoder::new(bytes);
+    dec.read_to_end(&mut out).await?;
+    Ok(out)
+}
+
 fn entry_dir(game_slug: &str, label: &str) -> String {
     let g = sanitize_component(game_slug);
     if label == "default" || label.is_empty() {

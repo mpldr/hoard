@@ -15,7 +15,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "1.0.3"
+version = "1.0.4"
 authors = ["insider <raileonoliva@gmail.com>"]
 license = "AGPL-3.0"
 # Self-hosted app, never published to crates.io. Marking the members private
@@ -100,6 +100,9 @@ strsim = "0.11"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 notify = "6"
 notify-debouncer-mini = "0.4"
+
+# Object-safe async traits (`hoard-server` BlobStore abstraction).
+async-trait = "0.1"
 
 # Test-only — used by per-crate `[dev-dependencies]` blocks.
 tempfile = "3"

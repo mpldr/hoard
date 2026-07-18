@@ -8,6 +8,10 @@ pub struct ServerState {
     pub pool: SqlitePool,
     pub config: crate::config::Config,
     pub start_time: Instant,
+    /// Blob/chunk storage backend (local disk or S3-compatible, ADR 0020).
+    /// The snapshot upload/download and trash-purge paths go through this
+    /// instead of touching blob files directly.
+    pub store: std::sync::Arc<dyn crate::store::BlobStore>,
     /// Per-user SSE fan-out backing `GET /v1/events` (self-hosted push). The
     /// snapshot-commit path publishes here; listening devices pull on the
     /// event. Empty/unused on the cloud deployment (Supabase Realtime does the

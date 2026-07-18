@@ -149,11 +149,7 @@ pub fn run() {
             // already running so its listener is up: emit, and also buffer it
             // so a not-yet-mounted webview still drains it on mount.
             if let Some(url) = first_hoard_url(argv.iter().cloned()) {
-                // Log the scheme+path only: the OAuth callback's query string
-                // carries the access and refresh tokens in plaintext, and this
-                // file both persists on disk and ships through logship.
-                let redacted = url.split('?').next().unwrap_or(&url);
-                tracing::info!(url = %redacted, "deep link via single-instance argv");
+                tracing::info!(url = %url, "deep link via single-instance argv");
                 capture_deep_link(app, url, true);
             }
         }))
@@ -179,7 +175,6 @@ pub fn run() {
         .manage(AppState::from_disk())
         .manage(TrayController::default())
         .manage(AutomaticScheduler::default())
-        .manage(commands::cloud_feed::CloudFeed::default())
         .manage(commands::cloud_pull::CloudPullScheduler::default())
         .manage(commands::cloud_realtime::RealtimeScheduler::default())
         .manage(commands::selfhosted_events::SelfHostedEventsScheduler::default())
@@ -187,11 +182,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::misc::greet,
             commands::misc::open_external,
-            commands::cloud_feed::notifications_backlog,
-            commands::cloud_feed::devices_refresh,
-            commands::cloud_feed::notification_dismiss,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,
+            commands::covers::has_custom_cover,
+            commands::covers::set_custom_cover,
+            commands::covers::remove_custom_cover,
             commands::auth::health_check,
             commands::auth::login,
             commands::auth::logout,
@@ -203,7 +198,6 @@ pub fn run() {
             commands::library::deep_scan_library,
             commands::library::scan_folder,
             commands::library::cached_detection,
-            commands::library::detected_paths_for_game,
             commands::library::add_game_to_tracking,
             commands::library::adopt_save,
             commands::library::list_tracked_saves,
@@ -233,7 +227,6 @@ pub fn run() {
             commands::prefs::set_scan_interval,
             commands::prefs::set_backup_interval,
             commands::prefs::set_conflict_retention,
-            commands::prefs::set_cloud_poll_interval,
             commands::prefs::set_live_activity_visible,
             commands::prefs::set_data_saving,
             commands::prefs::set_tray_state,
@@ -245,6 +238,9 @@ pub fn run() {
             commands::history::save_snapshot_detail,
             commands::history::delete_snapshot,
             commands::history::undelete_snapshot,
+            commands::history::get_max_versions,
+            commands::history::preview_max_versions,
+            commands::history::set_max_versions,
             commands::history::restore_snapshot,
             commands::history::set_save_paused,
             commands::history::set_save_local_path,
@@ -303,18 +299,41 @@ pub fn run() {
             // back to off.
             let first_run = Prefs::default_path().map(|p| !p.exists()).unwrap_or(false);
             if let Ok((mut prefs, path)) = Prefs::load_default() {
-                if first_run && prefs.autostart {
+                // Re-assert the OS autostart entry on *every* launch when the
+                // user wants it on — not just first run. The OS entry drifts
+                // out of sync behind our back, and since the Settings page
+                // re-probes `is_enabled()` on mount, any drift snaps the toggle
+                // back to off. Concretely:
+                //   - Windows: `is_enabled()` returns false when the Task
+                //     Manager / Settings "Startup apps" override disabled the
+                //     entry (StartupApproved\Run), or when an MSI update rewrote
+                //     the install path and dropped the HKCU\...\Run value. This
+                //     is the "toggle keeps turning itself off, only on Windows"
+                //     report — Linux only checks file existence so it doesn't
+                //     flip, but its `.desktop` Exec can still go stale.
+                //   - Both: after an update the recorded binary path can point
+                //     at a version that no longer exists, so autostart silently
+                //     launches nothing at login even while the toggle reads on.
+                // `enable()` is idempotent: it rewrites the entry with the
+                // current binary path and (on Windows) resets the StartupApproved
+                // override to enabled. Disabling in-app clears `autostart`, so
+                // we never fight a user who deliberately turned it off.
+                if prefs.autostart {
                     use tauri_plugin_autostart::ManagerExt;
                     #[cfg(target_os = "linux")]
                     commands::prefs::ensure_autostart_dir();
                     match app.autolaunch().enable() {
-                        Ok(()) => tracing::info!("first run: autostart enabled"),
+                        Ok(()) => tracing::info!("autostart entry re-asserted at startup"),
                         Err(e) => {
                             // Best-effort: some minimal Linux sessions have no
-                            // autostart dir we can write. Reflect the failure in
-                            // the pref so the UI doesn't claim it's on.
-                            tracing::warn!(error = %e, "first run: couldn't enable autostart");
-                            prefs.autostart = false;
+                            // autostart dir we can write. Only demote the pref on
+                            // a fresh install, where the failure means autostart
+                            // truly never took — for an existing install a
+                            // transient failure shouldn't silently wipe intent.
+                            tracing::warn!(error = %e, "couldn't re-assert autostart at startup");
+                            if first_run {
+                                prefs.autostart = false;
+                            }
                         }
                     }
                     // Persist so the mirror matches the OS truth from the start.
@@ -384,8 +403,7 @@ pub fn run() {
             let dl_handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
-                    // Path only — the callback query carries live tokens.
-                    tracing::info!(url = %format!("{}://{}{}", url.scheme(), url.host_str().unwrap_or(""), url.path()), "deep link opened (on_open_url)");
+                    tracing::info!(url = %url, "deep link opened (on_open_url)");
                     if let Some(window) = dl_handle.get_webview_window("main") {
                         let _ = window.unminimize();
                         let _ = window.show();
@@ -403,9 +421,7 @@ pub fn run() {
             // mounts. Scan argv ourselves and buffer the URL; the frontend
             // drains it on mount. Don't emit — no listener exists yet.
             if let Some(url) = first_hoard_url(std::env::args()) {
-                // Path only — the callback query carries live tokens.
-                let redacted = url.split('?').next().unwrap_or(&url);
-                tracing::info!(url = %redacted, "deep link via launch argv (cold start)");
+                tracing::info!(url = %url, "deep link via launch argv (cold start)");
                 capture_deep_link(app.handle(), url, false);
             }
 
@@ -433,19 +449,6 @@ pub fn run() {
         // already rotated server-side but we haven't persisted yet would orphan
         // the new token and sign the user out on next launch. Bounded wait.
         if let RunEvent::ExitRequested { .. } = event {
-            // Final presence beat before the process dies: flips this
-            // device's dot to grey on the other machines' Eye panels right
-            // away instead of after the 90s timeout. Bounded wait (3s) inside
-            // the handle, so quitting never hangs on a dead network.
-            let presence = app_handle
-                .state::<AppState>()
-                .presence
-                .lock()
-                .unwrap()
-                .take();
-            if let Some(p) = presence {
-                tauri::async_runtime::block_on(p.closing());
-            }
             crate::commands::cloud::wait_for_refresh_quiescent_blocking();
             return;
         }

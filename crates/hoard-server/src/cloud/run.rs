@@ -4,11 +4,11 @@
 use crate::cloud::{
     account_purge, archive,
     auth::{require_active_account, require_cloud_auth, JwksCache},
-    bandwidth, db, export, polar, r2,
+    bandwidth, compress, db, export, polar, pollguard, r2,
     routes::{
-        checkout, device as device_routes, entitlements as ent_routes, logs as log_routes, me,
-        notifications as notification_routes, playtime as playtime_routes, saves,
-        sync as sync_routes,
+        blob_proxy, checkout, device as device_routes, entitlements as ent_routes,
+        logs as log_routes, me, notifications as notification_routes,
+        playtime as playtime_routes, saves, sync as sync_routes,
     },
     state::CloudState,
 };
@@ -125,6 +125,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // link, and expires old exports.
     export::spawn(state.clone());
 
+    // At-rest blob compression sweep (no-op unless `[cloud.compression]`
+    // enables it). Rewrites old raw blobs as zstd in place; quota and
+    // everything user-visible keep counting raw bytes.
+    compress::spawn(state.clone());
+
     // 4e. Hard-purge of archived games ("caja negra") past their 7-day grace:
     //     deletes the save rows and GCs the frozen R2 blobs whose window
     //     elapsed. Daily cadence, detached like the sweepers above.
@@ -165,6 +170,19 @@ pub async fn run(cfg: Config) -> Result<()> {
     // countdown and reactivate. Everything else is on `authed`, which layers
     // `require_active_account` on top of auth so a scheduled-for-deletion
     // account can't read or write its data during the 30-day grace.
+
+    // Per-device cap on the polling endpoints (see `pollguard`). Attached
+    // with `route_layer` so it runs after `require_cloud_auth` and can key
+    // by user. Respects the master rate-limit switch.
+    let poll_guard = pollguard::PollGuard::new(if cfg.server.rate_limit.enabled {
+        cfg.server.rate_limit.poll_per_minute
+    } else {
+        0
+    });
+    let guarded = |class: &'static str| {
+        let g = poll_guard.clone();
+        middleware::from_fn(move |req, next| pollguard::guard(g.clone(), class, req, next))
+    };
     let authed_always = Router::new()
         .route("/v1/me", get(me::get_me).delete(me::delete_me))
         .route("/v1/me/reactivate", post(me::reactivate_me))
@@ -178,17 +196,31 @@ pub async fn run(cfg: Config) -> Result<()> {
             "/v1/me/export",
             get(me::get_export_status).post(me::create_export_job),
         )
-        .route("/v1/devices", get(me::list_devices))
+        // Per-user cap on stored versions per save (prunes immediately).
+        .route(
+            "/v1/me/max-versions",
+            axum::routing::put(me::set_max_versions),
+        )
+        .route(
+            "/v1/devices",
+            get(me::list_devices).route_layer(guarded("devices")),
+        )
         // Presence keepalive for the Eye panel. Lives off the `/devices/:id`
         // param path on purpose: matchit 0.7 (axum 0.7) panics on a static
         // segment colliding with a param at the same position — same caveat
         // as `/saves/cas` below.
-        .route("/v1/presence/heartbeat", post(me::heartbeat))
+        .route(
+            "/v1/presence/heartbeat",
+            post(me::heartbeat).route_layer(guarded("heartbeat")),
+        )
         .route("/v1/devices/:id", axum::routing::delete(me::delete_device))
         // Operator broadcasts for the bell panel. List is read-only; the
         // dismiss endpoint records a per-user, cross-device dismissal (see
         // cloud/routes/notifications.rs).
-        .route("/v1/notifications", get(notification_routes::list))
+        .route(
+            "/v1/notifications",
+            get(notification_routes::list).route_layer(guarded("notifications")),
+        )
         .route(
             "/v1/notifications/:id/dismiss",
             post(notification_routes::dismiss),
@@ -249,7 +281,10 @@ pub async fn run(cfg: Config) -> Result<()> {
             "/v1/cloud/saves/:save_id/versions/:version/download",
             get(saves::download),
         )
-        .route("/v1/cloud/sync", get(sync_routes::manifest))
+        .route(
+            "/v1/cloud/sync",
+            get(sync_routes::manifest).route_layer(guarded("sync")),
+        )
         .route(
             "/v1/cloud/playtime",
             get(playtime_routes::aggregate).post(playtime_routes::upload),
@@ -281,6 +316,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         // opens a pairing, `poll` collects the minted session once approved.
         .route("/v1/cloud/device/start", post(device_routes::start))
         .route("/v1/cloud/device/poll", post(device_routes::poll))
+        // Decompressing blob download proxy: the HMAC token in the path is
+        // the auth, same trust model as a presigned URL.
+        .route("/v1/cloud/blob/:token", get(blob_proxy::download))
         // Health is *also* available unauthed in cloud mode so Fly can probe it.
         .route("/v1/health", get(cloud_health));
 

@@ -33,6 +33,7 @@
     Snowflake,
     X,
     PauseCircle,
+    Cloud,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -43,7 +44,6 @@
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import ManualTrackModal from "../lib/components/ManualTrackModal.svelte";
-  import LinkOrphanModal from "../lib/components/LinkOrphanModal.svelte";
   import ScanFolderModal from "../lib/components/ScanFolderModal.svelte";
   import * as api from "../lib/api";
   import type {
@@ -51,7 +51,6 @@
     DetectedGame,
     DetectionReport,
     DetectionSource,
-    LocalDetection,
     PlaytimeGameInfo,
     ScanProgress,
     TrackedSave,
@@ -63,6 +62,8 @@
     refreshArchivedSaves,
     reactivateAndRefresh,
   } from "../lib/stores/cloud";
+  import { cardWidth } from "../lib/stores/cardSizes.svelte";
+  import CardResizeHandle from "../lib/components/CardResizeHandle.svelte";
 
   let report = $state<DetectionReport | null>(null);
   let tracked = $state<TrackedSave[]>([]);
@@ -70,12 +71,6 @@
   // both independent of the auto-detection flow.
   let emulatorModalOpen = $state(false);
   let scanFolderOpen = $state(false);
-  // The cloud orphan whose "Vincular a esta máquina" modal is open, if any.
-  let linkTarget = $state<TrackedSave | null>(null);
-  // What local detection knows per orphan slug, so a card can offer a direct
-  // "Vincular a <ruta>" instead of sending the user to the picker. Filled from
-  // the scan cache; a slug missing here just means no offer, never an error.
-  let orphanDetections = $state<Record<string, LocalDetection>>({});
 
   // Manually-added emulator saves carry a synthesized slug: `emu-<id>` for a
   // catalog pick or `emu-<slugified name>` for a custom one. The Library shows
@@ -655,45 +650,6 @@
   const localSaves = $derived(tracked.filter((t) => !t.orphan));
   const cloudOrphans = $derived(tracked.filter((t) => t.orphan));
 
-  /** Re-read what detection knows for every orphan on screen. One cheap
-   *  in-memory lookup per row (no scan), and orphans are few — they're games
-   *  from OTHER machines. Never auto-adopts: it only decides whether a card can
-   *  offer a one-click link. */
-  async function refreshOrphanDetections(slugs: string[]) {
-    if (slugs.length === 0) {
-      orphanDetections = {};
-      return;
-    }
-    const found = await Promise.all(
-      slugs.map(async (slug) => {
-        try {
-          return [slug, await api.detectedPathsForGame(slug)] as const;
-        } catch {
-          // A failed probe just means no offer for this card; the picker still
-          // works. Not worth a toast on page load.
-          return null;
-        }
-      }),
-    );
-    orphanDetections = Object.fromEntries(
-      found.filter((e): e is NonNullable<typeof e> => e !== null),
-    );
-  }
-
-  // Refresh whenever the orphan set changes (load, adopt, delete).
-  $effect(() => {
-    const slugs = [...new Set(cloudOrphans.map((o) => o.game_slug))];
-    void refreshOrphanDetections(slugs);
-  });
-
-  /** The single detected folder for an orphan, or `null` when detection is
-   *  ambiguous (several candidates ⇒ the user picks in the modal), found
-   *  nothing, or never ran. Mirrors `LocalDetection::unambiguous` agent-side. */
-  function directLinkFor(slug: string): string | null {
-    const paths = orphanDetections[slug]?.paths ?? [];
-    return paths.length === 1 ? paths[0].path : null;
-  }
-
   /** The cloud orphan for a slug, if any (prefers the "main" label). Lets the
    *  "+" / track flow adopt an existing cloud save instead of forking a new
    *  branch (BUG 3). */
@@ -721,18 +677,12 @@
     }
   }
 
-  /** "Vincular a esta máquina…" on a cloud-orphan card: offer whatever
-   *  detection already knows before falling back to the folder picker. */
-  function linkOrphan(orphan: TrackedSave) {
-    linkTarget = orphan;
-  }
-
-  /** A pick from the link modal — a detected folder or a hand-picked one. */
-  async function onLinkPick(path: string) {
-    const target = linkTarget;
-    if (!target) return;
-    linkTarget = null;
-    await adoptOrphan(target, path);
+  /** "Vincular a esta máquina…" on a cloud-orphan card: pick a folder, then
+   *  adopt the existing save into it. */
+  async function linkOrphan(orphan: TrackedSave) {
+    const chosen = await pickFolder(orphan.game_slug);
+    if (!chosen) return;
+    await adoptOrphan(orphan, chosen);
   }
 
   const filtered = $derived.by(() => {
@@ -883,18 +833,27 @@
         class="mb-2 flex items-center justify-between gap-3 text-xs uppercase tracking-wide text-zinc-500"
       >
         <span>{$_("library.tracked_games")}</span>
-        <span class="tabular-nums normal-case tracking-normal text-zinc-400">
-          {$_("library.tracked_summary", { values: { count: localSaves.length, size: fmtBytes(trackedTotalBytes) } })}
+        <!-- Header total = LOCAL footprint (this machine); the per-card pill
+             is the server-side size. Both are labelled so they can't be
+             confused — see summary_local / size_server_title. -->
+        <span
+          class="inline-flex items-center gap-1.5 tabular-nums normal-case tracking-normal text-zinc-400"
+          title={$_("library.size_local_title")}
+        >
+          <HardDrive size={11} class="shrink-0 text-zinc-500" />
+          {$_("library.summary_local", { values: { count: localSaves.length, size: fmtBytes(trackedTotalBytes) } })}
         </span>
       </div>
       <div
-        class="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4"
+        class="grid gap-2"
+        style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("tracked")}px, 1fr))"
       >
 {#each localSaves as save (save.save_id)}
           <div
-            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
             use:tilt
           >
+            <CardResizeHandle section="tracked" />
             <div class="flex items-start gap-2.5">
               <Cover
                 appId={appIdBySlug.get(save.game_slug) ?? null}
@@ -990,7 +949,13 @@
                 </span>
               {/if}
               {#if save.total_size_bytes > 0}
-                <span class="font-medium tabular-nums text-zinc-300">{fmtBytes(save.total_size_bytes)}</span>
+                <span
+                  class="inline-flex items-center gap-1 font-medium tabular-nums text-zinc-300"
+                  title={$_("library.size_server_title")}
+                >
+                  <Cloud size={10} class="shrink-0 text-zinc-500" />
+                  {fmtBytes(save.total_size_bytes)}
+                </span>
               {/if}
             </div>
           </div>
@@ -1008,18 +973,24 @@
         class="mb-2 flex items-center justify-between gap-3 text-xs uppercase tracking-wide text-zinc-500"
       >
         <span>{$_("library.cloud_other_machines")}</span>
-        <span class="tabular-nums normal-case tracking-normal text-zinc-400">
-          {$_("library.tracked_summary", { values: { count: cloudOrphans.length, size: fmtBytes(cloudTotalBytes) } })}
+        <span
+          class="inline-flex items-center gap-1.5 tabular-nums normal-case tracking-normal text-zinc-400"
+          title={$_("library.size_server_title")}
+        >
+          <Cloud size={11} class="shrink-0 text-zinc-500" />
+          {$_("library.summary_cloud", { values: { count: cloudOrphans.length, size: fmtBytes(cloudTotalBytes) } })}
         </span>
       </div>
       <div
-        class="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4"
+        class="grid gap-2"
+        style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("orphans")}px, 1fr))"
       >
         {#each cloudOrphans as save (save.save_id)}
           <div
-            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
             use:tilt
           >
+            <CardResizeHandle section="orphans" />
             <div class="flex items-start gap-2.5">
               <Cover
                 appId={appIdBySlug.get(save.game_slug) ?? null}
@@ -1063,30 +1034,19 @@
               </div>
             </div>
 
-            {#if directLinkFor(save.game_slug)}
-              {@const path = directLinkFor(save.game_slug) ?? ""}
-              <!-- Detection knows exactly where this game saves here, so skip
-                   the picker. Explicit click, never a silent auto-adopt. -->
-              <button
-                type="button"
-                onclick={() => adoptOrphan(save, path)}
-                title={path}
-                class="mt-2 flex w-full items-center gap-1.5 rounded-lg border border-emerald-600/40 bg-emerald-600/10 px-2 py-1.5 text-left transition-colors hover:border-emerald-500/60 hover:bg-emerald-600/20"
-              >
-                <Link size={11} class="shrink-0 text-emerald-300" />
-                <span class="min-w-0 flex-1 truncate text-[10px] text-emerald-200">
-                  {$_("library.link_to_path", { values: { path } })}
-                </span>
-              </button>
-            {/if}
-
             <div class="mt-1.5 flex items-center justify-between text-[10px]">
               <span class="flex items-center gap-1.5 text-zinc-500">
                 <span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-500"></span>
                 {$_("library.cloud_only_badge")}
               </span>
               {#if save.total_size_bytes > 0}
-                <span class="font-medium tabular-nums text-zinc-300">{fmtBytes(save.total_size_bytes)}</span>
+                <span
+                  class="inline-flex items-center gap-1 font-medium tabular-nums text-zinc-300"
+                  title={$_("library.size_server_title")}
+                >
+                  <Cloud size={10} class="shrink-0 text-zinc-500" />
+                  {fmtBytes(save.total_size_bytes)}
+                </span>
               {/if}
             </div>
           </div>
@@ -1111,14 +1071,16 @@
         {$_("library.playtime_hint")}
       </p>
       <div
-        class="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4"
+        class="grid gap-2"
+        style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("playtime")}px, 1fr))"
       >
         {#each playtimeGames as game (game.slug)}
           <div
-            class="group flex items-center justify-between gap-2 rounded-xl border p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 {game.excluded
+            class="group relative flex items-center justify-between gap-2 rounded-xl border p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 {game.excluded
               ? 'border-white/[0.08] bg-zinc-950/40 opacity-50'
               : 'border-amber-500/40 bg-amber-500/10 hover:border-amber-500/60'}"
           >
+            <CardResizeHandle section="playtime" />
             <Cover
               appId={appIdBySlug.get(game.slug) ?? null}
               slug={game.slug}
@@ -1259,13 +1221,14 @@
         {@render deepScanTile()}
       </div>
     {:else}
-      <div class="grid grid-cols-1 gap-3 px-3 md:grid-cols-2 xl:grid-cols-3">
+      <div class="grid gap-3 px-3" style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("detected")}px, 1fr))">
         {#each filtered as game (game.slug)}
           {@const isTracked = trackedSlugs.has(game.slug)}
           <div
-            class="tilt group flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-1 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-1 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
             use:tilt
           >
+            <CardResizeHandle section="detected" />
             <div class="flex items-start justify-between gap-2 p-4 pb-3">
               <div class="flex min-w-0 items-center gap-3">
                 <Cover
@@ -1388,8 +1351,12 @@
                     <Check size={12} />
                     {$_("library.tracked_badge")}
                     {#if sz > 0}
-                      <span class="text-emerald-400/70 tabular-nums">
-                        · {fmtBytes(sz)}
+                      <span
+                        class="inline-flex items-center gap-1 text-emerald-400/70 tabular-nums"
+                        title={$_("library.size_local_title")}
+                      >
+                        · <HardDrive size={10} class="shrink-0" />
+                        {fmtBytes(sz)}
                       </span>
                     {/if}
                   </span>
@@ -1519,22 +1486,6 @@
     onClose={() => (scanFolderOpen = false)}
     onAdded={(saved) => {
       tracked = [...tracked, saved];
-    }}
-  />
-
-  <LinkOrphanModal
-    open={linkTarget !== null}
-    orphan={linkTarget}
-    onClose={() => (linkTarget = null)}
-    onPick={onLinkPick}
-    onScanned={(r) => {
-      // A scan started from the modal refreshes the detection cards AND the
-      // orphan offers — otherwise a card would still say "never scanned" next
-      // to a modal that just found the folder.
-      report = r;
-      void refreshOrphanDetections([
-        ...new Set(cloudOrphans.map((o) => o.game_slug)),
-      ]);
     }}
   />
 

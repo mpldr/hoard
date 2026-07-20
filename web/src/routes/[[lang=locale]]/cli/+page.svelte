@@ -3,6 +3,7 @@
   import Button from '$lib/components/Button.svelte';
   import Seo from '$lib/components/Seo.svelte';
   import { reveal } from '$lib/actions/reveal';
+  import { tilt } from '$lib/actions/tilt';
   import { localeHref } from '$lib/i18n/href';
   import { onMount } from 'svelte';
   import { Apple, Github, Monitor, Terminal, ArrowRight, Server, Cpu, Copy, Check } from 'lucide-svelte';
@@ -86,7 +87,7 @@
 <section class="mx-auto max-w-5xl px-4 py-16 sm:px-6 sm:py-24">
   <!-- Hero: the install command, front and centre -->
   <div class="mx-auto max-w-2xl text-center">
-    <p class="kicker justify-center">
+    <p class="kicker flex items-center justify-center gap-1.5">
       <Terminal class="h-3.5 w-3.5" />
       Hoard CLI
     </p>
@@ -98,7 +99,22 @@
     </p>
   </div>
 
-  <div class="reveal mx-auto mt-8 max-w-2xl" use:reveal>
+  <figure
+    class="reveal tilt relative mx-auto mt-10 max-w-2xl rounded-2xl"
+    use:reveal
+    use:tilt={{ max: 5 }}
+  >
+    <img
+      src="/CLI.png"
+      alt={$_('hero.screenshot_cli_alt')}
+      width="664"
+      height="630"
+      decoding="async"
+      class="block w-full rounded-2xl border border-line-strong shadow-[0_40px_80px_-40px_rgba(0,0,0,0.9)]"
+    />
+  </figure>
+
+  <div class="reveal mx-auto mt-12 max-w-2xl" use:reveal>
     <p class="text-center text-sm font-medium text-ink">{$_('cli.run_hint')}</p>
     <div class="mt-4 space-y-3">
       {#each installRows as row (row.id)}

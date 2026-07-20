@@ -5,6 +5,7 @@
   import HowItWorks from '$lib/components/HowItWorks.svelte';
   import DownloadCTA from '$lib/components/DownloadCTA.svelte';
   import { reveal } from '$lib/actions/reveal';
+  import { tilt } from '$lib/actions/tilt';
   import { localeHref } from '$lib/i18n/href';
   import { SITE_URL } from '$lib/i18n/locales';
   import { PLANS } from '$lib/plans';
@@ -20,16 +21,6 @@
     Check
   } from 'lucide-svelte';
 
-  // Hairline dividers for the 1 / 2 / 3-column grid, spelled out per cell —
-  // overlapping nth-child rules resolve by stylesheet order, which is fragile.
-  const featureCell = [
-    '',
-    'border-t border-line sm:border-l sm:border-t-0',
-    'border-t border-line lg:border-l lg:border-t-0',
-    'border-t border-line sm:border-l lg:border-l-0',
-    'border-t border-line lg:border-l',
-    'border-t border-line sm:border-l'
-  ];
 
   const features = [
     { key: 'sync', icon: RefreshCw },
@@ -86,7 +77,7 @@
 
 <Seo path="/" key="home" />
 <svelte:head>
-  <link rel="preload" as="image" href="/app.webp" fetchpriority="high" />
+  <link rel="preload" as="image" href="/WEB.png" fetchpriority="high" />
   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
   {@html jsonLd}
 </svelte:head>
@@ -132,26 +123,43 @@
 
 <!-- ───────── SCREENSHOT ───────── -->
 <section class="relative">
-  <div
-    class="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 border-b border-line bg-surface"
-    aria-hidden="true"
-  ></div>
-  <div class="relative mx-auto max-w-6xl px-4 pt-14 sm:px-6">
-    <img
-      src="/app.webp"
-      alt={$_('hero.screenshot_alt')}
-      width="1533"
-      height="906"
-      fetchpriority="high"
-      decoding="async"
-      class="block w-full rounded-2xl border border-line-strong shadow-[0_40px_80px_-40px_rgba(0,0,0,0.8)] animate-fade-up"
-      style="animation-delay:0.3s"
-    />
+  <div class="relative mx-auto max-w-[84rem] px-4 pt-14 sm:px-6">
+    <div class="flex flex-col items-center gap-8 lg:flex-row lg:items-center lg:justify-center lg:gap-7">
+      <figure
+        class="tilt animate-fade-up relative w-full lg:w-auto"
+        style="animation-delay:0.3s"
+        use:tilt
+      >
+        <img
+          src="/WEB.png"
+          alt={$_('hero.screenshot_alt')}
+          width="1270"
+          height="920"
+          fetchpriority="high"
+          decoding="async"
+          class="block w-full rounded-2xl border border-line-strong shadow-[0_40px_90px_-40px_rgba(0,0,0,0.9)] lg:h-[22rem] lg:w-auto xl:h-[28rem] 2xl:h-[34rem]"
+        />
+      </figure>
+      <figure
+        class="tilt animate-fade-up relative w-full max-w-2xl lg:w-auto lg:max-w-none"
+        style="animation-delay:0.42s"
+        use:tilt
+      >
+        <img
+          src="/CLI.png"
+          alt={$_('hero.screenshot_cli_alt')}
+          width="664"
+          height="630"
+          decoding="async"
+          class="block w-full rounded-2xl border border-line-strong shadow-[0_40px_90px_-40px_rgba(0,0,0,0.9)] lg:h-[22rem] lg:w-auto xl:h-[28rem] 2xl:h-[34rem]"
+        />
+      </figure>
+    </div>
   </div>
 </section>
 
 <!-- ───────── FACT STRIP ───────── -->
-<section class="border-b border-line bg-surface">
+<section class="border-y border-line">
   <div class="mx-auto max-w-6xl px-4 sm:px-6">
     <dl class="grid grid-cols-2 sm:grid-cols-4">
       {#each facts as f, i (f)}
@@ -200,7 +208,7 @@
       </div>
 
       <div class="reveal" use:reveal={{ delay: 100 }}>
-        <div class="rounded-2xl border border-line bg-surface p-6 sm:p-8">
+        <div class="tilt relative rounded-2xl border border-line bg-surface p-6 sm:p-8" use:tilt={{ max: 5 }}>
           <div class="space-y-3 font-mono text-xs">
             <div class="flex items-center justify-between rounded-lg border border-line bg-bg px-4 py-3">
               <span class="text-ink">{$_('sync.demo_desktop')}</span>
@@ -248,8 +256,9 @@
     >
       {#each features as f, i (f.key)}
         <article
-          class="reveal group p-7 transition-colors hover:bg-bg {featureCell[i]}"
+          class="reveal tilt group relative border-t border-line p-7 transition-colors hover:bg-bg max-sm:[&:nth-child(2n)]:border-l sm:[&:nth-child(-n+2)]:border-t-0 sm:[&:nth-child(2n)]:border-l lg:[&:nth-child(-n+3)]:border-t-0 lg:[&:nth-child(3n)]:border-l-0 lg:[&:nth-child(3n+1)]:border-l-0"
           use:reveal={{ delay: i * 60 }}
+          use:tilt={{ max: 4 }}
         >
           <f.icon class="h-5 w-5 text-accent" />
           <h3 class="mt-4 font-semibold text-ink">{$_(`features.${f.key}.title`)}</h3>
@@ -297,7 +306,7 @@ docker compose up -d --build</code
 </section>
 
 <!-- ───────── FINAL CTA ───────── -->
-<section class="border-t border-line bg-surface">
+<section class="border-t border-line">
   <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-24">
     <div class="reveal mx-auto flex max-w-2xl flex-col items-center text-center" use:reveal>
       <h2 class="text-balance text-3xl font-semibold text-ink sm:text-4xl">

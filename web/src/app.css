@@ -7,21 +7,25 @@
   /* Dark, green-cast palette with a single emerald accent — the same
      family the desktop app uses, so site and app read as one product.
      `accent` is the bright emerald for text/icons on dark; `accent-deep`
-     is the filled-chip emerald that carries white text. */
-  --color-bg: #0b0f0c;
-  --color-surface: #111712;
+     is the filled-chip emerald that carries white text.
+
+     WOLED: the page canvas is pure #000 — the same off-black the desktop app
+     uses — so the emerald only ever shows on real surfaces (borders, chips,
+     buttons) and the black stays truly off. Surfaces are a hair above black. */
+  --color-bg: #000000;
+  --color-surface: #0a0f0b;
   --color-ink: #ebeeec;
   --color-ink-soft: #a6b0a9;
   --color-ink-faint: #6e7871;
-  --color-line: #1e2620;
-  --color-line-strong: #2c372f;
+  --color-line: #18201a;
+  --color-line-strong: #26312a;
   --color-accent: #34d399;
   --color-accent-deep: #047857;
-  --color-accent-tint: #10271c;
+  --color-accent-tint: #0d2117;
   /* Raised band — one step above the page, hairline-bordered. */
-  --color-pine: #121a14;
-  --color-pine-elev: #19231c;
-  --color-pine-line: #28332b;
+  --color-pine: #0c130e;
+  --color-pine-elev: #131c16;
+  --color-pine-line: #212b24;
 
   --font-display: "Bricolage Grotesque Variable", "Bricolage Grotesque",
     ui-sans-serif, system-ui, sans-serif;
@@ -47,6 +51,20 @@ body {
   font-feature-settings: "cv11", "ss01";
   background: var(--color-bg);
   color: var(--color-ink);
+}
+
+/* WOLED grain — a tiny tiled SVG turbulence blended low so the pure-black
+   canvas reads as paper tooth, not a dead flat void. Matches the desktop app.
+   pointer-events:none keeps it purely decorative and it sits behind content. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.03;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
 ::selection {
@@ -139,6 +157,50 @@ h3 {
   }
   .reveal {
     opacity: 1 !important;
+    transform: none !important;
+  }
+}
+
+/* ------------------------------------------------------------------
+   Tilt 3D — ported from the desktop app so cards/screenshots lean toward
+   the cursor with a soft directional glow. The `.tilt` class consumes CSS
+   vars set by the `tilt` action (lib/actions/tilt.ts); the action itself
+   stays transform-free. No `preserve-3d` / `mix-blend-mode` — a plain
+   opacity fade is cross-browser safe. Reduced-motion flattens it below.
+------------------------------------------------------------------ */
+.tilt {
+  transform: perspective(900px) rotateX(var(--tilt-rx, 0deg))
+    rotateY(var(--tilt-ry, 0deg));
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+/* Glow-only — cursor-following light with no 3D rotation, for smaller
+   interactive surfaces. Shares the --tilt-glow-x/y vars. */
+.glow {
+  position: relative;
+  overflow: hidden;
+}
+.glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease;
+  background: radial-gradient(
+    120px circle at var(--tilt-glow-x, 50%) var(--tilt-glow-y, 50%),
+    rgba(255, 255, 255, 0.14) 0%,
+    transparent 60%
+  );
+}
+.glow:hover::after {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tilt {
     transform: none !important;
   }
 }

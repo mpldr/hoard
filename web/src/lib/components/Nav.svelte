@@ -60,9 +60,7 @@
 </script>
 
 <header
-  class="sticky top-0 z-40 w-full border-b transition-[background-color,border-color] duration-300 {scrolled
-    ? 'border-line bg-bg/90 backdrop-blur-md'
-    : 'border-transparent bg-bg/75 backdrop-blur-sm'}"
+  class="sticky top-0 z-40 w-full bg-bg/80 backdrop-blur-md"
 >
   <nav class="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
     <a href={$localeHref('/')} class="flex items-center gap-2.5 rounded-md ring-focus" aria-label="Hoard home">
@@ -269,6 +267,15 @@
       </div>
     </div>
   {/if}
+
+  <!-- Bottom hairline: a dedicated line that only fades its opacity as you
+       scroll — background and blur stay constant, so appearing/disappearing
+       reads as a clean fade rather than a jump in fill + blur. -->
+  <div
+    class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-line transition-opacity duration-500 ease-out"
+    style="opacity: {scrolled ? 1 : 0};"
+    aria-hidden="true"
+  ></div>
 </header>
 
 <style>

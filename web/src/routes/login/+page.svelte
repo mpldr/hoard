@@ -1,6 +1,6 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
-  import { onMount, onDestroy } from 'svelte';
+  import { onDestroy } from 'svelte';
   import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
@@ -53,23 +53,23 @@
   // so they can sign in as someone else even though a session still lingers.
   let switching = $state(false);
 
-  let next = $derived(safeNext($page.url.searchParams.get('next')));
+  let next = $derived(browser ? safeNext($page.url.searchParams.get('next')) : '/');
   // Desktop login handoff: the Hoard app opens this page with ?desktop=1 and
   // expects the session to bounce back via the `hoard://` deep link instead of
   // staying in the browser. We carry the flag through to /auth/callback, which
   // does the actual redirect to the app.
-  let desktop = $derived($page.url.searchParams.get('desktop') === '1');
+  let desktop = $derived(browser && $page.url.searchParams.get('desktop') === '1');
   // Loopback port the desktop app is listening on for the OAuth handoff. When
   // present we bounce the session to http://127.0.0.1:<port> (confined browsers
   // like Ubuntu's snap Firefox can open that) instead of the custom hoard://
   // scheme (which they silently drop). Carried through to /auth/callback.
-  let port = $derived($page.url.searchParams.get('port') ?? '');
+  let port = $derived(browser ? $page.url.searchParams.get('port') ?? '' : '');
   // CSRF nonce the desktop app generated for this login attempt. The loopback
   // listener only accepts the callback if this exact value comes back, so we
   // must thread it through Supabase's redirect to /auth/callback untouched.
   // NB: must not be named `state` — that collides with the `$state` rune and
   // makes the compiler read `$state(...)` above as a store subscription.
-  let csrfState = $derived($page.url.searchParams.get('state') ?? '');
+  let csrfState = $derived(browser ? $page.url.searchParams.get('state') ?? '' : '');
   let dlExtra = $derived(
     `${desktop ? '&desktop=1' : ''}${port ? `&port=${encodeURIComponent(port)}` : ''}` +
       `${csrfState ? `&state=${encodeURIComponent(csrfState)}` : ''}`
@@ -97,9 +97,6 @@
   // desktop handoff we never auto-forward: a lingering browser session
   // (Supabase persists it in localStorage, which "clear cookies" doesn't touch)
   // would otherwise log the app into the previous account with no way to switch.
-  onMount(() => {
-    if ($session && !desktop) goto(postLogin);
-  });
 
   $effect(() => {
     if ($session && !desktop) goto(postLogin);

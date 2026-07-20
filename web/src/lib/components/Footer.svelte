@@ -72,7 +72,7 @@
       </ul>
     </div>
   </div>
-  <div class="border-t border-line bg-surface">
+  <div class="border-t border-line">
     <p class="mx-auto max-w-6xl px-4 py-4 text-xs text-ink-faint sm:px-6">
       {$_('footer.copyright', { values: { year } })}
     </p>

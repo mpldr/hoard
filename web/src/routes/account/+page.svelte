@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { _ } from 'svelte-i18n';
+  import { _, locale } from 'svelte-i18n';
   import { get } from 'svelte/store';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
@@ -46,7 +46,7 @@
 
   async function doSignOut() {
     await auth.signOut();
-    goto(get(localeHref)('/'));
+    goto($localeHref('/'));
   }
 
   function gotoBilling() {
@@ -59,7 +59,7 @@
     if (profile?.plan === 'free') {
       goto('/checkout?plan=pro&cycle=monthly');
     } else {
-      goto(get(localeHref)('/pricing'));
+      goto($localeHref('/pricing'));
     }
   }
 
@@ -81,7 +81,7 @@
     if (c !== 'DELETE') return;
     await api.deleteAccount();
     await auth.signOut();
-    goto(get(localeHref)('/'));
+    goto($localeHref('/'));
   }
 
   function timeAgo(iso: string): string {
@@ -167,7 +167,7 @@
         {#if p.plan !== 'free'}
           <span class="text-sm text-ink-soft">
             {$_('account.price_per_month', {
-              values: { price: plan.priceMonthly.toLocaleString('es-ES') }
+              values: { price: plan.priceMonthly.toLocaleString($locale ?? undefined) }
             })}
           </span>
         {/if}

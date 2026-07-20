@@ -10,7 +10,7 @@
   ];
 </script>
 
-<section class="border-t border-line bg-surface">
+<section class="border-t border-line">
   <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-24">
     <div class="reveal max-w-2xl" use:reveal>
       <p class="kicker">{$_('how.kicker')}</p>
@@ -21,7 +21,7 @@
     </div>
 
     <div
-      class="mt-12 grid overflow-hidden rounded-2xl border border-line bg-bg sm:grid-cols-3"
+      class="mt-12 grid overflow-hidden rounded-2xl border border-line bg-surface sm:grid-cols-3"
     >
       {#each steps as s, i (s.n)}
         <article

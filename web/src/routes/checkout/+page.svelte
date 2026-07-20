@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { _ } from 'svelte-i18n';
+  import { _, locale } from 'svelte-i18n';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { session } from '$lib/stores/session';
@@ -36,8 +36,8 @@
   );
   let priceLabel = $derived(
     cycle === 'yearly'
-      ? $_('checkout.price_yearly', { values: { price: price.toLocaleString('es-ES') } })
-      : $_('checkout.price_monthly', { values: { price: price.toLocaleString('es-ES') } })
+      ? $_('checkout.price_yearly', { values: { price: price.toLocaleString($locale ?? undefined) } })
+      : $_('checkout.price_monthly', { values: { price: price.toLocaleString($locale ?? undefined) } })
   );
 
   async function cont() {
@@ -114,7 +114,6 @@
 
       {#if error}
         <p class="mt-4 text-sm text-red-400">{$_('checkout.error')}</p>
-        <p class="mt-1 break-words text-xs text-ink-faint">{error}</p>
       {/if}
 
       <div class="mt-6 flex items-center gap-3">

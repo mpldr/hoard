@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { _ } from 'svelte-i18n';
+  import { _, locale } from 'svelte-i18n';
   import Seo from '$lib/components/Seo.svelte';
   import Button from '$lib/components/Button.svelte';
   import { PLANS, formatPlanQuota, formatMaxSaveSize } from '$lib/plans';
@@ -18,7 +18,7 @@
 
   function choose(plan: PlanId) {
     if (plan === 'free') {
-      goto(get(localeHref)('/download'));
+      goto($localeHref('/download'));
       return;
     }
     goto(`/checkout?plan=${plan}&cycle=${cycle}`);
@@ -26,12 +26,12 @@
 
   const proPrice = $derived(cycle === 'monthly' ? PLANS.pro.priceMonthly : PLANS.pro.priceYearly);
   const proPriceLabel = $derived(
-    `${proPrice.toLocaleString('es-ES', { minimumFractionDigits: 2 })} €`
+    `${proPrice.toLocaleString($locale ?? undefined, { minimumFractionDigits: 2 })} €`
   );
   const proSuffix = $derived(cycle === 'monthly' ? $_('pricing.per_month') : $_('pricing.per_year'));
   // Struck full-year price when yearly is selected (two months free).
   const fullYearLabel = $derived(
-    `${(PLANS.pro.priceMonthly * 12).toLocaleString('es-ES', { minimumFractionDigits: 2 })} €`
+    `${(PLANS.pro.priceMonthly * 12).toLocaleString($locale ?? undefined, { minimumFractionDigits: 2 })} €`
   );
 
   // Slider thumb geometry, measured off the real button rects.
@@ -67,6 +67,11 @@
       pro: { kind: 'text', value: formatPlanQuota('pro') }
     },
     {
+      label: $_('pricing.row_save_size'),
+      free: { kind: 'text', value: formatMaxSaveSize('free') },
+      pro: { kind: 'text', value: formatMaxSaveSize('pro') }
+    },
+    {
       label: $_('pricing.row_devices'),
       free: { kind: 'text', value: '3' },
       pro: { kind: 'text', value: $_('pricing.val_unlimited') }
@@ -75,11 +80,6 @@
       label: $_('pricing.row_history'),
       free: { kind: 'check' },
       pro: { kind: 'check' }
-    },
-    {
-      label: $_('pricing.row_save_size'),
-      free: { kind: 'text', value: formatMaxSaveSize('free') },
-      pro: { kind: 'text', value: formatMaxSaveSize('pro') }
     },
     {
       label: $_('pricing.row_sync'),
@@ -95,7 +95,7 @@
       label: 'Hoard Wrapped',
       brand: true,
       info: 'pricing.wrapped_body',
-      free: { kind: 'none' },
+      free: { kind: 'check' },
       pro: { kind: 'check' }
     },
     {
@@ -187,11 +187,8 @@
 
   <!-- MOBILE: stacked plan cards -->
   <div class="reveal mt-12 grid gap-5 sm:hidden" use:reveal>
-    <!-- Free card -->
-    <div class="relative overflow-hidden rounded-2xl border border-accent/25 bg-accent/[0.08] p-5">
-      <div
-        class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.06] to-transparent"
-      ></div>
+    <!-- Free card (neutral — only Pro is highlighted) -->
+    <div class="relative overflow-hidden rounded-2xl border border-line bg-surface p-5">
       <div class="relative flex items-baseline justify-between gap-3">
         <h3 class="font-display text-lg font-semibold text-ink">Hoard Free</h3>
         <span class="text-sm text-ink-soft">{$_('pricing.free_forever')}</span>
@@ -223,9 +220,9 @@
 
     <!-- Pro card (highlighted) — gradient border on all 4 sides, hermetic -->
     <div
-      class="relative rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
+      class="relative rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1px] shadow-lg shadow-accent-deep/30"
     >
-      <div class="relative overflow-hidden rounded-[15px] bg-accent-tint p-5">
+      <div class="relative overflow-hidden rounded-[14px] bg-accent-tint p-5">
         <div
           class="pointer-events-none absolute inset-0 bg-gradient-to-b from-accent/[0.12] via-accent/[0.03] to-transparent"
         ></div>
@@ -272,17 +269,20 @@
        glowing rectangle that spans the whole column. -->
   <div class="reveal mx-auto mt-12 hidden max-w-3xl sm:block" use:reveal>
     <div class="relative grid grid-cols-[1.5fr_1fr_1.15fr]">
-      <!-- Background highlight: fills the Pro column with a gradient-bordered
-           green panel across every row. -->
+      <!-- Background highlight: fills ONLY the Pro column with a gradient-bordered
+           green panel across every row. The label and Free columns stay neutral.
+           Left edge is square, right edge rounded — the panel reads as the Pro
+           column "peeling" off the table rather than a free-floating pill. -->
       <div
         class="pointer-events-none absolute inset-0 grid grid-cols-[1.5fr_1fr_1.15fr]"
         aria-hidden="true"
       >
-        <div class="col-span-2 -mr-4 rounded-l-2xl border border-r-0 border-accent/25 bg-accent/[0.08]"></div>
+        <div class="col-span-1 rounded-l-2xl border border-line"></div>
+        <div class="col-span-1 border-y border-line"></div>
         <div
-          class="rounded-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1.5px] shadow-xl shadow-accent-deep/40"
+          class="relative rounded-r-2xl bg-gradient-to-br from-accent via-accent-deep to-accent p-[1px] shadow-lg shadow-accent-deep/30"
         >
-          <div class="h-full w-full rounded-[15px] bg-accent-tint"></div>
+          <div class="h-full w-full rounded-r-[14px] bg-accent-tint"></div>
         </div>
       </div>
 

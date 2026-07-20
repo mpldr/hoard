@@ -58,6 +58,16 @@
             {$_('footer.github')}
           </a>
         </li>
+        <li>
+          <a
+            class="link-underline hover:text-ink"
+            href="https://discord.gg/BYpXT8v4rh"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Discord
+          </a>
+        </li>
         <li><a class="link-underline hover:text-ink" href={$localeHref('/help')}>{$_('footer.contact')}</a></li>
       </ul>
     </div>

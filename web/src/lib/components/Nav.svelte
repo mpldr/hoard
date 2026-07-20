@@ -70,6 +70,14 @@
 
     <div class="hidden items-center gap-7 md:flex">
       <a
+        href={$localeHref('/download')}
+        class="link-underline ring-focus text-sm transition-colors {isActive('/download')
+          ? 'text-ink'
+          : 'text-ink-soft hover:text-ink'}"
+      >
+        {$_('nav.download')}
+      </a>
+      <a
         href={$localeHref('/pricing')}
         class="link-underline ring-focus text-sm transition-colors {isActive('/pricing')
           ? 'text-ink'
@@ -78,12 +86,20 @@
         {$_('nav.pricing')}
       </a>
       <a
-        href={$localeHref('/help')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/help')
+        href={$localeHref('/cli')}
+        class="link-underline ring-focus text-sm transition-colors {isActive('/cli')
           ? 'text-ink'
           : 'text-ink-soft hover:text-ink'}"
       >
-        {$_('nav.help')}
+        {$_('nav.cli')}
+      </a>
+      <a
+        href="https://discord.gg/BYpXT8v4rh"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="link-underline ring-focus text-sm text-ink-soft transition-colors hover:text-ink"
+      >
+        Discord
       </a>
       <a
         href={$localeHref('/guides')}
@@ -94,20 +110,12 @@
         {$_('nav.guides')}
       </a>
       <a
-        href={$localeHref('/download')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/download')
+        href={$localeHref('/help')}
+        class="link-underline ring-focus text-sm transition-colors {isActive('/help')
           ? 'text-ink'
           : 'text-ink-soft hover:text-ink'}"
       >
-        {$_('nav.download')}
-      </a>
-      <a
-        href={$localeHref('/cli')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/cli')
-          ? 'text-ink'
-          : 'text-ink-soft hover:text-ink'}"
-      >
-        {$_('nav.cli')}
+        {$_('nav.help')}
       </a>
     </div>
 
@@ -212,20 +220,23 @@
       transition:slide={{ duration: 220, easing: cubicOut }}
     >
       <div class="mx-auto flex max-w-6xl flex-col gap-1 px-4 py-3">
+        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/download')} onclick={() => (open = false)}>
+          {$_('nav.download')}
+        </a>
         <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/pricing')} onclick={() => (open = false)}>
           {$_('nav.pricing')}
         </a>
-        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/help')} onclick={() => (open = false)}>
-          {$_('nav.help')}
+        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/cli')} onclick={() => (open = false)}>
+          {$_('nav.cli')}
+        </a>
+        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href="https://discord.gg/BYpXT8v4rh" target="_blank" rel="noopener noreferrer" onclick={() => (open = false)}>
+          Discord
         </a>
         <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/guides')} onclick={() => (open = false)}>
           {$_('nav.guides')}
         </a>
-        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/download')} onclick={() => (open = false)}>
-          {$_('nav.download')}
-        </a>
-        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/cli')} onclick={() => (open = false)}>
-          {$_('nav.cli')}
+        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/help')} onclick={() => (open = false)}>
+          {$_('nav.help')}
         </a>
         {#if $session}
           <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href="/account" onclick={() => (open = false)}>

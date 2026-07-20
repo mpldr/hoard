@@ -4,9 +4,9 @@
 
 > Steam Cloud is not a backup strategy. Hoard is.
 
-![Hoard's Library view: auto-detected games, which ones are synced, and a deep-scan option for the saves hiding in a Proton prefix](.github/readme/library.webp)
+![Hoard app photo](web/static/WEB.png)
 
-> *(Yes, that's Spanish — this is an alpha. Ships in eight languages, English included.)*
+> *Ships in eight languages, Spanish included.*
 
 Steam Cloud, GOG Galaxy and friends work fine — right up until they overwrite
 a 200-hour save with a corrupted one from another machine, the publisher
@@ -82,27 +82,22 @@ from source below; nothing about the app itself is Apple-Silicon-only.
 # Hoard-CLI
 
 Prefer the terminal, or running on a headless box (NAS / server / Steam Deck)?
-The `Hoard-CLI` ships as a standalone binary — no installer, no GUI deps.
-Grab the tarball for your platform from the [latest release](https://github.com/rleeon/hoard/releases/latest):
+The `Hoard-CLI` ships as a standalone binary no GUI deps.
+Download it in [cli latest release](https://hoard.services/cli):
 
-| Platform | Asset |
-|----------|-------|
-| Linux x86_64 | `hoard-<version>-linux-x86_64.tar.gz` |
-| Linux ARM64 (RPi / ARM server) | `hoard-<version>-linux-aarch64.tar.gz` |
-| macOS Apple Silicon | `hoard-<version>-macos-aarch64.tar.gz` |
-| macOS Intel | `hoard-<version>-macos-x86_64.tar.gz` |
-| Windows x86_64 | `hoard-<version>-windows-x86_64.tar.gz` |
-| Windows ARM64 | `hoard-<version>-windows-aarch64.tar.gz` |
+![Hoard cli photo](web/static/CLI.png)
 
-Extract it and put `hoard` (or `hoard.exe`) on your `PATH`:
+If web not open:
 
-```sh
-# Extract and run:
-tar -xzf hoard-<version>-<platform>.tar.gz    # replace <version> and <platform>
-sudo mv hoard-<version>-<platform>/hoard /usr/local/bin/    # replace <version> and <platform>
-hoard login # login to your account
-# Linux tarballs also include hoard-server and hoard-admin for self-hosting.
-```
+Linux: 
+
+curl -fsSL https://hoard.services/install.sh | sh
+
+Windows: 
+
+irm https://hoard.services/install.ps1 | iex
+
+
 ## Documentation
 
 - **[Self-hosting guide](SELF-HOST_GUIDE.md)** — Docker, bare-metal + systemd, and the headless CLI.

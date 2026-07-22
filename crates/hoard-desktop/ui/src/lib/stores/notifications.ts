@@ -173,36 +173,61 @@ export { notifications as unreadCount };
 
 let serverListener: (() => void) | null = null;
 
-/** Subscribe to `hoard://notification` Tauri events (server → client). Call
- *  once at boot; the listener lives for the app's lifetime. Idempotent. */
+/** Reconcile the store against the server's authoritative broadcast list.
+ *
+ *  The server (cloud/routes/notifications.rs) returns the FULL set of
+ *  broadcasts this user should currently see — already filtered by signup
+ *  date, expiry and per-user dismissals. So this is a replace, not a merge,
+ *  for server-sourced entries: add rows that are new, and DROP server rows the
+ *  server no longer delivers (expired, or dismissed on another device). App-
+ *  sourced notifications (`source: "app"`) are untouched. Existing `at`
+ *  timestamps are preserved so the ordering doesn't churn on every snapshot. */
+function reconcileServer(rows: ServerNotification[]): void {
+  notifications.update((list) => {
+    const prevAt = new Map(list.map((n) => [n.id, n.at]));
+    const app = list.filter((n) => n.source === "app");
+    const server: AppNotification[] = rows.map((p) => ({
+      id: p.id,
+      title: p.title,
+      body: p.body,
+      priority: p.priority ?? "normal",
+      at: prevAt.get(p.id) ?? Date.now(),
+      source: "server",
+      action_url: p.action_url,
+      action_label: p.action_label,
+    }));
+    // Newest first across both sources.
+    const next = [...server, ...app]
+      .sort((a, b) => b.at - a.at)
+      .slice(0, MAX_ENTRIES);
+    persist(next);
+    return next;
+  });
+}
+
+/** Subscribe to `hoard://notifications-snapshot` Tauri events (server →
+ *  client) and pull the boot-time backlog once the listener is armed. Call
+ *  once at boot; the listener lives for the app's lifetime. Idempotent.
+ *
+ *  Two delivery paths, same reconcile: the Rust `cloud_feed` poller/Realtime
+ *  emits `hoard://notifications-snapshot` with the full filtered list, and the
+ *  `notifications_backlog` command returns that same list for the events that
+ *  fired while the webview was still mounting. */
 export async function initServerNotifications(): Promise<void> {
   if (serverListener) return;
   try {
     const { listen } = await import("@tauri-apps/api/event");
-    const unlisten = await listen<ServerNotification>(
-      "hoard://notification",
-      (e) => {
-        const p = e.payload;
-        const id = p.id;
-        notifications.update((list) => {
-          if (list.some((x) => x.id === id)) return list;
-          const entry: AppNotification = {
-            id,
-            title: p.title,
-            body: p.body,
-            priority: p.priority ?? "normal",
-            at: Date.now(),
-            source: "server",
-            action_url: p.action_url,
-            action_label: p.action_label,
-          };
-          const next = [entry, ...list].slice(0, MAX_ENTRIES);
-          persist(next);
-          return next;
-        });
-      },
+    const unlisten = await listen<{ notifications: ServerNotification[] }>(
+      "hoard://notifications-snapshot",
+      (e) => reconcileServer(e.payload?.notifications ?? []),
     );
     serverListener = unlisten;
+    // Race-free catch-up: any snapshot emitted before this listener attached
+    // (broadcast sent while the app was closed, or during webview load) is
+    // recovered by pulling the backlog now.
+    const { invoke } = await import("@tauri-apps/api/core");
+    const rows = await invoke<ServerNotification[]>("notifications_backlog");
+    reconcileServer(rows ?? []);
   } catch {
     /* Tauri not available (e.g. dev in browser) — no-op */
   }

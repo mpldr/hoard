@@ -581,3 +581,38 @@ kernel**; el shell no se vuelve a tocar salvo para *quitarle* política.
 `fs_event_triggers_backup_without_game_running` de `BackupScheduled` a
 `BackupStarted` en vez de borrarlo es lo que había que hacer: prueba la cadena
 nueva de extremo a extremo.
+
+### D.9 — Slice 2 cerrado (2a + 2b + 2c). Decisiones a no deshacer
+
+D.8.1 y D.8.2 resueltos en 2c. **D.8.3 (`upload_landed` / anti-relaunch
+content-addressed) sigue abierto → va con el Slice 4**, donde reiniciar el daemon
+es rutina y el `in_flight` local deja de bastar.
+
+**Dos carriles de "no actuar hasta T" — no volver a fusionarlos.**
+`next_backup_at` es **sólo backoff de error** y nunca es saltable. El suelo de
+min-interval **no se almacena**: se deriva de
+`last_backup_at + min_backup_interval_secs`, y sólo lo salta el flush de
+desatasco cross-device. Fusionarlos otra vez reintroduce (a) el R.E.P.O. — un
+backup no-op anclaría el intervalo — y (b) una espera de hasta 600 s (preset
+`data_saver`) antes de destrabar un pull cross-device. Derivar el suelo hace que
+el no-op no lo ancle *por construcción*, en vez de por caso especial.
+
+**Guarda pendiente sobre ese carril.** El suelo de ahorro es lo que protege de la
+factura de ops de R2 (el hot-loop costó 1,29M). El carril que lo salta debe
+seguir siendo **sólo** el desatasco (`has_pending ∧ cloud_ahead ∧ !in_flight`),
+que es auto-limitado (si acierta, la condición se cierra; si falla, arma el
+backoff no-saltable). Añadir la propiedad de seguridad que lo fija: *fuera de esa
+condición, ningún backup se emite antes de `last_backup_at + min_interval`*.
+
+**Riesgo residual del port.** 2a introdujo al menos un drift silencioso respecto
+al motor original (`record_failure` anclado en `known_version` en vez de
+`obs.cloud_version`, cazado en 2c). Puede haber más anclas/umbrales portados mal;
+el corpus + proptests son la red. Ante un comportamiento raro del motor, sospecha
+primero de un ancla portada mal, no de la arquitectura.
+
+**Cadencia del tick, medida (2c):** `AgentConfig::poll_secs = 2` (8 s en idle vía
+`IDLE_POLL_MULT`), más `reconcile_all` inmediato en cada comando, en `done_rx` y
+en el nudge del debounce fs. `CLOUD_POLL_INTERVAL_SECS = 60` es otra cosa: el
+airbag del push Realtime, que al llegar dispara `SetCloudVersions` + reconcile
+inmediato. Por eso la pérdida del pre-launch barrier (D.8) es de **segundos** y se
+decidió no compensarla.

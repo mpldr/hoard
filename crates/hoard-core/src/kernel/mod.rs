@@ -93,8 +93,21 @@ pub struct RestoreFailures {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpResult {
     /// Terminó sin error. `version`/`fingerprint` son la cabeza a la que
-    /// quedamos sincronizados; `wrote` = escribió ficheros de verdad (no un
-    /// pase no-op "ya sincronizado").
+    /// quedamos sincronizados.
+    ///
+    /// `wrote` es el discriminante **commit vs no-op** (ADR 0021 D.8.2): en un
+    /// backup, `true` = un snapshot nuevo llegó al server; en un restore,
+    /// `true` = se aplicaron ficheros. `false` es el pase no-op — skip por
+    /// firma, carpeta vacía, save archivado, demasiado grande, o "ya
+    /// sincronizado" — y el reductor lo trata distinto: un no-op **no** ancla el
+    /// min-interval (pasarlo como commit es la regresión R.E.P.O.: la siguiente
+    /// subida real se empujaría un intervalo entero y una sesión corta nunca
+    /// volcaría su progreso) ni sella `last_restore_at`.
+    ///
+    /// Un backup no-op **con** `version` es el caso especial del 409
+    /// non-fast-forward asentado a la cabeza remota: no hubo commit, pero el
+    /// merge escribió en la carpeta como un restore, así que el reductor sí
+    /// sella `last_restore_at` ahí.
     Ok {
         version: Option<i64>,
         fingerprint: Option<u64>,
@@ -110,8 +123,13 @@ pub enum OpResult {
     /// (contar un throttle como "stuck" era justo el bug del spam). Simétrico
     /// backup/restore.
     Throttled { retry_after_secs: u32 },
-    /// Cualquier otro error (red, sha, permisos, timeout). Escala el contador y
-    /// el backoff.
+    /// Cualquier otro error (red, sha, permisos, timeout), tras agotar los
+    /// reintentos internos del ejecutor. Su efecto depende de la op en vuelo: en
+    /// una **bajada** escala el contador de fallos por versión cloud y el
+    /// backoff de restore; en una **subida** re-arma el intento en el backoff
+    /// largo ([`reconcile::BACKUP_FAILURE_BACKOFF_SECS`]) conservando
+    /// `has_pending` — los cambios nunca llegaron a una versión, y limpiarlos
+    /// dejaría que un restore los pisara.
     Failed,
 }
 
@@ -132,7 +150,8 @@ pub struct State {
     /// El restore está habilitado para este save (default global o preset).
     pub restore_enabled: bool,
     /// Suelo de intervalo entre backups con commit (ADR 0018, eje A). `0` = sin
-    /// suelo. Se aplica anclando `next_backup_at` tras cada subida exitosa.
+    /// suelo. Se mide desde [`Self::last_backup_at`] —que sólo avanza con un
+    /// commit real— así que un pase no-op no puede empujar el suelo.
     pub min_backup_interval_secs: u64,
 
     // ---- Status de sesión viva (durable cross-tick) --------------------
@@ -158,7 +177,9 @@ pub struct State {
     /// igualdad con el fingerprint observado es lo que hace "convergido ⇒ 0
     /// acciones": mata el hot-loop de compresión.
     pub synced_fingerprint: Option<u64>,
-    /// Último backup con commit real (ancla del min-interval).
+    /// Último backup con commit real: **el ancla del min-interval**. Sólo lo
+    /// mueve un `OpResult::Ok { wrote: true }` — un no-op moviéndolo empujaría la
+    /// siguiente subida real un intervalo entero (regresión R.E.P.O.).
     pub last_backup_at: Option<OffsetDateTime>,
 
     // ---- Operación en curso (anti-relaunch) ----------------------------
@@ -167,8 +188,12 @@ pub struct State {
     pub in_flight: Option<Op>,
 
     // ---- Deadlines de ritmo (sans-IO: contra `world.now`) --------------
-    /// Antes de este instante no se lanza otro backup (min-interval / debounce /
-    /// backoff de throttle de subida). `None` = sin freno.
+    /// Antes de este instante no se lanza otro backup por **backoff de error**:
+    /// throttle 429 de subida, o reintentos de subida agotados. `None` = sin
+    /// freno. El suelo de min-interval **no** vive aquí: se deriva de
+    /// [`Self::last_backup_at`] + [`Self::min_backup_interval_secs`], para poder
+    /// distinguir el pacing de ahorro (que un flush cross-device puede saltarse)
+    /// del backoff de error (que jamás).
     pub next_backup_at: Option<OffsetDateTime>,
     /// Antes de este instante no se lanza otro restore (cooldown / backoff de
     /// fallo / backoff de throttle de bajada). `None` = sin freno.
@@ -178,8 +203,10 @@ pub struct State {
     /// Una actualización cross-device espera pero un pull se vetó mid-session.
     /// Sobrevive al veto y aterriza al cerrarse el juego (bug del Deck).
     pub pull_pending: bool,
-    /// Ya se avisó al usuario de este pull en espera (dedupe del aviso, una vez
-    /// por actualización, no una por tick).
+    /// Ya se avisó al usuario de este pull en espera. De-duplica **sólo la
+    /// notificación de UI** (una por actualización, no una por tick); jamás la
+    /// acción: guardar una acción en un flag de flanco dentro de un reductor
+    /// level-triggered fue justo el deadlock de D.8.1.
     pub deferred_notified: bool,
 
     // ---- Escalada de fallos de restore ---------------------------------

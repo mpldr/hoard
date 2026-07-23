@@ -112,11 +112,12 @@ pub struct AgentConfig {
     /// remote head in before retrying. So outdated-while-playing now defers
     /// to the reconciliation sweep, which catches up as soon as the session
     /// settles — and a deferred `ForceRestore` that finds un-flushed local
-    /// changes flushes them immediately (bypassing the min-interval queue),
-    /// so live progress becomes a cloud version within seconds instead of
-    /// waiting out the debounce window. The only guarded-path exception is
-    /// the pre-launch barrier (see `process_poll`), which is launch-scoped
-    /// by construction.
+    /// changes flushes them immediately (the reductor marks that flush
+    /// *urgent*, so it skips the data-saving min-interval floor — never an
+    /// error backoff), so live progress becomes a cloud version within seconds
+    /// instead of waiting out the debounce window. There is no guarded-path
+    /// exception left: the pre-launch barrier died with the inversion of
+    /// `run_agent` (ADR 0021 Slice 2b) — the tick is the only authority.
     pub global_sync: bool,
 }
 
@@ -475,8 +476,9 @@ pub enum BackupReason {
     /// would be noise — but the resulting upload still announces normally.
     SweepStaggered,
     /// A previous attempt burned its whole retry budget and failed for real.
-    /// The upload is re-armed on a long backoff ([`BACKUP_RETRY_BACKOFF`]) so
-    /// there's a way back without waiting on a new fs event. See
+    /// The upload is re-armed on a long backoff
+    /// ([`kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS`]) so there's a way back
+    /// without waiting on a new fs event. See
     /// [`AgentCommand::RetryBackupAfterFailure`].
     RetryAfterFailure,
 }
@@ -622,8 +624,9 @@ enum AgentCommand {
     /// keep every restore off them) and `has_pending` is itself a
     /// `mid_session_reason` veto — so the save could neither be uploaded nor
     /// pulled until the user happened to write the folder again. The handler
-    /// re-arms the upload on [`BACKUP_RETRY_BACKOFF`], the recovery path that
-    /// doesn't depend on a new fs event.
+    /// feeds it to the reductor as `OpResult::Failed`, which re-arms the upload
+    /// on [`kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS`] — the recovery path
+    /// that doesn't depend on a new fs event.
     RetryBackupAfterFailure(String),
     /// Latest known cloud version per save id, as last seen by the `cloud_pull`
     /// poller's manifest. The poller already fetches the full manifest once per
@@ -871,8 +874,10 @@ struct SaveSlot {
     /// ingerir el [`kernel::OpResult`] correspondiente. Mapea 1:1 a
     /// [`kernel::State::in_flight`].
     in_flight: Option<kernel::Op>,
-    /// Suelo de instante para el próximo backup (min-interval / backoff de
-    /// throttle de subida / backoff de fallo de backup). `None` = sin freno.
+    /// Suelo de instante para el próximo backup por **backoff de error**
+    /// (throttle 429 de subida / reintentos de subida agotados). `None` = sin
+    /// freno. El suelo de min-interval no vive aquí: el reductor lo deriva de
+    /// `last_backup_at` (ver `kernel::reconcile`).
     /// `OffsetDateTime` (no `TokioInstant`) porque el kernel es sans-IO y
     /// compara contra `world.now`; la conversión vive aquí en el shell (ADR
     /// 0021 D.7). Mapea a [`kernel::State::next_backup_at`].
@@ -1113,7 +1118,6 @@ fn reconcile_all(
         };
         // Snapshot pre-reductor para derivar los eventos de observabilidad
         // (stuck/recovered) del delta de `restore_failures`.
-        let had_op = slot.pending_op_result;
         let was_stuck = slot.restore_failures.stuck_notified;
         let err_for_stuck = slot.last_restore_error.take();
 
@@ -1126,14 +1130,15 @@ fn reconcile_all(
         let (next, decisions) = kernel::reconcile::reconcile(&state, &obs, world);
         apply_state_to_slot(slot, next);
 
-        // Eventos stuck/recovered a partir del delta de la escalada de fallos.
-        // El reductor los codifica en `restore_failures.stuck_notified`; el shell
-        // los traduce a eventos de UI (ADR 0021 C.5: el veto/fallo es de primera
-        // clase y visible).
-        if matches!(had_op, Some(kernel::OpResult::Failed))
-            && !was_stuck
-            && slot.restore_failures.stuck_notified
-        {
+        // Eventos stuck/recovered puramente del delta de la escalada de fallos.
+        // El reductor decide (escala al ingerir un `Failed`, resetea con un `Ok`
+        // o con una versión cloud nueva); el shell sólo traduce el flanco a
+        // eventos de UI (ADR 0021 C.5: el veto/fallo es de primera clase y
+        // visible). Sin gate por el tipo de resultado: así el reseteo por
+        // versión nueva —que ya no llega como op— también avisa de la
+        // recuperación.
+        let now_stuck = slot.restore_failures.stuck_notified;
+        if !was_stuck && now_stuck {
             let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreStuck {
                 save_id: id.clone(),
                 game_slug: slot.save.game_slug.clone(),
@@ -1141,10 +1146,11 @@ fn reconcile_all(
                 error: err_for_stuck.unwrap_or_default(),
             });
         }
-        if matches!(had_op, Some(kernel::OpResult::Ok { .. }))
-            && was_stuck
-            && !slot.restore_failures.stuck_notified
-        {
+        if was_stuck && !now_stuck {
+            tracing::info!(
+                save_id = %id,
+                "agent: auto-restore escalation cleared — save recovered"
+            );
             let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreRecovered {
                 save_id: id.clone(),
                 game_slug: slot.save.game_slug.clone(),
@@ -1188,36 +1194,26 @@ fn execute_action(
         kernel::Action::Restore | kernel::Action::Pull => {
             execute_restore(slots, id, api, events_tx, cmd_tx, config);
         }
+        // Aviso de UI, nada más. El flush que antes vivía aquí (subir lo
+        // pendiente para que la nube dejase de ir por delante) era **política en
+        // el shell**: el reductor retenía el pull y retornaba antes de la rama de
+        // backup, así que el shell desatascaba a mano el par
+        // (has_pending, cloud_ahead). Ahora el propio reductor emite `Backup` en
+        // el mismo tick en que difiere el pull (ADR 0021 D.8.1), así que aquí
+        // sólo queda notificar.
         kernel::Action::DeferPull => {
-            // Diferir un pull con la nube por delante NO debe dejar el progreso
-            // de la sesión sin versionar: el reductor retiene el pull (protege lo
-            // local) y retorna antes de la rama de backup, así que el shell hace
-            // el flush aquí — igual que el viejo camino `ForceRestore`. La subida
-            // choca 409 non-fast-forward, `run_backup_with_retry` mergea la
-            // cabeza remota y `known_version` avanza: la nube deja de ir por
-            // delante y el pull diferido (persistido en `pull_pending`) aterriza
-            // en un tick tranquilo posterior. Sin esto, has_pending + nube-por-
-            // delante se quedaría atascado (el reductor no emite backup mientras
-            // quiere restaurar). Ver ADR 0021 D.7 y `AgentConfig::global_sync`.
-            let flush = slots
-                .get(id)
-                .is_some_and(|s| s.has_pending && s.in_flight.is_none());
-            let game_slug = slots.get(id).map(|s| s.save.game_slug.clone());
-            if let Some(game_slug) = game_slug {
-                tracing::info!(
-                    save_id = %id,
-                    flush,
-                    "agent: cross-device update deferred mid-session; pulls when the folder settles"
-                );
-                let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
-                    save_id: id.to_string(),
-                    game_slug,
-                    reason: "mid-session".to_string(),
-                });
-            }
-            if flush {
-                execute_backup(slots, id, api, events_tx, cmd_tx, config, done_tx);
-            }
+            let Some(game_slug) = slots.get(id).map(|s| s.save.game_slug.clone()) else {
+                return;
+            };
+            tracing::info!(
+                save_id = %id,
+                "agent: cross-device update deferred mid-session; pulls when the folder settles"
+            );
+            let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
+                save_id: id.to_string(),
+                game_slug,
+                reason: "mid-session".to_string(),
+            });
         }
         // El deadline ya vive en `next_backup_at`/`next_restore_at`; el shell no
         // reintenta hasta cruzarlo. Aquí sólo se registra (observabilidad).
@@ -1245,10 +1241,10 @@ fn execute_backup(
     let Some(slot) = slots.get_mut(id) else {
         return;
     };
-    // Marca la op en vuelo: el reductor ya lo hizo para `Act(Backup)`, pero el
-    // flush de `DeferPull` no pasa por esa rama, así que lo fijamos aquí para que
-    // el anti-relaunch (retén "operation in flight") lo cubra en ambos casos.
-    slot.in_flight = Some(kernel::Op::Backup);
+    // `in_flight` ya quedó `Some(Backup)` por el reductor (única vía de emisión
+    // de `Act(Backup)`), así que el anti-relaunch cubre esta subida sin que el
+    // shell toque estado de sync.
+    //
     // La subida anterior (si la había) ya terminó — el reductor no re-emite
     // Backup con `in_flight` puesto. Cancela cualquier timer de debounce fs
     // pendiente: su trabajo (nudge) ya no aplica, la subida arranca ahora.
@@ -1557,38 +1553,13 @@ async fn run_agent(
                             count = map.len(),
                             "agent: cloud version cache updated from poller"
                         );
-                        // Un save aparcado en el backoff de fallo NO debe esperar
-                        // por una versión *nueva*: el backoff era sobre la versión
-                        // que fallaba y el server acaba de pasarla. Es el único
-                        // punto donde el agente aprende que la nube avanzó, así que
-                        // aquí limpiamos la escalada (el reductor sólo la resetea al
-                        // ingerir el próximo `OpResult::Failed`, demasiado tarde) y
-                        // soltamos `next_restore_at` para que el reconcile reintente
-                        // ya. Emitimos recovered si había un aviso "stuck" en pie.
-                        let mut recovered: Vec<(String, String)> = Vec::new();
-                        for (id, slot) in slots.iter_mut() {
-                            let active = slot.restore_failures.consecutive > 0
-                                || slot.restore_failures.stuck_notified;
-                            if !active {
-                                continue;
-                            }
-                            if slot.restore_failures.version == map.get(id).copied() {
-                                continue;
-                            }
-                            if slot.restore_failures.stuck_notified {
-                                recovered.push((id.clone(), slot.save.game_slug.clone()));
-                            }
-                            slot.restore_failures = kernel::RestoreFailures::default();
-                            slot.next_restore_at = None;
-                        }
-                        for (save_id, game_slug) in recovered {
-                            tracing::info!(
-                                save_id = %save_id,
-                                "agent: cloud version advanced past the failing one — clearing stuck state"
-                            );
-                            let _ = events_tx
-                                .try_send(AgentEvent::SaveAutoRestoreRecovered { save_id, game_slug });
-                        }
+                        // Sólo se refresca la caché de cabezas: soltar el backoff
+                        // de un save aparcado cuando la nube publica una versión
+                        // distinta de la que fallaba es política, y vive en el
+                        // reductor desde el Slice 2c (ADR 0021 D.8.2) — lo aplica
+                        // el `reconcile_all` de abajo al ver el `cloud_version`
+                        // nuevo, y el evento "recovered" sale del delta de
+                        // `restore_failures` como cualquier otro.
                         latest_versions = map;
                         // La nube pudo adelantarse: reconcilia para pulsar las
                         // actualizaciones que acaban de destrabarse.
@@ -1635,23 +1606,26 @@ async fn run_agent(
                     }
                     Some(AgentCommand::RetryBackupAfterFailure(id)) => {
                         // La subida agotó su presupuesto de reintentos internos.
-                        // El reductor no modela el backoff de *fallo de backup*
-                        // (sólo el de restore), así que el shell repone el ritmo:
-                        // limpia `in_flight`, arma `next_backup_at` en el backoff
-                        // largo y CONSERVA `has_pending` (los cambios locales nunca
+                        // Como cualquier final de op, es una *entrada* del
+                        // reductor: `OpResult::Failed` sobre un `in_flight` de
+                        // backup limpia la op, arma `next_backup_at` en el backoff
+                        // largo y CONSERVA `has_pending` (los cambios nunca
                         // llegaron a una versión; perderlos dejaría que un restore
-                        // los pisara). El próximo tick, pasado el backoff, reintenta.
+                        // los pisara). Ese ritmo era política del shell hasta el
+                        // Slice 2c; ahora vive en el kernel (ADR 0021 D.8.2).
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.next_scheduled_backup_at = None;
-                            slot.in_flight = None;
-                            slot.next_backup_at =
-                                Some(OffsetDateTime::now_utc() + BACKUP_RETRY_BACKOFF);
+                            slot.pending_op_result = Some(kernel::OpResult::Failed);
                             tracing::info!(
                                 save_id = %id,
-                                backoff_secs = BACKUP_RETRY_BACKOFF.as_secs(),
+                                backoff_secs = kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS,
                                 "agent: backup retries exhausted — re-arming on the long backoff"
                             );
                         }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
+                        );
                     }
                     Some(AgentCommand::SweepAll { window_secs }) => {
                         // `window_secs` era el ancho del escalonado por tamaño del
@@ -1866,47 +1840,25 @@ async fn run_agent(
             // ----- Backup completions -----
             Some(done) = done_rx.recv() => {
                 // La subida terminó. En el modelo invertido su resultado es una
-                // *entrada* del reductor. Un commit real → `OpResult::Ok` (el
-                // reductor avanza known_version/synced_fingerprint, limpia
-                // has_pending y ancla el min-interval en last_backup_at). Un no-op
-                // (skip/unchanged/vacío/archived/too-large, o el 409 asentado a la
-                // cabeza sin divergencia) es bookkeeping del shell: NO debe avanzar
-                // el ancla del min-interval sobre un backup fantasma (regresión
-                // R.E.P.O.), sólo limpiar `in_flight` y cachear la firma — el
-                // reductor no distingue commit de no-op en `OpResult::Ok`, así que
-                // el shell lo hace aquí (conversión de resultado del ejecutor, ADR
-                // 0021 D.7).
+                // *entrada* del reductor: aquí sólo se traduce (conversión del
+                // ejecutor, ADR 0021 D.7). `committed` viaja como `OpResult::Ok
+                // { wrote }`, el discriminante commit/no-op que el reductor usa
+                // para anclar —o NO anclar— el min-interval: un skip/unchanged/
+                // vacío/archived, o el 409 asentado a la cabeza, no es un backup
+                // y no debe mover el ancla (regresión R.E.P.O.). Esa distinción
+                // vivía aquí como bookkeeping del shell; ahora está en el kernel
+                // (D.8.2), donde el replay de C.5 la reproduce.
                 if let Some(slot) = slots.get_mut(&done.save_id) {
                     slot.next_scheduled_backup_at = None;
                     slot.first_pending_event_at = None;
                     if let Some(h) = &done.new_set_hash {
                         slot.last_set_hash = Some(h.clone());
                     }
-                    if done.committed {
-                        slot.pending_op_result = Some(kernel::OpResult::Ok {
-                            version: done.version_num,
-                            fingerprint: done
-                                .new_set_hash
-                                .as_deref()
-                                .map(fingerprint_from_set_hash),
-                            wrote: true,
-                        });
-                    } else {
-                        slot.in_flight = None;
-                        slot.has_pending = false;
-                        if let Some(h) = &done.new_set_hash {
-                            slot.synced_fingerprint = Some(fingerprint_from_set_hash(h));
-                        }
-                        // `version_num` presente en un no-op = 409 asentado a la
-                        // cabeza: avanza known_version y sella `last_restore_at`
-                        // (el merge escribió en la carpeta como un restore, no debe
-                        // vetar el siguiente pull).
-                        if let Some(v) = done.version_num {
-                            slot.known_version = Some(v);
-                            slot.restore_failures = kernel::RestoreFailures::default();
-                            slot.last_restore_at = Some(OffsetDateTime::now_utc());
-                        }
-                    }
+                    slot.pending_op_result = Some(kernel::OpResult::Ok {
+                        version: done.version_num,
+                        fingerprint: done.new_set_hash.as_deref().map(fingerprint_from_set_hash),
+                        wrote: done.committed,
+                    });
                 }
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
@@ -2017,15 +1969,6 @@ fn handle_add(
     mark_pending_if_diverged(&mut slot);
     slots.insert(save_id, slot);
 }
-
-/// How long to wait before re-arming a backup whose in-task retry budget
-/// (`max_retries`, seconds-scale exponential backoff) is spent. Ten minutes is
-/// deliberately far slower than that budget: what survives it isn't a flaky
-/// packet but a real outage — server down, no network, disk unreadable, token
-/// expired — and those resolve on the scale of minutes to hours. Long enough
-/// that a dead backend isn't hammered (and the feed gets one row per ten
-/// minutes, not a scroll of red), short enough that recovery is unattended.
-const BACKUP_RETRY_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// Idle process-poll slowdown factor. When no tracked game is running the agent
 /// polls the process table every `poll_secs * IDLE_POLL_MULT` instead of every

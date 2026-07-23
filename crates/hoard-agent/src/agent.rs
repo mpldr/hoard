@@ -859,39 +859,73 @@ struct SaveSlot {
     /// When this save was last successfully backed up (UTC). Anchors the
     /// `min_snapshot_interval_secs` floor (ADR 0018, eje A): a new backup is
     /// never scheduled to fire before `last_backup_at + interval`. `None`
-    /// until the first success this session.
+    /// until the first success this session. Owned by the kernel now (mapped
+    /// to [`kernel::State::last_backup_at`]); the reductor advances it on a
+    /// committed backup.
     last_backup_at: Option<OffsetDateTime>,
-    /// `true` while a background auto-restore task is downloading into
-    /// this slot's local path. Prevents the reconciliation sweep from
-    /// firing the same restore twice. Cleared by
-    /// `AgentCommand::AutoRestoreFinished` when the task ends (success
-    /// or failure).
-    restoring: bool,
-    /// Earliest moment the reconciliation sweep is allowed to fire
-    /// another auto-restore for this slot. Used as a 60-second cooldown
-    /// after a failed attempt so a misbehaving server doesn't burn rate
-    /// limits in a tight loop, and stretched by `auto_restore_failures`
-    /// once a save keeps failing. `None` means "no cooldown active".
-    next_auto_restore_at: Option<TokioInstant>,
-    /// Consecutive auto-restore failures and the cloud version they're counted
-    /// against (the "every other error" arm only — 404 and 401 don't count; see
-    /// [`AutoRestoreDisposition`]). Drives [`auto_restore_backoff`], so the
-    /// retry pacing escalates instead of re-downloading a multi-GB save every
-    /// 60 s forever, and gates the one-shot stuck event.
-    ///
-    /// The counter is per *version*, not per save: a new version on the server
-    /// is genuinely new content and a fresh reason to try now, so it resets the
-    /// escalation rather than inheriting the old version's penalty. Comparing
-    /// versions rather than elapsed time is what keeps that honest — a save
-    /// stuck on v7 for an hour is still stuck on v7, no matter how long it's
-    /// been.
-    restore_failures: AutoRestoreFailures,
+    /// La operación de IO en curso para este slot (anti-relaunch, ADR 0021
+    /// C.1): mientras sea `Some`, el reductor retiene ("operation in flight")
+    /// en vez de relanzar una subida/bajada de varios GB. Sustituye al viejo
+    /// `restoring: bool`: ahora distingue backup de restore. El reductor lo
+    /// pone al emitir `Act(Backup)`/`Act(Restore)`; el shell lo limpia al
+    /// ingerir el [`kernel::OpResult`] correspondiente. Mapea 1:1 a
+    /// [`kernel::State::in_flight`].
+    in_flight: Option<kernel::Op>,
+    /// Suelo de instante para el próximo backup (min-interval / backoff de
+    /// throttle de subida / backoff de fallo de backup). `None` = sin freno.
+    /// `OffsetDateTime` (no `TokioInstant`) porque el kernel es sans-IO y
+    /// compara contra `world.now`; la conversión vive aquí en el shell (ADR
+    /// 0021 D.7). Mapea a [`kernel::State::next_backup_at`].
+    next_backup_at: Option<OffsetDateTime>,
+    /// Suelo de instante para el próximo restore (cooldown / backoff de fallo /
+    /// backoff de throttle de bajada). Antes `next_auto_restore_at:
+    /// Option<TokioInstant>`; ahora `OffsetDateTime` para casar con el kernel.
+    /// Mapea a [`kernel::State::next_restore_at`].
+    next_restore_at: Option<OffsetDateTime>,
+    /// Escalada de fallos de restore por versión cloud (404/401/429 no cuentan;
+    /// ver [`kernel::OpResult`]). El reductor la escala/resetea al ingerir el
+    /// resultado; el shell la lee para emitir los eventos stuck/recovered.
+    /// Antes `AutoRestoreFailures` (con métodos en el shell); ahora el tipo puro
+    /// del kernel [`kernel::RestoreFailures`] — la lógica vive en el reductor.
+    restore_failures: kernel::RestoreFailures,
     /// Skip-by-set-hash signature of the last successful upload this session
     /// (ADR 0019). Compared against the freshly-walked signature before each
     /// backup; an unchanged signature means the watcher fired on a no-op
     /// settle, so the upload is skipped. In-memory only — cross-restart
-    /// persistence is the CLI/desktop's job via `state.json`.
+    /// persistence is the CLI/desktop's job via `state.json`. Sigue siendo el
+    /// composite `"<cheap>:<content>"` que consume `run_backup_with_retry`; su
+    /// mitad *cheap* alimenta el fingerprint del kernel (`synced_fingerprint`).
     last_set_hash: Option<String>,
+    /// Fingerprint (`u64`) del contenido local ya sincronizado, para el
+    /// invariante "convergido ⇒ 0 acciones" del reductor (mata el hot-loop de
+    /// compresión R2). Es el hash de la mitad *cheap* de [`Self::last_set_hash`]:
+    /// igual función que el fingerprint muestreado en la observación L1, así que
+    /// contenido idéntico ⇒ mismo `u64` ⇒ el reductor retiene. Mapea a
+    /// [`kernel::State::synced_fingerprint`].
+    synced_fingerprint: Option<u64>,
+    /// mtime propio de la carpeta (su inodo) visto el último tick: gate del
+    /// muestreo L1. Sólo re-hasheamos (`walk_source` + `compute_set_signature`)
+    /// cuando este mtime cambió, cuando el watcher marcó [`Self::needs_l1`], o
+    /// en un sweep/manual — nunca cada tick (ADR 0021 C.1, observación por
+    /// niveles L0/L1).
+    last_l0_mtime: Option<OffsetDateTime>,
+    /// Fuerza el cálculo del fingerprint L1 en el próximo tick aunque el mtime
+    /// L0 no haya cambiado: lo pone el watcher fs (una reescritura in-place en
+    /// un subdirectorio no mueve el mtime propio de la carpeta), el barrido
+    /// horario (`SweepAll`) y el backup manual (`BackupNow`). Se limpia tras
+    /// muestrear.
+    needs_l1: bool,
+    /// Resultado de una op de IO que acaba de terminar, en cola para que el
+    /// próximo `reconcile` lo ingiera (limpia `in_flight`, actualiza
+    /// contabilidad/backoff). En el modelo invertido la finalización de una op
+    /// es una *entrada* del reductor, no un evento que muta estado por su
+    /// cuenta. Mapea a [`kernel::Observation::op_result`].
+    pending_op_result: Option<kernel::OpResult>,
+    /// La cadena de error del último restore fallido, en cola junto a un
+    /// `pending_op_result` = `Failed`. El reductor no la transporta (su
+    /// `OpResult::Failed` no lleva string), así que el shell la guarda para el
+    /// evento [`AgentEvent::SaveAutoRestoreStuck`] que emite al cruzar el umbral.
+    last_restore_error: Option<String>,
     /// Cloud version this slot is known to be synced to — advanced on a genuine
     /// upload commit and after a successful auto-restore. The reconciliation
     /// sweep passes it to `run_auto_restore`, which skips the download-to-diff
@@ -909,22 +943,384 @@ struct SaveSlot {
     /// often doesn't — suspend/resume keeps the game alive across days, and
     /// Proton regularly leaves the process behind after the user quits — so the
     /// veto held forever and a save made on another device only showed up after
-    /// a Steam restart. Consumed by the `GameStopped` transition (see
-    /// [`deferred_pull_ready`]), the first moment the folder is provably quiet.
+    /// a Steam restart. Consumido por el reductor el primer tick en que el slot
+    /// queda tranquilo (juego cerrado, nada pendiente). Mapea a
+    /// [`kernel::State::pull_pending`].
     pull_pending: bool,
-    /// The `GameStopped` final flush is in flight and owes this slot a deferred
-    /// pull once its `BackupDone` lands. A one-shot licence, consumed by the
-    /// next `BackupDone` whether or not the pull ends up firing: it scopes the
-    /// recency-guard skip to the stop transition, so no other backup (a
-    /// mid-session flush, a manual run) can license a pull into a folder that
-    /// was just written.
-    pull_after_flush: bool,
     /// Has [`AgentEvent::RestoreDeferred`] already gone out for the update
-    /// currently waiting? The sweep re-evaluates the veto every tick, so without
-    /// this the feed would take one "waiting" line per save per tick. Cleared
-    /// when the game starts (a new session earns a new notice) and when the
-    /// deferred pull finally fires.
+    /// currently waiting? The reductor re-evaluates the veto every tick, so
+    /// without this the feed would take one "waiting" line per save per tick.
+    /// Cleared when the game starts (a new session earns a new notice) and when
+    /// the deferred pull finally fires. Mapea a
+    /// [`kernel::State::deferred_notified`].
     deferred_notified: bool,
+}
+
+/// Semilla determinista del RNG del kernel para este save (ADR 0021 C.2): el
+/// jitter del backoff de throttle debe ser reproducible, así que se deriva del
+/// `save_id` en vez de `thread_rng`. Réplica inyectable del `hash(id) % 6`
+/// original del shell.
+fn seed_for(save_id: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(save_id, &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+/// Hash `u64` estable-en-proceso de una firma de set. Sólo se compara dentro de
+/// una misma ejecución (fingerprint muestreado vs sincronizado), así que
+/// `DefaultHasher` basta; no necesita estabilidad cross-restart.
+fn fingerprint_of(sig: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(sig, &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+/// El fingerprint del kernel a partir del composite `"<cheap>:<content>"` que
+/// persiste el backup: toma la mitad *cheap* (la firma de
+/// `(paths+sizes+mtimes)`), que es exactamente lo que muestrea
+/// [`observe_local_fingerprint`]. Así "contenido idéntico ⇒ mismo `u64`".
+fn fingerprint_from_set_hash(composite: &str) -> u64 {
+    let cheap = composite.split_once(':').map_or(composite, |(c, _)| c);
+    fingerprint_of(cheap)
+}
+
+/// Muestreo L1 (ADR 0021 C.1): camina la carpeta y computa la firma *cheap*
+/// (`compute_set_signature`, sin leer bytes — misma que usa el skip del backup)
+/// hasheada a `u64`. Sólo se llama cuando L0 cambió o un hint enfocó el save.
+/// `None` si la carpeta no se pudo caminar (se cae al `has_pending` en el
+/// reductor).
+fn observe_local_fingerprint(path: &Path) -> Option<u64> {
+    let files = crate::backup::walk_source(path).ok()?;
+    Some(fingerprint_of(&crate::backup::compute_set_signature(&files)))
+}
+
+/// Construye la [`kernel::State`] durable del slot para pasarla al reductor
+/// (ADR 0021 D.7: la conversión `SaveSlot`↔`kernel::State` vive en el shell).
+///
+/// `is_running`/`last_running_seen` se alimentan del valor **ya dereborotado**
+/// que mantiene `process_poll` (su sticky de 6 s, `STRONG_STOP_GRACE_FLOOR_SECS`),
+/// de modo que la stickiness del kernel es un passthrough y no se dobla la
+/// gracia. El resto de campos de sync los posee el reductor.
+fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -> kernel::State {
+    kernel::State {
+        track_only: slot.save.track_only,
+        restore_enabled: slot
+            .save
+            .policy
+            .auto_restore
+            .unwrap_or(config.auto_restore || config.global_sync),
+        min_backup_interval_secs: slot
+            .save
+            .policy
+            .min_snapshot_interval_secs
+            .unwrap_or(config.min_snapshot_interval_secs),
+        is_running: slot.is_running,
+        // Passthrough: `process_alive` == `is_running` en la observación, así
+        // que la gracia del kernel nunca extiende más allá del sticky del shell.
+        last_running_seen: if slot.is_running { Some(now) } else { None },
+        has_pending: slot.has_pending,
+        last_fs_event_at: slot.last_fs_event_at,
+        last_restore_at: slot.last_restore_at,
+        known_version: slot.known_version,
+        synced_fingerprint: slot.synced_fingerprint,
+        last_backup_at: slot.last_backup_at,
+        in_flight: slot.in_flight,
+        next_backup_at: slot.next_backup_at,
+        next_restore_at: slot.next_restore_at,
+        pull_pending: slot.pull_pending,
+        deferred_notified: slot.deferred_notified,
+        restore_failures: slot.restore_failures,
+    }
+}
+
+/// Vuelca el estado que el reductor devolvió de vuelta al slot. **No** toca
+/// `is_running`/`last_running_seen`: esos los posee `process_poll` (detección +
+/// eventos GameStarted/Stopped + playtime); el reductor sólo los lee.
+fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
+    slot.has_pending = next.has_pending;
+    slot.last_fs_event_at = next.last_fs_event_at;
+    slot.last_restore_at = next.last_restore_at;
+    slot.known_version = next.known_version;
+    slot.synced_fingerprint = next.synced_fingerprint;
+    slot.last_backup_at = next.last_backup_at;
+    slot.in_flight = next.in_flight;
+    slot.next_backup_at = next.next_backup_at;
+    slot.next_restore_at = next.next_restore_at;
+    slot.pull_pending = next.pull_pending;
+    slot.deferred_notified = next.deferred_notified;
+    slot.restore_failures = next.restore_failures;
+}
+
+/// Muestrea el mundo para un slot y construye la [`kernel::Observation`] del
+/// tick (ADR 0021 C.1). L0 (mtime propio + vacío) es barato cada tick; L1 (el
+/// fingerprint) sólo se calcula cuando L0 cambió, el watcher marcó `needs_l1`,
+/// o un sweep/manual lo forzó — nunca re-hasheando todo cada tick.
+fn observe_slot(slot: &mut SaveSlot, latest_versions: &HashMap<String, i64>) -> kernel::Observation {
+    let folder_mtime = folder_own_mtime(&slot.save.local_path);
+    let local_empty = is_path_empty_or_missing(&slot.save.local_path);
+    let l0_changed = folder_mtime != slot.last_l0_mtime;
+    slot.last_l0_mtime = folder_mtime;
+    let compute_l1 = !slot.save.track_only && !local_empty && (l0_changed || slot.needs_l1);
+    slot.needs_l1 = false;
+    let local_fingerprint = if compute_l1 {
+        observe_local_fingerprint(&slot.save.local_path)
+    } else {
+        None
+    };
+    kernel::Observation {
+        folder_mtime,
+        folder_size: None,
+        local_empty,
+        local_fingerprint,
+        // El estado de proceso lo posee `process_poll` (ya con su sticky de
+        // 6 s); aquí es un passthrough para la stickiness del kernel.
+        process_alive: slot.is_running,
+        cloud_version: latest_versions.get(&slot.save.save_id).copied(),
+        // El watcher fs marca `has_pending`/`last_fs_event_at` en el slot
+        // directamente (ver la rama `fs_rx`), así que no hace falta re-marcar
+        // por `fs_event` aquí; el reductor los lee del estado.
+        fs_event: false,
+        op_result: slot.pending_op_result.take(),
+        // El check content-addressed anti-relaunch (existencia en blobs/chunks)
+        // no se cablea en 2b; el anti-relaunch por `in_flight` basta.
+        upload_landed: None,
+    }
+}
+
+/// El paso de reconciliación (ADR 0021 C.1, Slice 2b): la autoridad invertida.
+/// Para cada slot: muestrea el mundo → construye la [`kernel::Observation`] →
+/// llama al reductor puro [`kernel::reconcile`] → vuelca el estado → ejecuta las
+/// [`kernel::Decision`]s (`Act` → IO; `Hold` → log del motivo). **Cero política
+/// aquí**: toda decisión de sync (backup/restore/defer/veto/cooldown/backoff/
+/// throttle/min-interval) la toma el reductor. El tick es la fuente de verdad;
+/// fs/realtime/op sólo dejaron hints en el slot que adelantan este paso.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_all(
+    slots: &mut HashMap<String, SaveSlot>,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    config: &AgentConfig,
+    done_tx: &mpsc::Sender<BackupDone>,
+    latest_versions: &HashMap<String, i64>,
+) {
+    let now = OffsetDateTime::now_utc();
+    let ids: Vec<String> = slots.keys().cloned().collect();
+    for id in ids {
+        // El slot pudo desaparecer entre iteraciones (no aquí, pero por higiene).
+        let Some(slot) = slots.get_mut(&id) else {
+            continue;
+        };
+        // Snapshot pre-reductor para derivar los eventos de observabilidad
+        // (stuck/recovered) del delta de `restore_failures`.
+        let had_op = slot.pending_op_result;
+        let was_stuck = slot.restore_failures.stuck_notified;
+        let err_for_stuck = slot.last_restore_error.take();
+
+        let world = kernel::World {
+            now,
+            seed: seed_for(&id),
+        };
+        let obs = observe_slot(slot, latest_versions);
+        let state = state_from_slot(slot, config, now);
+        let (next, decisions) = kernel::reconcile::reconcile(&state, &obs, world);
+        apply_state_to_slot(slot, next);
+
+        // Eventos stuck/recovered a partir del delta de la escalada de fallos.
+        // El reductor los codifica en `restore_failures.stuck_notified`; el shell
+        // los traduce a eventos de UI (ADR 0021 C.5: el veto/fallo es de primera
+        // clase y visible).
+        if matches!(had_op, Some(kernel::OpResult::Failed))
+            && !was_stuck
+            && slot.restore_failures.stuck_notified
+        {
+            let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreStuck {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+                failures: slot.restore_failures.consecutive,
+                error: err_for_stuck.unwrap_or_default(),
+            });
+        }
+        if matches!(had_op, Some(kernel::OpResult::Ok { .. }))
+            && was_stuck
+            && !slot.restore_failures.stuck_notified
+        {
+            let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreRecovered {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+            });
+        }
+
+        for decision in decisions {
+            match decision {
+                kernel::Decision::Act(action) => execute_action(
+                    slots, &id, action, api, events_tx, cmd_tx, config, done_tx,
+                ),
+                kernel::Decision::Hold { reason } => {
+                    tracing::debug!(save_id = %id, reason, "agent: reconcile hold");
+                }
+            }
+        }
+    }
+}
+
+/// Ejecuta una [`kernel::Action`] que el reductor pidió: la traducción
+/// decisión→IO. `Pull` y `Restore` comparten **un solo ejecutor**
+/// (`spawn_auto_restore` → `run_auto_restore`), para que no se vuelvan dos
+/// caminos divergentes de retry/throttle/integridad — el 429 fue exactamente
+/// eso (ADR 0021 D.7).
+#[allow(clippy::too_many_arguments)]
+fn execute_action(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    action: kernel::Action,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    config: &AgentConfig,
+    done_tx: &mpsc::Sender<BackupDone>,
+) {
+    match action {
+        kernel::Action::Backup => {
+            execute_backup(slots, id, api, events_tx, cmd_tx, config, done_tx);
+        }
+        // Pull y Restore: intents distintos del kernel, ejecutor único.
+        kernel::Action::Restore | kernel::Action::Pull => {
+            execute_restore(slots, id, api, events_tx, cmd_tx, config);
+        }
+        kernel::Action::DeferPull => {
+            // Diferir un pull con la nube por delante NO debe dejar el progreso
+            // de la sesión sin versionar: el reductor retiene el pull (protege lo
+            // local) y retorna antes de la rama de backup, así que el shell hace
+            // el flush aquí — igual que el viejo camino `ForceRestore`. La subida
+            // choca 409 non-fast-forward, `run_backup_with_retry` mergea la
+            // cabeza remota y `known_version` avanza: la nube deja de ir por
+            // delante y el pull diferido (persistido en `pull_pending`) aterriza
+            // en un tick tranquilo posterior. Sin esto, has_pending + nube-por-
+            // delante se quedaría atascado (el reductor no emite backup mientras
+            // quiere restaurar). Ver ADR 0021 D.7 y `AgentConfig::global_sync`.
+            let flush = slots
+                .get(id)
+                .is_some_and(|s| s.has_pending && s.in_flight.is_none());
+            let game_slug = slots.get(id).map(|s| s.save.game_slug.clone());
+            if let Some(game_slug) = game_slug {
+                tracing::info!(
+                    save_id = %id,
+                    flush,
+                    "agent: cross-device update deferred mid-session; pulls when the folder settles"
+                );
+                let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
+                    save_id: id.to_string(),
+                    game_slug,
+                    reason: "mid-session".to_string(),
+                });
+            }
+            if flush {
+                execute_backup(slots, id, api, events_tx, cmd_tx, config, done_tx);
+            }
+        }
+        // El deadline ya vive en `next_backup_at`/`next_restore_at`; el shell no
+        // reintenta hasta cruzarlo. Aquí sólo se registra (observabilidad).
+        kernel::Action::Throttle { until } => {
+            tracing::info!(save_id = %id, ?until, "agent: throttled — backing off until deadline");
+        }
+    }
+}
+
+/// Lanza el backup (subida local→nube) que el reductor pidió. `in_flight` ya
+/// quedó marcado `Some(Backup)` por el reductor; el anti-relaunch lo protege de
+/// relanzarse. Al terminar, `run_backup_with_retry` reporta vía `done_tx` /
+/// `RetryBackupAfterFailure` y el shell lo convierte en un `OpResult` para el
+/// próximo tick.
+#[allow(clippy::too_many_arguments)]
+fn execute_backup(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    config: &AgentConfig,
+    done_tx: &mpsc::Sender<BackupDone>,
+) {
+    let Some(slot) = slots.get_mut(id) else {
+        return;
+    };
+    // Marca la op en vuelo: el reductor ya lo hizo para `Act(Backup)`, pero el
+    // flush de `DeferPull` no pasa por esa rama, así que lo fijamos aquí para que
+    // el anti-relaunch (retén "operation in flight") lo cubra en ambos casos.
+    slot.in_flight = Some(kernel::Op::Backup);
+    // La subida anterior (si la había) ya terminó — el reductor no re-emite
+    // Backup con `in_flight` puesto. Cancela cualquier timer de debounce fs
+    // pendiente: su trabajo (nudge) ya no aplica, la subida arranca ahora.
+    if let Some(p) = slot.pending.take() {
+        p.abort();
+    }
+    slot.next_scheduled_backup_at = None;
+    let save = slot.save.clone();
+    let prev_set_hash = slot.last_set_hash.clone();
+    let base_version = slot.known_version;
+    let max_retries = config.max_retries;
+    let auto_restore = slot
+        .save
+        .policy
+        .auto_restore
+        .unwrap_or(config.auto_restore || config.global_sync);
+    let conflict_root = config.conflict_root.clone();
+    let conflict_retention_days = config.conflict_retention_days;
+    let api = api.clone();
+    let events_tx = events_tx.clone();
+    let done_tx = done_tx.clone();
+    let cmd_tx = cmd_tx.clone();
+    tracing::info!(save_id = %id, "agent: reconcile → backup");
+    tokio::spawn(async move {
+        run_backup_with_retry(
+            api,
+            save,
+            prev_set_hash,
+            base_version,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            max_retries,
+            auto_restore,
+            conflict_root,
+            conflict_retention_days,
+        )
+        .await;
+    });
+}
+
+/// Lanza el restore (bajada nube→local, conflict-aware) que el reductor pidió.
+/// `in_flight` ya quedó `Some(Restore)` y `next_restore_at` armó el cooldown por
+/// el reductor; el resultado vuelve como `AutoRestoreFinished` → `OpResult`.
+fn execute_restore(
+    slots: &HashMap<String, SaveSlot>,
+    id: &str,
+    api: &ApiClient,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    config: &AgentConfig,
+) {
+    let (save, known_version) = match slots.get(id) {
+        Some(s) => (s.save.clone(), s.known_version),
+        None => return,
+    };
+    tracing::info!(save_id = %id, "agent: reconcile → restore");
+    spawn_auto_restore(
+        save,
+        api.clone(),
+        events_tx.clone(),
+        cmd_tx.clone(),
+        config.conflict_root.clone(),
+        config.conflict_retention_days,
+        known_version,
+        // Autoritativo: el reductor ya decidió que hay que bajar (vacío o nube
+        // por delante); busca la cabeza real en vez de fiarte de una caché que
+        // pudo quedar un tick stale. El version-gate interno lo deja gratis si
+        // ya estamos al día.
+        None,
+        None,
+    );
 }
 
 async fn run_agent(
@@ -948,9 +1344,18 @@ async fn run_agent(
     // debouncer already throttles, but we cap at 256 to be defensive.
     let (fs_tx, mut fs_rx) = mpsc::channel::<PathBuf>(256);
 
-    // Backup tasks signal "save_id of save just successfully backed up"
-    // so the agent loop can clear `has_pending`. Cap matches `cmd_rx`.
+    // Backup tasks signal completion (committed / no-op / conflict-settled) so
+    // the agent loop can feed it into the reductor as an `OpResult`. Cap matches
+    // `cmd_rx`.
     let (done_tx, mut done_rx) = mpsc::channel::<BackupDone>(64);
+
+    // Nudge de reconciliación fuera de banda (ADR 0021 C.1: los eventos son
+    // hints que sólo *adelantan* un tick). El timer de debounce fs lo dispara al
+    // asentarse la escritura; el bucle corre entonces `reconcile_all` sin esperar
+    // al siguiente `poll.tick()`. Los nudges coalescen (drenamos la cola antes de
+    // reconciliar), así que una ráfaga de autosaves no dispara una ráfaga de
+    // reconciliaciones.
+    let (nudge_tx, mut nudge_rx) = mpsc::channel::<()>(64);
 
     // Process watcher: periodic poll. We refresh only the bits we care
     // about (process names + exe paths) to keep CPU near zero when idle.
@@ -1031,16 +1436,17 @@ async fn run_agent(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(AgentCommand::AddSave(save)) => {
-                        let added_id = save.save_id.clone();
-                        handle_add(
-                            &mut slots, *save, &fs_tx, &api, &events_tx, &cmd_tx, &config,
-                        );
-                        // Baseline a freshly-added save that already holds
-                        // content. When auto-restore is in flight (`restoring`)
-                        // this no-ops and the post-restore path below handles
-                        // it instead, so we never upload pre-restore content.
-                        maybe_schedule_initial_backup(
-                            &mut slots, &added_id, &api, &events_tx, &config, &done_tx, &cmd_tx,
+                        // handle_add registra el slot, arma el watcher y, si la
+                        // carpeta ya tiene contenido divergente de lo sincronizado,
+                        // siembra `has_pending` para la línea base inicial. La
+                        // decisión (restaurar en vacío / subir la base / vetar por
+                        // sesión) la toma el reductor en el reconcile de abajo — el
+                        // veto de recencia cubre el "carpeta tocada hace poco" que
+                        // antes difería a mano.
+                        handle_add(&mut slots, *save, &fs_tx);
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
                         );
                     }
                     Some(AgentCommand::RearmWatcher(id)) => {
@@ -1052,137 +1458,50 @@ async fn run_agent(
                         }
                     }
                     Some(AgentCommand::AutoRestoreFinished { id, disposition, synced_version, post_restore_set_hash, wrote_files }) => {
-                        // The background restore task signalled completion
-                        // (success or failure). Clear the in-flight flag so
-                        // the reconciliation sweep can try again once the
-                        // cooldown expires — `next_auto_restore_at` was set
-                        // when we spawned, so we don't reset it here…
-                        let latest = latest_versions.get(&id).copied();
-                        let mut stuck: Option<(String, u32, String)> = None;
-                        let mut recovered: Option<(String, String)> = None;
-                        if let Some(slot) = slots.get_mut(&id) {
-                            slot.restoring = false;
-                            // Remember the version we just synced to so the next
-                            // sweep can skip the expensive download-to-diff when
-                            // nothing newer has landed from another device.
-                            if synced_version.is_some() {
-                                slot.known_version = synced_version;
+                        // La op de restore terminó: en el modelo invertido su
+                        // resultado es una *entrada* del reductor (ADR 0021 C.1).
+                        // Traducimos la disposición al `OpResult` del kernel y la
+                        // encolamos; el próximo `reconcile_all` limpia `in_flight`,
+                        // aplica la contabilidad/backoff (cooldown, 404, 401, 429,
+                        // escalada de fallos por versión) y —vía el delta de
+                        // `restore_failures`— emite los eventos stuck/recovered.
+                        // `wrote_files` viaja en `OpResult::Ok.wrote` para sellar
+                        // `last_restore_at` (que el propio toque del restore no
+                        // vete el siguiente pull); el fingerprint sincronizado sale
+                        // de la firma post-merge sólo cuando el árbol quedó igual a
+                        // la cabeza (sin divergencia local).
+                        let fingerprint =
+                            post_restore_set_hash.as_deref().map(fingerprint_from_set_hash);
+                        let op_result = match disposition {
+                            AutoRestoreDisposition::Ok => kernel::OpResult::Ok {
+                                version: synced_version,
+                                fingerprint,
+                                wrote: wrote_files,
+                            },
+                            AutoRestoreDisposition::NotOnServer => kernel::OpResult::NotFound,
+                            AutoRestoreDisposition::Unauthorized => kernel::OpResult::Unauthorized,
+                            AutoRestoreDisposition::Throttled { retry_after_secs } => {
+                                kernel::OpResult::Throttled { retry_after_secs }
                             }
-                            // Adopt the post-merge signature when the tree now
-                            // equals head — stops the merge's own fs writes from
-                            // triggering a redundant re-upload of head's content.
+                            AutoRestoreDisposition::Failed(err) => {
+                                if let Some(slot) = slots.get_mut(&id) {
+                                    slot.last_restore_error = Some(err);
+                                }
+                                kernel::OpResult::Failed
+                            }
+                        };
+                        if let Some(slot) = slots.get_mut(&id) {
+                            // Adoptar la firma post-merge también refresca el skip
+                            // del backup: las escrituras del propio merge no
+                            // rebotan como una subida redundante de la cabeza.
                             if let Some(h) = post_restore_set_hash {
                                 slot.last_set_hash = Some(h);
                             }
-                            // Stamp the restore so its own folder-touch / fs-event
-                            // echo doesn't veto the NEXT pull (see
-                            // `mid_session_reason`). Only when it actually wrote —
-                            // a no-op "already synced" pass bumped nothing.
-                            if wrote_files {
-                                slot.last_restore_at = Some(OffsetDateTime::now_utc());
-                            }
-                            match disposition {
-                                // …unless the save simply isn't on the server
-                                // (404). Retrying every 60s can't conjure a
-                                // snapshot that doesn't exist; park it on a long
-                                // backoff so we check ~hourly instead of spamming.
-                                AutoRestoreDisposition::NotOnServer => {
-                                    slot.next_auto_restore_at = Some(
-                                        TokioInstant::now()
-                                            + Duration::from_secs(
-                                                AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS,
-                                            ),
-                                    );
-                                }
-                                // A token blip isn't this save's fault: leave the
-                                // failure state untouched (neither escalate nor
-                                // reset) and let the short cooldown retry once the
-                                // refresh lands.
-                                AutoRestoreDisposition::Unauthorized => {}
-                                // Throttled: wait the server's exact window slide
-                                // (clamped so a bogus value can't park the slot
-                                // forever) and leave the failure counter alone —
-                                // a bandwidth 429 isn't a broken save.
-                                AutoRestoreDisposition::Throttled { retry_after_secs } => {
-                                    let wait = (u64::from(retry_after_secs)).clamp(1, 300) + 2;
-                                    // Per-save jitter so a sweep that 429'd a dozen
-                                    // saves at once doesn't re-fire them all on the
-                                    // same tick and stampede the window again. A
-                                    // cheap deterministic hash of the id spreads
-                                    // them across an extra few seconds.
-                                    let jitter = {
-                                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                                        std::hash::Hash::hash(&id, &mut h);
-                                        std::hash::Hasher::finish(&h) % 6
-                                    };
-                                    slot.next_auto_restore_at = Some(
-                                        TokioInstant::now() + Duration::from_secs(wait + jitter),
-                                    );
-                                }
-                                AutoRestoreDisposition::Ok => {
-                                    // The save works. Drop the escalation so the
-                                    // next hiccup starts from 60s again, and take
-                                    // down any persistent warning we raised.
-                                    if slot.restore_failures.clear() {
-                                        recovered =
-                                            Some((id.clone(), slot.save.game_slug.clone()));
-                                    }
-                                }
-                                AutoRestoreDisposition::Failed(err) => {
-                                    let (delay, emit_stuck) =
-                                        slot.restore_failures.record_failure(latest);
-                                    slot.next_auto_restore_at = Some(TokioInstant::now() + delay);
-                                    tracing::debug!(
-                                        save_id = %id,
-                                        failures = slot.restore_failures.consecutive,
-                                        version = ?latest,
-                                        backoff_secs = delay.as_secs(),
-                                        "agent: auto-restore failed — escalating backoff"
-                                    );
-                                    // Escalation alone would make a chronically
-                                    // broken save *quieter* over time. Surface it
-                                    // once instead, so backing off doesn't turn
-                                    // into hiding.
-                                    if emit_stuck {
-                                        stuck = Some((
-                                            slot.save.game_slug.clone(),
-                                            slot.restore_failures.consecutive,
-                                            err,
-                                        ));
-                                    }
-                                }
-                            }
+                            slot.pending_op_result = Some(op_result);
                         }
-                        if let Some((game_slug, failures, error)) = stuck {
-                            tracing::warn!(
-                                save_id = %id,
-                                game_slug = %game_slug,
-                                failures,
-                                error = %error,
-                                "agent: auto-restore stuck — repeated failures on the same version"
-                            );
-                            let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreStuck {
-                                save_id: id.clone(),
-                                game_slug,
-                                failures,
-                                error,
-                            });
-                        }
-                        if let Some((save_id, game_slug)) = recovered {
-                            tracing::info!(
-                                save_id = %save_id,
-                                "agent: auto-restore recovered after repeated failures"
-                            );
-                            let _ = events_tx
-                                .try_send(AgentEvent::SaveAutoRestoreRecovered { save_id, game_slug });
-                        }
-                        // Restore has settled: if the slot still has no baseline
-                        // (server was empty / 404 and the local folder holds
-                        // content the watcher never saw written — the manual
-                        // emulator-save case), take the first snapshot now
-                        // instead of waiting on an fs write or the hourly sweep.
-                        maybe_schedule_initial_backup(
-                            &mut slots, &id, &api, &events_tx, &config, &done_tx, &cmd_tx,
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
                         );
                     }
                     Some(AgentCommand::SetAutoRestore(enabled)) => {
@@ -1192,12 +1511,14 @@ async fn run_agent(
                             auto_restore = enabled,
                             "agent: auto_restore preference updated"
                         );
-                        // Flipping from off → on is the user's cue that they
-                        // want any already-empty folder pulled back right
-                        // now. Don't wait for the next poll tick.
+                        // Off → on = "ponme al día ahora". Reconcilia sin esperar
+                        // al siguiente tick: el reductor restaura cualquier carpeta
+                        // vacía / desactualizada, con el version-gate y los vetos
+                        // de sesión intactos.
                         if !was && enabled {
-                            sweep_for_auto_restore(
-                                &mut slots, &api, &events_tx, &cmd_tx, &config, &latest_versions,
+                            reconcile_all(
+                                &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                                &latest_versions,
                             );
                         }
                     }
@@ -1208,202 +1529,57 @@ async fn run_agent(
                             global_sync = enabled,
                             "agent: global_sync preference updated"
                         );
-                        // Flipping on means "catch me up now". Kick an
-                        // immediate sweep; the version-gate keeps it free when
-                        // already current, and the mid-session guards defer
-                        // any save with a live game until it settles.
                         if !was && enabled {
-                            sweep_for_auto_restore(
-                                &mut slots, &api, &events_tx, &cmd_tx, &config, &latest_versions,
+                            reconcile_all(
+                                &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                                &latest_versions,
                             );
                         }
                     }
-                    Some(AgentCommand::ForceRestore(id)) => {
-                        // Low-latency pull requested by the cloud_pull poller
-                        // (or the self-hosted SSE stream). Honour the
-                        // backup-only opt-out and the in-flight guard, but
-                        // ignore the cooldown — the poller already confirmed a
-                        // version bump, so this is never spurious.
-                        //
-                        // The *failure* backoff is different from the cooldown and
-                        // is not bypassed. "The poller confirmed a bump" is only a
-                        // reason to skip pacing if the bump is news to us: the
-                        // poller re-reports the same latest version every tick, so
-                        // a save failing on v7 would get a fresh kick every poll
-                        // interval, which is exactly the every-minute multi-GB
-                        // retry loop the backoff exists to stop — the kick would
-                        // walk straight around it. So a kick for the version that
-                        // keeps failing waits out the backoff, while a kick for a
-                        // newer version resets it and proceeds (the reset happens
-                        // in `SetCloudVersions`, which both pollers send *before*
-                        // this command, so by the time we get here `failing_version`
-                        // is already cleared for a genuine bump).
-                        //
-                        // Only an equal, *known* version blocks: when we have no
-                        // cloud version for the save (self-hosted SSE, which sends
-                        // `ForceRestore` without populating the cache, or the window
-                        // before the first poll) `failing_version` is `None` and we
-                        // can't prove the kick is a repeat — let it through, since
-                        // the kick is itself evidence something changed.
-                        let backoff_held = slots.get(&id).is_some_and(|slot| {
-                            slot.restore_failures.version.is_some()
-                                && slot.restore_failures.version == latest_versions.get(&id).copied()
-                                && slot
-                                    .next_auto_restore_at
-                                    .is_some_and(|t| TokioInstant::now() < t)
-                        });
-                        if backoff_held {
-                            tracing::debug!(
-                                save_id = %id,
-                                version = ?latest_versions.get(&id).copied(),
-                                "agent: force-restore ignored — same version is on the failure backoff"
-                            );
-                        }
-                        let eligible = !backoff_held && slots.get(&id).is_some_and(|slot| {
-                            !slot.save.track_only
-                                && slot
-                                    .save
-                                    .policy
-                                    .auto_restore
-                                    .unwrap_or(config.auto_restore || config.global_sync)
-                                && !slot.restoring
-                        });
-                        // Mid-session veto (REPO data-loss, 2026-07-05): a
-                        // push-triggered pull used to land between the game's
-                        // save write and the debounced backup, re-applying the
-                        // last uploaded version over progress that hadn't been
-                        // flushed yet — on a single device, the poller's echo
-                        // of our own upload could erase a live session. Never
-                        // pull into a folder the user is actively playing in.
-                        //
-                        // Deferring it, however, is not the same as dropping it.
-                        // This used to drop the command on the theory that the
-                        // sweep re-runs every tick with the same guards and
-                        // would pick the delta up "as soon as the session
-                        // settles". On a Steam Deck the session doesn't settle:
-                        // suspend/resume keeps the process alive for days and
-                        // Proton leaves it behind after the user quits, so the
-                        // veto never lifted and the other device's save never
-                        // arrived (the user's fix was reloading Steam). We now
-                        // remember the pull and run it the moment the game
-                        // closes — see `SaveSlot::pull_pending`.
-                        let mid_session = if eligible {
-                            slots.get(&id).and_then(mid_session_reason)
-                        } else {
-                            None
-                        };
-                        if let Some(reason) = mid_session {
-                            // Deferring the pull must not leave the session's
-                            // progress sitting un-versioned in the debounce /
-                            // min-interval queue while the remote moves: flush
-                            // it now. The upload either commits cleanly (this
-                            // device becomes head and the deferred pull turns
-                            // into a no-op) or hits the 409 non-fast-forward
-                            // reconcile, which merges the newer remote head and
-                            // versions both sides — either way the progress
-                            // exists as a cloud version within seconds, even if
-                            // it never ends up being the version the user keeps.
-                            // 2s mirrors the GameStopped final flush; skipping
-                            // the ADR 0018 min-interval floor here is deliberate
-                            // (correctness beats data saving under contention).
-                            //
-                            // The poller only sends this after confirming a
-                            // version bump, so an update really is waiting: mark
-                            // the slot and tell the user it's queued.
-                            let notify = slots
-                                .get_mut(&id)
-                                .is_some_and(note_deferred_pull);
-                            if notify {
-                                if let Some(slot) = slots.get(&id) {
-                                    let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
-                                        save_id: id.clone(),
-                                        game_slug: slot.save.game_slug.clone(),
-                                        reason: reason.to_string(),
-                                    });
-                                }
-                            }
-                            let flush_pending =
-                                slots.get(&id).is_some_and(|s| s.has_pending);
-                            if flush_pending {
-                                tracing::info!(
-                                    save_id = %id,
-                                    reason,
-                                    "agent: force-restore deferred — flushing pending local changes so they're versioned first"
-                                );
-                                schedule_backup(
-                                    &mut slots, &id, BackupReason::FilesystemSettled,
-                                    Duration::from_secs(2),
-                                    &api, &events_tx, &config, &done_tx, &cmd_tx,
-                                );
-                            } else {
-                                tracing::info!(
-                                    save_id = %id,
-                                    reason,
-                                    "agent: force-restore deferred — user is mid-session; the pull runs when the game closes"
-                                );
-                            }
-                        } else if eligible {
-                            let known_version =
-                                slots.get(&id).and_then(|s| s.known_version);
-                            let save = slots.get(&id).map(|s| s.save.clone());
-                            if let Some(slot) = slots.get_mut(&id) {
-                                slot.restoring = true;
-                                slot.next_auto_restore_at = Some(
-                                    TokioInstant::now()
-                                        + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS),
-                                );
-                            }
-                            if let Some(save) = save {
-                                tracing::info!(
-                                    save_id = %id,
-                                    "agent: force-restore (sync global, cloud delta)"
-                                );
-                                spawn_auto_restore(
-                                    save,
-                                    api.clone(),
-                                    events_tx.clone(),
-                                    cmd_tx.clone(),
-                                    config.conflict_root.clone(),
-                                    config.conflict_retention_days,
-                                    known_version,
-                                    // Authoritative path: the poller already
-                                    // confirmed a bump, so fetch the real latest
-                                    // rather than trusting a possibly-stale cache.
-                                    // One save per command — no batch to share a
-                                    // manifest with.
-                                    None,
-                                    None,
-                                );
-                            }
-                        }
+                    Some(AgentCommand::ForceRestore(_id)) => {
+                        // Pull de baja latencia pedido por el poller cloud (o el
+                        // stream SSE self-hosted). En el modelo invertido es un
+                        // *hint que adelanta un tick* (ADR 0021 C.1): el poller ya
+                        // actualizó `latest_versions` (envía `SetCloudVersions`
+                        // antes), así que basta con reconciliar ahora — el reductor
+                        // ve la nube por delante y decide restaurar, o diferir con
+                        // flush si el usuario está en sesión, o retener si el
+                        // cooldown/backoff sigue activo. Toda la elegibilidad
+                        // (track-only, backup-only, in-flight, cooldown, veto) vive
+                        // en el reductor; aquí no queda política.
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
+                        );
                     }
                     Some(AgentCommand::SetCloudVersions(map)) => {
                         tracing::debug!(
                             count = map.len(),
                             "agent: cloud version cache updated from poller"
                         );
-                        // A save parked on the escalating failure backoff must not
-                        // sit out a *new* version: the backoff is a statement about
-                        // the version that kept failing, and the server just moved
-                        // past it. Clear the escalation here — the single place the
-                        // agent learns the cloud advanced — so the next sweep tick
-                        // retries immediately instead of honouring a penalty of up
-                        // to an hour that no longer applies to anything. Without
-                        // this, only the sync-global `ForceRestore` kick would
-                        // notice, and a save with restore-on/sync-global-off would
-                        // stay stale for the rest of the backoff.
+                        // Un save aparcado en el backoff de fallo NO debe esperar
+                        // por una versión *nueva*: el backoff era sobre la versión
+                        // que fallaba y el server acaba de pasarla. Es el único
+                        // punto donde el agente aprende que la nube avanzó, así que
+                        // aquí limpiamos la escalada (el reductor sólo la resetea al
+                        // ingerir el próximo `OpResult::Failed`, demasiado tarde) y
+                        // soltamos `next_restore_at` para que el reconcile reintente
+                        // ya. Emitimos recovered si había un aviso "stuck" en pie.
                         let mut recovered: Vec<(String, String)> = Vec::new();
                         for (id, slot) in slots.iter_mut() {
-                            if !slot.restore_failures.is_active() {
+                            let active = slot.restore_failures.consecutive > 0
+                                || slot.restore_failures.stuck_notified;
+                            if !active {
                                 continue;
                             }
                             if slot.restore_failures.version == map.get(id).copied() {
                                 continue;
                             }
-                            if slot.restore_failures.clear() {
+                            if slot.restore_failures.stuck_notified {
                                 recovered.push((id.clone(), slot.save.game_slug.clone()));
                             }
-                            slot.next_auto_restore_at = None;
+                            slot.restore_failures = kernel::RestoreFailures::default();
+                            slot.next_restore_at = None;
                         }
                         for (save_id, game_slug) in recovered {
                             tracing::info!(
@@ -1414,6 +1590,12 @@ async fn run_agent(
                                 .try_send(AgentEvent::SaveAutoRestoreRecovered { save_id, game_slug });
                         }
                         latest_versions = map;
+                        // La nube pudo adelantarse: reconcilia para pulsar las
+                        // actualizaciones que acaban de destrabarse.
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
+                        );
                     }
                     Some(AgentCommand::SetProbeCandidates(dirs)) => {
                         // Reemplaza el set conservando los baselines de los que
@@ -1438,41 +1620,63 @@ async fn run_agent(
                         }
                     }
                     Some(AgentCommand::BackupNow(id)) => {
-                        if slots.contains_key(&id) {
-                            schedule_backup(
-                                &mut slots, &id, BackupReason::Manual,
-                                Duration::ZERO, &api, &events_tx, &config, &done_tx, &cmd_tx,
-                            );
+                        // Backup manual: marca pendiente si el contenido diverge de
+                        // lo sincronizado (como el skip-por-set-hash del backup, un
+                        // contenido idéntico no genera snapshot) y deja que el
+                        // reductor decida. `needs_l1` fuerza un fingerprint fresco.
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.needs_l1 = true;
+                            mark_pending_if_diverged(slot);
                         }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
+                        );
                     }
                     Some(AgentCommand::RetryBackupAfterFailure(id)) => {
-                        if slots.contains_key(&id) {
-                            // Clear the stale "a backup is queued" stamp before
-                            // re-arming. `done_rx` never ran for the attempt
-                            // that just died, so it still points at that dead
-                            // schedule — and `schedule_backup` reads it as "a
-                            // window is already open", takes the retry for a
-                            // debounce reset and stays silent. The user would
-                            // see the failure and no sign of the recovery.
-                            if let Some(slot) = slots.get_mut(&id) {
-                                slot.next_scheduled_backup_at = None;
-                            }
+                        // La subida agotó su presupuesto de reintentos internos.
+                        // El reductor no modela el backoff de *fallo de backup*
+                        // (sólo el de restore), así que el shell repone el ritmo:
+                        // limpia `in_flight`, arma `next_backup_at` en el backoff
+                        // largo y CONSERVA `has_pending` (los cambios locales nunca
+                        // llegaron a una versión; perderlos dejaría que un restore
+                        // los pisara). El próximo tick, pasado el backoff, reintenta.
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.next_scheduled_backup_at = None;
+                            slot.in_flight = None;
+                            slot.next_backup_at =
+                                Some(OffsetDateTime::now_utc() + BACKUP_RETRY_BACKOFF);
                             tracing::info!(
                                 save_id = %id,
                                 backoff_secs = BACKUP_RETRY_BACKOFF.as_secs(),
                                 "agent: backup retries exhausted — re-arming on the long backoff"
                             );
-                            schedule_backup(
-                                &mut slots, &id, BackupReason::RetryAfterFailure,
-                                BACKUP_RETRY_BACKOFF,
-                                &api, &events_tx, &config, &done_tx, &cmd_tx,
-                            );
                         }
                     }
                     Some(AgentCommand::SweepAll { window_secs }) => {
-                        sweep_all(
-                            &mut slots, window_secs, &api, &events_tx,
-                            &config, &done_tx, &cmd_tx,
+                        // `window_secs` era el ancho del escalonado por tamaño del
+                        // viejo `sweep_all`; hoy es informativo (el escalonado se
+                        // simplificó — ver abajo). Se registra y no se usa para
+                        // pacing.
+                        tracing::debug!(window_secs, "agent: hourly sweep — re-checking fingerprints");
+                        // Barrido horario (Modo Automático): re-hashea cada save
+                        // para cazar cambios que el watcher fs se perdió. En el
+                        // modelo invertido eso es: recomputar el fingerprint L1 y,
+                        // si diverge de lo sincronizado, marcar `has_pending` para
+                        // que el reductor suba. El escalonado por tamaño del viejo
+                        // `sweep_all` (suavizar I/O) se simplifica: hoy caminamos
+                        // todas las carpetas de golpe. `has_pending` sólo se marca
+                        // cuando hay divergencia REAL, así el veto sigue honesto.
+                        for slot in slots.values_mut() {
+                            if slot.save.track_only {
+                                continue;
+                            }
+                            slot.needs_l1 = true;
+                            mark_pending_if_diverged(slot);
+                        }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &latest_versions,
                         );
                     }
                     Some(AgentCommand::QueryStatus(resp)) => {
@@ -1506,54 +1710,69 @@ async fn run_agent(
                         .get(&save_id)
                         .and_then(|s| s.save.policy.debounce_secs)
                         .unwrap_or(config.debounce_secs);
-                    let min_interval_secs = slots
-                        .get(&save_id)
-                        .and_then(|s| s.save.policy.min_snapshot_interval_secs)
-                        .unwrap_or(config.min_snapshot_interval_secs);
                     let mut delay = Duration::from_secs(debounce_secs);
+                    // ¿Ya había una ventana de debounce abierta? Sólo se anuncia
+                    // en el flanco de subida: re-anunciar en cada evento fs es lo
+                    // que inundaba el feed de filas "en cola" huérfanas cuando un
+                    // juego autoguarda cada segundo.
+                    let already_scheduled = slots
+                        .get(&save_id)
+                        .is_some_and(|s| s.next_scheduled_backup_at.is_some());
                     if let Some(slot) = slots.get_mut(&save_id) {
+                        // Hints del watcher (ADR 0021 C.1): marcan pendiente y
+                        // enfocan el save para el muestreo L1 — una reescritura
+                        // in-place en un subdirectorio no mueve el mtime propio de
+                        // la carpeta, así que L0 no la vería. El reductor decide;
+                        // esto sólo adelanta un tick. El suelo de min-interval ya no
+                        // se calcula aquí: vive en el reductor (`next_backup_at`).
                         slot.has_pending = true;
                         slot.last_fs_event_at = Some(now);
-                        // Anti-starvation cap. Each fs event resets the
-                        // debounce, so a game writing every second would
-                        // never settle and never flush ("se quedó todo en
-                        // cola"). Anchor the oldest un-flushed change; once
-                        // it has waited MAX_BACKUP_WAIT_SECS, stop resetting
-                        // and back up now even though writes keep arriving.
+                        slot.needs_l1 = true;
+                        // Anti-starvation cap. Cada evento fs reinicia el debounce,
+                        // así que un juego que escribe cada segundo nunca asentaría
+                        // ("se quedó todo en cola"). Ancla el cambio más viejo sin
+                        // volcar; pasado MAX_BACKUP_WAIT_SECS deja de reiniciar y
+                        // nudge-a ya, aunque sigan llegando escrituras.
                         let waited_since = *slot.first_pending_event_at.get_or_insert(now);
                         if (now - waited_since).whole_seconds() >= MAX_BACKUP_WAIT_SECS {
                             delay = Duration::ZERO;
                             slot.first_pending_event_at = Some(now);
                         }
-                        // Minimum-interval floor (ADR 0018, eje A). Never start
-                        // a new backup sooner than `min_snapshot_interval_secs`
-                        // after the last successful one — coalesce the burst
-                        // into the next allowed slot. The anchor is the fixed
-                        // `last_backup_at`, so repeated writes converge on the
-                        // same fire time instead of drifting. Wins over the
-                        // anti-starvation `delay = ZERO` above: we deliberately
-                        // wait, and always upload the final state when we do.
-                        if min_interval_secs > 0 {
-                            if let Some(last) = slot.last_backup_at {
-                                let earliest = last
-                                    + Duration::from_secs(min_interval_secs);
-                                if now + delay < earliest {
-                                    delay = (earliest - now).unsigned_abs();
-                                }
-                            }
+                        slot.next_scheduled_backup_at = Some(now + delay);
+                        // (Re)arma el timer de debounce: al asentarse dispara un
+                        // nudge que corre `reconcile_all` sin esperar al poll tick.
+                        // Cancelar el previo reinicia el debounce, como antes. El
+                        // reductor puede aún diferir la subida (min-interval).
+                        if let Some(p) = slot.pending.take() {
+                            p.abort();
                         }
+                        let nudge = nudge_tx.clone();
+                        slot.pending = Some(tokio::spawn(async move {
+                            if delay > Duration::ZERO {
+                                tokio::time::sleep(delay).await;
+                            }
+                            let _ = nudge.send(()).await;
+                        }));
                     }
                     tracing::info!(
                         save_id = %save_id,
                         path = %path.display(),
                         delay_ms = delay.as_millis() as u64,
-                        "agent: fs event observed; scheduling backup"
+                        "agent: fs event observed; nudging reconcile after debounce"
                     );
-                    schedule_backup(
-                        &mut slots, &save_id, BackupReason::FilesystemSettled,
-                        delay,
-                        &api, &events_tx, &config, &done_tx, &cmd_tx,
-                    );
+                    // La píldora "próximo backup en Xs" de la UI. Antes la emitía
+                    // `schedule_backup`; ahora el dato vive aquí, en el timer de
+                    // debounce. Mismas reglas que antes: nada en delay cero y nada
+                    // si la ventana ya estaba abierta. (El reductor puede aún
+                    // diferir la subida por min-interval; el anuncio es del
+                    // debounce, como siempre lo fue.)
+                    if delay > Duration::ZERO && !already_scheduled {
+                        let _ = events_tx.try_send(AgentEvent::BackupScheduled {
+                            save_id: save_id.clone(),
+                            delay_ms: delay.as_millis() as u64,
+                            reason: BackupReason::FilesystemSettled,
+                        });
+                    }
 
                     // DETECCIÓN (fase 3, ADR 0020): la carpeta se reescribió;
                     // muestrea los procesos de juego vivos y registra la
@@ -1586,10 +1805,10 @@ async fn run_agent(
                 // estable) antes de que el poll atribuya horas por carpeta.
                 steam_index.refresh_if_stale();
                 let any_running = process_poll(
-                    &mut sys, &mut slots, &events_tx, &api, &config, &done_tx, &cmd_tx,
+                    &mut sys, &mut slots, &events_tx, &config,
                     &mut playtime, playtime_path.as_deref(), &mut reported_heavy,
                     &mut corr_store, corr_path.as_deref(), &steam_index, &mut prev_pids,
-                    &mut corr_running, &latest_versions,
+                    &mut corr_running,
                 );
                 // Watcher self-healing: a slot whose folder didn't exist when
                 // the game was tracked (freshly installed, save dir created on
@@ -1611,18 +1830,16 @@ async fn run_agent(
                         arm_watcher(slot, &fs_tx);
                     }
                 }
-                // Reconciliation backstop: every tick, look for tracked
-                // saves whose local folder is empty and (a) restore is enabled
-                // for that save (global default or per-save preset), (b) we're
-                // not already restoring, and (c) the cooldown has elapsed.
-                // Catches the cases the event-driven paths miss — uninstall
-                // while Hoard was closed, network came back online after a
-                // failed attempt, user just turned auto_restore on with several
-                // stale slots. The per-slot filter inside resolves the
-                // effective preference, so we always call (a backup-only save
-                // is filtered out there, not here).
-                sweep_for_auto_restore(
-                    &mut slots, &api, &events_tx, &cmd_tx, &config, &latest_versions,
+                // La reconciliación (ADR 0021 C.1): el tick es la fuente de
+                // verdad. `process_poll` ya muestreó el mundo (procesos →
+                // `is_running`, eventos, playtime); ahora reconciliamos cada slot
+                // contra el reductor. Sustituye al viejo `sweep_for_auto_restore`
+                // (restore) Y al flush/pull en las transiciones de `process_poll`:
+                // el reductor emite restore en vacío/desactualizado, backup del
+                // flush final al cerrarse el juego, y el aterrizaje del pull
+                // diferido — todo level-triggered, sin política en el bucle.
+                reconcile_all(
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
                 );
 
                 // DETECCIÓN (fase 3, ADR 0020): sonda de candidatos. `sys` ya
@@ -1646,45 +1863,85 @@ async fn run_agent(
                 }
             }
 
-            // ----- Backup success notifications -----
+            // ----- Backup completions -----
             Some(done) = done_rx.recv() => {
-                // Was this the `GameStopped` final flush a deferred pull is
-                // waiting on? Taken here so the licence can't outlive the one
-                // backup it was granted for.
-                let mut owed_pull = false;
+                // La subida terminó. En el modelo invertido su resultado es una
+                // *entrada* del reductor. Un commit real → `OpResult::Ok` (el
+                // reductor avanza known_version/synced_fingerprint, limpia
+                // has_pending y ancla el min-interval en last_backup_at). Un no-op
+                // (skip/unchanged/vacío/archived/too-large, o el 409 asentado a la
+                // cabeza sin divergencia) es bookkeeping del shell: NO debe avanzar
+                // el ancla del min-interval sobre un backup fantasma (regresión
+                // R.E.P.O.), sólo limpiar `in_flight` y cachear la firma — el
+                // reductor no distingue commit de no-op en `OpResult::Ok`, así que
+                // el shell lo hace aquí (conversión de resultado del ejecutor, ADR
+                // 0021 D.7).
                 if let Some(slot) = slots.get_mut(&done.save_id) {
-                    slot.has_pending = false;
                     slot.next_scheduled_backup_at = None;
                     slot.first_pending_event_at = None;
-                    owed_pull = std::mem::take(&mut slot.pull_after_flush);
-                    // Advance the throttle anchor only on a real upload — a
-                    // skip/empty must not push the next change a full
-                    // min-interval into the future.
+                    if let Some(h) = &done.new_set_hash {
+                        slot.last_set_hash = Some(h.clone());
+                    }
                     if done.committed {
-                        slot.last_backup_at = Some(OffsetDateTime::now_utc());
-                        // Remember the version we just produced so the sweep
-                        // won't re-download our own upload to diff it.
-                        if done.version_num.is_some() {
-                            slot.known_version = done.version_num;
+                        slot.pending_op_result = Some(kernel::OpResult::Ok {
+                            version: done.version_num,
+                            fingerprint: done
+                                .new_set_hash
+                                .as_deref()
+                                .map(fingerprint_from_set_hash),
+                            wrote: true,
+                        });
+                    } else {
+                        slot.in_flight = None;
+                        slot.has_pending = false;
+                        if let Some(h) = &done.new_set_hash {
+                            slot.synced_fingerprint = Some(fingerprint_from_set_hash(h));
+                        }
+                        // `version_num` presente en un no-op = 409 asentado a la
+                        // cabeza: avanza known_version y sella `last_restore_at`
+                        // (el merge escribió en la carpeta como un restore, no debe
+                        // vetar el siguiente pull).
+                        if let Some(v) = done.version_num {
+                            slot.known_version = Some(v);
+                            slot.restore_failures = kernel::RestoreFailures::default();
+                            slot.last_restore_at = Some(OffsetDateTime::now_utc());
                         }
                     }
-                    if let Some(h) = done.new_set_hash {
-                        slot.last_set_hash = Some(h);
-                    }
                 }
-                // The exit save is versioned and the folder has gone quiet:
-                // run the pull the session deferred. A no-op unless the game
-                // really is closed and nothing else is pending — a relaunch
-                // during the flush's 2s window defers it again, and
-                // `pull_pending` keeps it owed until the next quiet moment.
-                if owed_pull {
-                    run_deferred_pull(
-                        &mut slots, &done.save_id, &api, &events_tx, &cmd_tx,
-                        &config, &latest_versions,
-                    );
-                }
+                reconcile_all(
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
+                );
+            }
+
+            // ----- Nudge de reconciliación (debounce fs asentado) -----
+            Some(()) = nudge_rx.recv() => {
+                // Coalescen: una ráfaga de autosaves de varios slots deja varios
+                // nudges; los drenamos y reconciliamos una sola vez.
+                while nudge_rx.try_recv().is_ok() {}
+                reconcile_all(
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
+                );
             }
         }
+    }
+}
+
+/// Marca `has_pending` si el contenido local diverge de lo ya sincronizado
+/// (fingerprint L1 distinto de `synced_fingerprint`), la condición para que el
+/// reductor tome un backup. Se usa donde no hubo evento fs pero puede haber algo
+/// que subir: alta con contenido, barrido horario (`SweepAll`) y backup manual
+/// (`BackupNow`). **Sólo** marca ante divergencia REAL, así el veto —que mira
+/// `has_pending`— sigue honesto (marcarlo espurio vetaría pulls para siempre).
+/// Carpeta vacía / track-only: no marca (no hay nada que subir; una vacía la
+/// resuelve el reductor por la rama de restore).
+fn mark_pending_if_diverged(slot: &mut SaveSlot) {
+    if slot.save.track_only || is_path_empty_or_missing(&slot.save.local_path) {
+        return;
+    }
+    let fp = observe_local_fingerprint(&slot.save.local_path);
+    if fp.is_some() && fp != slot.synced_fingerprint {
+        slot.has_pending = true;
+        slot.needs_l1 = true;
     }
 }
 
@@ -1699,24 +1956,25 @@ async fn run_agent(
 /// `GameStarted`/`GameStopped` for UI signalling but no longer gates the
 /// fs subsystem.
 ///
-/// Since 1.4.2: if `config.auto_restore` is on and the local folder is
-/// missing or empty, kick off a background restore of the latest server
-/// snapshot. Files land on disk, the agent loop receives `RearmWatcher`,
-/// and the slot ends up watching the restored folder for the rest of
-/// the session.
+/// Slice 2b (ADR 0021): ya no lanza el restore-en-alta ni el backup-inicial a
+/// mano — sólo registra el slot, siembra el fingerprint sincronizado desde el
+/// set-hash persistido y marca `has_pending` si hay contenido divergente. El
+/// reductor, en el `reconcile_all` que sigue al `AddSave`, decide: restaura una
+/// carpeta vacía / desactualizada, sube la línea base de contenido nuevo, y el
+/// veto de recencia difiere si el usuario está en sesión (sustituye al viejo
+/// chequeo `is_path_recently_touched`).
 fn handle_add(
     slots: &mut HashMap<String, SaveSlot>,
     save: WatchedSave,
     fs_tx: &mpsc::Sender<PathBuf>,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-    config: &AgentConfig,
 ) {
-    let save_for_restore = save.clone();
     let save_id = save.save_id.clone();
     let known_version = save.known_version;
     let last_set_hash = save.set_hash.clone();
+    // Siembra el fingerprint sincronizado desde el set-hash persistido
+    // (state.json) para que "convergido ⇒ 0 acciones" valga desde el primer
+    // tick: sin esto un save ya subido re-subiría su base al arrancar.
+    let synced_fingerprint = last_set_hash.as_deref().map(fingerprint_from_set_hash);
     let mut slot = SaveSlot {
         save,
         watcher: None,
@@ -1730,249 +1988,34 @@ fn handle_add(
         next_scheduled_backup_at: None,
         first_pending_event_at: None,
         last_backup_at: None,
-        restoring: false,
-        next_auto_restore_at: None,
-        restore_failures: AutoRestoreFailures::default(),
+        in_flight: None,
+        next_backup_at: None,
+        next_restore_at: None,
+        restore_failures: kernel::RestoreFailures::default(),
         last_set_hash,
+        synced_fingerprint,
+        last_l0_mtime: None,
+        needs_l1: false,
+        pending_op_result: None,
+        last_restore_error: None,
         known_version,
         pull_pending: false,
-        pull_after_flush: false,
         deferred_notified: false,
     };
     // Playtime-only entries exist purely to be matched by the process poll
     // so their hours accrue for the recap. They own no save folder, so we
     // never arm a watcher or run any restore/backup logic for them.
     if slot.save.track_only {
-        slots.insert(save_id.clone(), slot);
+        slots.insert(save_id, slot);
         return;
     }
     arm_watcher(&mut slot, fs_tx);
-    slots.insert(save_id.clone(), slot);
-
-    // Since 1.5.4 auto-restore is diff-based and non-destructive: it always
-    // runs when `auto_restore` is on, and decides per-file whether to copy.
-    // If nothing's missing the task ends with `restored == 0` and no event
-    // is emitted, so this is cheap even on a fully-populated slot.
-    //
-    // Since 1.5.5 (ADR 0014) the same "user is playing" guard from the
-    // sweep applies here too: if the folder was just touched, the user is
-    // likely mid-session — let the next sweep handle it once mtime
-    // stabilises. Since 1.7.x this is unconditional (no longer gated on
-    // `processes.is_empty()`): a game whose process name doesn't match the
-    // manifest leaves `is_running` false *and* `processes` non-empty, so
-    // the old gate skipped this guard and an auto-restore could fire
-    // mid-session, resurrecting rotated-out autosaves. The recent-touch
-    // check is the reliable "user is playing" signal regardless of process
-    // detection.
-    if config.auto_restore || config.global_sync {
-        // The recent-touch defer applies to sync global too. It used to be
-        // skipped there ("catch up immediately even if the folder was just
-        // written"), but AddSave fires for every save at app start — before
-        // the first process poll, so `is_running` can't veto yet — and this
-        // pull is un-gated (`known_version = None`, it always downloads to
-        // diff). Starting the app mid-game could therefore merge the last
-        // uploaded version into a live folder. A just-written folder means
-        // the user is (or was seconds ago) here; let the sweep catch up once
-        // mtime stabilises.
-        let recently_touched =
-            is_path_recently_touched(&save_for_restore.local_path, RECENT_SAVE_GRACE);
-        if recently_touched {
-            tracing::debug!(
-                save_id = %save_id,
-                path = %save_for_restore.local_path.display(),
-                "agent: handle_add auto-restore deferred — folder touched recently"
-            );
-        } else {
-            if let Some(slot) = slots.get_mut(&save_id) {
-                slot.restoring = true;
-                slot.next_auto_restore_at =
-                    Some(TokioInstant::now() + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS));
-            }
-            spawn_auto_restore(
-                save_for_restore,
-                api.clone(),
-                events_tx.clone(),
-                cmd_tx.clone(),
-                config.conflict_root.clone(),
-                config.conflict_retention_days,
-                // Fresh add: no known baseline yet, so this first pull downloads
-                // once to establish it.
-                None,
-                // No poller cache to consult on a brand-new add either.
-                None,
-                // Single save — no sweep batch to share a manifest with.
-                None,
-            );
-        }
-    }
-}
-
-/// Ensure a freshly-added save with existing on-disk content gets a first
-/// snapshot without waiting on a filesystem write or the hourly backup sweep.
-///
-/// Motivating case: emulator saves. The user points Hoard at a folder that
-/// already holds a `.sav` the agent never observed being written, so no fs
-/// event ever fires (`has_pending` stays false, the GameStopped path skips),
-/// and the hourly sweep — the only other path to a first backup — may not run
-/// for a long time (it restarts whenever the app relaunches). The result is a
-/// tracked save that never reaches the cloud (`last_backup_at = None`).
-///
-/// Fires only when the slot has no baseline yet (never backed up, no known
-/// set-hash, nothing already queued) and the folder isn't empty, so it's a
-/// one-shot for the add and a no-op for every established save. Reuses
-/// `SweepStaggered` so the queued row stays quiet in the feed; the resulting
-/// upload still announces normally. Skipped while `restoring` so we never
-/// upload pre-restore content — the post-restore caller re-checks once the
-/// restore has settled.
-#[allow(clippy::too_many_arguments)]
-fn maybe_schedule_initial_backup(
-    slots: &mut HashMap<String, SaveSlot>,
-    save_id: &str,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    config: &AgentConfig,
-    done_tx: &mpsc::Sender<BackupDone>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-) {
-    let needs = match slots.get(save_id) {
-        Some(slot) => {
-            !slot.save.track_only
-                && !slot.restoring
-                && slot.last_backup_at.is_none()
-                && slot.last_set_hash.is_none()
-                && slot.next_scheduled_backup_at.is_none()
-                && !is_path_empty_or_missing(&slot.save.local_path)
-        }
-        None => false,
-    };
-    if !needs {
-        return;
-    }
-    tracing::info!(
-        save_id = %save_id,
-        "agent: scheduling initial baseline backup for freshly-added save with existing content"
-    );
-    schedule_backup(
-        slots,
-        save_id,
-        BackupReason::SweepStaggered,
-        Duration::from_secs(2),
-        api,
-        events_tx,
-        config,
-        done_tx,
-        cmd_tx,
-    );
-}
-
-/// Minimum interval between successive auto-restore attempts for the
-/// same save. Applied to both successful and failed attempts so a server
-/// that's flapping ("snapshot available", "snapshot gone", "snapshot
-/// available" — possible during a GC race) doesn't get hammered by the
-/// reconciliation sweep.
-const AUTO_RESTORE_COOLDOWN_SECS: u64 = 60;
-
-/// Escalating pacing for an auto-restore that keeps failing on the *same*
-/// cloud version: 60 s → 5 min → 15 min → 60 min, then 60 min forever.
-///
-/// The flat 60 s cooldown above is right for a one-off failure and wrong for a
-/// chronic one. A restore that fails is not free: it fails *after* pulling the
-/// snapshot, so each retry costs a full download. A Windows client hit exactly
-/// this in July 2026 — auto-restores failing on the pre-1.0.3 60 s download
-/// timeout, a failed restore recording no synced version, and the sweep
-/// retrying at full download cost every minute. It re-downloaded the same 13
-/// saves (~3.7 GB a burst) for eight days, ~60 GB/day, and nothing stopped it:
-/// the bandwidth quota was working as designed (each burst fit inside the
-/// window) and the only user-visible trace was a transient error toast.
-///
-/// Escalating cuts the steady-state cost by ~60× (1440 attempts/day → 24)
-/// without dulling the common case: the first retry is still at 60 s, so a
-/// transient blip recovers exactly as fast as it did before. We only slow down
-/// once the save has *proved* that retrying doesn't work. The 60 min cap is
-/// deliberately not the hour-scale parking of `AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS`:
-/// a 404 is a statement of fact ("this isn't here"), while these errors are
-/// usually environmental (network, disk, permissions) and do fix themselves, so
-/// the ceiling stays inside a typical play session and repair stays unattended.
-const AUTO_RESTORE_FAILURE_BACKOFF_SECS: [u64; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
-
-/// Consecutive failures on the same version before the agent stops treating the
-/// problem as transient and emits [`AgentEvent::SaveAutoRestoreStuck`].
-///
-/// Three is the point where the escalation has already spent 60 s + 5 min and is
-/// about to stretch to 15 min and beyond: the retries have gone from "you won't
-/// notice" to "this save is effectively not syncing", which is precisely when a
-/// toast the user may have missed stops being adequate and the state has to
-/// become persistent.
-const AUTO_RESTORE_STUCK_AFTER: u32 = 3;
-
-/// How long to wait before the next auto-restore attempt, given how many
-/// consecutive failures this save has hit on the current cloud version.
-///
-/// `failures` is 1-based (1 = the attempt that just failed). Saturates at the
-/// last step of [`AUTO_RESTORE_FAILURE_BACKOFF_SECS`] rather than growing
-/// without bound — an unbounded backoff eventually parks a recoverable save for
-/// days, which is the opposite failure of the one we're fixing.
-fn auto_restore_backoff(failures: u32) -> Duration {
-    let idx = (failures.max(1) as usize - 1).min(AUTO_RESTORE_FAILURE_BACKOFF_SECS.len() - 1);
-    Duration::from_secs(AUTO_RESTORE_FAILURE_BACKOFF_SECS[idx])
-}
-
-/// Per-save auto-restore failure state: how many consecutive failures, on which
-/// cloud version, and whether the user has already been told.
-///
-/// Kept as its own type rather than three loose fields on [`SaveSlot`] because
-/// the three only make sense together — a count without the version it counts
-/// for is what made the original bug possible ("retry forever" is what you get
-/// when nothing remembers *what* kept failing). Bundling them also makes the
-/// state machine unit-testable without standing up an agent loop.
-#[derive(Debug, Default, Clone)]
-struct AutoRestoreFailures {
-    /// Consecutive failures against `version`.
-    consecutive: u32,
-    /// The cloud version those failures are counted for. `None` = unknown
-    /// (self-hosted, or before the first poll).
-    version: Option<i64>,
-    /// Whether `SaveAutoRestoreStuck` has already been emitted for
-    /// (this save, `version`).
-    stuck_notified: bool,
-}
-
-impl AutoRestoreFailures {
-    /// Record one failed attempt against the cloud's current `latest` version.
-    ///
-    /// Returns the delay to re-arm `next_auto_restore_at` with, and whether the
-    /// caller should emit [`AgentEvent::SaveAutoRestoreStuck`] — true exactly
-    /// once per (save, version), on the [`AUTO_RESTORE_STUCK_AFTER`]th failure.
-    fn record_failure(&mut self, latest: Option<i64>) -> (Duration, bool) {
-        // A different version is a fresh reason to try: start the escalation
-        // over instead of inheriting the old version's penalty.
-        if self.version != latest {
-            self.version = latest;
-            self.consecutive = 0;
-            self.stuck_notified = false;
-        }
-        self.consecutive = self.consecutive.saturating_add(1);
-        let emit_stuck = self.consecutive >= AUTO_RESTORE_STUCK_AFTER && !self.stuck_notified;
-        if emit_stuck {
-            self.stuck_notified = true;
-        }
-        (auto_restore_backoff(self.consecutive), emit_stuck)
-    }
-
-    /// Clear the failure state after a successful attempt. Returns whether a
-    /// persistent warning was up (so the caller emits `...Recovered` and the UI
-    /// can drop the badge).
-    fn clear(&mut self) -> bool {
-        let was_stuck = self.stuck_notified;
-        *self = Self::default();
-        was_stuck
-    }
-
-    /// Whether this save is currently carrying failure state worth clearing
-    /// when the cloud version moves on.
-    fn is_active(&self) -> bool {
-        self.consecutive > 0 || self.stuck_notified
-    }
+    // Contenido ya en disco que diverge de lo sincronizado (add fresco sin
+    // set-hash — el caso emulador — o cambios offline): siembra `has_pending`
+    // para que el reductor tome la línea base. Vacío + restore habilitado → el
+    // reductor restaura.
+    mark_pending_if_diverged(&mut slot);
+    slots.insert(save_id, slot);
 }
 
 /// How long to wait before re-arming a backup whose in-task retry budget
@@ -2034,14 +2077,6 @@ const RUNNING_STICKY_POLLS: u64 = 3;
 /// for exactly this long after the game quits). 6 s ≈ RUNNING_STICKY_POLLS ticks
 /// at the default 2 s poll, still comfortably above any real refresh hiccup.
 const STRONG_STOP_GRACE_FLOOR_SECS: u64 = 6;
-
-/// Backoff applied when an auto-restore fails with a 404: the save is tracked
-/// locally but has no record/snapshot on the backend we're talking to (e.g.
-/// saves carried over from another account, or a stale `state.json` entry).
-/// Retrying on the normal 60s cooldown floods the log with WARNs forever, so
-/// we space these out to roughly hourly — still self-heals if the user later
-/// uploads the save, without the spam.
-const AUTO_RESTORE_NOT_FOUND_BACKOFF_SECS: u64 = 60 * 60;
 
 /// Hard ceiling on how long a continuously-writing save can defer its
 /// backup. The notify debounce resets the timer on every write, so a game
@@ -2272,328 +2307,6 @@ fn spawn_auto_restore(
             })
             .await;
     });
-}
-
-/// Reconciliation sweep: every tick, schedule a diff-based auto-restore for
-/// any save not already being restored and outside its cooldown window. The
-/// restore task itself decides whether anything actually needs copying —
-/// since 1.5.4 a populated local folder no longer skips the attempt at
-/// this stage; it skips inside `restore_files_into` once we've compared
-/// the snapshot against what's on disk.
-///
-/// Guards apply *before* spawning to avoid stomping on a save the user is
-/// actively touching:
-/// 1. `slot.is_running` → game is open, skip.
-/// 2. `slot.has_pending` → un-flushed local changes queued, skip.
-/// 3. `last_fs_event_at` within `RECENT_SAVE_GRACE` → the watcher saw a
-///    write recently, skip.
-/// 4. Disk mtime within `RECENT_SAVE_GRACE` → fallback for the startup
-///    window before the agent has fs history of its own.
-///
-/// Since 1.7.x the activity guards (2, 3) drive the decision and the mtime
-/// check is only a fallback. The earlier version gated solely on
-/// `is_running` + dir mtime, both of which miss real-world cases: a game
-/// whose process name doesn't match its manifest never sets `is_running`,
-/// and autosavers that truncate-and-overwrite the same file in place don't
-/// bump the *directory* mtime — so the sweep auto-restored mid-session,
-/// re-downloading autosaves the game had already rotated away and failing
-/// uploads as the restore mutated the folder under them. The agent's own
-/// inotify stream catches both. The guards are unconditional: `global_sync`
-/// no longer bypasses them (see [`AgentConfig::global_sync`] for the
-/// data-loss incident that ended that).
-///
-/// Cheap: per-slot work here is just a `restoring` flag check and a
-/// timer compare. The network/disk cost happens inside the spawned task,
-/// which dedupes via `restoring` so the next sweep doesn't pile up.
-fn sweep_for_auto_restore(
-    slots: &mut HashMap<String, SaveSlot>,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-    config: &AgentConfig,
-    latest_versions: &HashMap<String, i64>,
-) {
-    let now = TokioInstant::now();
-    // Slots the mid-session guards vetoed while the poller's cache says the
-    // cloud is ahead: an update really is waiting on them. Recorded here and
-    // applied after the scan (the filter only holds `&SaveSlot`), so the
-    // `GameStopped` transition can run the pull the moment the game closes
-    // instead of leaving it to a sweep that a stuck process may veto forever.
-    let mut deferred: Vec<(String, &'static str)> = Vec::new();
-    // Collect candidate save_ids first to keep the borrow checker happy
-    // (we mutate the slot afterwards, then spawn a task that holds a
-    // clone of `WatchedSave`).
-    let candidates: Vec<(String, WatchedSave)> = slots
-        .iter()
-        .filter(|(id, slot)| {
-            // Playtime-only entries have no save folder to restore into.
-            if slot.save.track_only {
-                return false;
-            }
-            // Per-save preset can opt out of restore (backup-only) or opt in
-            // even when the global default is off. `global_sync` raises the
-            // floor: it counts as a global opt-in for restore, but a save
-            // explicitly marked backup-only (`Some(false)`) still wins.
-            if !slot
-                .save
-                .policy
-                .auto_restore
-                .unwrap_or(config.auto_restore || config.global_sync)
-            {
-                return false;
-            }
-            if slot.restoring {
-                return false;
-            }
-            if let Some(t) = slot.next_auto_restore_at {
-                if now < t {
-                    return false;
-                }
-            }
-            // Mid-session guards. These apply to sync global too: it used to
-            // bypass them ("pull en el momento, even mid-session"), which on
-            // a single device let the pull race the user's own debounced
-            // backup and re-apply the last uploaded version over un-flushed
-            // progress (REPO data-loss, 2026-07-05). The sweep re-runs every
-            // tick and the version-gate keeps every retry free — but a tick
-            // that keeps being vetoed never lands, so a veto with the cloud
-            // ahead is also recorded on the slot and honoured at `GameStopped`.
-            if let Some(reason) = mid_session_reason(slot) {
-                tracing::debug!(save_id = %id, reason, "sweep: skipping — user is mid-session");
-                if cloud_ahead(slot, latest_versions) {
-                    deferred.push((id.to_string(), reason));
-                }
-                return false;
-            }
-            true
-        })
-        .map(|(id, slot)| (id.clone(), slot.save.clone()))
-        .collect();
-
-    for (id, reason) in deferred {
-        let notify = slots.get_mut(&id).is_some_and(note_deferred_pull);
-        if notify {
-            if let Some(slot) = slots.get(&id) {
-                let _ = events_tx.try_send(AgentEvent::RestoreDeferred {
-                    save_id: id.clone(),
-                    game_slug: slot.save.game_slug.clone(),
-                    reason: reason.to_string(),
-                });
-            }
-        }
-    }
-
-    // One manifest fetch for the whole batch when the poller cache is cold
-    // (e.g. a cold start scheduling several restores at once): the first
-    // spawned task that needs it pulls `/v1/cloud/sync` once and the rest
-    // reuse the result instead of each fetching the identical manifest.
-    let shared_manifest = Arc::new(tokio::sync::OnceCell::new());
-    for (id, save) in candidates {
-        let known_version = slots.get(&id).and_then(|s| s.known_version);
-        let cached_latest = latest_versions.get(&id).copied();
-        if let Some(slot) = slots.get_mut(&id) {
-            slot.restoring = true;
-            slot.next_auto_restore_at = Some(now + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS));
-        }
-        tracing::debug!(
-            save_id = %id,
-            "agent: reconciliation sweep — scheduling diff auto-restore"
-        );
-        spawn_auto_restore(
-            save,
-            api.clone(),
-            events_tx.clone(),
-            cmd_tx.clone(),
-            config.conflict_root.clone(),
-            config.conflict_retention_days,
-            known_version,
-            cached_latest,
-            Some(shared_manifest.clone()),
-        );
-    }
-}
-
-/// Grace window for the "save touched recently" heuristic in sweep guards.
-/// Five minutes matches the ADR 0014 acceptance: while playing, the
-/// process poll will normally mark the slot `is_running`; this catches the
-/// case where the slot has no process match in the catalog.
-const RECENT_SAVE_GRACE: Duration = Duration::from_secs(5 * 60);
-
-/// The "user is mid-session" test shared by the reconciliation sweep and the
-/// push-triggered `ForceRestore` path: the game's process is running, there
-/// are un-flushed local changes queued for backup, the watcher saw a write
-/// within [`RECENT_SAVE_GRACE`], or (fallback for the startup window before
-/// the agent has fs history) the folder's disk mtime is that recent. Any of
-/// these means a pull could overwrite progress the backup hasn't captured
-/// yet, so restores must wait until the save settles. Returns the first
-/// tripped guard for logging, `None` when the slot is quiet.
-///
-/// The watcher signals matter because inotify catches in-place file rewrites
-/// that don't bump the directory's mtime (OpenTTD and other autosavers
-/// truncate-and-overwrite the same .sav): never auto-restore into a folder
-/// the user is actively writing, or the restore and the backup fight over
-/// the same files.
-fn mid_session_reason(slot: &SaveSlot) -> Option<&'static str> {
-    // Sans-IO boundary (ADR 0021, Slice 1): the decision lives in the kernel;
-    // this shell samples the non-determinism (`now`) and the world
-    // (`folder_mtime`) and hands it in as data. The kernel's `veto_reason`
-    // makes the same choice the old in-place logic did, returning the same
-    // `&'static str` reasons — behaviour is identical.
-    // Los campos que el kernel creció en el Slice 2 no los mira el veto de
-    // sesión; el shell sólo rellena los que `veto_reason` consulta y deja el
-    // resto en su default. `run_agent` no cambia.
-    let state = kernel::State {
-        is_running: slot.is_running,
-        has_pending: slot.has_pending,
-        last_fs_event_at: slot.last_fs_event_at,
-        last_restore_at: slot.last_restore_at,
-        ..Default::default()
-    };
-    let obs = kernel::Observation {
-        folder_mtime: folder_own_mtime(&slot.save.local_path),
-        ..Default::default()
-    };
-    let world = kernel::World {
-        now: OffsetDateTime::now_utc(),
-        seed: 0,
-    };
-    kernel::session::veto_reason(&state, &obs, &world)
-}
-
-/// Does the poller's version cache say this save moved past what this device
-/// last committed or restored? A cached version with no `known_version` counts
-/// as ahead: this device has never synced the save, so whatever the cloud holds
-/// is news. No cache entry means we simply don't know (self-hosted, headless
-/// CLI, or the poller hasn't reported yet) — never claim ahead on a guess, the
-/// callers use this to decide whether an update is *waiting*, and the pull
-/// itself re-checks the real head anyway.
-fn cloud_ahead(slot: &SaveSlot, latest_versions: &HashMap<String, i64>) -> bool {
-    match latest_versions.get(&slot.save.save_id) {
-        Some(latest) => slot.known_version.is_none_or(|known| *latest > known),
-        None => false,
-    }
-}
-
-/// Remember that a pull for this slot was vetoed mid-session so the
-/// `GameStopped` transition can honour it once the folder goes quiet. Returns
-/// `true` when the caller should emit [`AgentEvent::RestoreDeferred`] — once
-/// per waiting update, not once per sweep tick.
-fn note_deferred_pull(slot: &mut SaveSlot) -> bool {
-    slot.pull_pending = true;
-    let first = !slot.deferred_notified;
-    slot.deferred_notified = true;
-    first
-}
-
-/// May the pull deferred by a mid-session veto run now? Asked only from the
-/// `GameStopped` transition — either straight away, or once the final flush's
-/// `BackupDone` lands (`SaveSlot::pull_after_flush`).
-///
-/// This path drops **only** the recency guards of [`mid_session_reason`]
-/// (`last_fs_event_at` and the disk-mtime fallback). Both are guaranteed to
-/// trip here and both are describing the same write: the save the game made on
-/// its way out, which the final flush has just uploaded. Waiting out their
-/// 5-minute grace is what left the update stranded — nothing re-fires once it
-/// expires except the sweep, and on a Deck the sweep is usually still vetoed by
-/// a leftover Proton process. The restore is conflict-aware by design
-/// (local-newer files win, conflicts are backed up), so the exiting write can't
-/// be lost even if the grace was hiding a real race.
-///
-/// The live-session guards stay exactly as they were (REPO data-loss,
-/// 2026-07-05): `is_running` means the user is playing *right now*,
-/// `has_pending` means local changes aren't versioned yet, and `restoring`
-/// means a pull is already writing into the folder. Any of them defers again —
-/// `pull_pending` survives, so the next quiet moment gets another chance.
-fn deferred_pull_ready(
-    slot: &SaveSlot,
-    config: &AgentConfig,
-    latest_versions: &HashMap<String, i64>,
-) -> bool {
-    // Playtime-only entries have no save folder to pull into.
-    if slot.save.track_only {
-        return false;
-    }
-    // Nothing is waiting: no veto recorded one, and the poller's cache doesn't
-    // show the cloud ahead of us either.
-    if !slot.pull_pending && !cloud_ahead(slot, latest_versions) {
-        return false;
-    }
-    // Per-save preset can opt out of restore (backup-only) or opt in when the
-    // global default is off; `global_sync` counts as a global opt-in.
-    if !slot
-        .save
-        .policy
-        .auto_restore
-        .unwrap_or(config.auto_restore || config.global_sync)
-    {
-        return false;
-    }
-    !(slot.is_running || slot.has_pending || slot.restoring)
-}
-
-/// Run the pull a mid-session veto deferred, if the slot is finally ready for
-/// it. Called from the `GameStopped` transition and from the `BackupDone` of
-/// its final flush; a no-op for every slot with nothing waiting.
-fn run_deferred_pull(
-    slots: &mut HashMap<String, SaveSlot>,
-    id: &str,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-    config: &AgentConfig,
-    latest_versions: &HashMap<String, i64>,
-) {
-    let Some(slot) = slots.get(id) else {
-        return;
-    };
-    if !deferred_pull_ready(slot, config, latest_versions) {
-        return;
-    }
-    let save = slot.save.clone();
-    let known_version = slot.known_version;
-    if let Some(slot) = slots.get_mut(id) {
-        slot.pull_pending = false;
-        slot.deferred_notified = false;
-        slot.restoring = true;
-        slot.next_auto_restore_at =
-            Some(TokioInstant::now() + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS));
-    }
-    tracing::info!(
-        save_id = %id,
-        "agent: game closed — running the pull that was deferred mid-session"
-    );
-    spawn_auto_restore(
-        save,
-        api.clone(),
-        events_tx.clone(),
-        cmd_tx.clone(),
-        config.conflict_root.clone(),
-        config.conflict_retention_days,
-        known_version,
-        // Authoritative, like the force/barrier paths: this is the user's
-        // cross-device hand-off finally landing, so fetch the real head instead
-        // of trusting a cache that may be a tick stale. The version-gate inside
-        // still makes it free when we're already current.
-        None,
-        // Single save — no sweep batch to share a manifest with.
-        None,
-    );
-}
-
-/// True if `path` exists and has been modified within `grace`. Conservative
-/// on errors: an unreadable path returns `false` so we don't deadlock the
-/// auto-restore against a slot we can't stat.
-fn is_path_recently_touched(path: &Path, grace: Duration) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(mtime) = meta.modified() else {
-        return false;
-    };
-    match std::time::SystemTime::now().duration_since(mtime) {
-        Ok(age) => age < grace,
-        Err(_) => false,
-    }
 }
 
 /// The save folder's own mtime (its inode, not recursive), as an
@@ -3348,216 +3061,6 @@ fn match_save_for_path(slots: &HashMap<String, SaveSlot>, path: &Path) -> Option
     None
 }
 
-/// Cancel any in-flight pending backup, then schedule a new one to run
-/// after `delay`. The pending task does the wait *and* the upload, so we
-/// can abort the wait cleanly when a new event resets the timer.
-#[allow(clippy::too_many_arguments)]
-fn schedule_backup(
-    slots: &mut HashMap<String, SaveSlot>,
-    save_id: &str,
-    reason: BackupReason,
-    delay: Duration,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    config: &AgentConfig,
-    done_tx: &mpsc::Sender<BackupDone>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-) {
-    let Some(slot) = slots.get_mut(save_id) else {
-        return;
-    };
-    // Was a backup already scheduled for this slot? If so, this call is
-    // just resetting the debounce timer inside an in-progress window — the
-    // feed already shows a "queued" row for it. Re-announcing on every fs
-    // event is what flooded the activity feed with orphaned "en cola"
-    // entries when a game autosaves every second. Only announce on the
-    // leading edge; the row resolves when the upload completes (which
-    // clears `next_scheduled_backup_at` via `done_rx`).
-    let already_scheduled = slot.next_scheduled_backup_at.is_some();
-    if let Some(p) = slot.pending.take() {
-        p.abort();
-    }
-
-    slot.next_scheduled_backup_at = Some(OffsetDateTime::now_utc() + delay);
-
-    tracing::info!(
-        save_id = %save_id,
-        delay_ms = delay.as_millis() as u64,
-        reason = ?reason,
-        "agent: backup scheduled"
-    );
-
-    // Don't announce zero-delay backups (manual / forced flush) — they'd
-    // add noise — nor re-announce a window that's already queued, nor the
-    // staggered sweep entries (there's no user-visible trigger and one row
-    // per save every hour would flood the feed; the resulting upload still
-    // announces normally when it runs).
-    if delay > Duration::ZERO
-        && !already_scheduled
-        && !matches!(reason, BackupReason::SweepStaggered)
-    {
-        let _ = events_tx.try_send(AgentEvent::BackupScheduled {
-            save_id: save_id.to_string(),
-            delay_ms: delay.as_millis() as u64,
-            reason,
-        });
-    }
-
-    let api = api.clone();
-    let events_tx = events_tx.clone();
-    let done_tx = done_tx.clone();
-    let cmd_tx = cmd_tx.clone();
-    let save = slot.save.clone();
-    let prev_set_hash = slot.last_set_hash.clone();
-    // Fast-forward base for the upload: the version this device believes is the
-    // server head. Sending it lets the server reject (409 non-fast-forward) when
-    // another device advanced the save since we last synced, instead of burying
-    // their version under our stale content. Captured at schedule time; if it's
-    // gone stale by the time the debounced upload runs, the 409 path reconciles
-    // and retries with the fresh head. `None` only for a brand-new save the
-    // device has never synced (no head to fast-forward against yet).
-    let base_version = slot.known_version;
-    let max_retries = config.max_retries;
-    // Per-save preset can force backup-only (`Some(false)`) or force restore
-    // (`Some(true)`) regardless of the global default.
-    let auto_restore = slot
-        .save
-        .policy
-        .auto_restore
-        .unwrap_or(config.auto_restore || config.global_sync);
-    let conflict_root = config.conflict_root.clone();
-    let conflict_retention_days = config.conflict_retention_days;
-
-    slot.pending = Some(tokio::spawn(async move {
-        if delay > Duration::ZERO {
-            tokio::time::sleep(delay).await;
-        }
-        run_backup_with_retry(
-            api,
-            save,
-            prev_set_hash,
-            base_version,
-            events_tx,
-            done_tx,
-            cmd_tx,
-            max_retries,
-            auto_restore,
-            conflict_root,
-            conflict_retention_days,
-        )
-        .await;
-    }));
-}
-
-/// Nominal hash-throughput budget for the staggered sweep: how many bytes of
-/// save data each second of the *effective* window covers. Calibrated so
-/// ~20 GiB of saves stretches the window to ~2h (≈6 min per GiB), keeping
-/// sustained disk reads thin. Below this footprint the configured interval
-/// dominates and the window stays at its nominal length.
-const SWEEP_BYTES_PER_WINDOW_SEC: f64 = 20.0 * 1024.0 * 1024.0 * 1024.0 / 7200.0;
-
-/// Floor on the gap between consecutive saves in a staggered sweep, so even a
-/// pile of tiny saves gets a visible beat between each re-hash instead of
-/// firing back-to-back.
-const SWEEP_MIN_GAP_SECS: f64 = 15.0;
-
-/// Staggered backup sweep (see `AgentCommand::SweepAll`). Walks each tracked
-/// save's folder for its byte footprint (metadata only — no file contents are
-/// read here), then schedules a re-hash for each at a size-proportional offset
-/// inside an effective window. The window is
-/// `max(window_secs, total / SWEEP_BYTES_PER_WINDOW_SEC)`, so a small set
-/// finishes within the nominal interval while tens of GB stretch it out. Saves
-/// already queued for backup (live fs event, or a still-running previous
-/// sweep) are left alone so repeated ticks don't reset the stagger or pile up
-/// concurrent hashes.
-#[allow(clippy::too_many_arguments)]
-fn sweep_all(
-    slots: &mut HashMap<String, SaveSlot>,
-    window_secs: u64,
-    api: &ApiClient,
-    events_tx: &mpsc::Sender<AgentEvent>,
-    config: &AgentConfig,
-    done_tx: &mpsc::Sender<BackupDone>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
-) {
-    // Snapshot (id, path, already-queued) up front: scheduling borrows `slots`
-    // mutably, so we can't hold an iterator over it while calling
-    // `schedule_backup` below.
-    let entries: Vec<(String, PathBuf, bool)> = slots
-        .values()
-        // Playtime-only entries never back up.
-        .filter(|s| !s.save.track_only)
-        .map(|s| {
-            (
-                s.save.save_id.clone(),
-                s.save.local_path.clone(),
-                s.next_scheduled_backup_at.is_some(),
-            )
-        })
-        .collect();
-    if entries.is_empty() {
-        return;
-    }
-
-    // Byte footprint per save (metadata walk). Missing/unreadable folders
-    // count as zero — they're handled (or skipped-empty) when their turn to
-    // back up comes.
-    let sized: Vec<(String, bool, u64)> = entries
-        .into_iter()
-        .map(|(id, path, queued)| (id, queued, dir_size_bytes(&path)))
-        .collect();
-    let total_bytes: u64 = sized.iter().map(|(_, _, b)| *b).sum();
-    let n = sized.len() as f64;
-
-    // Effective window: grows past the nominal interval once the footprint is
-    // large enough that spreading it thin needs more time.
-    let window = window_secs.max(1) as f64;
-    let effective_window = if total_bytes > 0 {
-        window.max(total_bytes as f64 / SWEEP_BYTES_PER_WINDOW_SEC)
-    } else {
-        window
-    };
-
-    tracing::info!(
-        saves = sized.len(),
-        total_mib = (total_bytes / (1024 * 1024)),
-        window_secs,
-        effective_window_secs = effective_window as u64,
-        "agent: starting staggered backup sweep"
-    );
-
-    let mut offset = 0.0_f64;
-    for (id, already_queued, bytes) in sized {
-        // Per-save slice of the window: size-proportional when we have a
-        // total, an even split otherwise, floored so tiny saves still space
-        // out.
-        let slice = if total_bytes > 0 {
-            (effective_window * (bytes as f64 / total_bytes as f64)).max(SWEEP_MIN_GAP_SECS)
-        } else {
-            (effective_window / n).max(SWEEP_MIN_GAP_SECS)
-        };
-        // Skip saves already on the schedule (live fs change, or a previous
-        // sweep that hasn't run yet): don't reset their timer. We still
-        // advance `offset` by their slice so the remaining saves keep their
-        // size-proportional spacing — and so a long sweep that overruns into
-        // the next tick finishes instead of restarting.
-        if !already_queued {
-            schedule_backup(
-                slots,
-                &id,
-                BackupReason::SweepStaggered,
-                Duration::from_secs_f64(offset),
-                api,
-                events_tx,
-                config,
-                done_tx,
-                cmd_tx,
-            );
-        }
-        offset += slice;
-    }
-}
-
 /// Sum the byte size of every regular file under `root`, recursively. Reads
 /// directory entries + file metadata only — never opens a file — so it's the
 /// cheap way to learn a save's footprint for sweep staggering. Unreadable
@@ -3625,29 +3128,19 @@ async fn run_backup_with_retry(
             auto_restore,
             "agent: backup skipped — local folder is empty/missing"
         );
-        // Always clear has_pending so a future fs event isn't blocked.
+        // No-op: limpia has_pending (via el bookkeeping del shell) para que un
+        // evento fs futuro no quede bloqueado. Ya NO se lanza el restore desde
+        // aquí — con la carpeta vacía el reductor emitirá `Restore` en el
+        // próximo tick (rama `local_empty`), sin duplicar caminos de ejecución.
+        // El toast "backup omitido: carpeta vacía" sólo cuando el restore está
+        // deshabilitado (si no, el reductor la rellena).
         let _ = done_tx.try_send(BackupDone {
             save_id: save.save_id.clone(),
             new_set_hash: None,
             committed: false,
             version_num: None,
         });
-        if auto_restore {
-            spawn_auto_restore(
-                save.clone(),
-                api.clone(),
-                events_tx.clone(),
-                cmd_tx,
-                conflict_root,
-                conflict_retention_days,
-                // Empty/missing folder: we genuinely want the save back, so
-                // don't version-gate this pull.
-                None,
-                None,
-                // Single save — no sweep batch to share a manifest with.
-                None,
-            );
-        } else {
+        if !auto_restore {
             let _ = events_tx
                 .send(AgentEvent::BackupSkippedEmpty {
                     save_id: save.save_id.clone(),
@@ -3883,33 +3376,27 @@ async fn run_backup_with_retry(
                                 // The merged tree equals the head we just pulled:
                                 // re-uploading would only mint head+1 with
                                 // identical bytes (and fan a no-op realtime push
-                                // out to every other device). Settle instead —
-                                // advance known_version, adopt the post-merge
-                                // signature so the merge's own fs writes don't
-                                // bounce back as an upload, and clear has_pending.
+                                // out to every other device). Settle instead. En el
+                                // modelo invertido señalamos UNA sola terminación:
+                                // un `BackupDone` no-committed que ACARREA la versión
+                                // asentada (`version_num`) y la firma post-merge. El
+                                // shell (rama `done_rx`) lo trata como el 409-settle:
+                                // avanza `known_version`, adopta el fingerprint,
+                                // sella `last_restore_at` (el merge escribió como un
+                                // restore) y limpia has_pending — sin cruzar el
+                                // `OpResult` de restore con un `in_flight` de backup.
                                 tracing::info!(
                                     save_id = %save.save_id,
                                     game_slug = %save.game_slug,
                                     version_num = outcome.version_num,
                                     "agent: backup conflict reconciled to head with no local divergence — settled without re-upload"
                                 );
-                                let _ = cmd_tx
-                                    .send(AgentCommand::AutoRestoreFinished {
-                                        id: save.save_id.clone(),
-                                        disposition: AutoRestoreDisposition::Ok,
-                                        synced_version: Some(outcome.version_num),
-                                        post_restore_set_hash: outcome.disk_set_hash.clone(),
-                                        // The reconcile merge wrote head's files
-                                        // into the folder — treat like a restore.
-                                        wrote_files: true,
-                                    })
-                                    .await;
                                 let _ = done_tx
                                     .send(BackupDone {
                                         save_id: save.save_id.clone(),
-                                        new_set_hash: None,
+                                        new_set_hash: outcome.disk_set_hash.clone(),
                                         committed: false,
-                                        version_num: None,
+                                        version_num: Some(outcome.version_num),
                                     })
                                     .await;
                                 return;
@@ -3917,20 +3404,12 @@ async fn run_backup_with_retry(
                             // Local content survived the merge that head lacks —
                             // fast-forward from the head we just reconciled to and
                             // retry so that genuinely-new local data goes up.
-                            // Advance the slot's known_version (and the sweep's
-                            // gate); leave last_set_hash stale so the retry's
-                            // signature check still sees the divergence to upload.
+                            // `known_version` avanzará en el `BackupDone` final del
+                            // commit; no hace falta un `AutoRestoreFinished`
+                            // intermedio (el gate se arma al terminar). Deja
+                            // `last_set_hash` stale para que el retry vea la
+                            // divergencia y suba.
                             base_version = Some(outcome.version_num);
-                            let _ = cmd_tx
-                                .send(AgentCommand::AutoRestoreFinished {
-                                    id: save.save_id.clone(),
-                                    disposition: AutoRestoreDisposition::Ok,
-                                    synced_version: Some(outcome.version_num),
-                                    post_restore_set_hash: None,
-                                    // The reconcile merge wrote into the folder.
-                                    wrote_files: true,
-                                })
-                                .await;
                             continue;
                         }
                         Ok(None) => {
@@ -3952,6 +3431,13 @@ async fn run_backup_with_retry(
                                     will_retry: false,
                                 })
                                 .await;
+                            // Devuelve el reintento al bucle: limpia `in_flight` y
+                            // repone `next_backup_at` (conserva has_pending — los
+                            // cambios locales nunca llegaron a una versión). Sin
+                            // esto la op quedaría "in flight" para siempre.
+                            let _ = cmd_tx
+                                .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                                .await;
                             return;
                         }
                         Err(re) => {
@@ -3968,6 +3454,9 @@ async fn run_backup_with_retry(
                                     error: chain,
                                     will_retry: false,
                                 })
+                                .await;
+                            let _ = cmd_tx
+                                .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
                                 .await;
                             return;
                         }
@@ -4345,10 +3834,7 @@ fn process_poll(
     sys: &mut System,
     slots: &mut HashMap<String, SaveSlot>,
     events_tx: &mpsc::Sender<AgentEvent>,
-    api: &ApiClient,
     config: &AgentConfig,
-    done_tx: &mpsc::Sender<BackupDone>,
-    cmd_tx: &mpsc::Sender<AgentCommand>,
     playtime: &mut crate::playtime::PlaytimeStore,
     playtime_path: Option<&std::path::Path>,
     reported_heavy: &mut HashSet<Pid>,
@@ -4359,11 +3845,13 @@ fn process_poll(
     steam_index: &crate::playtime_index::SteamPlaytimeIndex,
     prev_pids: &mut HashSet<Pid>,
     corr_running: &mut HashMap<String, (Pid, u64)>,
-    // Poller's per-save cloud version cache. Read only on the `GameStopped`
-    // transition, to spot a save the cloud has moved past while the user was
-    // playing (see `run_deferred_pull`).
-    latest_versions: &HashMap<String, i64>,
 ) -> bool {
+    // Slice 2b (ADR 0021 C.1): `process_poll` es el **muestreador del mundo** —
+    // detección de procesos, `is_running` (con su sticky de 6 s), eventos
+    // GameStarted/Stopped, playtime, heavy/correlación/probes. Ya NO toma
+    // decisiones de sync (barrier, flush final, deferred-pull): las emite el
+    // reductor en el `reconcile_all` que sigue a este poll. Por eso dejó de
+    // recibir `api`/`done_tx`/`cmd_tx`/`latest_versions`.
     // Refresh every process. The `true` flag asks sysinfo to remove
     // entries for processes that have exited since the last refresh,
     // which is exactly what we need to detect "game stopped".
@@ -4751,57 +4239,6 @@ fn process_poll(
         };
 
         if now_running {
-            // Decide the pre-launch sync barrier *before* flipping
-            // `is_running` — the sweep skips running slots, but the whole
-            // point of the barrier is to pull on launch. We still honour the
-            // other "user is here" guards so we never clobber an active local
-            // session: un-flushed changes, a recent fs event, a recently
-            // touched folder, an in-flight restore, or an unexpired cooldown
-            // all veto the pull. The restore itself is conflict-aware
-            // (local-newer files win, conflicts are backed up), so even when
-            // it does fire it can't lose newer local progress.
-            let barrier_save: Option<WatchedSave> = {
-                slots.get(&id).and_then(|slot| {
-                    // Playtime-only entries have no save folder to pull into.
-                    if slot.save.track_only {
-                        return None;
-                    }
-                    // Per-save preset can disable (backup-only) or enable the
-                    // pull barrier regardless of the global default. `global_sync`
-                    // counts as a global opt-in.
-                    if !slot
-                        .save
-                        .policy
-                        .auto_restore
-                        .unwrap_or(config.auto_restore || config.global_sync)
-                    {
-                        return None;
-                    }
-                    if slot.restoring {
-                        return None;
-                    }
-                    if let Some(t) = slot.next_auto_restore_at {
-                        if TokioInstant::now() < t {
-                            return None;
-                        }
-                    }
-                    // The user-is-here guards apply under sync global too. The
-                    // old bypass ("pull at launch even if the folder was just
-                    // written") meant a quick relaunch — or a process-poll flap
-                    // re-firing GameStarted mid-session — could merge the cloud
-                    // head over changes the backup hadn't flushed yet. A
-                    // genuine cross-device hand-off passes these guards anyway
-                    // (this device wasn't the one just writing the folder), so
-                    // the barrier still fires exactly when it's wanted.
-                    // `is_running` is still false here — it flips after the
-                    // barrier decision — so the launch itself never vetoes.
-                    if mid_session_reason(slot).is_some() {
-                        return None;
-                    }
-                    Some(slot.save.clone())
-                })
-            };
-
             // ¿Arranque solo-débil? Ninguna señal fuerte lo corrobora este
             // tick: candidato a sesión fantasma (ver `SaveSlot::weak_session`).
             let weak_start = !strong_now.contains(id.as_str());
@@ -4834,38 +4271,14 @@ fn process_poll(
                 save_id: id.clone(),
                 game_slug,
             });
-
-            // Pre-launch sync barrier (Fase 1): the instant a game launches,
-            // pull the latest remote snapshot so a cross-device hand-off feels
-            // immediate — play on the tablet, sit down at the PC, launch, and
-            // the tablet's progress is already there. Reuses the same
-            // conflict-aware restore as the reconciliation sweep.
-            if let Some(save) = barrier_save {
-                let known_version = slots.get(&id).and_then(|s| s.known_version);
-                if let Some(slot) = slots.get_mut(&id) {
-                    slot.restoring = true;
-                    slot.next_auto_restore_at =
-                        Some(TokioInstant::now() + Duration::from_secs(AUTO_RESTORE_COOLDOWN_SECS));
-                }
-                tracing::info!(
-                    save_id = %id,
-                    "agent: GameStarted — pre-launch sync barrier, pulling latest snapshot"
-                );
-                spawn_auto_restore(
-                    save,
-                    api.clone(),
-                    events_tx.clone(),
-                    cmd_tx.clone(),
-                    config.conflict_root.clone(),
-                    config.conflict_retention_days,
-                    known_version,
-                    // Pre-launch barrier wants the freshest truth before play
-                    // starts — fetch it rather than trust the poller cache.
-                    None,
-                    // Single save — no sweep batch to share a manifest with.
-                    None,
-                );
-            }
+            // El viejo "pre-launch sync barrier" (pull edge-triggered en el
+            // instante del arranque) desaparece con la autoridad invertida (ADR
+            // 0021 C.1): el modelo es level-triggered, así que el reductor ya
+            // restauró cualquier delta cross-device en un tick tranquilo ANTES de
+            // lanzar, y el `reconcile_all` que sigue a este poll difiere (con
+            // flush) el pull si la nube se adelantó justo al arrancar. Se pierde
+            // algo de latencia en la ventana estrecha "bump < 1 tick antes de
+            // lanzar" (aterriza al cerrar); ver el resumen del slice.
         } else {
             let was_weak_session = slots
                 .get(&id)
@@ -4919,38 +4332,15 @@ fn process_poll(
                 save_id: id.clone(),
                 game_slug,
             });
-            // Final flush on GameStopped *only* if something changed since
-            // the last successful backup — avoids re-uploading an identical
-            // snapshot every time the user quits.
-            if had_pending {
-                schedule_backup(
-                    slots,
-                    &id,
-                    BackupReason::GameStopped,
-                    Duration::from_secs(2),
-                    api,
-                    events_tx,
-                    config,
-                    done_tx,
-                    cmd_tx,
-                );
-                // Any pull deferred during the session waits for this flush's
-                // `BackupDone`: pulling now would fight the upload over the
-                // same files, and `has_pending` would veto it anyway. The
-                // licence is one-shot — `done_rx` takes it whether or not the
-                // pull fires.
-                if let Some(slot) = slots.get_mut(&id) {
-                    slot.pull_after_flush = true;
-                }
-            } else {
-                tracing::debug!(
-                    save_id = %id,
-                    "agent: GameStopped with no pending changes; skipping backup"
-                );
-                // Nothing to flush, so the folder is already quiet: an update
-                // that arrived mid-session can land right now.
-                run_deferred_pull(slots, &id, api, events_tx, cmd_tx, config, latest_versions);
-            }
+            // El flush final al cerrarse el juego y el aterrizaje del pull
+            // diferido ya NO se lanzan aquí: son decisiones de sync que el
+            // reductor emite en el `reconcile_all` que sigue a este poll. Al
+            // limpiar `is_running` arriba, el veto de sesión se levanta (pasada
+            // la gracia sticky) y el reductor ve `has_pending` + carpeta quieta →
+            // backup (el flush final), y `pull_pending`/nube-por-delante +
+            // tranquilo → restore (el pull diferido aterriza). `process_poll`
+            // sólo muestrea el mundo (ADR 0021 C.1). `had_pending` ya sólo
+            // alimenta el striking de sesión fantasma de arriba.
         }
     }
 
@@ -4971,134 +4361,6 @@ fn process_poll(
 mod tests {
     use super::*;
     use std::io::Write;
-
-    /// The escalation the July-2026 incident needed: 60s → 5min → 15min → 60min,
-    /// then flat. The first step must stay at the old flat cooldown so a
-    /// one-off blip recovers exactly as fast as it did before.
-    #[test]
-    fn auto_restore_backoff_escalates_then_caps() {
-        assert_eq!(auto_restore_backoff(1), Duration::from_secs(60));
-        assert_eq!(auto_restore_backoff(2), Duration::from_secs(5 * 60));
-        assert_eq!(auto_restore_backoff(3), Duration::from_secs(15 * 60));
-        assert_eq!(auto_restore_backoff(4), Duration::from_secs(60 * 60));
-        // Capped, not unbounded: a save that fails all day is retried hourly,
-        // never parked for days.
-        assert_eq!(auto_restore_backoff(5), Duration::from_secs(60 * 60));
-        assert_eq!(auto_restore_backoff(99), Duration::from_secs(60 * 60));
-        // 0 shouldn't happen (the counter is 1-based) but must not panic on
-        // the index maths.
-        assert_eq!(auto_restore_backoff(0), Duration::from_secs(60));
-    }
-
-    /// The whole point of the fix: repeated failures on the same version pace
-    /// themselves instead of re-downloading gigabytes every minute forever.
-    #[test]
-    fn record_failure_escalates_on_same_version() {
-        let mut f = AutoRestoreFailures::default();
-        let delays: Vec<u64> = (0..5)
-            .map(|_| f.record_failure(Some(7)).0.as_secs())
-            .collect();
-        assert_eq!(delays, vec![60, 300, 900, 3600, 3600]);
-        assert_eq!(f.consecutive, 5);
-        assert_eq!(f.version, Some(7));
-    }
-
-    /// A successful attempt wipes the slate: the next unrelated hiccup starts
-    /// from 60s again rather than inheriting an hour-long penalty.
-    #[test]
-    fn success_resets_the_escalation() {
-        let mut f = AutoRestoreFailures::default();
-        f.record_failure(Some(7));
-        f.record_failure(Some(7));
-        assert_eq!(f.consecutive, 2);
-
-        assert!(!f.clear(), "no warning was up, so nothing to recover from");
-        assert_eq!(f.consecutive, 0);
-        assert_eq!(f.version, None);
-        assert!(!f.is_active());
-
-        // Back to the bottom of the ladder.
-        assert_eq!(f.record_failure(Some(7)).0, Duration::from_secs(60));
-    }
-
-    /// A new cloud version is a fresh reason to try now: it must not inherit the
-    /// old version's backoff. This is compared by *version*, not elapsed time —
-    /// a save stuck on v7 is still stuck on v7 an hour later.
-    #[test]
-    fn new_version_resets_the_escalation() {
-        let mut f = AutoRestoreFailures::default();
-        for _ in 0..4 {
-            f.record_failure(Some(7));
-        }
-        assert_eq!(f.consecutive, 4);
-
-        // v8 landed: start over at 60s instead of the 60min v7 had earned.
-        let (delay, _) = f.record_failure(Some(8));
-        assert_eq!(delay, Duration::from_secs(60));
-        assert_eq!(f.consecutive, 1);
-        assert_eq!(f.version, Some(8));
-    }
-
-    /// The stuck warning fires once per (save, version) — the sweep keeps
-    /// retrying and re-failing, but the user is told a single time. A warning
-    /// re-emitted on every retry is just the toast spam this replaces.
-    #[test]
-    fn stuck_event_is_one_shot_per_version() {
-        let mut f = AutoRestoreFailures::default();
-        // Below the threshold: still plausibly transient, stay quiet.
-        assert!(!f.record_failure(Some(7)).1);
-        assert!(!f.record_failure(Some(7)).1);
-        // Third strike on the same version: surface it.
-        assert!(f.record_failure(Some(7)).1);
-        // …and never again for this version, however long it keeps failing.
-        for _ in 0..10 {
-            assert!(!f.record_failure(Some(7)).1);
-        }
-        assert!(f.stuck_notified);
-    }
-
-    /// A new version re-arms the one-shot: if v8 also fails three times, that's
-    /// a new fact about a new version and worth saying again.
-    #[test]
-    fn stuck_event_rearms_on_new_version() {
-        let mut f = AutoRestoreFailures::default();
-        for _ in 0..3 {
-            f.record_failure(Some(7));
-        }
-        assert!(f.stuck_notified);
-
-        // v8: the warning clears and the count restarts.
-        assert!(!f.record_failure(Some(8)).1);
-        assert!(!f.stuck_notified);
-        assert!(!f.record_failure(Some(8)).1);
-        assert!(f.record_failure(Some(8)).1);
-    }
-
-    /// Recovering from a stuck state reports it, so the frontends can drop the
-    /// persistent badge. A warning that can't clear itself trains users to
-    /// ignore warnings.
-    #[test]
-    fn clear_reports_whether_a_warning_was_up() {
-        let mut f = AutoRestoreFailures::default();
-        for _ in 0..AUTO_RESTORE_STUCK_AFTER {
-            f.record_failure(Some(7));
-        }
-        assert!(f.is_active());
-        assert!(f.clear(), "was stuck → the UI has a badge to take down");
-        assert!(!f.is_active());
-        assert!(!f.clear(), "already clean → nothing to announce");
-    }
-
-    /// Self-hosted (and the window before the first poll) has no cloud version
-    /// cache, so every attempt reports `None`. That must still escalate — the
-    /// unknown version is a stable key, not a reason to reset every time.
-    #[test]
-    fn unknown_version_still_escalates() {
-        let mut f = AutoRestoreFailures::default();
-        assert_eq!(f.record_failure(None).0, Duration::from_secs(60));
-        assert_eq!(f.record_failure(None).0, Duration::from_secs(300));
-        assert_eq!(f.consecutive, 2);
-    }
 
     #[test]
     fn canon_token_unifies_slug_name_and_exe() {
@@ -5275,13 +4537,18 @@ mod tests {
                 next_scheduled_backup_at: None,
                 first_pending_event_at: None,
                 last_backup_at: None,
-                restoring: false,
-                next_auto_restore_at: None,
-                restore_failures: AutoRestoreFailures::default(),
+                in_flight: None,
+                next_backup_at: None,
+                next_restore_at: None,
+                restore_failures: kernel::RestoreFailures::default(),
                 last_set_hash: None,
+                synced_fingerprint: None,
+                last_l0_mtime: None,
+                needs_l1: false,
+                pending_op_result: None,
+                last_restore_error: None,
                 known_version: None,
                 pull_pending: false,
-                pull_after_flush: false,
                 deferred_notified: false,
             },
         );
@@ -5297,125 +4564,6 @@ mod tests {
         assert_eq!(
             match_save_for_path(&slots, Path::new("/tmp/saves/other")),
             None
-        );
-    }
-
-    /// Quiet slot over `path`: no process, nothing pending, no fs history.
-    /// Whether it reads as mid-session then depends only on the disk-mtime
-    /// fallback (i.e. on `path`'s own mtime).
-    fn quiet_slot(path: &Path) -> SaveSlot {
-        SaveSlot {
-            save: WatchedSave {
-                save_id: "mid-session-test".into(),
-                game_slug: "r-e-p-o".into(),
-                display_name: "R.E.P.O.".into(),
-                label: "main".into(),
-                local_path: path.to_path_buf(),
-                steam_install_dir: None,
-                processes: vec![],
-                policy: Default::default(),
-                known_version: None,
-                set_hash: None,
-                track_only: false,
-            },
-            watcher: None,
-            pending: None,
-            is_running: false,
-            weak_session: false,
-            last_running_seen: None,
-            has_pending: false,
-            last_fs_event_at: None,
-            last_restore_at: None,
-            next_scheduled_backup_at: None,
-            first_pending_event_at: None,
-            last_backup_at: None,
-            restoring: false,
-            next_auto_restore_at: None,
-            restore_failures: AutoRestoreFailures::default(),
-            last_set_hash: None,
-            known_version: None,
-            pull_pending: false,
-            pull_after_flush: false,
-            deferred_notified: false,
-        }
-    }
-
-    /// The guard shared by the sweep, the push force-restore and the launch
-    /// barrier (REPO data-loss regression, 2026-07-05): any live-session
-    /// signal must veto a pull; a genuinely quiet slot must not.
-    #[test]
-    fn mid_session_reason_flags_live_session_signals() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Age the folder so the disk-mtime fallback doesn't trip by itself.
-        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
-        filetime::set_file_mtime(tmp.path(), filetime::FileTime::from_system_time(old)).unwrap();
-
-        let mut slot = quiet_slot(tmp.path());
-        assert_eq!(
-            mid_session_reason(&slot),
-            None,
-            "quiet slot must be pullable"
-        );
-
-        slot.is_running = true;
-        assert!(
-            mid_session_reason(&slot).is_some(),
-            "running game must veto"
-        );
-        slot.is_running = false;
-
-        slot.has_pending = true;
-        assert!(
-            mid_session_reason(&slot).is_some(),
-            "un-flushed changes must veto"
-        );
-        slot.has_pending = false;
-
-        slot.last_fs_event_at = Some(OffsetDateTime::now_utc());
-        assert!(
-            mid_session_reason(&slot).is_some(),
-            "recent fs event must veto"
-        );
-        slot.last_fs_event_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
-        assert_eq!(
-            mid_session_reason(&slot),
-            None,
-            "an hour-old fs event is outside the grace window"
-        );
-    }
-
-    #[test]
-    fn mid_session_reason_ignores_own_restore_touch() {
-        // A freshly-created tempdir has mtime ≈ now, so it reads as
-        // "save folder touched recently" — the veto a restore trips on itself.
-        let tmp = tempfile::tempdir().unwrap();
-        let mut slot = quiet_slot(tmp.path());
-        assert_eq!(
-            mid_session_reason(&slot),
-            Some("save folder touched recently"),
-            "a just-touched folder vetoes by default"
-        );
-        // Stamp a recent restore: the touch is ours, so the next pull isn't vetoed.
-        slot.last_restore_at = Some(OffsetDateTime::now_utc());
-        assert_eq!(
-            mid_session_reason(&slot),
-            None,
-            "our own recent restore must not veto the next pull"
-        );
-        // A genuine un-flushed user change still wins (checked before the gate).
-        slot.has_pending = true;
-        assert_eq!(
-            mid_session_reason(&slot),
-            Some("un-flushed local changes pending"),
-            "a real pending change still vetoes despite the restore stamp"
-        );
-        slot.has_pending = false;
-        // A stale restore stamp no longer suppresses the touch veto.
-        slot.last_restore_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
-        assert_eq!(
-            mid_session_reason(&slot),
-            Some("save folder touched recently"),
-            "a restore older than the grace window stops covering the touch"
         );
     }
 
@@ -5474,125 +4622,15 @@ mod tests {
         );
     }
 
-    /// Restore-enabled config, matching a device with sync global on.
-    fn restore_config() -> AgentConfig {
-        AgentConfig {
-            auto_restore: true,
-            ..Default::default()
-        }
-    }
-
-    /// The Steam Deck bug (a save from device A never appearing on device B):
-    /// a pull vetoed mid-session must be remembered, must stay vetoed while the
-    /// user is actually playing, and must land the moment the game closes —
-    /// without waiting out the recency guards, which the exiting save's own
-    /// write always trips.
-    #[test]
-    fn deferred_pull_survives_the_veto_and_lands_when_the_game_closes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = restore_config();
-        let latest = HashMap::new();
-        let mut slot = quiet_slot(tmp.path());
-
-        // The poller confirmed a bump while the game is running: veto, and
-        // remember it instead of dropping it.
-        slot.is_running = true;
-        assert!(
-            mid_session_reason(&slot).is_some(),
-            "a live game must veto the pull"
-        );
-        assert!(note_deferred_pull(&mut slot), "the first veto notifies");
-        assert!(
-            !note_deferred_pull(&mut slot),
-            "later ticks must not re-notify — the sweep re-checks every tick"
-        );
-        assert!(slot.pull_pending);
-        assert!(
-            !deferred_pull_ready(&slot, &config, &latest),
-            "never pull into a folder the user is playing in"
-        );
-
-        // The game closed but its final flush is still queued: the changes
-        // aren't versioned yet, so a pull could still overwrite them.
-        slot.is_running = false;
-        slot.has_pending = true;
-        assert!(!deferred_pull_ready(&slot, &config, &latest));
-
-        // Flush landed. The fs event and the folder's mtime are seconds old —
-        // that write *is* the exit save, already uploaded, and skipping those
-        // two guards here is the whole point: nothing else would re-fire.
-        slot.has_pending = false;
-        slot.last_fs_event_at = Some(OffsetDateTime::now_utc());
-        assert!(
-            mid_session_reason(&slot).is_some(),
-            "the recency guards still veto the sweep"
-        );
-        assert!(
-            deferred_pull_ready(&slot, &config, &latest),
-            "the stop transition pulls anyway"
-        );
-
-        // A restore already writing into the folder defers again.
-        slot.restoring = true;
-        assert!(!deferred_pull_ready(&slot, &config, &latest));
-        slot.restoring = false;
-
-        // Nothing waiting, nothing to do.
-        slot.pull_pending = false;
-        assert!(!deferred_pull_ready(&slot, &config, &latest));
-    }
-
-    /// Two more ways in: the poller's cache showing the cloud ahead arms the
-    /// stop transition on its own (no veto need have been recorded), and a
-    /// backup-only save never pulls no matter what's waiting.
-    #[test]
-    fn deferred_pull_reads_the_version_cache_and_honours_backup_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = restore_config();
-        let mut slot = quiet_slot(tmp.path());
-        let id = slot.save.save_id.clone();
-        slot.known_version = Some(4);
-
-        let mut latest = HashMap::new();
-        assert!(
-            !deferred_pull_ready(&slot, &config, &latest),
-            "no cache entry is not evidence the cloud moved"
-        );
-
-        latest.insert(id.clone(), 4);
-        assert!(
-            !deferred_pull_ready(&slot, &config, &latest),
-            "same version — nothing to pull"
-        );
-
-        latest.insert(id, 5);
-        assert!(
-            deferred_pull_ready(&slot, &config, &latest),
-            "another device committed v5 while we sat at v4"
-        );
-
-        slot.save.policy.auto_restore = Some(false);
-        assert!(
-            !deferred_pull_ready(&slot, &config, &latest),
-            "a backup-only save must never be pulled into"
-        );
-    }
-
-    #[test]
-    fn mid_session_reason_falls_back_to_disk_mtime() {
-        // Fresh tempdir → dir mtime = now → the startup-window fallback trips
-        // even with no fs history of our own.
-        let tmp = tempfile::tempdir().unwrap();
-        let slot = quiet_slot(tmp.path());
-        assert!(mid_session_reason(&slot).is_some());
-    }
-
-    /// Regression for the "watcher only arms on GameStarted" bug.
-    /// A save with no `processes` and no `steam_install_dir` should still
-    /// trigger a debounced backup when its folder changes — even with no
-    /// game process running. Today this fails: `handle_add` doesn't arm
-    /// the watcher and `process_poll` never finds a matching process, so
-    /// the fs event is never observed.
+    /// Integración end-to-end del camino invertido (ADR 0021 Slice 2b): un save
+    /// sin `processes` ni `steam_install_dir` (ningún proceso casa) debe, al
+    /// reescribirse su carpeta, disparar un backup **sin juego corriendo**. En el
+    /// modelo invertido eso es: watcher armado en `handle_add` → evento fs marca
+    /// `has_pending`/`needs_l1` y arma el timer de debounce → nudge → `reconcile_all`
+    /// → el reductor emite `Backup` (has_pending && contenido divergente) →
+    /// `run_backup_with_retry` arranca y emite `BackupStarted`. (Antes se esperaba
+    /// `BackupScheduled`, que emitía el `schedule_backup` ya retirado; la subida
+    /// real empezando prueba el mismo invariante extremo-a-extremo, mejor.)
     #[tokio::test(flavor = "current_thread")]
     async fn fs_event_triggers_backup_without_game_running() {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -5640,11 +4678,11 @@ mod tests {
         f.sync_all().expect("sync save file");
         drop(f);
 
-        // Wait for BackupScheduled within 10s. If the bug is present this
-        // times out because no watcher is ever armed.
-        let scheduled = tokio::time::timeout(Duration::from_secs(10), async {
+        // Espera `BackupStarted` en 10s. Si el watcher no armara (el bug) o el
+        // reductor no emitiera el backup, esto expira.
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(evt) = events_rx.recv().await {
-                if let AgentEvent::BackupScheduled { save_id, .. } = evt {
+                if let AgentEvent::BackupStarted { save_id, .. } = evt {
                     return save_id;
                 }
             }
@@ -5656,8 +4694,8 @@ mod tests {
         let _ = handle.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 
-        let save_id = scheduled.expect(
-            "timed out waiting for BackupScheduled — the fs watcher never armed for an idle save",
+        let save_id = started.expect(
+            "timed out waiting for BackupStarted — the fs event never reached the reducer as a backup",
         );
         assert_eq!(save_id, "watcher-bug-1");
     }

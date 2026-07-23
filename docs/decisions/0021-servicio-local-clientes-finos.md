@@ -493,7 +493,10 @@ enfocó ese save (Deck/batería).
 - convergido ⇒ sólo `Hold` (cero `Act`).
 - ninguna `Act` sin un delta en la entrada que la cause (`now` cruzando un
   deadline **es** delta → el retry tras un 429 no la viola).
-- nunca `Act(Backup)` mid-session.
+- nunca `Act(Restore)` mid-session. **(Corregido 2026-07-24: esta línea decía
+  `Act(Backup)` y era falsa — el autobackup con debounce *mientras juegas* es la
+  feature, no un bug. El invariante commiteado y bueno es
+  `inv_restore_never_mid_session`. Manda el código.)**
 - nunca perder un local más nuevo que el remoto.
 - `Act` de storage acotadas por tick.
 
@@ -501,3 +504,80 @@ enfocó ese save (Deck/batería).
 (sticky 90s→6s, `Throttled` simétrico backup/restore, convergido⇒0 acciones,
 deferred-pull aterriza); los tests que codificaban el bug se actualizan con
 justificación, el resto siguen verdes.
+
+### D.7 — Slice 2 se parte en 2a (hecho) + 2b (invertir run_agent)
+
+El paso 1 (reductor puro + invariantes + corpus) está commiteado (`d9a153b`).
+Pero **el reductor es código muerto hasta que `run_agent` lo use**: las
+correcciones (hot-loop, sticky, deferred-pull, 429) sólo existen en los tests del
+kernel, no en el producto. **2b no es opcional** — es donde aterriza el valor.
+
+Para el Opus de 2b:
+
+- **Rotar los tests inline NO es salirse de alcance.** Invertir `run_agent`
+  obsoleta unit-tests inline (`fs_event_triggers_backup_without_game_running`,
+  `note_deferred_pull`/`deferred_pull_ready`, `sweep`, `record_failure`…) cuya
+  lógica **se muda al reductor** (ya cubierta por proptests + corpus). Migrarlos a
+  tests de reductor equivalentes y borrar los inline con justificación es la
+  consecuencia esperada del slice. D.2 prohíbe el trabajo de *otros* slices
+  (daemon, SQLite), no la reescritura intrínseca a éste.
+- **La conversión vive en el shell, no en el kernel.** `SaveSlot`↔`kernel::State`
+  y `TokioInstant`↔`OffsetDateTime` las hace `run_agent` al construir
+  `World`/`Observation` y al reprogramar deadlines. El kernel se queda puro (sólo
+  `OffsetDateTime`); nada de tokio dentro.
+- **`Pull` y `Restore`: intents distintos, ejecutor único.** No dejes que se
+  vuelvan dos caminos de ejecución divergentes — el 429 fue exactamente eso
+  (throttle en un camino y no en el otro). Retry/throttle/integridad unificados
+  en el executor aunque el kernel los pida por separado.
+- **Correr a `max`, en sesión fresca.** Es el rewrite más arriesgado del plan
+  (~660 líneas del `select!` + `sweep_for_auto_restore` + ramas fs/backup/restore).
+  Contexto limpio + el reductor ya commiteado. Puerta de revisión después.
+
+### D.8 — Revisión de 2b: lo que queda (Slice 2c, **sólo kernel**)
+
+2b es correcto de forma: tick como única autoridad, `process_poll` degradado a
+muestreador, ejecutor único para `Pull`/`Restore`, conversión entera en el shell,
+L1 gateado por L0, −954 líneas. Lo que la puerta devuelve va **dentro del
+kernel**; el shell no se vuelve a tocar salvo para *quitarle* política.
+
+1. **Deadlock `has_pending` + `cloud_ahead` (bug real).** La rama de restore
+   retorna (`reconcile.rs:128`) antes de la de backup (`:159`), así que con la
+   nube por delante nunca se emite `Backup`, y `has_pending` sólo se limpia con un
+   backup. Hoy lo desatasca el *ejecutor* de `DeferPull` (`agent.rs:1191`) — eso
+   es **política en el shell**, prohibido por esta ADR y además invisible al
+   replay de C.5. **Causa raíz:** `deferred_notified` (`reconcile.rs:117-121`) es
+   un one-shot de flanco dentro de un reductor level-triggered: guarda la
+   *acción* cuando sólo debería guardar la *notificación*. **Fix:** el reductor
+   emite `Backup` al diferir un pull por `has_pending`; `deferred_notified` pasa a
+   de-duplicar sólo el evento de UI; el flush sale del ejecutor. **Corpus:** dos
+   adelantos de nube en la misma sesión, sin cierre de juego de por medio, no se
+   encallan.
+2. **Bookkeeping del shell → kernel.** Los tres que 2b dejó comentados (backoff de
+   fallo de *backup*; `commit` vs `no-op` en `OpResult::Ok` — el ancla del
+   min-interval, regresión R.E.P.O.; limpiar el backoff de restore con versión
+   nueva) no son deuda estética: **cada trozo de política fuera del kernel es un
+   agujero en la fidelidad del replay de C.5**. Deben estar dentro del kernel
+   **antes del Slice 6**, o el replay no reproduce esas decisiones.
+3. **`upload_landed` sin cablear.** El anti-relaunch va sólo por `in_flight`, que
+   no sobrevive a un crash; el check content-addressed contra la verdad del server
+   (C.1) sigue sin implementar. Tolerable ahora, **obligatorio con el Slice 4**,
+   donde reiniciar el daemon es rutina.
+
+**Cambios de comportamiento aceptados, con dos a vigilar:**
+
+- **Muere el pre-launch barrier.** La gravedad depende de la cadencia del tick: si
+  es de segundos, irrelevante; si es el poll de 60 s, la ventana "la nube se
+  adelanta y lanzas antes del siguiente tick" te deja jugar una sesión entera
+  sobre un save viejo → conflicto al cerrar (escenario Deck↔PC). Si es lo segundo,
+  el arreglo limpio y compatible con level-triggered es que **el arranque de
+  proceso sea un hint que adelanta el tick**, y que el reductor permita restaurar
+  con el juego vivo pero aún sin escribir (`local == synced_fingerprint`).
+- **`ForceRestore` respeta el cooldown de 60 s.** Aceptable como límite de thrash;
+  sólo muerde si hubo un pull hace <60 s. Si el handoff Deck↔PC se nota lento, el
+  knob es distinguir *reintento* (misma versión → cooldown) de *información nueva*
+  (`cloud_version` nueva → colapsa el cooldown).
+
+**Rotación de tests: correcta.** Reapuntar
+`fs_event_triggers_backup_without_game_running` de `BackupScheduled` a
+`BackupStarted` en vez de borrarlo es lo que había que hacer: prueba la cadena
+nueva de extremo a extremo.

@@ -139,6 +139,7 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
         while let Ok(m) = rx.try_recv() {
             match m {
                 Message::SetScene { scene } => engine.set_scene(scene),
+                Message::GetScene => emit_scene(engine),
                 Message::SetEditor { editor } => {
                     let want = if editor { Mode::Editor } else { Mode::View };
                     if want != mode {

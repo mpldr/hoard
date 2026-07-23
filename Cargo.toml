@@ -15,7 +15,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "1.0.4"
+version = "7.7.12"
 authors = ["insider <raileonoliva@gmail.com>"]
 license = "AGPL-3.0"
 # Self-hosted app, never published to crates.io. Marking the members private
@@ -107,7 +107,21 @@ async-trait = "0.1"
 # Test-only — used by per-crate `[dev-dependencies]` blocks.
 tempfile = "3"
 
+# Property-based testing with automatic shrinking. Test-only; drives the
+# kernel reconciler's invariant suite (ADR 0021, Slice 2): random tick
+# sequences that shrink to a minimal counterexample when an invariant breaks.
+proptest = "1"
+
 # ZIP writer for cloud account exports (server, `cloud` feature). No default
 # features: game saves are already compressed, so export entries are `Stored`
 # (no re-deflate) — we only need the archive container, not compression.
 zip = { version = "2", default-features = false }
+
+# Smaller, slightly faster release binaries (desktop bundle, server, sidecar).
+# Thin LTO + one codegen unit trade release-build time for output quality;
+# strip drops the symbol table — panics still print message + file:line, which
+# is what we actually read in the field.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

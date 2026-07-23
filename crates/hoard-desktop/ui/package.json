@@ -1,7 +1,7 @@
 {
   "name": "hoard-desktop-ui",
   "private": true,
-  "version": "1.0.4",
+  "version": "7.7.12",
   "type": "module",
   "scripts": {
     "dev": "vite",

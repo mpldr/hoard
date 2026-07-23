@@ -60,14 +60,20 @@ pub struct RateLimitConfig {
     pub burst: u32,
     /// Per-device cap on the cheap polling endpoints (`/v1/cloud/sync`,
     /// `/v1/devices`, `/v1/notifications`, `/v1/presence/heartbeat`), in
-    /// requests per minute per (user, device, endpoint). The official client
-    /// polls each at most 1-2×/min, so this only bites modified or
-    /// misconfigured clients hammering the server. `0` disables the guard.
-    /// Separate from the per-IP limit above: that one is loose enough
-    /// (50/s on Fly) to let a whole re-sync burst through, which a single
-    /// runaway poller also fits under.
+    /// sustained requests per minute per (user, device, endpoint). `0`
+    /// disables the guard. Separate from the per-IP limit above: that one
+    /// is loose enough (50/s on Fly) to let a whole re-sync burst through,
+    /// which a single runaway poller also fits under.
     #[serde(default = "default_rate_limit_poll_per_minute")]
     pub poll_per_minute: u32,
+    /// Burst capacity for the poll guard. Must absorb the legitimate spikes
+    /// of the official client: app startup fires one `/v1/cloud/sync` per
+    /// save being auto-restored (`hoard-agent::restore` fetches the
+    /// manifest per game) on top of the login pull and feed kicks. The
+    /// sustained rate above is what actually stops a hammering client —
+    /// after the burst drains it converges to `poll_per_minute`.
+    #[serde(default = "default_rate_limit_poll_burst")]
+    pub poll_burst: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -77,6 +83,7 @@ impl Default for RateLimitConfig {
             per_second: default_rate_limit_per_second(),
             burst: default_rate_limit_burst(),
             poll_per_minute: default_rate_limit_poll_per_minute(),
+            poll_burst: default_rate_limit_poll_burst(),
         }
     }
 }
@@ -92,6 +99,9 @@ fn default_rate_limit_burst() -> u32 {
 }
 fn default_rate_limit_poll_per_minute() -> u32 {
     10
+}
+fn default_rate_limit_poll_burst() -> u32 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

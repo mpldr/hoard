@@ -17,6 +17,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Upgrade the CLI to the latest release (re-runs the official installer)
+    Upgrade {
+        /// Pin a specific version instead of the latest (e.g. `1.0.4`)
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Open the desktop app (forwards to `hoard-desktop`)
     Desktop {
         /// Arguments passed through as-is to the app
@@ -238,6 +244,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         return commands::banner::show(true).await;
     };
     match command {
+        Commands::Upgrade { version } => commands::upgrade::run(version).await,
         Commands::Desktop { args } => commands::launch::run("hoard-desktop", &args),
         Commands::Server { args } => commands::launch::run("hoard-server", &args),
         Commands::Sync { action } => commands::service::run(action).await,

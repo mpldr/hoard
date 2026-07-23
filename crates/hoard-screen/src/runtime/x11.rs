@@ -187,8 +187,18 @@ pub fn run(mut engine: Engine) -> Result<(), String> {
             }
         }
 
-        while let Ok(msg) = rx.try_recv() {
+        loop {
+            let msg = match rx.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // Desktop app died (stdin EOF): don't outlive our controller.
+                Err(mpsc::TryRecvError::Disconnected) => Message::Quit,
+            };
             match msg {
+                Message::GetScene => {
+                    emit_mode(mode);
+                    emit_scene(&scene);
+                }
                 Message::SetScene { scene: next } => {
                     scene = next;
                     // The engine never sees window panels (it would GetImage them);

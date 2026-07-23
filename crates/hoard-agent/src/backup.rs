@@ -9,16 +9,25 @@
 //! GUI gets it for free.
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use reqwest::multipart;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 
-use crate::api::{ApiClient, CloudCasFileEntry, CloudCasInit, Snapshot};
+use crate::api::{ApiClient, CloudCasFileEntry, CloudCasInit, CloudCasMissingBlob, Snapshot};
 use crate::state::{CliState, SaveState};
+
+/// Bounded fan-out for per-file work in the cloud path (hashing local files,
+/// PUTting missing blobs). Saves are mostly many small files, so per-file
+/// open/read and R2 round-trip latency dominates over raw throughput; a small
+/// window hides that latency without saturating the disk or the uplink.
+const TRANSFER_CONCURRENCY: usize = 4;
 
 /// The source directory exists but holds no regular files to upload (only
 /// empty subdirs, or nothing). Typed so the agent can treat it as "nothing to
@@ -259,7 +268,9 @@ pub async fn upload_directory<F>(
     progress: F,
 ) -> Result<UploadOutcome>
 where
-    F: Fn(u64, u64),
+    // `Sync` because the cloud path shares the callback by reference across
+    // its in-flight uploads.
+    F: Fn(u64, u64) + Send + Sync,
 {
     let source = source
         .canonicalize()
@@ -394,17 +405,33 @@ async fn upload_directory_cloud<F>(
     progress: F,
 ) -> Result<UploadOutcome>
 where
-    F: Fn(u64, u64),
+    F: Fn(u64, u64) + Send + Sync,
 {
     progress(0, total_bytes);
 
     // 1. Whole-file SHA-256 of every file — the dedup key. Hashed once up
     //    front and cached by path so a per-save-cap trim-and-retry (below)
-    //    doesn't re-read the files.
-    let mut sha_by_path: HashMap<&str, String> = HashMap::with_capacity(files.len());
+    //    doesn't re-read the files. A few files hash in flight at once so
+    //    per-file open/read latency overlaps instead of adding up.
+    // (The futures are built eagerly into a Vec of `BoxFuture`s rather than
+    // through `iter().map(closure)`: a closure over borrowed items retained
+    // inside the stream trips rustc's "Send/FnOnce is not general enough"
+    // false positive when the whole upload future crosses a `tokio::spawn`.
+    // One small allocation per file, all of them IO-bound.)
+    let mut hash_futs = Vec::with_capacity(files.len());
     for f in files {
-        sha_by_path.insert(f.relative_path.as_str(), hash_file(&f.absolute_path).await?);
+        hash_futs.push(
+            async move {
+                let sha = hash_file(&f.absolute_path).await?;
+                Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
+            }
+            .boxed(),
+        );
     }
+    let sha_by_path: HashMap<&str, String> = stream::iter(hash_futs)
+        .buffer_unordered(TRANSFER_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     // Working set, newest first, so if the save is too big for the plan's
     // per-save cap we keep the most recent saves and drop the oldest — a
@@ -522,8 +549,10 @@ where
     // Progress is reported against the bytes actually transferred, so the bar
     // reflects the real (deduped) upload rather than the whole save size.
     let denom = upload_total.max(1);
-    let mut uploaded = 0u64;
-    progress(0, denom);
+    // Resolve every missing blob to its source file before moving any bytes,
+    // so a manifest mismatch aborts up front rather than mid-upload.
+    let mut pending: Vec<(&CloudCasMissingBlob, &UploadFile)> =
+        Vec::with_capacity(init.missing.len());
     for blob in &init.missing {
         let Some(f) = by_sha.get(blob.sha256.as_str()) else {
             bail!(
@@ -531,14 +560,37 @@ where
                 blob.sha256
             );
         };
-        let body = file_to_body(&f.absolute_path).await?;
-        client
-            .put_presigned(&blob.upload, body, f.size_bytes)
-            .await
-            .with_context(|| format!("uploading {}", f.relative_path))?;
-        uploaded += f.size_bytes;
-        progress(uploaded, denom);
+        pending.push((blob, *f));
     }
+    // A few PUTs in flight at once: presigned-URL round-trip latency, not
+    // bandwidth, dominates the many-small-blobs shape. Completion order is
+    // irrelevant — each blob is its own R2 object — so progress just counts
+    // bytes as they land. (Eager Vec of boxed futures for the same
+    // trait-inference reason as the hashing pass above.)
+    let uploaded = AtomicU64::new(0);
+    progress(0, denom);
+    let mut put_futs = Vec::with_capacity(pending.len());
+    for (blob, f) in pending {
+        let uploaded = &uploaded;
+        let progress = &progress;
+        put_futs.push(
+            async move {
+                let body = file_to_body(&f.absolute_path).await?;
+                client
+                    .put_presigned(&blob.upload, body, f.size_bytes)
+                    .await
+                    .with_context(|| format!("uploading {}", f.relative_path))?;
+                let done = uploaded.fetch_add(f.size_bytes, Ordering::Relaxed) + f.size_bytes;
+                progress(done, denom);
+                Ok::<_, anyhow::Error>(())
+            }
+            .boxed(),
+        );
+    }
+    stream::iter(put_futs)
+        .buffer_unordered(TRANSFER_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
 
     // 4. Commit — the server verifies the new blobs landed and finalizes.
     // The commit must target the *canonical* cloud save id: when another
@@ -636,7 +688,7 @@ pub async fn upload_directory_checked<F, G>(
     on_upload_start: G,
 ) -> Result<BackupResult>
 where
-    F: Fn(u64, u64),
+    F: Fn(u64, u64) + Send + Sync,
     G: FnOnce(),
 {
     let canonical = source

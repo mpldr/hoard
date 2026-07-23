@@ -2209,7 +2209,11 @@ fn path_already_known(candidate: &Path, known: &HashSet<PathBuf>) -> bool {
 fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
     if let Some(proc) = store.attributed_name(path) {
         let trimmed = proc.trim();
-        if !trimmed.is_empty() {
+        // Una atribución envenenada de antes del fix `is_installer_like`
+        // (p.ej. `Codex Windows Sandbox Setup.exe`) sigue en el store persistido;
+        // no dejes que rebautice un save perfectamente nombrado por su carpeta.
+        // Cae al fallback por nombre de carpeta ancestral en ese caso.
+        if !trimmed.is_empty() && crate::correlation::is_game_like(trimmed, None) {
             return prettify_process_name(trimmed);
         }
     }

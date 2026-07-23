@@ -6,8 +6,49 @@
   // overlay reenvíe la escena. `onMount` la rehidrata cuando `screen_is_open`,
   // `onDestroy` la vuelca antes de irse. No se persiste a disco: al cerrar la
   // app el overlay muere y `screen_is_open` pasa a false.
+  // Parámetros de una mirilla (SourceRef::Crosshair del overlay). `color` es
+  // hex #rrggbb y `alpha` 0..1; el overlay recibe RGBA de 8 bits.
+  export type Ch = {
+    style: "cross" | "x" | "dot" | "circle";
+    size: number;
+    thickness: number;
+    gap: number;
+    color: string;
+    alpha: number;
+    dot: boolean;
+    outline: boolean;
+  };
+
+  export function defaultCh(): Ch {
+    return {
+      style: "cross",
+      size: 48,
+      thickness: 3,
+      gap: 6,
+      color: "#34d399",
+      alpha: 240 / 255,
+      dot: false,
+      outline: true,
+    };
+  }
+
+  // Parámetros del visor de francotirador (SourceRef::Scope): lente que
+  // muestra aumentado lo que hay debajo del panel.
+  export type Sc = {
+    shape: "circle" | "square";
+    zoom: number;
+    border: boolean;
+  };
+
+  export function defaultSc(): Sc {
+    return { shape: "circle", zoom: 2, border: true };
+  }
+
   export type Panel = {
     id: string;
+    // "window" captura una app; "crosshair" dibuja una mirilla procedural;
+    // "scope" es la lente de aumento (visor de francotirador).
+    kind: "window" | "crosshair" | "scope";
     windowId: string;
     label: string;
     x: number;
@@ -35,6 +76,12 @@
     // otherwise it's drawn only on `monitorId`. Rects are monitor-local.
     monitorId: number;
     mirror: boolean;
+    // Siempre presente (los paneles window lo ignoran): evita pelear con el
+    // narrowing de null en la plantilla. Manda solo cuando kind="crosshair",
+    // y entonces el rect se mantiene w=h=ch.size para que el blit sea 1:1.
+    ch: Ch;
+    // Ídem para el visor: solo manda cuando kind="scope".
+    sc: Sc;
   };
 
   let savedPanels: Panel[] = [];
@@ -69,6 +116,10 @@
     Crop,
     RotateCcw,
     MousePointerClick,
+    Crosshair,
+    Locate,
+    ZoomIn,
+    Layers,
   } from "lucide-svelte";
   import { tr } from "./lib";
 
@@ -128,11 +179,47 @@
     return `${tr({ es: "Pantalla", en: "Screen" })} ${n}${m.primary ? " ★" : ""}`;
   }
 
+  // hex #rrggbb + opacidad 0..1 → RGBA de 8 bits (el formato del overlay).
+  function hexToRgba(hex: string, alpha: number): [number, number, number, number] {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+    const v = m ? parseInt(m[1], 16) : 0x34d399;
+    const a = Math.round(clamp(alpha, 0, 1) * 255);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255, a];
+  }
+
+  function rgbaToHex(c: number[] | undefined): string {
+    const [r, g, b] = c ?? [52, 211, 153];
+    const h = (n: number) =>
+      Math.max(0, Math.min(255, Math.round(n)))
+        .toString(16)
+        .padStart(2, "0");
+    return `#${h(r)}${h(g)}${h(b)}`;
+  }
+
   function sceneJson() {
     return {
       panels: panels.map((p) => ({
         id: p.id,
-        source: { kind: "window", id: p.windowId },
+        source:
+          p.kind === "crosshair"
+            ? {
+                kind: "crosshair",
+                style: p.ch.style,
+                size: p.ch.size,
+                thickness: p.ch.thickness,
+                gap: p.ch.gap,
+                color: hexToRgba(p.ch.color, p.ch.alpha),
+                dot: p.ch.dot,
+                outline: p.ch.outline,
+              }
+            : p.kind === "scope"
+              ? {
+                  kind: "scope",
+                  shape: p.sc.shape,
+                  zoom: p.sc.zoom,
+                  border: p.sc.border,
+                }
+              : { kind: "window", id: p.windowId },
         rect: { x: p.x, y: p.y, w: p.w, h: p.h },
         crop: p.crop,
         scale: p.scale,
@@ -145,8 +232,13 @@
     };
   }
 
+  // Última edición local: mientras sea reciente, una escena entrante del
+  // overlay no la pisa (el push ya la lleva; el poll re-sincroniza al calmarse).
+  let lastPush = 0;
+
   async function pushScene() {
     if (!open) return;
+    lastPush = Date.now();
     try {
       await invoke("screen_send", {
         line: JSON.stringify({ type: "set_scene", scene: sceneJson() }),
@@ -154,6 +246,14 @@
     } catch (e) {
       error = String(e);
     }
+  }
+
+  // Pide al overlay su escena real (responde con un evento `scene`). Es el
+  // arreglo del desync: si la app pierde su copia (recarga, evento perdido),
+  // el editor vuelve a reflejar lo que hay EN PANTALLA y todo sigue editable.
+  function syncScene() {
+    if (!open) return;
+    invoke("screen_send", { line: '{"type":"get_scene"}' }).catch(() => {});
   }
 
   async function loadWindows() {
@@ -182,16 +282,50 @@
   // Scene pushed back by the overlay after an in-overlay drag/resize: adopt the
   // new geometry/z, keeping our human labels. Skipped while dragging here.
   function applyIncomingScene(scene: any) {
-    if (drag) return;
+    if (drag || cropDrag) return;
+    if (Date.now() - lastPush < 1500) return;
     const sp = scene?.panels;
     if (!Array.isArray(sp)) return;
     panels = sp.map((p: any) => {
       const prev = panels.find((q) => q.id === p.id);
       const t = p.monitor;
+      const src = p.source ?? {};
+      const isCh = src.kind === "crosshair";
+      const isSc = src.kind === "scope";
       return {
         id: p.id,
-        windowId: p.source?.id ?? "",
-        label: prev?.label ?? p.source?.id ?? p.id,
+        kind: isCh
+          ? ("crosshair" as const)
+          : isSc
+            ? ("scope" as const)
+            : ("window" as const),
+        windowId: isCh || isSc ? "" : (src.id ?? ""),
+        label:
+          prev?.label ??
+          (isCh
+            ? tr({ es: "Mirilla", en: "Crosshair" })
+            : isSc
+              ? tr({ es: "Visor", en: "Scope" })
+              : (src.id ?? p.id)),
+        ch: isCh
+          ? {
+              style: src.style ?? "cross",
+              size: src.size ?? 48,
+              thickness: src.thickness ?? 3,
+              gap: src.gap ?? 6,
+              color: rgbaToHex(src.color),
+              alpha: (src.color?.[3] ?? 240) / 255,
+              dot: !!src.dot,
+              outline: src.outline ?? true,
+            }
+          : (prev?.ch ?? defaultCh()),
+        sc: isSc
+          ? {
+              shape: src.shape ?? "circle",
+              zoom: src.zoom ?? 2,
+              border: src.border ?? true,
+            }
+          : (prev?.sc ?? defaultSc()),
         x: p.rect.x,
         y: p.rect.y,
         w: p.rect.w,
@@ -234,7 +368,10 @@
 
   function startPolling() {
     stopPolling();
-    pollTimer = setInterval(loadWindows, 2500);
+    pollTimer = setInterval(() => {
+      loadWindows();
+      syncScene();
+    }, 2500);
   }
   function stopPolling() {
     if (pollTimer) clearInterval(pollTimer);
@@ -275,13 +412,27 @@
     editing = false;
   }
 
+  // z para un panel nuevo no-mirilla: por encima de las demás apps/visores
+  // pero por debajo de cualquier mirilla (que por defecto vive en la banda
+  // +1000, "siempre encima"). La lista de Capas permite reordenar después.
+  function nextZ(): number {
+    return (
+      panels
+        .filter((p) => p.kind !== "crosshair")
+        .reduce((m, p) => Math.max(m, p.z), 0) + 1
+    );
+  }
+
   function addPanel(win: WinInfo) {
     const w = Math.round(mon.w / 3);
     const h = Math.round(mon.h / 3);
     const id = `p${Date.now().toString(36)}`;
-    const z = panels.reduce((m, p) => Math.max(m, p.z), 0) + 1;
+    const z = nextZ();
     panels.push({
       id,
+      kind: "window",
+      ch: defaultCh(),
+      sc: defaultSc(),
       windowId: win.id,
       label: win.app || win.title || win.id,
       x: Math.round((mon.w - w) / 2),
@@ -301,6 +452,97 @@
     pushScene();
   }
 
+  function addCrosshair() {
+    const ch = defaultCh();
+    const id = `ch${Date.now().toString(36)}`;
+    // Banda +1000: la mirilla nace encima de todo (apps y visores).
+    const z = panels.reduce((m, p) => Math.max(m, p.z), 0) + 1000;
+    panels.push({
+      id,
+      kind: "crosshair",
+      ch,
+      sc: defaultSc(),
+      windowId: "",
+      label: tr({ es: "Mirilla", en: "Crosshair" }),
+      x: Math.round((mon.w - ch.size) / 2),
+      y: Math.round((mon.h - ch.size) / 2),
+      w: ch.size,
+      h: ch.size,
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      scale: "fit",
+      z,
+      passthrough: true,
+      compat: false,
+      passthroughRadius: 90,
+      monitorId: activeMonId,
+      mirror: false,
+    });
+    selectedId = id;
+    pushScene();
+  }
+
+  function addScope() {
+    const size = 360;
+    const id = `sc${Date.now().toString(36)}`;
+    panels.push({
+      id,
+      kind: "scope",
+      ch: defaultCh(),
+      sc: defaultSc(),
+      windowId: "",
+      label: tr({ es: "Visor", en: "Scope" }),
+      x: Math.round((mon.w - size) / 2),
+      y: Math.round((mon.h - size) / 2),
+      w: size,
+      h: size,
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      scale: "fill",
+      z: nextZ(),
+      passthrough: true,
+      compat: false,
+      passthroughRadius: 90,
+      monitorId: activeMonId,
+      mirror: false,
+    });
+    selectedId = id;
+    pushScene();
+  }
+
+  // Reordena capas intercambiando z con el vecino en el orden actual — así
+  // cruza sin problemas la banda +1000 de las mirillas cuando el usuario
+  // decide explícitamente que algo vaya encima de ellas.
+  function moveLayer(p: Panel, dir: 1 | -1) {
+    const order = [...panels].sort((a, b) => a.z - b.z);
+    const i = order.indexOf(p);
+    const j = i + dir;
+    if (j < 0 || j >= order.length) return;
+    const other = order[j];
+    const tmp = p.z;
+    p.z = other.z;
+    other.z = tmp;
+    if (p.z === other.z) p.z += dir;
+    pushScene();
+  }
+
+  // Cambia el tamaño de una mirilla manteniendo su centro (el rect sigue al
+  // spec para que el blit sea 1:1 y los bordes queden nítidos).
+  function setChSize(p: Panel, size: number) {
+    const cx = p.x + p.w / 2;
+    const cy = p.y + p.h / 2;
+    p.ch.size = size;
+    p.w = size;
+    p.h = size;
+    p.x = Math.round(cx - size / 2);
+    p.y = Math.round(cy - size / 2);
+    pushScene();
+  }
+
+  function centerPanel(p: Panel) {
+    p.x = Math.round((mon.w - p.w) / 2);
+    p.y = Math.round((mon.h - p.h) / 2);
+    pushScene();
+  }
+
   function setPanelTarget(p: Panel, value: string) {
     if (value === "all") {
       p.mirror = true;
@@ -317,10 +559,6 @@
     pushScene();
   }
 
-  function bumpZ(p: Panel, dir: 1 | -1) {
-    p.z += dir;
-    pushScene();
-  }
 
   // --- drag / resize on the preview ---------------------------------------
   const MIN_W = 80;
@@ -350,6 +588,14 @@
   ];
 
   const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+  // Estilos de mirilla del picker (tipado aquí para no castear en la plantilla).
+  const CH_STYLES: { st: Ch["style"]; glyph: string }[] = [
+    { st: "cross", glyph: "+" },
+    { st: "x", glyph: "×" },
+    { st: "dot", glyph: "•" },
+    { st: "circle", glyph: "○" },
+  ];
 
   // Imanta un valor a uno de varios objetivos si queda dentro del umbral
   // (expresado en px de monitor, por eso dividimos SNAP por la escala).
@@ -446,6 +692,8 @@
     if (!e.key.startsWith("Arrow")) return;
     const step = e.shiftKey ? 10 : 1;
     if (e.altKey) {
+      // El tamaño de una mirilla se cambia con su slider (rect = spec, 1:1).
+      if (s.kind === "crosshair") return;
       if (e.key === "ArrowRight") s.w = Math.max(MIN_W, s.w + step);
       else if (e.key === "ArrowLeft") s.w = Math.max(MIN_W, s.w - step);
       else if (e.key === "ArrowDown") s.h = Math.max(MIN_H, s.h + step);
@@ -551,12 +799,14 @@
     try {
       open = await invoke<boolean>("screen_is_open");
       if (open) {
-        // El overlay sigue vivo de un montaje anterior: recupera su escena para
-        // que los paneles se pinten en el preview sin tener que pasar por editar.
+        // El overlay sigue vivo de un montaje anterior: pinta el buffer local al
+        // instante y pide la escena REAL al overlay (la copia local puede estar
+        // vacía o vieja tras una recarga — el bug del panel imborrable).
         panels = savedPanels;
         await loadMonitors();
         await loadWindows();
         startPolling();
+        syncScene();
       }
     } catch {
       /* community build: command missing → stays closed */
@@ -701,10 +951,34 @@
                 previewScale}px;z-index:{p.z}"
               onpointerdown={(e) => !inCrop && onPointerDown(e, p, "move")}
             >
-              <span
-                class="pointer-events-none absolute inset-x-0 top-0 truncate px-1 py-0.5 text-zinc-100"
-                >{p.label}</span
-              >
+              {#if p.kind === "crosshair"}
+                <span
+                  class="pointer-events-none absolute inset-0 grid select-none place-items-center leading-none"
+                  style="color:{p.ch.color};opacity:{p.ch.alpha};font-size:{Math.max(
+                    10,
+                    p.w * previewScale,
+                  )}px"
+                  >{p.ch.style === "x"
+                    ? "×"
+                    : p.ch.style === "dot"
+                      ? "•"
+                      : p.ch.style === "circle"
+                        ? "○"
+                        : "+"}</span
+                >
+              {:else if p.kind === "scope"}
+                <span
+                  class="pointer-events-none absolute inset-1 grid select-none place-items-center border-2 border-zinc-300/70 text-[10px] text-zinc-200 {p.sc
+                    .shape === 'circle'
+                    ? 'rounded-full'
+                    : 'rounded-sm'}">×{p.sc.zoom}</span
+                >
+              {:else}
+                <span
+                  class="pointer-events-none absolute inset-x-0 top-0 truncate px-1 py-0.5 text-zinc-100"
+                  >{p.label}</span
+                >
+              {/if}
 
               {#if inCrop}
                 <!-- Capa de recorte: lo que cae fuera se atenúa; los bordes del
@@ -759,8 +1033,9 @@
                   style="top:{pct((p.crop.top + 1 - p.crop.bottom) / 2)};right:{pct(p.crop.right)}"
                   onpointerdown={(e) => onCropDown(e, p, "right")}
                 ></div>
-              {:else if isSel}
-                <!-- tiradores de redimensión -->
+              {:else if isSel && p.kind !== "crosshair"}
+                <!-- tiradores de redimensión (una mirilla se dimensiona con su
+                     slider de tamaño; solo se arrastra) -->
                 {#each HANDLES as hd (hd.h)}
                   <div
                     role="button"
@@ -783,13 +1058,13 @@
                 <button
                   type="button"
                   title={tr({ es: "Subir capa", en: "Raise layer" })}
-                  onclick={() => bumpZ(s, 1)}
+                  onclick={() => moveLayer(s, 1)}
                   class="rounded p-1 text-zinc-300 hover:bg-zinc-700"><ArrowUp size={14} /></button
                 >
                 <button
                   type="button"
                   title={tr({ es: "Bajar capa", en: "Lower layer" })}
-                  onclick={() => bumpZ(s, -1)}
+                  onclick={() => moveLayer(s, -1)}
                   class="rounded p-1 text-zinc-300 hover:bg-zinc-700"
                   ><ArrowDown size={14} /></button
                 >
@@ -801,7 +1076,7 @@
               </div>
             </div>
             <div class="grid grid-cols-4 gap-1.5">
-              {#each [["x", "X"], ["y", "Y"], ["w", tr({ es: "An", en: "W" })], ["h", tr({ es: "Al", en: "H" })]] as [key, lbl]}
+              {#each s.kind === "crosshair" ? [["x", "X"], ["y", "Y"]] : [["x", "X"], ["y", "Y"], ["w", tr({ es: "An", en: "W" })], ["h", tr({ es: "Al", en: "H" })]] as [key, lbl]}
                 <label class="flex flex-col gap-0.5 text-[10px] text-zinc-500">
                   <span>{lbl}</span>
                   <input
@@ -829,6 +1104,7 @@
                 </select>
               </label>
             {/if}
+            {#if s.kind === "window"}
             <div class="inline-flex rounded-md border border-zinc-700 p-0.5">
               <button
                 type="button"
@@ -970,12 +1246,273 @@
                 })}
               </p>
             </div>
+            {:else if s.kind === "scope"}
+              <!-- controles del visor -->
+              <div class="flex items-center gap-2">
+                <div class="inline-flex rounded-md border border-zinc-700 p-0.5">
+                  <button
+                    type="button"
+                    onclick={() => {
+                      s.sc.shape = "circle";
+                      pushScene();
+                    }}
+                    class="w-7 rounded py-1 text-sm leading-none {s.sc.shape === 'circle'
+                      ? 'bg-emerald-600 text-white'
+                      : 'text-zinc-300 hover:bg-zinc-700'}">○</button
+                  >
+                  <button
+                    type="button"
+                    onclick={() => {
+                      s.sc.shape = "square";
+                      pushScene();
+                    }}
+                    class="w-7 rounded py-1 text-sm leading-none {s.sc.shape === 'square'
+                      ? 'bg-emerald-600 text-white'
+                      : 'text-zinc-300 hover:bg-zinc-700'}">□</button
+                  >
+                </div>
+                <button
+                  type="button"
+                  title={tr({ es: "Centrar en la pantalla", en: "Center on screen" })}
+                  onclick={() => centerPanel(s)}
+                  class="rounded border border-zinc-700 p-1.5 text-zinc-300 hover:bg-zinc-700"
+                  ><Locate size={14} /></button
+                >
+                <button
+                  type="button"
+                  onclick={() => {
+                    s.sc.border = !s.sc.border;
+                    pushScene();
+                  }}
+                  class="flex items-center justify-between gap-2 rounded border border-zinc-700 px-2 py-1 text-xs {s.sc
+                    .border
+                    ? 'bg-emerald-600/20 text-emerald-300'
+                    : 'text-zinc-300 hover:bg-zinc-700'}"
+                >
+                  <span>{tr({ es: "Borde", en: "Border" })}</span>
+                  <span class="tabular-nums">{s.sc.border ? "ON" : "OFF"}</span>
+                </button>
+              </div>
+              <label class="flex items-center gap-2 text-xs text-zinc-400">
+                <span class="w-16">{tr({ es: "Aumento", en: "Zoom" })}</span>
+                <input
+                  type="range"
+                  min="1"
+                  max="4"
+                  step="0.25"
+                  bind:value={s.sc.zoom}
+                  oninput={() => pushScene()}
+                  class="flex-1 accent-emerald-500"
+                />
+                <span class="w-10 text-right tabular-nums text-zinc-500">×{s.sc.zoom}</span>
+              </label>
+              <p class="text-[11px] text-zinc-500">
+                {tr({
+                  es: "Lente que aumenta lo que hay debajo (como una mira de francotirador). Arrástrala y redimensiónala; los clics pasan al juego. La mirilla se dibuja encima sin aumentar. Mientras haya un visor, el overlay no sale en grabaciones/OBS.",
+                  en: "Lens that magnifies what's underneath (sniper-style). Drag and resize it; clicks pass to the game. The crosshair draws on top unmagnified. While a scope exists, the overlay is hidden from recordings/OBS.",
+                })}
+              </p>
+            {:else}
+              <!-- controles de mirilla -->
+              <div class="flex items-center gap-2">
+                <div class="inline-flex rounded-md border border-zinc-700 p-0.5">
+                  {#each CH_STYLES as { st, glyph } (st)}
+                    <button
+                      type="button"
+                      onclick={() => {
+                        s.ch.style = st;
+                        pushScene();
+                      }}
+                      class="w-7 rounded py-1 text-sm leading-none {s.ch.style === st
+                        ? 'bg-emerald-600 text-white'
+                        : 'text-zinc-300 hover:bg-zinc-700'}">{glyph}</button
+                    >
+                  {/each}
+                </div>
+                <button
+                  type="button"
+                  title={tr({ es: "Centrar en la pantalla", en: "Center on screen" })}
+                  onclick={() => centerPanel(s)}
+                  class="rounded border border-zinc-700 p-1.5 text-zinc-300 hover:bg-zinc-700"
+                  ><Locate size={14} /></button
+                >
+                <input
+                  type="color"
+                  bind:value={s.ch.color}
+                  oninput={() => pushScene()}
+                  title={tr({ es: "Color", en: "Color" })}
+                  class="h-7 w-9 cursor-pointer rounded border border-zinc-700 bg-zinc-900 p-0.5"
+                />
+              </div>
+              <div class="space-y-1.5 text-xs text-zinc-400">
+                <label class="flex items-center gap-2">
+                  <span class="w-16">{tr({ es: "Tamaño", en: "Size" })}</span>
+                  <input
+                    type="range"
+                    min="16"
+                    max="256"
+                    step="2"
+                    value={s.ch.size}
+                    oninput={(e) => setChSize(s, +e.currentTarget.value)}
+                    class="flex-1 accent-emerald-500"
+                  />
+                  <span class="w-10 text-right tabular-nums text-zinc-500">{s.ch.size}px</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <span class="w-16">{tr({ es: "Grosor", en: "Thickness" })}</span>
+                  <input
+                    type="range"
+                    min="1"
+                    max="12"
+                    step="0.5"
+                    bind:value={s.ch.thickness}
+                    oninput={() => pushScene()}
+                    class="flex-1 accent-emerald-500"
+                  />
+                  <span class="w-10 text-right tabular-nums text-zinc-500"
+                    >{s.ch.thickness}px</span
+                  >
+                </label>
+                {#if s.ch.style === "cross" || s.ch.style === "x"}
+                  <label class="flex items-center gap-2">
+                    <span class="w-16">{tr({ es: "Hueco", en: "Gap" })}</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="40"
+                      step="1"
+                      bind:value={s.ch.gap}
+                      oninput={() => pushScene()}
+                      class="flex-1 accent-emerald-500"
+                    />
+                    <span class="w-10 text-right tabular-nums text-zinc-500">{s.ch.gap}px</span>
+                  </label>
+                {/if}
+                <label class="flex items-center gap-2">
+                  <span class="w-16">{tr({ es: "Opacidad", en: "Opacity" })}</span>
+                  <input
+                    type="range"
+                    min="0.15"
+                    max="1"
+                    step="0.05"
+                    bind:value={s.ch.alpha}
+                    oninput={() => pushScene()}
+                    class="flex-1 accent-emerald-500"
+                  />
+                  <span class="w-10 text-right tabular-nums text-zinc-500"
+                    >{Math.round(s.ch.alpha * 100)}%</span
+                  >
+                </label>
+              </div>
+              <div class="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onclick={() => {
+                    s.ch.dot = !s.ch.dot;
+                    pushScene();
+                  }}
+                  class="flex items-center justify-between rounded border border-zinc-700 px-2 py-1 text-xs {s.ch.dot
+                    ? 'bg-emerald-600/20 text-emerald-300'
+                    : 'text-zinc-300 hover:bg-zinc-700'}"
+                >
+                  <span>{tr({ es: "Punto central", en: "Center dot" })}</span>
+                  <span class="tabular-nums">{s.ch.dot ? "ON" : "OFF"}</span>
+                </button>
+                <button
+                  type="button"
+                  onclick={() => {
+                    s.ch.outline = !s.ch.outline;
+                    pushScene();
+                  }}
+                  class="flex items-center justify-between rounded border border-zinc-700 px-2 py-1 text-xs {s.ch.outline
+                    ? 'bg-emerald-600/20 text-emerald-300'
+                    : 'text-zinc-300 hover:bg-zinc-700'}"
+                >
+                  <span>{tr({ es: "Contorno", en: "Outline" })}</span>
+                  <span class="tabular-nums">{s.ch.outline ? "ON" : "OFF"}</span>
+                </button>
+              </div>
+              <p class="text-[11px] text-zinc-500">
+                {tr({
+                  es: "La mirilla es solo visual: los clics siempre pasan al juego. Arrástrala en la vista previa para colocarla donde quieras.",
+                  en: "The crosshair is visual only: clicks always pass through to the game. Drag it in the preview to place it anywhere.",
+                })}
+              </p>
+            {/if}
           </div>
         {/if}
       </div>
 
       <!-- window picker -->
       <div>
+        <div class="mb-4">
+          <span class="text-sm font-medium text-zinc-200"
+            >{tr({ es: "Widgets", en: "Widgets" })}</span
+          >
+          <button
+            type="button"
+            onclick={addCrosshair}
+            class="mt-2 flex w-full items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800/40 px-2 py-1.5 text-left text-xs text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-800"
+          >
+            <Crosshair size={14} class="shrink-0 text-emerald-400" />
+            <span class="min-w-0 flex-1 truncate font-medium text-zinc-100"
+              >{tr({ es: "Añadir mirilla", en: "Add crosshair" })}</span
+            >
+          </button>
+          <button
+            type="button"
+            onclick={addScope}
+            class="mt-1 flex w-full items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800/40 px-2 py-1.5 text-left text-xs text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-800"
+          >
+            <ZoomIn size={14} class="shrink-0 text-emerald-400" />
+            <span class="min-w-0 flex-1 truncate font-medium text-zinc-100"
+              >{tr({ es: "Añadir visor (lupa)", en: "Add scope (magnifier)" })}</span
+            >
+          </button>
+        </div>
+        {#if panels.length > 1}
+          <div class="mb-4">
+            <span class="flex items-center gap-1 text-sm font-medium text-zinc-200"
+              ><Layers size={14} /> {tr({ es: "Capas", en: "Layers" })}</span
+            >
+            <div class="mt-2 space-y-1">
+              {#each [...panels].sort((a, b) => b.z - a.z) as p (p.id)}
+                <div
+                  class="flex items-center gap-1 rounded-md border px-2 py-1 text-xs {selectedId ===
+                  p.id
+                    ? 'border-emerald-500/60 bg-emerald-600/10 text-emerald-100'
+                    : 'border-zinc-700 bg-zinc-800/40 text-zinc-300'}"
+                >
+                  <button
+                    type="button"
+                    class="min-w-0 flex-1 truncate text-left"
+                    onclick={() => (selectedId = p.id)}
+                    >{p.kind === "crosshair" ? "+" : p.kind === "scope" ? "◎" : "▢"}
+                    {p.label}</button
+                  >
+                  <button
+                    type="button"
+                    title={tr({ es: "Subir capa", en: "Raise layer" })}
+                    onclick={() => moveLayer(p, 1)}
+                    class="rounded p-0.5 hover:bg-zinc-700"><ArrowUp size={12} /></button
+                  >
+                  <button
+                    type="button"
+                    title={tr({ es: "Bajar capa", en: "Lower layer" })}
+                    onclick={() => moveLayer(p, -1)}
+                    class="rounded p-0.5 hover:bg-zinc-700"><ArrowDown size={12} /></button
+                  >
+                </div>
+              {/each}
+            </div>
+            <p class="mt-1 text-[11px] text-zinc-500">
+              {tr({
+                es: "Arriba = encima. Mirillas y visores se dibujan siempre sobre las apps colocadas.",
+                en: "Top = above. Crosshairs and scopes always draw over placed apps.",
+              })}
+            </p>
+          </div>
+        {/if}
         <div class="mb-2 flex items-center justify-between">
           <span class="text-sm font-medium text-zinc-200"
             >{tr({ es: "Apps", en: "Apps" })}</span

@@ -264,6 +264,9 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
     if NON_GAME_PROCESS_EXACT.iter().any(|bad| lower == *bad) {
         return false;
     }
+    if is_installer_like(&lower) {
+        return false;
+    }
     if let Some(exe) = exe {
         let exe_str = exe.to_string_lossy().to_lowercase();
         if SYSTEM_EXE_PREFIXES.iter().any(|p| exe_str.starts_with(p)) {
@@ -282,9 +285,29 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
             if NON_GAME_PROCESS_EXACT.iter().any(|bad| base == *bad) {
                 return false;
             }
+            if is_installer_like(&base) {
+                return false;
+            }
         }
     }
     true
+}
+
+/// Instaladores/desinstaladores multi-palabra que el veto EXACTO de
+/// [`NON_GAME_PROCESS_EXACT`] (solo `setup`/`setup.exe`) no atrapa: un exe como
+/// `Codex Windows Sandbox Setup.exe` o `Elden Ring Installer.exe` pasaba
+/// `is_game_like`, envenenaba la correlación de la carpeta que reescribía y en
+/// `attribute_game_name` bautizaba el save con su nombre. No se puede usar
+/// substring "setup" (pescaría juegos con esa palabra dentro); aquí exigimos que
+/// sea el ÚLTIMO token del basename (o el propio nombre empiece por `unins`), lo
+/// que distingue un instalador de un juego que casualmente mencione la palabra.
+fn is_installer_like(name: &str) -> bool {
+    let stem = name.strip_suffix(".exe").unwrap_or(name).trim();
+    if stem.starts_with("unins") {
+        return true;
+    }
+    let last = stem.rsplit([' ', '_', '-']).next().unwrap_or(stem);
+    matches!(last, "setup" | "installer" | "install" | "uninstall")
 }
 
 /// Foto de los procesos vivos que parecen juegos. `sys` debe venir ya
@@ -723,6 +746,26 @@ mod tests {
         // Real games still pass.
         assert!(is_game_like("eldenring.exe", None));
         assert!(is_game_like("Hades.exe", None));
+    }
+
+    #[test]
+    fn is_game_like_rejects_multiword_installers() {
+        // El caso real: un instalador que el veto EXACTO de "setup" no atrapaba,
+        // envenenaba la carpeta de Plan B Terraform y la rebautizaba.
+        for n in [
+            "Codex Windows Sandbox Setup.exe",
+            "Codex Windows Sandbox Setup",
+            "Elden Ring Installer.exe",
+            "vcredist_x64 setup",
+            "unins000.exe",
+            "MyGame-Uninstall.exe",
+        ] {
+            assert!(!is_game_like(n, None), "{n} should be filtered as installer");
+        }
+        // Falsos positivos que NO debe tumbar: un juego que menciona la palabra
+        // en medio (no como último token) sigue pasando.
+        assert!(is_game_like("Setup Simulator.exe", None));
+        assert!(is_game_like("Installer Tycoon.exe", None));
     }
 
     #[test]

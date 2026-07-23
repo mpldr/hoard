@@ -79,6 +79,7 @@ pub trait CaptureBackend: Send {
 mod linux;
 #[cfg(all(target_os = "macos", feature = "runtime"))]
 mod macos;
+pub mod screen;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
 #[cfg(all(target_os = "windows", feature = "runtime"))]

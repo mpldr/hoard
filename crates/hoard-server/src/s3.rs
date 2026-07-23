@@ -187,11 +187,13 @@ impl S3 {
         Ok(out.body.into_async_read())
     }
 
-    /// Streaming multipart PUT from an arbitrary reader, bounded memory
-    /// (one part buffer at a time). Returns the total bytes written. The
-    /// upload is atomic: the key serves its previous content until
-    /// `complete` succeeds, and an error path aborts the multipart so no
-    /// half-written object ever becomes visible.
+    /// Streaming PUT from an arbitrary reader, bounded memory (one part
+    /// buffer at a time). Bodies that fit in one part go out as a single
+    /// PUT (one Class A op); larger ones use multipart. Returns the total
+    /// bytes written. Either way the upload is atomic: the key serves its
+    /// previous content until the PUT/`complete` succeeds, and an error
+    /// path aborts the multipart so no half-written object ever becomes
+    /// visible.
     pub async fn put_from_reader<R>(&self, key: &str, mut reader: R) -> Result<i64>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -202,6 +204,34 @@ impl S3 {
         // S3 minimum part size is 5 MiB (except the last part); 8 MiB keeps
         // part counts low without hurting the 512 MB machine.
         const PART_SIZE: usize = 8 * 1024 * 1024;
+
+        // Buffer the first part up front: a body that fits in one part goes
+        // out as a single PUT — one Class A op instead of multipart's three
+        // (create + part + complete), and most save files are far below the
+        // part size. Only genuinely multi-part bodies pay for multipart.
+        let mut first = Vec::with_capacity(PART_SIZE);
+        while first.len() < PART_SIZE {
+            let n = (&mut reader)
+                .take((PART_SIZE - first.len()) as u64)
+                .read_to_end(&mut first)
+                .await
+                .context("s3 put_from_reader read")?;
+            if n == 0 {
+                break;
+            }
+        }
+        if first.len() < PART_SIZE {
+            let total = first.len() as i64;
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(first.into())
+                .send()
+                .await
+                .with_context(|| format!("s3 put_from_reader single put {key}"))?;
+            return Ok(total);
+        }
 
         let mp = self
             .client
@@ -220,21 +250,12 @@ impl S3 {
             let mut parts: Vec<CompletedPart> = Vec::new();
             let mut total: i64 = 0;
             let mut part_number = 1i32;
+            // Part 1 is the buffer already read above — a full part; smaller
+            // bodies (including empty) took the single-PUT path.
+            let mut buf = first;
             loop {
-                let mut buf = Vec::with_capacity(PART_SIZE);
-                while buf.len() < PART_SIZE {
-                    let n = (&mut reader)
-                        .take((PART_SIZE - buf.len()) as u64)
-                        .read_to_end(&mut buf)
-                        .await
-                        .context("s3 multipart read")?;
-                    if n == 0 {
-                        break;
-                    }
-                }
-                // An empty first part still uploads (zero-byte object);
-                // an empty later part means the reader is drained.
-                if buf.is_empty() && part_number > 1 {
+                // An empty part means the reader drained on a part boundary.
+                if buf.is_empty() {
                     break;
                 }
                 let done = buf.len() < PART_SIZE;
@@ -259,6 +280,17 @@ impl S3 {
                 part_number += 1;
                 if done {
                     break;
+                }
+                buf = Vec::with_capacity(PART_SIZE);
+                while buf.len() < PART_SIZE {
+                    let n = (&mut reader)
+                        .take((PART_SIZE - buf.len()) as u64)
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("s3 multipart read")?;
+                    if n == 0 {
+                        break;
+                    }
                 }
             }
             self.client

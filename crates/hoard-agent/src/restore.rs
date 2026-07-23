@@ -7,10 +7,11 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_compression::tokio::bufread::ZstdDecoder;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::StreamReader;
 
@@ -38,6 +39,12 @@ pub struct RestoreOutcome {
 /// expands to terabytes. Used as-is when the expanded size isn't known ahead of
 /// time (the legacy whole-archive cloud path) and as an upper clamp otherwise.
 const MAX_RESTORE_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+
+/// Bounded fan-out for the content-addressed restore: how many blob
+/// downloads run in flight at once. Presigned-GET round-trip latency, not
+/// bandwidth, dominates the many-small-files shape of most saves; a small
+/// window hides it without hammering the disk with concurrent writes.
+const RESTORE_CONCURRENCY: usize = 4;
 
 /// Slack factor over the manifest-declared expanded size: enough room for
 /// unlisted sidecar files while still bounding a bomb to ~2× the real payload.
@@ -253,6 +260,23 @@ where
     })
 }
 
+/// Whether a blob download error is worth re-fetching the same blob for:
+/// transient R2/Cloudflare connection drops (the reqwest "end of file before
+/// message length reached" family) and the sha256 mismatch a truncated body
+/// produces. Permanent errors (disk full, permission denied) fall through and
+/// fail the restore so we don't spin on them.
+fn is_retryable_blob_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("end of file")
+        || s.contains("error reading a body")
+        || s.contains("decoding response body")
+        || s.contains("connection reset")
+        || s.contains("connection closed")
+        || s.contains("broken pipe")
+        || s.contains("timed out")
+        || s.contains("sha256 mismatch")
+}
+
 /// Hoard Cloud download: presigned R2 GET → temp tar.zst → verify whole-
 /// archive sha256 → extract.
 ///
@@ -343,75 +367,126 @@ where
         .iter()
         .map(|f| f.size_bytes.max(0) as u64)
         .sum();
-    let mut downloaded = 0u64;
-    let mut files_extracted = 0usize;
-    let mut bytes_extracted = 0u64;
-    progress(0, total);
 
+    // Sanitize every path before moving any bytes: a hostile manifest aborts
+    // up front, not after some files have already landed in dest.
+    let mut jobs = Vec::with_capacity(manifest.files.len());
     for file in &manifest.files {
         let safe_rel = sanitize(Path::new(&file.relative_path))
             .ok_or_else(|| anyhow!("unsafe path in manifest: {}", file.relative_path))?;
-        let dest_path = dest.join(&safe_rel);
-        if let Some(parent) = dest_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating parent {}", parent.display()))?;
-        }
-
-        let presigned = file
-            .download
-            .as_ref()
-            .ok_or_else(|| anyhow!("manifest missing download URL for {}", file.relative_path))?;
-        let resp = client.get_presigned(presigned).await?;
-
-        let mut out = tokio::fs::File::create(&dest_path)
-            .await
-            .with_context(|| format!("writing {}", dest_path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("downloading blob")?;
-            if !options.skip_verify {
-                hasher.update(&chunk);
-            }
-            out.write_all(&chunk)
-                .await
-                .with_context(|| format!("writing {}", dest_path.display()))?;
-            downloaded += chunk.len() as u64;
-            progress(downloaded, total);
-        }
-        out.flush().await.context("flushing file")?;
-        drop(out);
-
-        if !options.skip_verify {
-            let got = hex::encode(hasher.finalize());
-            if got != file.sha256 {
-                bail!(
-                    "sha256 mismatch for {}: expected {}, got {}",
-                    file.relative_path,
-                    file.sha256,
-                    got
-                );
-            }
-        }
-
-        // Preserve the recorded mtime — without it every cloud pull would look
-        // strictly newer than the local copy and silently win the auto-restore
-        // diff. Best-effort: a failure only degrades conflict resolution.
-        if let Some(secs) = file.modified_at {
-            if secs > 0 {
-                let ft = filetime::FileTime::from_unix_time(secs, 0);
-                let _ = filetime::set_file_mtime(&dest_path, ft);
-            }
-        }
-
-        bytes_extracted += file.size_bytes.max(0) as u64;
-        files_extracted += 1;
+        jobs.push((file, dest.join(safe_rel)));
     }
 
+    // A few blobs download in flight at once — presigned-GET round-trip
+    // latency dominates the many-small-files shape. Each blob writes to its
+    // own dest path and verifies independently, so completion order doesn't
+    // matter; progress counts bytes as they land. (Eager Vec of boxed
+    // futures rather than `iter().map(closure)`: a closure over borrowed
+    // items retained inside the stream trips rustc's "Send is not general
+    // enough" false positive when the restore future crosses `tokio::spawn`.)
+    let downloaded = AtomicU64::new(0);
+    progress(0, total);
+
+    let mut fetch_futs = Vec::with_capacity(jobs.len());
+    for (file, dest_path) in &jobs {
+        let downloaded = &downloaded;
+        let progress = &progress;
+        let options = &options;
+        fetch_futs.push(async move {
+            if let Some(parent) = dest_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("creating parent {}", parent.display()))?;
+            }
+
+            let presigned = file.download.as_ref().ok_or_else(|| {
+                anyhow!("manifest missing download URL for {}", file.relative_path)
+            })?;
+            // R2/Cloudflare occasionally truncates a blob mid-stream ("end of
+            // file before message length reached"). Failing the whole restore
+            // over one dropped connection is a brutal retry — the next
+            // reconciliation sweep re-downloads *every* blob. Blobs are
+            // content-addressed and sha-verified, so just re-fetch the one blob a
+            // few times with a short backoff (a truncated body fails the sha
+            // check, which is retried too).
+            const BLOB_FETCH_ATTEMPTS: u32 = 4;
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let fetch = async {
+                    let resp = client.get_presigned(presigned).await?;
+                    let mut out = tokio::fs::File::create(&dest_path)
+                        .await
+                        .with_context(|| format!("writing {}", dest_path.display()))?;
+                    let mut hasher = Sha256::new();
+                    let mut stream = resp.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.context("downloading blob")?;
+                        if !options.skip_verify {
+                            hasher.update(&chunk);
+                        }
+                        out.write_all(&chunk)
+                            .await
+                            .with_context(|| format!("writing {}", dest_path.display()))?;
+                        let done = downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                            + chunk.len() as u64;
+                        progress(done, total);
+                    }
+                    out.flush().await.context("flushing file")?;
+                    if !options.skip_verify {
+                        let got = hex::encode(hasher.finalize());
+                        if got != file.sha256 {
+                            bail!(
+                                "sha256 mismatch for {}: expected {}, got {}",
+                                file.relative_path,
+                                file.sha256,
+                                got
+                            );
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                match fetch {
+                    Ok(()) => break,
+                    Err(e) if attempt < BLOB_FETCH_ATTEMPTS && is_retryable_blob_error(&e) => {
+                        tracing::warn!(
+                            attempt,
+                            path = %file.relative_path,
+                            error = %format!("{e:#}"),
+                            "cloud restore: blob download failed — retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            300u64 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Preserve the recorded mtime — without it every cloud pull would look
+            // strictly newer than the local copy and silently win the auto-restore
+            // diff. Best-effort: a failure only degrades conflict resolution.
+            if let Some(secs) = file.modified_at {
+                if secs > 0 {
+                    let ft = filetime::FileTime::from_unix_time(secs, 0);
+                    let _ = filetime::set_file_mtime(&dest_path, ft);
+                }
+            }
+
+            Ok::<u64, anyhow::Error>(file.size_bytes.max(0) as u64)
+        }
+        .boxed());
+    }
+    let sizes: Vec<u64> = futures::stream::iter(fetch_futs)
+        .buffer_unordered(RESTORE_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     Ok(RestoreOutcome {
-        files_extracted,
-        bytes_extracted,
+        files_extracted: sizes.len(),
+        bytes_extracted: sizes.iter().sum(),
         destination: dest.to_path_buf(),
     })
 }
@@ -646,6 +721,24 @@ pub fn sanitize(p: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_blob_error_covers_truncation_and_sha() {
+        use anyhow::anyhow;
+        // The exact R2/Cloudflare truncation the user hit.
+        assert!(is_retryable_blob_error(&anyhow!(
+            "downloading blob: error decoding response body: request or response body error: error reading a body from connection: end of file before message length reached"
+        )));
+        assert!(is_retryable_blob_error(&anyhow!(
+            "sha256 mismatch for save.zip: expected abc, got def"
+        )));
+        assert!(is_retryable_blob_error(&anyhow!("connection reset by peer")));
+        // Permanent errors must NOT retry.
+        assert!(!is_retryable_blob_error(&anyhow!(
+            "writing /x: No space left on device (os error 28)"
+        )));
+        assert!(!is_retryable_blob_error(&anyhow!("permission denied")));
+    }
 
     #[test]
     fn cap_unknown_size_uses_absolute_ceiling() {

@@ -19,6 +19,12 @@ pub enum Message {
     /// Force a mode (e.g. the desktop's own "edit overlay" button); the global
     /// Ctrl+O hotkey toggles it locally too.
     SetEditor { editor: bool },
+    /// Ask the overlay to emit its current mode + scene on stdout right now.
+    /// The desktop sends this on (re)mount to resync its editor with what the
+    /// overlay is actually showing — its own copy of the scene can go stale
+    /// (webview reload, missed event), which left panels on screen that the
+    /// editor no longer listed and so could never be moved or removed.
+    GetScene,
     /// Ask the overlay to shut down cleanly.
     Quit,
 }
@@ -89,10 +95,67 @@ mod tests {
     }
 
     #[test]
+    fn crosshair_parses_from_bare_kind_with_defaults() {
+        // The editor may send just the kind; every spec field has a default.
+        let line = r#"{"type":"set_scene","scene":{"panels":[
+            {"id":"ch","source":{"kind":"crosshair"},
+             "rect":{"x":936,"y":516,"w":48,"h":48}}]}}"#;
+        let Message::SetScene { scene } = parse_line(line).unwrap().unwrap() else {
+            panic!("expected set_scene");
+        };
+        let SourceRef::Crosshair(spec) = &scene.panels[0].source else {
+            panic!("expected crosshair source");
+        };
+        assert_eq!(*spec, crate::crosshair::CrosshairSpec::default());
+        // And the full spec round-trips.
+        let msg = Message::SetScene { scene };
+        let line = to_line(&msg).unwrap();
+        assert_eq!(parse_line(&line).unwrap(), Some(msg));
+    }
+
+    #[test]
+    fn unknown_source_kind_degrades_instead_of_dropping_the_scene() {
+        // A newer editor may send kinds this build doesn't know; the line must
+        // still parse (that one panel becomes SourceRef::Unknown) so the rest
+        // of the scene survives.
+        let line = r#"{"type":"set_scene","scene":{"panels":[
+            {"id":"f","source":{"kind":"hologram","spin":9},
+             "rect":{"x":0,"y":0,"w":10,"h":10}},
+            {"id":"w","source":{"kind":"window","id":"0xabc"},
+             "rect":{"x":0,"y":0,"w":10,"h":10}}]}}"#;
+        let Message::SetScene { scene } = parse_line(line).unwrap().unwrap() else {
+            panic!("expected set_scene");
+        };
+        assert_eq!(scene.panels[0].source, SourceRef::Unknown);
+        assert_eq!(
+            scene.panels[1].source,
+            SourceRef::Window { id: "0xabc".into() }
+        );
+    }
+
+    #[test]
     fn parses_quit() {
         assert_eq!(
             parse_line(r#"{"type":"quit"}"#).unwrap(),
             Some(Message::Quit)
         );
+    }
+
+    #[test]
+    fn parses_get_scene_and_scope_defaults() {
+        assert_eq!(
+            parse_line(r#"{"type":"get_scene"}"#).unwrap(),
+            Some(Message::GetScene)
+        );
+        let line = r#"{"type":"set_scene","scene":{"panels":[
+            {"id":"z","source":{"kind":"scope"},
+             "rect":{"x":0,"y":0,"w":300,"h":300}}]}}"#;
+        let Message::SetScene { scene } = parse_line(line).unwrap().unwrap() else {
+            panic!("expected set_scene");
+        };
+        let SourceRef::Scope(spec) = &scene.panels[0].source else {
+            panic!("expected scope source");
+        };
+        assert_eq!(*spec, crate::scope::ScopeSpec::default());
     }
 }

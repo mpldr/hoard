@@ -26,6 +26,18 @@
 //!      (multipart, atomic on complete), re-verify the final object the
 //!      same way, delete the tmp and finalize `stored_bytes`.
 //!
+//! Blobs that don't gain from compression (already-compressed save
+//! formats) are left raw and marked `encoding = 'raw'`: a terminal state
+//! the sweep skips and every reader treats as uncompressed.
+//!
+//! A blob whose R2 object no longer exists (refcount desync from a past
+//! incident) is marked `encoding = 'missing'` — also terminal. Retrying
+//! can't conjure the bytes back, and leaving the row claimed-but-eligible
+//! is how a ≥`batch` cohort of them once turned the drain loop into a
+//! permanent hot loop of HEADs (~10/s of Class B ops, 2026-07-18). For the
+//! same reason the drain only keeps going while a batch actually makes
+//! progress: persistent failures wait for the next tick.
+//!
 //! Crash at any point is healed on retry: the claim keeps the blob in the
 //! sweep, and a final object whose size differs from `size_bytes` is
 //! re-verified by content — never re-compressed blind (zstd output can't
@@ -73,14 +85,16 @@ pub fn spawn(state: CloudState) {
             tick.tick().await;
             // Drain: keep pulling full batches until the backlog is empty,
             // so "older than min_age ⇒ compressed" holds instead of
-            // trickling `batch` blobs per tick forever.
+            // trickling `batch` blobs per tick forever. Only while batches
+            // make progress, though — a full batch of failures must wait
+            // for the next tick, not respin the same rows back-to-back.
             loop {
                 match sweep_once(&state, &cfg).await {
-                    Ok(n) => {
-                        if n > 0 {
-                            tracing::info!(blobs = n, "blob compression sweep: batch done");
+                    Ok((picked, ok)) => {
+                        if ok > 0 {
+                            tracing::info!(blobs = ok, "blob compression sweep: batch done");
                         }
-                        if n < cfg.batch as usize {
+                        if picked < cfg.batch as usize || ok == 0 {
                             break;
                         }
                     }
@@ -95,8 +109,13 @@ pub fn spawn(state: CloudState) {
 }
 
 /// One batch: claim up to `batch` eligible blobs, compress each. Returns
-/// how many were picked up (successfully or not — failures retry later).
-async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Result<usize> {
+/// `(picked, ok)` — how many were picked up and how many of those finished
+/// (compressed, kept raw, or marked missing). Failures retry on a later
+/// tick; the caller uses `ok` to stop draining when nothing progresses.
+async fn sweep_once(
+    state: &CloudState,
+    cfg: &CompressionConfig,
+) -> anyhow::Result<(usize, usize)> {
     // Eligible: raw (or claimed-but-unfinished) blobs old enough, with no
     // recent direct-download URL out in the wild, still referenced and not
     // frozen in the archive grace window.
@@ -123,16 +142,20 @@ async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Resu
     .await?;
 
     let n = rows.len();
+    let mut ok = 0usize;
     for row in rows {
         let user_id: Uuid = row.get("user_id");
         let sha: String = row.get("sha256");
         let key: String = row.get("r2_key");
         let raw_size: i64 = row.get("size_bytes");
-        if let Err(e) = compress_one(state, cfg, user_id, &sha, &key, raw_size).await {
-            tracing::warn!(error = %e, %user_id, sha, "blob compress failed; will retry");
+        match compress_one(state, cfg, user_id, &sha, &key, raw_size).await {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                tracing::warn!(error = %e, %user_id, sha, "blob compress failed; will retry");
+            }
         }
     }
-    Ok(n)
+    Ok((n, ok))
 }
 
 async fn compress_one(
@@ -159,14 +182,33 @@ async fn compress_one(
 
     let tmp_key = format!("{key}.ztmp");
 
+    // The object is gone but the row survived (refcount desync from a past
+    // incident). Terminal 'missing' state: retrying can't conjure the bytes
+    // back, and leaving the row eligible is what once melted the drain loop
+    // into a HEAD-per-retry hot loop. Loud on purpose — every referencing
+    // version is unrestorable and someone should look at why.
+    let Some(head) = state.r2.head(key).await? else {
+        sqlx::query(
+            "UPDATE cloud_blobs SET encoding = 'missing'
+              WHERE user_id = $1 AND sha256 = $2
+                AND encoding = 'zstd' AND stored_bytes IS NULL",
+        )
+        .bind(user_id)
+        .bind(sha)
+        .execute(&state.pool)
+        .await?;
+        tracing::warn!(
+            %user_id,
+            sha,
+            key,
+            "blob object missing in R2 — marked encoding='missing'; referencing versions are unrestorable"
+        );
+        return Ok(());
+    };
+
     // Retry healing: an object whose size differs from the raw size means a
     // previous attempt already landed the overwrite. Verify it by content
     // (never re-compress blind — that would double-compress) and finalize.
-    let head = state
-        .r2
-        .head(key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("object missing during compress: {key}"))?;
     if head != raw_size {
         if decompressed_sha_matches(state, key, sha).await? {
             let _ = state.r2.delete_object(&tmp_key).await;
@@ -193,6 +235,32 @@ async fn compress_one(
     let reader = state.r2.get_reader(key).await?;
     let encoder = ZstdEncoder::with_quality(reader, Level::Precise(cfg.level));
     let stored = state.r2.put_from_reader(&tmp_key, encoder).await?;
+
+    // Not worth it? Plenty of game saves are already-compressed formats and
+    // zstd only adds frame overhead. Keep the raw object, drop the tmp and
+    // mark the row `encoding = 'raw'` — a terminal "evaluated, leave alone"
+    // state the sweep never re-picks and every reader treats as raw (the
+    // proxy and manifest only special-case 'zstd').
+    if stored as f64 >= raw_size as f64 * 0.98 {
+        let _ = state.r2.delete_object(&tmp_key).await;
+        sqlx::query(
+            "UPDATE cloud_blobs SET encoding = 'raw'
+              WHERE user_id = $1 AND sha256 = $2
+                AND encoding = 'zstd' AND stored_bytes IS NULL",
+        )
+        .bind(user_id)
+        .bind(sha)
+        .execute(&state.pool)
+        .await?;
+        tracing::info!(
+            %user_id,
+            sha,
+            raw_bytes = raw_size,
+            compressed_bytes = stored,
+            "blob incompressible — kept raw"
+        );
+        return Ok(());
+    }
 
     // Phase 3: verify the tmp round-trips to the exact content hash. This
     // also proves the raw source itself was intact (the hash chain starts

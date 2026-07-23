@@ -57,6 +57,15 @@ fn dim(s: &str, color: bool) -> String {
     }
 }
 
+/// Amber-500 (#f59e0b): "on, but needs attention" — an outdated CLI.
+fn amber(s: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[38;2;245;158;11m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Status dot: solid green (on) or hollow grey (off).
 fn dot(on: bool, color: bool) -> String {
     if on {
@@ -70,6 +79,20 @@ fn dot(on: bool, color: bool) -> String {
 /// applied to the plain text so the dot's ANSI codes don't throw it off.
 fn component(label: &str, ver: &str, on: bool, status: &str, color: bool) -> String {
     format!("{label:<8} {ver:<9} {} {status}", dot(on, color))
+}
+
+/// The `cli` row. Green ● + "in use" normally; amber ● + "update available →
+/// vX.Y.Z" when a newer release exists (`latest` is `Some`).
+fn cli_component(ver: &str, latest: Option<&str>, color: bool) -> String {
+    match latest {
+        Some(v) => format!(
+            "{:<8} {:<9} {} update available → v{v}",
+            "cli",
+            ver,
+            amber("●", color)
+        ),
+        None => component("cli", ver, true, "in use", color),
+    }
 }
 
 /// One cheat-sheet line: `cmd` (green) at fixed width + description.
@@ -177,6 +200,10 @@ pub async fn show(full: bool) -> Result<()> {
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let cli_ver = format!("v{}", env!("CARGO_PKG_VERSION"));
 
+    // Is a newer CLI out? Cached (6h) so this is instant on repeated runs and
+    // best-effort — a failed check just leaves the dot green.
+    let cli_update = hoard_agent::update::available_update().await;
+
     // Session: Cloud wins over self-host (same as when resolving). Best-effort,
     // no network.
     let cloud = matches!(hoard_agent::cloud_auth::load_session(), Ok(Some(_)));
@@ -231,7 +258,7 @@ pub async fn show(full: bool) -> Result<()> {
         bold_emerald("hoard", color),
         dim("game save sync", color),
         String::new(),
-        component("cli", &cli_ver, true, "in use", color),
+        cli_component(&cli_ver, cli_update.as_deref(), color),
         component(
             "desktop",
             "—",

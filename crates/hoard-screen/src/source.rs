@@ -58,6 +58,11 @@ impl Frame {
 pub trait Source: Send {
     fn id(&self) -> &str;
     fn acquire(&mut self) -> Option<Frame>;
+    /// Where this source's panel currently sits (monitor-local rect + target
+    /// monitor id). Fed by the engine right before each `acquire`, so a source
+    /// that samples the *screen* (the scope/magnifier) tracks its panel as the
+    /// user drags it. Most sources don't care — default is a no-op.
+    fn set_viewport(&mut self, _rect: crate::scene::Rect, _monitor: u32) {}
 }
 
 /// Animated test pattern: a moving diagonal gradient. Drives the entire

@@ -93,9 +93,16 @@ impl Engine {
                     Box::new(Placeholder::new(panel_id, [40, 40, 48, 255]))
                 }
             },
+            SourceRef::Crosshair(spec) => {
+                Box::new(crate::crosshair::CrosshairSource::new(panel_id, spec))
+            }
+            SourceRef::Scope(spec) => Box::new(crate::scope::ScopeSource::new(panel_id, spec)),
             // Image decode and note text rendering land here; placeholder for now.
             SourceRef::Image { .. } => Box::new(Placeholder::new(panel_id, [24, 24, 28, 255])),
             SourceRef::Note { .. } => Box::new(Placeholder::new(panel_id, [18, 18, 22, 230])),
+            // A kind from a newer editor: draw nothing (fully transparent) so
+            // the rest of the scene stays intact.
+            SourceRef::Unknown => Box::new(Placeholder::new(panel_id, [0, 0, 0, 0])),
         }
     }
 
@@ -103,11 +110,23 @@ impl Engine {
     /// source produced a new frame this tick, so the windowed runtime can skip
     /// recompositing + presenting when nothing changed (a paused video, a static
     /// note, a capture running below the overlay's frame rate).
+    ///
+    /// Each source first learns where its panel currently sits (rect + target
+    /// monitor) via [`Source::set_viewport`], so screen-sampling sources (the
+    /// scope) follow their panel as it is dragged or resized.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
-        for (id, src) in self.sources.iter_mut() {
+        for panel in &self.scene.panels {
+            let Some(src) = self.sources.get_mut(&panel.id) else {
+                continue;
+            };
+            let mon = match panel.monitor {
+                crate::scene::PanelTarget::Monitor { id } => id,
+                crate::scene::PanelTarget::All => 0,
+            };
+            src.set_viewport(panel.rect, mon);
             if let Some(f) = src.acquire() {
-                self.frames.insert(id.clone(), f);
+                self.frames.insert(panel.id.clone(), f);
                 changed = true;
             }
         }

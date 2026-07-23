@@ -13,6 +13,10 @@
 //!   geometry. A panel never escapes its rect, so "amplify" fills the panel box
 //!   and never the monitor.
 //! - [`source`] — the `Source` trait: anything that yields RGBA frames.
+//! - [`crosshair`] — procedural reticle widgets (cross/x/dot/circle), the
+//!   first non-capture source kind.
+//! - [`scope`] — live magnifier lens (sniper view) sampling the screen under
+//!   its panel via [`capture::screen`].
 //! - [`engine`] — owns live sources behind a scene, ticks and composites.
 //! - [`capture`] — per-OS window-capture backends behind one trait
 //!   (Windows.Graphics.Capture / ScreenCaptureKit / portal+PipeWire / X11
@@ -29,11 +33,13 @@ pub mod slog;
 
 pub mod capture;
 pub mod compositor;
+pub mod crosshair;
 pub mod engine;
 pub mod ipc;
 pub mod mode;
 pub mod monitors;
 pub mod scene;
+pub mod scope;
 pub mod source;
 
 #[cfg(any(feature = "runtime", feature = "wayland"))]

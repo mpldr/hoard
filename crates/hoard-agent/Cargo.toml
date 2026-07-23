@@ -11,6 +11,7 @@ name = "hoard_agent"
 path = "src/lib.rs"
 
 [dependencies]
+hoard-core = { path = "../hoard-core" }
 hoard-manifest = { path = "../hoard-manifest" }
 
 tokio = { workspace = true }

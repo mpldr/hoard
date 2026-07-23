@@ -29,6 +29,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 hoard-agent = { path = "../hoard-agent" }
 hoard-manifest = { path = "../hoard-manifest" }
+base64 = { workspace = true }
 
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"

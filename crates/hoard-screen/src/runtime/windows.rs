@@ -59,16 +59,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetTopWindow, GetWindow, GetWindowLongW,
     GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
     IsZoomed, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, RegisterClassW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPlacement,
-    SetWindowPos, ShowWindow, TranslateMessage, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT,
-    GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST,
-    LWA_ALPHA, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WINDOWPLACEMENT, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongW,
+    SetWindowPlacement, SetWindowPos, ShowWindow, TranslateMessage, CWP_SKIPINVISIBLE,
+    CWP_SKIPTRANSPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, HTCLIENT, HTTRANSPARENT,
+    HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    WINDOWPLACEMENT, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 use super::win_gpu::{GpuOverlay, Quad};
@@ -450,6 +451,15 @@ struct OverlayWin {
     /// monitor-local coords, centred on the cursor while it hovers a passthrough-ON
     /// panel. `None` = no hole. Tracked so we only re-clip when it actually moves.
     hole: Option<(i32, i32, i32)>,
+    /// Whether the window currently has `WS_EX_LAYERED`. Added while this monitor
+    /// shows only engine content (crosshair/notes) so the window is OS-level
+    /// click-through — `HTTRANSPARENT` from our wndproc does NOT route a click to
+    /// another process's window, it just eats it, which left the mouse "stuck" on
+    /// a centred crosshair (games lock the cursor exactly there). Dropped while a
+    /// compat panel sits on this monitor: those need the wndproc hit-test to catch
+    /// and forward clicks. `NOREDIRECTIONBITMAP` has no redirection surface, so
+    /// layering can't bleed outside the region clip like it does on real windows.
+    layered: bool,
 }
 
 /// Book-keeping for a real app window we've taken over: its original ex-style
@@ -540,6 +550,7 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
             shown: false,
             region: Vec::new(),
             hole: None,
+            layered: false,
         });
     }
     crate::slog!(
@@ -580,6 +591,8 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
     // Set whenever the scene/mode changes so the next frame repaints even if no
     // capture produced a new frame (geometry moved, a panel appeared/vanished).
     let mut scene_dirty = true;
+    // Whether our windows currently carry WDA_EXCLUDEFROMCAPTURE (scope active).
+    let mut affinity_on = false;
 
     loop {
         let frame_start = Instant::now();
@@ -645,9 +658,9 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
             force_foreground(HWND(t as *mut core::ffi::c_void));
         }
 
-        while let Ok(m) = rx.try_recv() {
-            match m {
-                Message::SetScene { scene: next } => {
+        loop {
+            match rx.try_recv() {
+                Ok(Message::SetScene { scene: next }) => {
                     scene = next;
                     // Engine only ever gets note/image/test panels now; window
                     // panels are real placed windows or (compat in View) GPU
@@ -655,8 +668,29 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                     engine.set_scene(engine_subset(&scene));
                     apply_windows(&scene, &mons, &mut managed, mode == Mode::Editor);
                     scene_dirty = true;
+                    // A scope lens samples the screen under itself; keep OUR
+                    // windows out of every capture path while one exists or the
+                    // lens recursively magnifies itself. (Side effect while on:
+                    // the overlay also disappears from OBS/recordings.)
+                    let want_affinity = scene
+                        .panels
+                        .iter()
+                        .any(|p| matches!(p.source, SourceRef::Scope(_)));
+                    if want_affinity != affinity_on {
+                        for ov in overlays.iter() {
+                            let _ = SetWindowDisplayAffinity(
+                                ov.hwnd,
+                                if want_affinity {
+                                    WDA_EXCLUDEFROMCAPTURE
+                                } else {
+                                    WDA_NONE
+                                },
+                            );
+                        }
+                        affinity_on = want_affinity;
+                    }
                 }
-                Message::SetEditor { editor } => {
+                Ok(Message::SetEditor { editor }) => {
                     let want = if editor { Mode::Editor } else { Mode::View };
                     if want != mode {
                         set_mode(
@@ -673,7 +707,15 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                         }
                     }
                 }
-                Message::Quit => {
+                Ok(Message::GetScene) => {
+                    // Desktop resync: tell it what is ACTUALLY on screen.
+                    emit_mode(mode);
+                    emit_scene(&scene);
+                }
+                // Quit — or the desktop app died (stdin hit EOF, sender gone).
+                // A controllerless overlay must not outlive its app: it kept
+                // running forever with panels nobody could move or close.
+                Ok(Message::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
                     for (&win, m) in managed.iter() {
                         restore_window(HWND(win as *mut core::ffi::c_void), m);
                     }
@@ -681,6 +723,7 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                     let _ = UnregisterHotKey(hotkey_hwnd, HOTKEY_TOGGLE);
                     return Ok(());
                 }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
         }
 
@@ -805,6 +848,30 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
                     .iter()
                     .any(|p| p.compat && panel_win(p).is_some() && p.monitor.draws_on(ov.mon.id));
             let active = has_compat || notes_present[idx];
+            // Engine-only content (crosshair/notes) is pure visual: make the
+            // window OS-level click-through (`LAYERED` + the `TRANSPARENT` it
+            // already has) so the mouse never sees it. Our wndproc can't route a
+            // non-slot click to another process (`HTTRANSPARENT` just eats it),
+            // which pinned the cursor on a centred crosshair in cursor-locking
+            // games. With a compat panel here the wndproc must hit-test, so
+            // layering comes off. (Known gap: compat + crosshair on the SAME
+            // monitor keeps the trap over the crosshair rect.)
+            let want_layered = !has_compat;
+            if want_layered != ov.layered {
+                let mut ex = GetWindowLongW(ov.hwnd, GWL_EXSTYLE) as u32;
+                if want_layered {
+                    ex |= WS_EX_LAYERED.0;
+                } else {
+                    ex &= !WS_EX_LAYERED.0;
+                }
+                let _ = SetWindowLongW(ov.hwnd, GWL_EXSTYLE, ex as i32);
+                if want_layered {
+                    // Attributes must be set once after adding LAYERED or the
+                    // window counts as "unset" and may not display.
+                    let _ = SetLayeredWindowAttributes(ov.hwnd, COLORREF(0), 255, LWA_ALPHA);
+                }
+                ov.layered = want_layered;
+            }
             // Clip the overlay to just its content so the rest of the monitor is
             // not covered by any window (clicks reach the game/background apps).
             if active {
@@ -835,6 +902,24 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
             reposition_popup(&mons);
             if frame_no % REASSERT_EVERY == 0 {
                 reassert_z(&scene, &managed);
+                // The overlay (crosshair/scope/notes + compat quads) stays
+                // visually ABOVE the placed real windows: widgets are meant to
+                // float over everything, and among themselves panel `z` orders
+                // them inside the swapchain. Raised after the app windows so
+                // this window wins the TOPMOST band.
+                for ov in overlays.iter() {
+                    if ov.shown {
+                        let _ = SetWindowPos(
+                            ov.hwnd,
+                            HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
             }
         } else if frame_no % REASSERT_EVERY == 0 {
             // A window won't shrink below its own minimum size (and the user can

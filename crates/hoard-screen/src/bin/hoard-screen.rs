@@ -234,6 +234,11 @@ fn run_headless() {
                 );
             }
             Ok(Some(Message::SetEditor { editor })) => eprintln!("hoard-screen: editor={editor}"),
+            Ok(Some(Message::GetScene)) => {
+                if let Ok(s) = serde_json::to_string(e.scene()) {
+                    println!("{{\"type\":\"scene\",\"scene\":{s}}}");
+                }
+            }
             Ok(Some(Message::Quit)) => break,
             Ok(None) => {}
             Err(err) => eprintln!("hoard-screen: bad message: {err}"),

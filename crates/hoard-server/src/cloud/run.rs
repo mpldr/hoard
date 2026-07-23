@@ -174,11 +174,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Per-device cap on the polling endpoints (see `pollguard`). Attached
     // with `route_layer` so it runs after `require_cloud_auth` and can key
     // by user. Respects the master rate-limit switch.
-    let poll_guard = pollguard::PollGuard::new(if cfg.server.rate_limit.enabled {
-        cfg.server.rate_limit.poll_per_minute
-    } else {
-        0
-    });
+    let poll_guard = pollguard::PollGuard::new(
+        if cfg.server.rate_limit.enabled {
+            cfg.server.rate_limit.poll_per_minute
+        } else {
+            0
+        },
+        cfg.server.rate_limit.poll_burst,
+    );
     let guarded = |class: &'static str| {
         let g = poll_guard.clone();
         middleware::from_fn(move |req, next| pollguard::guard(g.clone(), class, req, next))

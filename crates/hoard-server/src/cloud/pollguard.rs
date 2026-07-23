@@ -48,14 +48,17 @@ impl PollGuard {
     /// `per_minute = 0` builds a disabled guard that lets everything through.
     /// Spawns the idle-bucket eviction task, so call it from inside the
     /// runtime.
-    pub fn new(per_minute: u32) -> Arc<Self> {
+    pub fn new(per_minute: u32, burst: u32) -> Arc<Self> {
         let limiter = NonZeroU32::new(per_minute).map(|n| {
-            // Sustained one request every 60/n seconds, with the full minute
-            // allowance available as burst so kick bursts and app startup
-            // (poll + feeds at once) never trip it.
+            // Sustained one request every 60/n seconds. The burst must be
+            // large enough for the official client's legitimate spikes —
+            // app startup fires one `/v1/cloud/sync` per auto-restored save
+            // on top of the login pull — while the sustained rate is what
+            // walls off a hammering client once the burst drains.
+            let burst = NonZeroU32::new(burst.max(1)).expect("clamped > 0");
             let quota = Quota::with_period(Duration::from_secs_f64(60.0 / n.get() as f64))
                 .expect("non-zero period")
-                .allow_burst(n);
+                .allow_burst(burst.max(n));
             RateLimiter::keyed(quota)
         });
         let guard = Arc::new(Self {
@@ -133,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn burst_allowed_then_denied() {
-        let g = PollGuard::new(3);
+        let g = PollGuard::new(3, 3);
         let user = Uuid::new_v4();
         let key = || (user, "fp-a".to_string(), "sync");
         for _ in 0..3 {
@@ -145,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_device_and_class_have_own_buckets() {
-        let g = PollGuard::new(2);
+        let g = PollGuard::new(2, 2);
         let user = Uuid::new_v4();
         for _ in 0..2 {
             assert!(g.check((user, "fp-a".into(), "sync")).is_ok());
@@ -158,8 +161,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_burst_passes_beyond_sustained_rate() {
+        // Regression: app startup fires one /v1/cloud/sync per auto-restored
+        // save; a burst well above the sustained per-minute rate must pass.
+        let g = PollGuard::new(2, 40);
+        let user = Uuid::new_v4();
+        for i in 0..40 {
+            assert!(
+                g.check((user, "fp".into(), "sync")).is_ok(),
+                "burst request {i} should pass"
+            );
+        }
+        assert!(g.check((user, "fp".into(), "sync")).is_err());
+    }
+
+    #[tokio::test]
     async fn zero_disables_the_guard() {
-        let g = PollGuard::new(0);
+        let g = PollGuard::new(0, 0);
         let user = Uuid::new_v4();
         for _ in 0..100 {
             assert!(g.check((user, "fp".into(), "sync")).is_ok());

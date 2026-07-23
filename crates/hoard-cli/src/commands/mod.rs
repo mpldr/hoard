@@ -14,3 +14,4 @@ pub mod session;
 pub mod status;
 pub mod track;
 pub mod tracked;
+pub mod upgrade;

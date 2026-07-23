@@ -36,6 +36,7 @@ pub mod scoring;
 pub mod serverclass;
 pub mod state;
 pub mod steam;
+pub mod update;
 pub mod wine_prefixes;
 
 pub use api::{ApiClient, ApiError};

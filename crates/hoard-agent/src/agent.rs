@@ -24,9 +24,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use hoard_core::kernel;
+use hoard_core::kernel::correlation::accept_correlation_signals;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::{Deserialize, Serialize};
 use sysinfo::{
@@ -517,6 +520,13 @@ enum AutoRestoreDisposition {
     /// token blip toward "this save is stuck" would let one expired session
     /// mark every tracked save as broken.
     Unauthorized,
+    /// 429: the server's rolling bandwidth limiter deferred this download. Like
+    /// [`Self::Unauthorized`] it isn't this save's fault and must *not* touch the
+    /// failure counter — counting a throttle toward "stuck" is exactly what made
+    /// a busy reconciliation sweep spam "keeps failing to restore (3×)". Carries
+    /// the server's `retry_after_secs` so the slot re-arms on the exact window
+    /// slide instead of the generic 60s cooldown. Swallowed (no failure toast).
+    Throttled { retry_after_secs: u32 },
     /// Any other error (network, sha mismatch, permission denied, timeout).
     /// Carries the formatted error chain for the event. Escalates the
     /// consecutive-failure counter and the backoff.
@@ -568,6 +578,12 @@ enum AgentCommand {
         /// content already on the server. `None` leaves `last_set_hash` alone
         /// so a genuinely-diverged tree still uploads.
         post_restore_set_hash: Option<String>,
+        /// Whether this attempt actually wrote files into the folder (restored
+        /// or conflict-backed-up ≥1 file), as opposed to a no-op "already
+        /// synced" pass. Only a real write bumps the folder mtime / echoes fs
+        /// events, so only then do we stamp `last_restore_at` to keep the
+        /// restore from vetoing the next pull (see `mid_session_reason`).
+        wrote_files: bool,
     },
     /// Live-toggle `config.auto_restore` so the user's Settings change
     /// reaches the running agent without a restart. When flipped from
@@ -820,6 +836,15 @@ struct SaveSlot {
     /// `AgentSlotStatus` so the diagnostics panel can prove the watcher
     /// is actually seeing writes.
     last_fs_event_at: Option<OffsetDateTime>,
+    /// When our own auto-restore last *wrote files* into this slot's folder
+    /// (UTC). A restore bumps the folder mtime and echoes fs events, which would
+    /// otherwise trip the `mid_session_reason` "folder touched recently" /
+    /// "fs event observed recently" vetoes and throttle the NEXT cross-device
+    /// pull for a whole `RECENT_SAVE_GRACE` — so back-to-back saves from another
+    /// device landed at most one per window on the receiver. This lets the veto
+    /// tell our own restore writes apart from the user's. Only set when files
+    /// were actually applied (not on a no-op "already synced" pass).
+    last_restore_at: Option<OffsetDateTime>,
     /// When the currently-pending backup will fire (UTC). `None` if no
     /// backup is scheduled. Recomputed in `schedule_backup`.
     next_scheduled_backup_at: Option<OffsetDateTime>,
@@ -1026,7 +1051,7 @@ async fn run_agent(
                             arm_watcher(slot, &fs_tx);
                         }
                     }
-                    Some(AgentCommand::AutoRestoreFinished { id, disposition, synced_version, post_restore_set_hash }) => {
+                    Some(AgentCommand::AutoRestoreFinished { id, disposition, synced_version, post_restore_set_hash, wrote_files }) => {
                         // The background restore task signalled completion
                         // (success or failure). Clear the in-flight flag so
                         // the reconciliation sweep can try again once the
@@ -1049,6 +1074,13 @@ async fn run_agent(
                             if let Some(h) = post_restore_set_hash {
                                 slot.last_set_hash = Some(h);
                             }
+                            // Stamp the restore so its own folder-touch / fs-event
+                            // echo doesn't veto the NEXT pull (see
+                            // `mid_session_reason`). Only when it actually wrote —
+                            // a no-op "already synced" pass bumped nothing.
+                            if wrote_files {
+                                slot.last_restore_at = Some(OffsetDateTime::now_utc());
+                            }
                             match disposition {
                                 // …unless the save simply isn't on the server
                                 // (404). Retrying every 60s can't conjure a
@@ -1067,6 +1099,26 @@ async fn run_agent(
                                 // reset) and let the short cooldown retry once the
                                 // refresh lands.
                                 AutoRestoreDisposition::Unauthorized => {}
+                                // Throttled: wait the server's exact window slide
+                                // (clamped so a bogus value can't park the slot
+                                // forever) and leave the failure counter alone —
+                                // a bandwidth 429 isn't a broken save.
+                                AutoRestoreDisposition::Throttled { retry_after_secs } => {
+                                    let wait = (u64::from(retry_after_secs)).clamp(1, 300) + 2;
+                                    // Per-save jitter so a sweep that 429'd a dozen
+                                    // saves at once doesn't re-fire them all on the
+                                    // same tick and stampede the window again. A
+                                    // cheap deterministic hash of the id spreads
+                                    // them across an extra few seconds.
+                                    let jitter = {
+                                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                                        std::hash::Hash::hash(&id, &mut h);
+                                        std::hash::Hasher::finish(&h) % 6
+                                    };
+                                    slot.next_auto_restore_at = Some(
+                                        TokioInstant::now() + Duration::from_secs(wait + jitter),
+                                    );
+                                }
                                 AutoRestoreDisposition::Ok => {
                                     // The save works. Drop the escalation so the
                                     // next hiccup starts from 60s again, and take
@@ -1317,6 +1369,9 @@ async fn run_agent(
                                     // Authoritative path: the poller already
                                     // confirmed a bump, so fetch the real latest
                                     // rather than trusting a possibly-stale cache.
+                                    // One save per command — no batch to share a
+                                    // manifest with.
+                                    None,
                                     None,
                                 );
                             }
@@ -1671,6 +1726,7 @@ fn handle_add(
         last_running_seen: None,
         has_pending: false,
         last_fs_event_at: None,
+        last_restore_at: None,
         next_scheduled_backup_at: None,
         first_pending_event_at: None,
         last_backup_at: None,
@@ -1743,6 +1799,8 @@ fn handle_add(
                 // once to establish it.
                 None,
                 // No poller cache to consult on a brand-new add either.
+                None,
+                // Single save — no sweep batch to share a manifest with.
                 None,
             );
         }
@@ -1962,9 +2020,20 @@ const CORRELATION_MIN_CPU_PCT: f32 = 5.0;
 /// screen can dip under the floor for a tick and momentarily look stopped;
 /// without this it flaps GameStarted/Stopped (and a final-flush backup) every
 /// few seconds. We keep the slot "running" for this many consecutive
-/// not-seen polls (converted to seconds via `poll_secs`, floored at 90 s) before
-/// firing GameStopped. A genuine quit still resolves within the grace.
+/// not-seen polls (converted to seconds via `poll_secs`, floored at
+/// [`STRONG_STOP_GRACE_FLOOR_SECS`]) before firing GameStopped. A genuine quit
+/// still resolves within the grace.
 const RUNNING_STICKY_POLLS: u64 = 3;
+
+/// Floor for the strong-signal stop grace (see the `sticky` computation below).
+/// It only has to swallow a rare 1-tick process-table refresh race, so a handful
+/// of seconds is plenty. Was 90 s — badly over-provisioned: because the
+/// [`mid_session_reason`] veto keys on `is_running`, that 90 s got tacked onto
+/// *every* GameStopped, inflating both close-detection latency ("2 min to notice
+/// I quit") and cross-device restore latency (the receiver keeps vetoing pulls
+/// for exactly this long after the game quits). 6 s ≈ RUNNING_STICKY_POLLS ticks
+/// at the default 2 s poll, still comfortably above any real refresh hiccup.
+const STRONG_STOP_GRACE_FLOOR_SECS: u64 = 6;
 
 /// Backoff applied when an auto-restore fails with a 404: the save is tracked
 /// locally but has no record/snapshot on the backend we're talking to (e.g.
@@ -2019,6 +2088,12 @@ fn spawn_auto_restore(
     // fetch. `None` falls back to the per-save network call (self-hosted,
     // headless CLI, fresh add, or the authoritative force/barrier paths).
     cached_latest: Option<i64>,
+    // One manifest fetch shared by every restore of the same sweep: when
+    // `cached_latest` is `None` on a cold start (the poller hasn't filled the
+    // cache yet) the first task pulls `/v1/cloud/sync` once and the rest
+    // reuse it, instead of N tasks fetching the identical manifest (the
+    // startup burst that tripped the server's poll guard).
+    shared_manifest: Option<Arc<tokio::sync::OnceCell<HashMap<String, i64>>>>,
 ) {
     tokio::spawn(async move {
         tracing::debug!(
@@ -2035,6 +2110,9 @@ fn spawn_auto_restore(
         // don't bounce back as a redundant upload. Stays `None` on a diverged
         // tree so the genuinely-new local content still uploads.
         let mut post_restore_set_hash: Option<String> = None;
+        // True once we've actually written pulled files into the folder — used
+        // to stamp `last_restore_at` so our own writes don't veto the next pull.
+        let mut wrote_files = false;
         match run_auto_restore(
             &api,
             &save,
@@ -2042,6 +2120,7 @@ fn spawn_auto_restore(
             retention,
             known_version,
             cached_latest,
+            shared_manifest,
         )
         .await
         {
@@ -2055,6 +2134,7 @@ fn spawn_auto_restore(
                     post_restore_set_hash = outcome.disk_set_hash.clone();
                 }
                 let touched = outcome.files_restored + outcome.conflicts_backed_up;
+                wrote_files = touched > 0;
                 if touched > 0 {
                     tracing::info!(
                         save_id = %save.save_id,
@@ -2128,11 +2208,30 @@ fn spawn_auto_restore(
                 // already reflects the session problem) and let the normal
                 // short cooldown retry once the token is refreshed.
                 let unauthorized = matches!(api_err, Some(ApiError::Unauthorized));
+                // A 429 is the rolling bandwidth limiter, not a per-save failure:
+                // during a reconciliation sweep every tracked save races for the
+                // same window, so one over-quota moment 429s a dozen restores at
+                // once. Treated as a failure it burned the escalation budget and
+                // fired "keeps failing to restore (3×)" for saves that were never
+                // broken. Honour the server's retry_after and don't count it.
+                let throttled = match api_err {
+                    Some(ApiError::RateLimited { retry_after_seconds, .. }) => {
+                        Some(*retry_after_seconds)
+                    }
+                    _ => None,
+                };
                 if not_on_server {
                     disposition = AutoRestoreDisposition::NotOnServer;
                     tracing::debug!(
                         save_id = %save.save_id,
                         "agent: auto-restore — save not on server (404); backing off"
+                    );
+                } else if let Some(retry_after_secs) = throttled {
+                    disposition = AutoRestoreDisposition::Throttled { retry_after_secs };
+                    tracing::debug!(
+                        save_id = %save.save_id,
+                        retry_after_secs,
+                        "agent: auto-restore throttled (429); waiting the server window"
                     );
                 } else if unauthorized {
                     disposition = AutoRestoreDisposition::Unauthorized;
@@ -2169,6 +2268,7 @@ fn spawn_auto_restore(
                 disposition,
                 synced_version,
                 post_restore_set_hash,
+                wrote_files,
             })
             .await;
     });
@@ -2283,6 +2383,11 @@ fn sweep_for_auto_restore(
         }
     }
 
+    // One manifest fetch for the whole batch when the poller cache is cold
+    // (e.g. a cold start scheduling several restores at once): the first
+    // spawned task that needs it pulls `/v1/cloud/sync` once and the rest
+    // reuse the result instead of each fetching the identical manifest.
+    let shared_manifest = Arc::new(tokio::sync::OnceCell::new());
     for (id, save) in candidates {
         let known_version = slots.get(&id).and_then(|s| s.known_version);
         let cached_latest = latest_versions.get(&id).copied();
@@ -2303,6 +2408,7 @@ fn sweep_for_auto_restore(
             config.conflict_retention_days,
             known_version,
             cached_latest,
+            Some(shared_manifest.clone()),
         );
     }
 }
@@ -2328,21 +2434,30 @@ const RECENT_SAVE_GRACE: Duration = Duration::from_secs(5 * 60);
 /// the user is actively writing, or the restore and the backup fight over
 /// the same files.
 fn mid_session_reason(slot: &SaveSlot) -> Option<&'static str> {
-    if slot.is_running {
-        return Some("game process is running");
-    }
-    if slot.has_pending {
-        return Some("un-flushed local changes pending");
-    }
-    if let Some(last) = slot.last_fs_event_at {
-        if (OffsetDateTime::now_utc() - last).whole_seconds() < RECENT_SAVE_GRACE.as_secs() as i64 {
-            return Some("fs event observed recently");
-        }
-    }
-    if is_path_recently_touched(&slot.save.local_path, RECENT_SAVE_GRACE) {
-        return Some("save folder touched recently");
-    }
-    None
+    // Sans-IO boundary (ADR 0021, Slice 1): the decision lives in the kernel;
+    // this shell samples the non-determinism (`now`) and the world
+    // (`folder_mtime`) and hands it in as data. The kernel's `veto_reason`
+    // makes the same choice the old in-place logic did, returning the same
+    // `&'static str` reasons — behaviour is identical.
+    // Los campos que el kernel creció en el Slice 2 no los mira el veto de
+    // sesión; el shell sólo rellena los que `veto_reason` consulta y deja el
+    // resto en su default. `run_agent` no cambia.
+    let state = kernel::State {
+        is_running: slot.is_running,
+        has_pending: slot.has_pending,
+        last_fs_event_at: slot.last_fs_event_at,
+        last_restore_at: slot.last_restore_at,
+        ..Default::default()
+    };
+    let obs = kernel::Observation {
+        folder_mtime: folder_own_mtime(&slot.save.local_path),
+        ..Default::default()
+    };
+    let world = kernel::World {
+        now: OffsetDateTime::now_utc(),
+        seed: 0,
+    };
+    kernel::session::veto_reason(&state, &obs, &world)
 }
 
 /// Does the poller's version cache say this save moved past what this device
@@ -2460,6 +2575,8 @@ fn run_deferred_pull(
         // of trusting a cache that may be a tick stale. The version-gate inside
         // still makes it free when we're already current.
         None,
+        // Single save — no sweep batch to share a manifest with.
+        None,
     );
 }
 
@@ -2477,6 +2594,18 @@ fn is_path_recently_touched(path: &Path, grace: Duration) -> bool {
         Ok(age) => age < grace,
         Err(_) => false,
     }
+}
+
+/// The save folder's own mtime (its inode, not recursive), as an
+/// `OffsetDateTime`, or `None` if it can't be stat'd. This is the sampled
+/// [`kernel::Observation::folder_mtime`] the sans-IO session veto consumes:
+/// same source as [`is_path_recently_touched`], but the recency comparison
+/// now lives in the kernel against an injected `now`.
+fn folder_own_mtime(path: &Path) -> Option<OffsetDateTime> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(OffsetDateTime::from)
 }
 
 /// Mayor mtime entre la propia carpeta y sus ficheros inmediatos (no
@@ -2635,23 +2764,42 @@ async fn run_auto_restore(
     retention: Duration,
     known_version: Option<i64>,
     cached_latest: Option<i64>,
+    shared_manifest: Option<Arc<tokio::sync::OnceCell<HashMap<String, i64>>>>,
 ) -> Result<Option<AutoRestoreOutcome>> {
     // Prefer the version the cloud_pull poller already learned this tick: it
     // fetched the whole manifest once, so reusing it spares us a per-save
-    // `cloud_sync`/`get_save` round-trip (the old sweep N+1). Only hit the
-    // network when the cache has no entry for this save — self-hosted, the
-    // headless CLI (no poller at all), a fresh add, or the authoritative
-    // force-restore / pre-launch barrier paths that pass `None` deliberately.
+    // `cloud_sync`/`get_save` round-trip (the old sweep N+1). When the poller
+    // cache is cold (cold start), the sweep's `shared_manifest` cell fills
+    // that role: one fetch for the whole batch of restores. Only the
+    // authoritative force-restore / pre-launch barrier paths (which pass
+    // neither) and self-hosted / headless one-offs hit the network per save.
     let latest = match cached_latest {
         Some(v) => Some(v),
         None => {
             if api.is_cloud().await {
-                api.cloud_sync()
-                    .await?
-                    .saves
-                    .into_iter()
-                    .find(|e| e.save_id == save.save_id)
-                    .map(|e| e.latest_version_num)
+                match &shared_manifest {
+                    Some(cell) => cell
+                        .get_or_try_init(|| async {
+                            Ok::<_, anyhow::Error>(
+                                api.cloud_sync()
+                                    .await?
+                                    .saves
+                                    .into_iter()
+                                    .map(|e| (e.save_id, e.latest_version_num))
+                                    .collect::<HashMap<String, i64>>(),
+                            )
+                        })
+                        .await?
+                        .get(&save.save_id)
+                        .copied(),
+                    None => api
+                        .cloud_sync()
+                        .await?
+                        .saves
+                        .into_iter()
+                        .find(|e| e.save_id == save.save_id)
+                        .map(|e| e.latest_version_num),
+                }
             } else {
                 api.get_save(&save.save_id).await?.latest_version_num
             }
@@ -2945,26 +3093,37 @@ pub(crate) async fn restore_files_into(
                     stats.skipped += 1;
                     continue;
                 }
-                // Bytes differ — resolve via mtime. 1s tolerance covers
-                // FAT32 and friends; remote ties take the local side so a
-                // close call doesn't trash data.
-                if local_mtime_wins(&dest, &path).await {
-                    tracing::debug!(
-                        rel = %rel.display(),
-                        "auto-restore diff: local wins on mtime"
-                    );
-                    stats.conflicts_resolved_local += 1;
-                    continue;
-                }
-                let Some(backup_root) = conflict_backup_dir else {
-                    // No backup dir configured (legacy fallback): never
-                    // destroy local data even if remote looks newer.
-                    tracing::warn!(
-                        rel = %rel.display(),
-                        "auto-restore diff: remote appears newer but no conflict_backup_dir; keeping local"
-                    );
-                    stats.conflicts_resolved_local += 1;
-                    continue;
+                // Bytes differ — the resolution policy is the kernel's; this
+                // shell samples the mtime winner and executes the chosen
+                // branch. 1s tolerance covers FAT32 and friends; remote ties
+                // take the local side so a close call doesn't trash data.
+                let local_wins = local_mtime_wins(&dest, &path).await;
+                let backup_root = match kernel::restore_merge::resolve_conflict(
+                    local_wins,
+                    conflict_backup_dir.is_some(),
+                ) {
+                    kernel::restore_merge::ConflictResolution::KeepLocal => {
+                        if local_wins {
+                            tracing::debug!(
+                                rel = %rel.display(),
+                                "auto-restore diff: local wins on mtime"
+                            );
+                        } else {
+                            // Remote looked newer but there's no
+                            // conflict_backup_dir (legacy fallback): never
+                            // destroy local data.
+                            tracing::warn!(
+                                rel = %rel.display(),
+                                "auto-restore diff: remote appears newer but no conflict_backup_dir; keeping local"
+                            );
+                        }
+                        stats.conflicts_resolved_local += 1;
+                        continue;
+                    }
+                    kernel::restore_merge::ConflictResolution::BackupThenTakeRemote => {
+                        conflict_backup_dir
+                            .expect("BackupThenTakeRemote is only chosen when a backup dir exists")
+                    }
                 };
                 let backup_dest = backup_root.join(rel);
                 if let Some(parent) = backup_dest.parent() {
@@ -3087,18 +3246,12 @@ async fn preserve_staging_mtime(src: &Path, dest: &Path) {
 /// server's committed timestamps, which are more reliable than a local
 /// filesystem with quirks (FAT32 2s rounding, network share clock skew).
 async fn local_mtime_wins(local: &Path, remote: &Path) -> bool {
-    let local_mtime = match tokio::fs::metadata(local).await.and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let remote_mtime = match tokio::fs::metadata(remote).await.and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    match local_mtime.duration_since(remote_mtime) {
-        Ok(d) => d > Duration::from_secs(1),
-        Err(_) => false,
-    }
+    // Sans-IO boundary: this shell samples both mtimes; the kernel decides.
+    // An unreadable file → `None` → the kernel hands the tie to the remote,
+    // exactly as the old early-return `false` did.
+    let local_mtime = tokio::fs::metadata(local).await.and_then(|m| m.modified()).ok();
+    let remote_mtime = tokio::fs::metadata(remote).await.and_then(|m| m.modified()).ok();
+    kernel::restore_merge::local_wins_on_mtime(local_mtime, remote_mtime)
 }
 
 /// Cheap bytes-equal: size first (saves the read for the common
@@ -3491,6 +3644,8 @@ async fn run_backup_with_retry(
                 // don't version-gate this pull.
                 None,
                 None,
+                // Single save — no sweep batch to share a manifest with.
+                None,
             );
         } else {
             let _ = events_tx
@@ -3680,14 +3835,16 @@ async fn run_backup_with_retry(
                         Duration::from_secs(u64::from(conflict_retention_days) * 86_400);
                     // Pass our stale `base_version` as known_version (so the
                     // version-gate won't trip — remote is strictly ahead) and
-                    // `None` cached_latest so we fetch the authoritative head
-                    // rather than trust a poller cache that may itself be stale.
+                    // `None` cached_latest / shared_manifest so we fetch the
+                    // authoritative head rather than trust a cache that may
+                    // itself be stale.
                     match run_auto_restore(
                         &api,
                         &save,
                         conflict_root.as_deref(),
                         retention,
                         base_version,
+                        None,
                         None,
                     )
                     .await
@@ -3742,6 +3899,9 @@ async fn run_backup_with_retry(
                                         disposition: AutoRestoreDisposition::Ok,
                                         synced_version: Some(outcome.version_num),
                                         post_restore_set_hash: outcome.disk_set_hash.clone(),
+                                        // The reconcile merge wrote head's files
+                                        // into the folder — treat like a restore.
+                                        wrote_files: true,
                                     })
                                     .await;
                                 let _ = done_tx
@@ -3767,6 +3927,8 @@ async fn run_backup_with_retry(
                                     disposition: AutoRestoreDisposition::Ok,
                                     synced_version: Some(outcome.version_num),
                                     post_restore_set_hash: None,
+                                    // The reconcile merge wrote into the folder.
+                                    wrote_files: true,
                                 })
                                 .await;
                             continue;
@@ -3994,45 +4156,10 @@ async fn run_backup_with_retry(
     }
 }
 
-/// Filtra las señales de correlación carpeta→proceso para que sólo cuenten
-/// PLAYTIME las fiables, eliminando las horas-fantasma. `candidates` son tuplas
-/// `(proc_name_lower, save_id, game_slug)` de saves SIN manifest cuya carpeta
-/// tiene una observación de correlación válida; `configured` son los
-/// process-names ya declarados por juegos CON manifest.
-///
-/// Dos vetos, derivados del bug real (un proceso de Rust acumulando horas para
-/// Ark/Minecraft/Offworld/REPO porque algo de fondo —Steam Cloud— reescribió
-/// sus carpetas de save mientras Rust corría):
-///  (a) un proceso ya configurado en OTRO juego con manifest pertenece a ESE
-///      juego, no a la carpeta que casualmente tocó;
-///  (b) un proceso atado a varios `game_slug` distintos es ruido de fondo, no
-///      "estás jugando" a ninguno de ellos.
-/// Devuelve `(proc_name_lower, save_id)` aceptadas, un único save por proceso
-/// (un juego con varias carpetas no duplica horas). Las observaciones quedan
-/// intactas para la detección de carpetas, que es revisable.
-fn accept_correlation_signals<'a>(
-    candidates: &[(String, &'a str, &'a str)],
-    configured: &HashSet<String>,
-) -> Vec<(String, &'a str)> {
-    let mut slugs_per_proc: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for (pname, _, slug) in candidates {
-        slugs_per_proc.entry(pname).or_default().insert(slug);
-    }
-    let mut out: Vec<(String, &'a str)> = Vec::new();
-    let mut taken: HashSet<&str> = HashSet::new();
-    for (pname, save_id, _) in candidates {
-        if configured.contains(pname) {
-            continue; // (a)
-        }
-        if slugs_per_proc.get(pname.as_str()).map_or(0, |s| s.len()) != 1 {
-            continue; // (b)
-        }
-        if taken.insert(pname.as_str()) {
-            out.push((pname.clone(), save_id));
-        }
-    }
-    out
-}
+/// `accept_correlation_signals` (el filtro anti horas-fantasma) se movió al
+/// kernel leaf en el Slice 1 (ADR 0021): vive en
+/// [`hoard_core::kernel::correlation`] y se importa arriba. Era ya una función
+/// pura, así que su sitio natural es el kernel.
 
 /// Longitud mínima de un token de identidad para que cuente en el match
 /// genérico. Por debajo (`gta`, `ori`, `ff`) es demasiado corto y colisiona
@@ -4526,7 +4653,7 @@ fn process_poll(
         config
             .poll_secs
             .saturating_mul(RUNNING_STICKY_POLLS)
-            .max(90),
+            .max(STRONG_STOP_GRACE_FLOOR_SECS),
     );
     let readd: Vec<String> = slots
         .iter()
@@ -4734,6 +4861,8 @@ fn process_poll(
                     known_version,
                     // Pre-launch barrier wants the freshest truth before play
                     // starts — fetch it rather than trust the poller cache.
+                    None,
+                    // Single save — no sweep batch to share a manifest with.
                     None,
                 );
             }
@@ -5111,62 +5240,9 @@ mod tests {
         assert!(probe_detect_writes(&mut probes).is_empty());
     }
 
-    #[test]
-    fn correlation_rejects_shared_process_phantom_hours() {
-        // El bug real: el proceso de Rust quedó correlacionado con las carpetas
-        // de save de cuatro juegos NO jugados (Steam Cloud las reescribió
-        // mientras Rust corría). Un proceso atado a >1 juego es ruido: no debe
-        // dar horas a ninguno.
-        let configured: HashSet<String> = ["rustclient.exe".to_string()].into_iter().collect();
-        let candidates = vec![
-            ("rustclient.exe".to_string(), "ark", "ark-survival-ascended"),
-            ("rustclient.exe".to_string(), "mc", "minecraft-java"),
-            ("rustclient.exe".to_string(), "off", "offworld-trading"),
-            ("rustclient.exe".to_string(), "repo", "r-e-p-o"),
-        ];
-        let accepted = accept_correlation_signals(&candidates, &configured);
-        assert!(
-            accepted.is_empty(),
-            "un proceso compartido por varios juegos no debe acumular horas: {accepted:?}"
-        );
-    }
-
-    #[test]
-    fn correlation_accepts_exclusive_off_catalog_game() {
-        // El caso legítimo que la correlación existe para rescatar: un juego sin
-        // manifest (EU5 bajo Proton) cuyo propio exe escribió su save. Proceso
-        // exclusivo de un juego y no configurado en ningún otro ⇒ cuenta.
-        let configured: HashSet<String> = HashSet::new();
-        let candidates = vec![("eu5.exe".to_string(), "eu5-save", "europa-universalis-5")];
-        let accepted = accept_correlation_signals(&candidates, &configured);
-        assert_eq!(accepted, vec![("eu5.exe".to_string(), "eu5-save")]);
-    }
-
-    #[test]
-    fn correlation_one_save_per_process_no_double_count() {
-        // Un mismo juego con dos carpetas rastreadas: el proceso es exclusivo de
-        // ese slug, pero sólo debe inyectarse UNA vez (marcar las dos duplicaría
-        // las horas del mismo juego).
-        let configured: HashSet<String> = HashSet::new();
-        let candidates = vec![
-            ("eu5.exe".to_string(), "save-a", "eu5"),
-            ("eu5.exe".to_string(), "save-b", "eu5"),
-        ];
-        let accepted = accept_correlation_signals(&candidates, &configured);
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].0, "eu5.exe");
-    }
-
-    #[test]
-    fn correlation_rejects_configured_process_of_another_game() {
-        // Aunque el proceso de Rust sólo hubiera ensuciado UNA carpeta ajena,
-        // está configurado como proceso de Rust (manifest): pertenece a Rust,
-        // no a la carpeta que tocó.
-        let configured: HashSet<String> = ["rustclient.exe".to_string()].into_iter().collect();
-        let candidates = vec![("rustclient.exe".to_string(), "ark", "ark-survival-ascended")];
-        let accepted = accept_correlation_signals(&candidates, &configured);
-        assert!(accepted.is_empty());
-    }
+    // Los tests de `accept_correlation_signals` (incluida la regresión de
+    // horas-fantasma del corpus D.4) se movieron con la función al kernel
+    // leaf: `hoard_core::kernel::correlation::tests`.
 
     #[test]
     fn match_save_for_path_finds_exact_and_subpath() {
@@ -5195,6 +5271,7 @@ mod tests {
                 last_running_seen: None,
                 has_pending: false,
                 last_fs_event_at: None,
+                last_restore_at: None,
                 next_scheduled_backup_at: None,
                 first_pending_event_at: None,
                 last_backup_at: None,
@@ -5248,6 +5325,7 @@ mod tests {
             last_running_seen: None,
             has_pending: false,
             last_fs_event_at: None,
+            last_restore_at: None,
             next_scheduled_backup_at: None,
             first_pending_event_at: None,
             last_backup_at: None,
@@ -5303,6 +5381,41 @@ mod tests {
             mid_session_reason(&slot),
             None,
             "an hour-old fs event is outside the grace window"
+        );
+    }
+
+    #[test]
+    fn mid_session_reason_ignores_own_restore_touch() {
+        // A freshly-created tempdir has mtime ≈ now, so it reads as
+        // "save folder touched recently" — the veto a restore trips on itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut slot = quiet_slot(tmp.path());
+        assert_eq!(
+            mid_session_reason(&slot),
+            Some("save folder touched recently"),
+            "a just-touched folder vetoes by default"
+        );
+        // Stamp a recent restore: the touch is ours, so the next pull isn't vetoed.
+        slot.last_restore_at = Some(OffsetDateTime::now_utc());
+        assert_eq!(
+            mid_session_reason(&slot),
+            None,
+            "our own recent restore must not veto the next pull"
+        );
+        // A genuine un-flushed user change still wins (checked before the gate).
+        slot.has_pending = true;
+        assert_eq!(
+            mid_session_reason(&slot),
+            Some("un-flushed local changes pending"),
+            "a real pending change still vetoes despite the restore stamp"
+        );
+        slot.has_pending = false;
+        // A stale restore stamp no longer suppresses the touch veto.
+        slot.last_restore_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+        assert_eq!(
+            mid_session_reason(&slot),
+            Some("save folder touched recently"),
+            "a restore older than the grace window stops covering the touch"
         );
     }
 

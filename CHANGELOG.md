@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Sniper scope (magnifier) in Hoard Screen.** A lens — circle or square —
+  that shows whatever is under it magnified (×1–×4), sniper-style. Drag and
+  resize it anywhere; clicks pass through to the game, and a crosshair draws
+  on top of it unmagnified. Windows-only capture for now; while a scope is
+  active the overlay is excluded from recordings/OBS (it has to be, or the
+  lens would magnify itself).
+- **Layers panel in Hoard Screen.** An ordered list of everything on the
+  overlay: click to select, arrows to decide what draws over what. New
+  crosshairs start above everything; widgets always float over placed apps.
+- **Crosshair widget in Hoard Screen.** The overlay grows its first
+  non-capture widget: a procedural crosshair (cross, ×, dot or circle) with
+  color, opacity, size, thickness, center gap, center dot and outline — all
+  editable live from the Screen panel, per monitor or mirrored. It renders
+  through the same compositing path on every OS, is always click-through,
+  and stays pixel-crisp at any size.
+
+### Fixed
+- **Hoard Screen editor can no longer lose track of the overlay.** The editor
+  now re-syncs with the overlay process every few seconds (and on open), so a
+  panel that is really on screen — e.g. a TikTok capture while gaming — can
+  always be moved or removed even if the app's own copy of the layout went
+  stale (reload, missed event). The overlay also shuts itself down if the app
+  dies instead of lingering as an unremovable ghost.
+
 ## [1.0.4] — 2026-07-18
 
 ### Added
@@ -28,7 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Works on Cloud and self-hosted (`hoard snapshots max-versions` in the CLI,
   same preview + `[y/N]` prompt, `--yes` to skip).
 
+### Fixed
+- **Leaner startup sync.** When several games need restoring at once (e.g.
+  first launch of the day), the app now fetches the cloud save list once for
+  the whole batch instead of once per game — faster startup and fewer
+  requests.
+
 ### Changed
+- **Faster cloud sync.** Backups now hash and upload several files at a time,
+  and restores download several at a time, instead of strictly one by one.
+  Saves made of many small files — the common case — sync noticeably faster
+  in both directions.
 - **Local vs. server sizes, labelled.** The Library's tracked-games header
   (local, this machine) and each card's size pill (server-side) now carry
   icons and tooltips saying which is which, so the two totals can no longer

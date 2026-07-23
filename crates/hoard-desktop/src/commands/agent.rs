@@ -58,6 +58,22 @@ pub fn register_agent_client(client: ApiClient) {
     *agent_client_slot().lock().unwrap() = Some(client);
 }
 
+/// Serialises concurrent `start_agent` calls. Boot rehydrate fires it from two
+/// paths (the automatic-scheduler rehydrate and the cloud-login rehydrate), and
+/// the `.await`s inside `start_agent` (the `is_cloud` probe, save hydration)
+/// open a TOCTOU window between the `state.agent` "already running?" check and
+/// where the handle is finally stored. Without this gate both callers pass the
+/// check and spawn *two* agents, each with its own `ApiClient` token cell; only
+/// the last-registered one gets `update_agent_token`, so the orphan agent's
+/// uploads and presence heartbeats 401 forever on a stale JWT while the other
+/// keeps working (observed 2026-07-21: factorio restored fine while its backup
+/// 401'd seconds later). Held across the whole `start_agent` body so the second
+/// caller observes the first's stored handle and no-ops.
+fn agent_start_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Forget the agent's client (logout / agent stop).
 pub fn clear_agent_client() {
     *agent_client_slot().lock().unwrap() = None;
@@ -112,6 +128,11 @@ pub async fn start_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentStatus, String> {
+    // Serialise starts: two concurrent boot-rehydrate callers must not both pass
+    // the `already running?` check below and spawn a second, orphaned agent.
+    // Held for the whole body (see `agent_start_gate`).
+    let _start = agent_start_gate().lock().await;
+
     if state.agent.lock().unwrap().is_some() {
         return Ok(AgentStatus {
             running: true,

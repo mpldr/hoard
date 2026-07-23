@@ -59,6 +59,27 @@ pub async fn run(action: Option<SyncCommand>) -> Result<()> {
     }
 }
 
+/// Bounce the resident sync service after `hoard upgrade` has swapped the binary,
+/// so the daemon re-execs the new code. Best-effort and conservative:
+/// - only when the OS service is actually installed on this machine — an upgrade
+///   must never install/start sync as a side effect;
+/// - a restart hiccup is a warning, not a failure: the upgrade already
+///   succeeded, so we never return `Err` here.
+///
+/// A foreground `hoard sync` or the desktop app running the shared agent isn't
+/// an installed OS service, so it's left alone (the user restarts those
+/// themselves) — we don't reach into another frontend's process.
+pub async fn reload_after_upgrade() {
+    if !installed().await {
+        return;
+    }
+    println!("reloading the sync service to run the new binary…");
+    if let Err(e) = restart().await {
+        eprintln!("warning: couldn't restart the sync service automatically: {e:#}");
+        eprintln!("  restart it yourself with `hoard sync restart`.");
+    }
+}
+
 // ---- shared helpers ---------------------------------------------------
 
 /// Absolute path to this `hoard` binary — what the service unit will exec.
@@ -202,6 +223,11 @@ async fn restart() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+async fn installed() -> bool {
+    unit_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 async fn status() -> Result<()> {
     if !unit_path()?.exists() {
         println!("hoard sync is not installed. Run `hoard sync start`.");
@@ -324,6 +350,11 @@ async fn restart() -> Result<()> {
     }
     println!("hoard sync restarted.");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn installed() -> bool {
+    plist_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -513,6 +544,11 @@ async fn restart() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+async fn installed() -> bool {
+    task_exists().await
+}
+
+#[cfg(target_os = "windows")]
 async fn status() -> Result<()> {
     if task_exists().await {
         let _ = run_status("schtasks", &["/Query", "/TN", TASK, "/V", "/FO", "LIST"]).await;
@@ -573,6 +609,10 @@ async fn stop() -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn restart() -> Result<()> {
     bail!("no service backend for this OS")
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn installed() -> bool {
+    false
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn status() -> Result<()> {

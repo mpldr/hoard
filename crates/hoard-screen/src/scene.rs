@@ -142,10 +142,25 @@ pub enum SourceRef {
     Image { path: String },
     /// A text note rendered by the overlay.
     Note { text: String },
+    /// A procedurally-drawn crosshair / reticle (see [`crate::crosshair`]).
+    /// Static: the overlay rasterises the spec once and re-renders only when
+    /// the descriptor changes.
+    Crosshair(crate::crosshair::CrosshairSpec),
+    /// A live magnifier lens over the screen region under the panel (see
+    /// [`crate::scope`]).
+    Scope(crate::scope::ScopeSpec),
     /// Built-in animated test pattern — lets the full pipeline (window +
     /// compositor + crop) be driven on a real desktop before any capture
     /// backend is finished.
     Test,
+    /// Forward-compat safety net: any `kind` this build doesn't know. Renders
+    /// as an invisible placeholder instead of failing the whole `set_scene`
+    /// line — an older overlay paired with a newer editor must degrade to
+    /// "that one panel is missing", never to "the entire scene was dropped"
+    /// (which also made the next mode-toggle echo the stale scene back and
+    /// erase the new panel from the editor).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One element of the overlay.

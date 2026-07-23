@@ -154,6 +154,14 @@ impl Overlay {
                         self.apply_input_region();
                     }
                 }
+                Message::GetScene => {
+                    // Desktop resync: what the overlay is actually showing.
+                    if let Ok(s) = serde_json::to_string(self.engine.scene()) {
+                        println!("{{\"type\":\"scene\",\"scene\":{s}}}");
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().flush();
+                    }
+                }
                 Message::Quit => self.exit = true,
             }
         }

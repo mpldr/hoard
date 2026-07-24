@@ -420,7 +420,10 @@ embebido, cero cambio visible, y empiezan a pagar bugs desde el día uno.
   construida sobre los wire types del Slice 3), "spawn if absent", borrar
   `instance.rs`. Desktop y CLI → clientes finos. Primer slice con packaging (3
   SOs, servicios de usuario). *Acceptance:* matar un cliente no mata el sync; sin
-  race de arranque; un único rotador de `cloud.toml`.
+  race de arranque; un único rotador de `cloud.toml`. **Restricción:** mantener
+  **estable la interfaz pública de los stores TS** de la UI (`ui/src/lib/stores`)
+  al cambiar `invoke` → IPC; las pantallas no deben notar el cambio de backend.
+  (Hay pulido de UI en paralelo que depende de esa interfaz fija.)
 - **Slice 5 — Estado en SQLite (C.4).** `rusqlite` + WAL + migraciones, DB
   **privada del daemon** (clientes solo por IPC), migración + cleanse del estado
   viejo, prefs dentro sin excepción. *Requiere el plan de D.1.2.*
@@ -668,3 +671,103 @@ diff fuera revisable.
 es el JSON byte a byte de la v1.0.4. Compilar juntos sólo garantiza coherencia
 dentro de un build; cliente y server se despliegan por separado. Al añadir un
 campo: `#[serde(default)]` y **no se toca el fixture**.
+
+---
+
+### D.11 — BLOQUEANTE de publicación: el poller de nube enmudece (shell, no kernel)
+
+Hallado dogfoodeando el 2026-07-24 (Windows sube factorio v138, Linux nunca la
+baja). **No es regresión del kernel:** `cloud_pull.rs` es shell del desktop y los
+Slices 1-3 no lo tocaron. Al contrario — el `Hold{reason}` de C.5/2c es lo que
+permitió cerrarlo en minutos: el reductor decía `converged`, no un veto.
+
+**Síntoma:** `agent: cloud version cache updated from poller` aparece **solo en
+los primeros ~7 s del primer lanzamiento del día** y nunca más. Tres arranques
+del poller en la misma sesión (21:01:13, 21:01:55, 22:06:21) y feeds solo en
+21:01:14 y 21:01:20. Cero WARN/ERROR. El poller hace como mucho **un** pull por
+lanzamiento y muere en silencio.
+
+**Cadena:** sin feed, `obs.cloud_version` queda congelado (120 mientras la nube
+va por 138) → `cloud_ahead = false` → `converged` para siempre → no restaura. El
+reductor decide bien sobre una entrada mentirosa: el fallo está *aguas arriba*
+del kernel.
+
+**Candidatos** (`cloud_pull.rs`): (a) el gate de single-flight no tiene guarda
+RAII — `guarded_pull` pone `running = true` y si la tarea es abortada
+(`start()` → `prev.abort()`) o entra en pánico, nadie lo libera y todo tick
+posterior sale por `if g.running { rerun = true; return; }` **sin loguear**;
+(b) `.lock().unwrap()` sobre un mutex envenenado mata la tarea del poller sin
+rastro en el log. Ambas explican el silencio absoluto.
+
+**Confirmado 2026-07-24:** el restore **manual** desde el historial funciona. El
+ejecutor de restore y el kernel están sanos; lo único roto es el disparo
+automático por falta de feed. Daño acotado al poller.
+
+**Fix estructural (el importante, sí toca el kernel):** hoy el kernel **no puede
+distinguir "convergido" de "ciego"** — las dos cosas se ven como
+`Hold{"converged"}`, y por eso 47 min sin noticias de la nube se disfrazaron de
+normalidad. `Observation` lleva `cloud_version` pero no *desde cuándo*. Añadir
+`cloud_version_as_of: Option<OffsetDateTime>` y, cuando esa marca envejece más
+que un umbral (p. ej. varias veces `CLOUD_POLL_INTERVAL_SECS`), emitir
+`Hold{reason: "cloud state stale"}` en vez de `converged`. Mismo principio que
+loguear los vetos: **un fallo invisible pasa a ser observable**. La UI puede
+colgar de ahí un indicador de "sin contacto con la nube".
+
+**Fix proximal (slice de shell, antes de publicar):** guarda RAII que libere el gate en
+`Drop`; no `unwrap()` sobre locks envenenados; **loguear cada tick** y el camino
+"gate ocupado" para que esto no vuelva a ser invisible; y re-alimentar versiones
+cuando aparece el handle del agente (hoy, si el primer tick corre antes de que
+`AppState.agent` exista, el feed se salta en silencio).
+
+**A verificar en el mismo slice:** `~/.config/hoard/config.toml` apunta a
+`http://localhost:8082` (self-hosted) mientras poller/entitlements/realtime
+hablan con Cloud. Confirmar a qué servidor apunta realmente el `ApiClient` del
+agente — un desajuste ahí explicaría también los `server has no snapshots yet`.
+
+**Síntomas secundarios sin perseguir aún:** `automatic scan: done tracked=0` (la
+UI no muestra "vigilando <juego>" aunque el agente tiene 4 watchers armados) y
+`couldn't persist detection cache — No existe el archivo o el directorio`.
+
+**Bug de UI hermano (peligroso, mismo día):** el panel muestra la versión de
+**nube** sin distinguirla del estado **local**. Con Linux anclado en v120 y disco
+del 22-jul, el panel rotulaba "guardada v138 / v142" y el usuario creyó tenerlas.
+El estado interno era honesto (`last_version_num: 120`, `had_pending=false`, cero
+restores en el log): mentía solo la presentación. En una herramienta de saves esto
+invita a jugar encima creyendo estar al día — y con el poller muerto, esa partida
+se subiría como v143 haciendo **retroceder la cabeza** de la nube. La UI debe
+separar "la nube tiene vN" de "este equipo tiene vN".
+
+#### Resuelto (2026-07-25) — los cuatro puntos
+
+- **Kernel:** `Observation::cloud_version_as_of`; pasado
+  `CLOUD_STALE_AFTER_SECS = CLOUD_POLL_INTERVAL_SECS × 5`, el reposo se rotula
+  `Hold{"cloud state stale"}` en vez de `converged`. `const _: () =
+  assert!(CLOUD_STALE_AFTER_POLLS >= 2)` en compilación: un solo poll perdido
+  jamás declara ceguera. **La obsolescencia sólo cambia el motivo del reposo — no
+  frena backups ni restores.** Decisión correcta y a no deshacer: no subir pierde
+  trabajo real, mientras que subir desde una base vieja choca 409 y mergea la
+  cabeza (historial content-addressed, nada se pierde). Bloquear cambiaría un
+  fallo recuperable por uno que no lo es.
+- **Poller:** `GateGuard` con `Drop` — causa raíz confirmada: `start()` aborta el
+  poller anterior y, si el abort caía mid-pull, `running = true` quedaba clavado
+  en el scheduler (que sobrevive al reinicio de la tarea) y todo tick y todo
+  `kick()` posterior salía sin loguear. Además: recuperación de mutex envenenado
+  en vez de `unwrap()`, una línea por tick (`trigger=timer|kick`), camino
+  "gate ocupado" logueado, `warn!` si el holder pasa de 5 min, y
+  `feed_agent_versions()` llamado también desde `start_agent` (el primer tick le
+  ganaba la carrera al spawn del agente y tiraba el manifest en silencio).
+- **Servidor: no hay desajuste.** `~/.config/hoard/config.toml` es el `CliConfig`
+  de la CLI; el desktop sólo lo lee para rutas. El `ApiClient` sale de
+  `library::current_client()` (prefiere self-hosted, cae a creds cloud) y el
+  contexto vivo es el cloud → `api.hoard.services`.
+- **UI:** `TrackedSave.last_version_num` → `cloud_version_num`, más
+  `local_version_num` (cursor de `CliState`, el `known_version` del kernel). El
+  pill del panel es estrictamente local; la nube tiene su propio chip, ámbar
+  cuando va por delante.
+
+**Remate pendiente (no bloquea):** `is_stale` usa `is_some_and`, así que
+`cloud_version_as_of: None` — "nunca he sabido nada de la nube", la ceguera más
+grave — **no** se reporta obsoleto. La distinción correcta es *contexto cloud vs
+self-hosted*, no `None` vs `Some`: en contexto cloud, `None` pasado un margen de
+arranque debería ser `stale`. Mitigado en la práctica porque
+`feed_agent_versions()` desde `start_agent` cierra la carrera que lo producía.

@@ -55,6 +55,9 @@ export type SaveActivity = {
    *  the elapsed-time counter in the Eye panel. */
   running_since?: number;
   reason?: BackupReason;
+  /** The version **this device** now holds — set by an upload that committed
+   *  and by an auto-restore that landed. Never the cloud head: the panel keeps
+   *  those apart on purpose (ADR 0021 D.10). */
   last_version?: number;
   last_bytes?: number;
   error?: string;
@@ -198,8 +201,12 @@ function applyEvent(ev: AgentEvent) {
       break;
     }
     case "save_auto_restored": {
-      // Auto-restore is a one-shot adoption side-effect — no need to mutate
-      // `activity` (no ongoing watch state to update), but we do want to
+      // A restore that landed moves *this device's* version forward, so record
+      // it: without this the dashboard keeps flagging the cloud as ahead until
+      // the next full `list_tracked_saves`. Deliberately doesn't touch `state`
+      // — a restore isn't a backup lifecycle transition.
+      patch(ev.save_id, { last_version: ev.version_num });
+      // Beyond that it's a one-shot adoption side-effect, but we do want to
       // surface a toast so the user notices files appeared under `~`. The
       // `game_slug` is what we have to hand; resolving to display_name would
       // require another store dependency just for cosmetics.

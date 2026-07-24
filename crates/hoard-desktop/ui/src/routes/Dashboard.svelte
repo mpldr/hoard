@@ -186,29 +186,55 @@
     }
   }
 
+  /**
+   * The version **this device** holds: the backend's local cursor, moved
+   * forward by anything the live session has since confirmed (an upload that
+   * committed, or an auto-restore that landed). Never the cloud head.
+   *
+   * Keeping the two apart is the whole point: the panel used to label the
+   * *cloud* head "Guardado (v138)" while this machine sat at v120 with a dead
+   * poller, so the user believed they had versions they'd never downloaded
+   * (ADR 0021 D.10).
+   */
+  function localVersion(save: TrackedSave): number | null {
+    const live = $activity[save.save_id]?.last_version;
+    const stored = save.local_version_num;
+    if (live == null) return stored;
+    if (stored == null) return live;
+    return Math.max(live, stored);
+  }
+
+  /** `true` when the cloud holds a version this device doesn't have yet. */
+  function cloudAhead(save: TrackedSave): boolean {
+    if (save.cloud_version_num == null) return false;
+    const local = localVersion(save);
+    return local == null || save.cloud_version_num > local;
+  }
+
+  /** Tooltip for the cloud-version chip: always spells out both numbers, so
+   *  "the cloud has vN" can never be read as "this device has vN". */
+  function cloudTitle(save: TrackedSave): string {
+    const cloud = save.cloud_version_num;
+    const local = localVersion(save);
+    if (!cloudAhead(save)) return $_("dashboard.cloud_version_title");
+    if (local == null) {
+      return $_("dashboard.cloud_ahead_no_local_title", { values: { cloud } });
+    }
+    return $_("dashboard.cloud_ahead_title", { values: { cloud, local } });
+  }
+
+  /** The status pill. Reflects **local** state only — what this machine has
+   *  on disk and what the agent is doing about it. The cloud head gets its
+   *  own chip so the two are never conflated. */
   function pillFor(save: TrackedSave) {
     const a = $activity[save.save_id];
+    const local = localVersion(save);
     // Live activity always wins — if the agent reports anything, the pill
     // reflects *that* (it's the freshest signal on screen). Falls through
     // to the server-side history check only when we have no in-memory state
     // for this save, which is the case on a cold app launch.
     if (!a) {
-      if (save.last_version_num != null) {
-        return {
-          label: $_("dashboard.pill_saved_v", { values: { version: save.last_version_num } }),
-          icon: Check,
-          klass: "text-emerald-400",
-          rail: "bg-emerald-500",
-          tint: "bg-emerald-500/[0.04]",
-        };
-      }
-      return {
-        label: $_("dashboard.pill_no_backup"),
-        icon: CircleDot,
-        klass: "text-zinc-400",
-        rail: "bg-zinc-600",
-        tint: "",
-      };
+      return idlePill(save, local);
     }
     switch (a.state) {
       case "running":
@@ -242,8 +268,8 @@
         };
       case "ok":
         return {
-          label: a.last_version
-            ? $_("dashboard.pill_saved_v", { values: { version: a.last_version } })
+          label: local
+            ? $_("dashboard.pill_saved_local_v", { values: { version: local } })
             : $_("dashboard.pill_saved"),
           icon: Check,
           klass: "text-emerald-400",
@@ -267,23 +293,41 @@
           tint: "bg-red-500/[0.05]",
         };
       default:
-        if (save.last_version_num != null) {
-          return {
-            label: $_("dashboard.pill_saved_v", { values: { version: save.last_version_num } }),
-            icon: Check,
-            klass: "text-emerald-400",
-            rail: "bg-emerald-500",
-            tint: "bg-emerald-500/[0.04]",
-          };
-        }
-        return {
-          label: $_("dashboard.pill_no_backup"),
-          icon: CircleDot,
-          klass: "text-zinc-400",
-          rail: "bg-zinc-600",
-          tint: "",
-        };
+        return idlePill(save, local);
     }
+  }
+
+  /** Resting pill (no live activity): what this device holds, or — when it
+   *  holds nothing — an explicit "only in the cloud" instead of a version
+   *  number the user would read as their own. */
+  function idlePill(save: TrackedSave, local: number | null) {
+    if (local != null) {
+      return {
+        label: $_("dashboard.pill_saved_local_v", { values: { version: local } }),
+        icon: Check,
+        klass: "text-emerald-400",
+        rail: "bg-emerald-500",
+        tint: "bg-emerald-500/[0.04]",
+      };
+    }
+    if (save.cloud_version_num != null) {
+      return {
+        label: $_("dashboard.pill_cloud_only_v", {
+          values: { version: save.cloud_version_num },
+        }),
+        icon: Cloud,
+        klass: "text-zinc-400",
+        rail: "bg-zinc-600",
+        tint: "",
+      };
+    }
+    return {
+      label: $_("dashboard.pill_no_backup"),
+      icon: CircleDot,
+      klass: "text-zinc-400",
+      rail: "bg-zinc-600",
+      tint: "",
+    };
   }
 </script>
 
@@ -449,6 +493,25 @@
               <span class="truncate font-mono">{save.local_path}</span>
             </p>
           </div>
+          {#if save.cloud_version_num != null}
+            <!-- The CLOUD's head version, always labelled as such and never
+                 merged into the status pill (which is this device's). Amber
+                 when the cloud is ahead: same "there's something newer waiting"
+                 semantics as the update-available badge. -->
+            <span
+              class="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] tabular-nums ring-1 ring-inset {cloudAhead(
+                save,
+              )
+                ? 'bg-amber-500/10 text-amber-400 ring-amber-500/30'
+                : 'bg-white/[0.04] text-zinc-300 ring-white/[0.06]'}"
+              title={cloudTitle(save)}
+            >
+              <Cloud size={11} class={cloudAhead(save) ? "" : "text-zinc-500"} />
+              {$_("dashboard.cloud_version_badge", {
+                values: { version: save.cloud_version_num },
+              })}
+            </span>
+          {/if}
           {#if save.total_size_bytes > 0}
             <!-- Cloud footprint only — the panel never shows local sizes. -->
             <span

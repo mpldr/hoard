@@ -31,7 +31,23 @@ pub struct TrackedSave {
     pub game_slug: String,
     pub label: String,
     pub local_path: String,
-    pub last_version_num: Option<i64>,
+    /// Cabeza del **server**: la última versión que existe en la nube (o en el
+    /// server self-hosted), venga de donde venga — normalmente de otra máquina.
+    ///
+    /// Se llamaba `last_version_num`, un nombre que invitaba a leerlo como "la
+    /// versión que tengo". El panel lo rotulaba «Guardado (v138)» con este
+    /// equipo anclado en la v120 y el poller muerto (ADR 0021 D.10): en una
+    /// herramienta de saves eso invita a jugar encima creyendo estar al día, y
+    /// esa partida subiría como v139 haciendo retroceder la cabeza de la nube.
+    /// El par con [`Self::local_version_num`] es lo que impide volver a
+    /// confundirlos.
+    pub cloud_version_num: Option<i64>,
+    /// Versión a la que está sincronizado **este equipo** (el cursor
+    /// `SaveState::last_version_num` del `CliState` local, que es lo que el
+    /// kernel usa como `known_version`). `None` = esta máquina nunca subió ni
+    /// bajó este save: existe en la nube pero no aquí.
+    #[serde(default)]
+    pub local_version_num: Option<i64>,
     pub last_backup_at: Option<String>,
     #[serde(default)]
     pub paused: bool,
@@ -480,7 +496,8 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 game_slug: args.game_slug,
                 label,
                 local_path: local_path.to_string_lossy().into_owned(),
-                last_version_num: None,
+                cloud_version_num: None,
+                local_version_num: None,
                 last_backup_at: None,
                 paused: false,
                 total_size_bytes: 0,
@@ -554,7 +571,11 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             game_slug: save.game_slug.into_inner(),
             label: save.label,
             local_path: local_path.to_string_lossy().into_owned(),
-            last_version_num: save.latest_version_num,
+            cloud_version_num: save.latest_version_num,
+            // Recién insertado en `CliState` con el cursor a cero: la cabeza
+            // del server puede existir ya (re-vínculo por 409) pero esta
+            // máquina todavía no tiene ninguna versión.
+            local_version_num: None,
             last_backup_at: None,
             paused: false,
             total_size_bytes: save.total_size_bytes.unwrap_or(0),
@@ -611,7 +632,8 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             game_slug: args.game_slug,
             label: args.label,
             local_path: local_path.to_string_lossy().into_owned(),
-            last_version_num: None,
+            cloud_version_num: None,
+            local_version_num: None,
             last_backup_at: None,
             paused: false,
             total_size_bytes: 0,
@@ -696,7 +718,8 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 game_slug: st.game_slug.clone(),
                 label: st.label.clone(),
                 local_path: st.local_path.to_string_lossy().into_owned(),
-                last_version_num: entry.map(|e| e.latest_version_num),
+                cloud_version_num: entry.map(|e| e.latest_version_num),
+                local_version_num: st.last_version_num,
                 // Manifest `updated_at` bumps on every committed upload, so it
                 // doubles as "last backup" for cloud rows (the panel sorts on it).
                 last_backup_at: entry.map(|e| e.updated_at.clone()),
@@ -720,7 +743,8 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 game_slug: entry.game_slug.clone(),
                 label: entry.label.clone(),
                 local_path: String::new(),
-                last_version_num: Some(entry.latest_version_num),
+                cloud_version_num: Some(entry.latest_version_num),
+                local_version_num: None,
                 last_backup_at: Some(entry.updated_at.clone()),
                 total_size_bytes: entry.latest_size_bytes,
                 paused: false,
@@ -744,7 +768,8 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 game_slug: s.game_slug.into_inner(),
                 label: s.label,
                 local_path: st.local_path.to_string_lossy().into_owned(),
-                last_version_num: s.latest_version_num,
+                cloud_version_num: s.latest_version_num,
+                local_version_num: st.last_version_num,
                 last_backup_at: format_optional_time(Some(s.updated_at)),
                 paused: st.paused,
                 total_size_bytes: s.total_size_bytes.unwrap_or(0),
@@ -757,7 +782,8 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 game_slug: s.game_slug.into_inner(),
                 label: s.label,
                 local_path: String::new(),
-                last_version_num: s.latest_version_num,
+                cloud_version_num: s.latest_version_num,
+                local_version_num: None,
                 last_backup_at: format_optional_time(Some(s.updated_at)),
                 paused: false,
                 total_size_bytes: s.total_size_bytes.unwrap_or(0),
@@ -788,16 +814,17 @@ pub async fn rename_label(
     let updated = client.rename_save_label(save_id, trimmed).await?;
 
     let (mut cli_state, path) = CliState::load_default()?;
-    let (local_path_string, preset, processes) =
+    let (local_path_string, preset, processes, local_cursor) =
         if let Some(entry) = cli_state.saves.get_mut(save_id) {
             entry.label = updated.label.clone();
             (
                 entry.local_path.to_string_lossy().into_owned(),
                 entry.preset.clone(),
                 entry.processes.clone(),
+                entry.last_version_num,
             )
         } else {
-            (String::new(), None, Vec::new())
+            (String::new(), None, Vec::new(), None)
         };
     cli_state.save(&path)?;
 
@@ -819,7 +846,8 @@ pub async fn rename_label(
             game_slug: updated.game_slug.into_inner(),
             label: updated.label,
             local_path: local_path_string,
-            last_version_num: updated.latest_version_num,
+            cloud_version_num: updated.latest_version_num,
+            local_version_num: local_cursor,
             last_backup_at: None,
             paused: false,
             total_size_bytes: updated.total_size_bytes.unwrap_or(0),

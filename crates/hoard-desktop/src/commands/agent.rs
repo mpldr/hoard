@@ -360,6 +360,14 @@ pub async fn start_agent(
 
     *state.agent.lock().unwrap() = Some(handle);
     *state.presence.lock().unwrap() = Some(presence);
+
+    // Hand the fresh agent whatever cloud heads the poller already pulled. The
+    // poller's first tick fires immediately on sign-in and can easily beat this
+    // spawn; before ADR 0021 D.10 that manifest was dropped silently and the
+    // agent ran on an empty version cache — `cloud_ahead = false` for every
+    // save, so cross-device updates never landed. No-op when nothing has been
+    // pulled yet (self-hosted, or poller not started).
+    crate::commands::cloud_pull::feed_agent_versions(&app).await;
     // Hold the cross-process lock for as long as our agent lives, so a `hoard
     // sync` daemon started afterwards backs off instead of double-running.
     *state.agent_lock.lock().unwrap() = Some(hoard_agent::instance::AgentLock::acquire());

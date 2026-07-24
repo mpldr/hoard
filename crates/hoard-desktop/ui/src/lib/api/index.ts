@@ -155,7 +155,17 @@ export type TrackedSave = {
   game_slug: string;
   label: string;
   local_path: string;
-  last_version_num: number | null;
+  /** The **server's** head version: the newest version that exists in the
+   *  cloud, whoever uploaded it — usually another machine. Never render this
+   *  as "saved": with the cloud at v138 and this device pinned at v120 that
+   *  label invites the user to play on top of a stale save and push it as
+   *  v139, walking the cloud head backwards (ADR 0021 D.10). Pair it with
+   *  {@link local_version_num} and say which is which. */
+  cloud_version_num: number | null;
+  /** The version **this device** is synced to (its local `CliState` cursor,
+   *  the same number the sync kernel uses as `known_version`). `null` = this
+   *  machine has never uploaded or downloaded this save. */
+  local_version_num: number | null;
   last_backup_at: string | null;
   paused: boolean;
   /** Bytes occupied on the server (sum of non-deleted snapshots). */

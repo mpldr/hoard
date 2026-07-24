@@ -38,14 +38,31 @@
 //!   dot until the next successful pull.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
+use hoard_agent::agent::AgentHandle;
 use hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
+
+/// Lock a mutex, recovering from poisoning instead of panicking.
+///
+/// Every lock in this module guards *derived, rebuildable* state — the seen-map
+/// reseeds from the next manifest, the gate reseeds from the next tick. A panic
+/// while one was held used to poison it, and the next `.lock().unwrap()` killed
+/// the poller task with no log line at all: one of the two candidate causes of
+/// the silent death in ADR 0021 D.10. Taking the value anyway degrades a
+/// poisoned lock into "stale but usable data", which for this data is exactly
+/// right and, unlike dying, is visible.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("cloud-pull: recovering from a poisoned lock");
+        poisoned.into_inner()
+    })
+}
 
 /// Managed singleton holding the currently-active poller task, if any.
 /// Mirrors `AutomaticScheduler`. We mutate the inner `Option<JoinHandle>`
@@ -78,6 +95,72 @@ struct PullGate {
     /// more pass when the current one finishes (collapses any number of
     /// concurrent kicks into a single re-run).
     rerun: bool,
+    /// When the current holder took the gate. Only used to tell a normal
+    /// coalesced kick from a holder that is *stuck* — see [`STUCK_GATE_SECS`].
+    since: Option<Instant>,
+}
+
+/// How long the gate may stay held before a blocked kick escalates to a
+/// warning. A pull is one ≤15 s HTTP request plus a version feed, so anything
+/// past this is a hung task, not coalescing. The RAII guard makes the old
+/// permanent wedge impossible; this catches whatever wedges next, out loud.
+const STUCK_GATE_SECS: u64 = 5 * 60;
+
+/// RAII release for [`CloudPullScheduler::gate`].
+///
+/// **This is the D.10 fix.** The gate used to be released by hand at the end of
+/// `guarded_pull`, so a task that got aborted (`start()` aborts the previous
+/// poller) or panicked mid-pull left `running = true` forever, and every later
+/// tick returned through `if g.running { … return; }` — silently, which is why
+/// a dead poller looked exactly like a healthy one. Dropping is the one thing
+/// that happens on *every* exit path (return, panic-unwind, and abort, which
+/// drops the future's locals), so the gate now cannot leak.
+struct GateGuard {
+    gate: Arc<Mutex<PullGate>>,
+}
+
+impl GateGuard {
+    /// Take the gate, or `None` if another pull holds it (the caller's request
+    /// is folded into that pull's re-run flag).
+    fn acquire(gate: &Arc<Mutex<PullGate>>) -> Option<Self> {
+        let mut g = lock(gate);
+        if g.running {
+            // Someone is already pulling; ask them to do one more pass with
+            // the freshest server state and bail.
+            g.rerun = true;
+            let held = g.since.map(|t| t.elapsed()).unwrap_or_default();
+            if held.as_secs() >= STUCK_GATE_SECS {
+                tracing::warn!(
+                    held_secs = held.as_secs(),
+                    "cloud-pull: gate busy — the in-flight pull looks stuck; cloud versions are going stale"
+                );
+            } else {
+                tracing::debug!(
+                    held_secs = held.as_secs(),
+                    "cloud-pull: gate busy — coalescing into the in-flight pull"
+                );
+            }
+            return None;
+        }
+        g.running = true;
+        g.since = Some(Instant::now());
+        Some(Self { gate: gate.clone() })
+    }
+
+    /// Drain the re-run flag: `true` when kicks arrived mid-flight and one more
+    /// pass is owed.
+    fn take_rerun(&self) -> bool {
+        let mut g = lock(&self.gate);
+        std::mem::take(&mut g.rerun)
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        let mut g = lock(&self.gate);
+        g.running = false;
+        g.since = None;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,8 +210,12 @@ struct QuotaReached {
 pub fn start(app: &AppHandle) {
     let scheduler = app.state::<CloudPullScheduler>();
     {
-        let mut slot = scheduler.handle.lock().unwrap();
+        let mut slot = lock(&scheduler.handle);
         if let Some(prev) = slot.take() {
+            // The aborted task may have been mid-pull. Its `GateGuard` is
+            // dropped with the future, so the gate reopens on its own — the
+            // hand-rolled release this replaced did not, and that stuck gate
+            // is what silenced the poller for a whole session (D.10).
             prev.abort();
         }
     }
@@ -155,7 +242,7 @@ pub fn start(app: &AppHandle) {
             - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
         loop {
             ticker.tick().await;
-            guarded_pull(&app_for_task, &seen, &gate).await;
+            guarded_pull(&app_for_task, &seen, &gate, "timer").await;
             if last_feed.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS {
                 last_feed = tokio::time::Instant::now();
                 crate::commands::cloud_feed::kick_all(&app_for_task);
@@ -163,7 +250,7 @@ pub fn start(app: &AppHandle) {
         }
     });
 
-    let mut slot = scheduler.handle.lock().unwrap();
+    let mut slot = lock(&scheduler.handle);
     *slot = Some(new_handle);
 }
 
@@ -180,7 +267,7 @@ pub fn kick(app: &AppHandle) {
     let gate = scheduler.gate.clone();
     let app = app.clone();
     tokio::task::spawn(async move {
-        guarded_pull(&app, &seen, &gate).await;
+        guarded_pull(&app, &seen, &gate, "kick").await;
     });
 }
 
@@ -189,45 +276,42 @@ pub fn kick(app: &AppHandle) {
 /// caller drains that flag with exactly one extra pass when it finishes. A
 /// burst of kicks (e.g. a backup sweep touching every save) therefore costs
 /// at most two `/v1/cloud/sync` requests instead of one per save.
+/// The gate is released by [`GateGuard`]'s `Drop`, so an abort or a panic can
+/// no longer wedge the poller shut (ADR 0021 D.10).
 async fn guarded_pull(
     app: &AppHandle,
     seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>,
     gate: &Arc<Mutex<PullGate>>,
+    trigger: &'static str,
 ) {
-    {
-        let mut g = gate.lock().unwrap();
-        if g.running {
-            // Someone is already pulling; ask them to do one more pass with
-            // the freshest server state and bail.
-            g.rerun = true;
-            return;
-        }
-        g.running = true;
-    }
-
+    let Some(guard) = GateGuard::acquire(gate) else {
+        return;
+    };
+    // One line per pull attempt, unconditionally. The whole reason D.10 took a
+    // day to find is that a poller that stops pulling and a poller that pulls
+    // fine looked identical in the log; from here on, silence in this stream
+    // *is* the symptom.
+    tracing::debug!(trigger, "cloud-pull: tick");
     loop {
         run_one_pull(app, seen).await;
-        let mut g = gate.lock().unwrap();
-        if g.rerun {
-            g.rerun = false;
-            // Loop again to honour the kick(s) that arrived mid-flight.
-        } else {
-            g.running = false;
+        // Honour the kick(s) that arrived mid-flight, then let `guard` drop.
+        if !guard.take_rerun() {
             return;
         }
+        tracing::debug!(trigger, "cloud-pull: re-running for kicks that arrived mid-pull");
     }
 }
 
 /// Abort the running poller. No-op when nothing is scheduled.
 pub fn stop(app: &AppHandle) {
     let scheduler = app.state::<CloudPullScheduler>();
-    let mut slot = scheduler.handle.lock().unwrap();
+    let mut slot = lock(&scheduler.handle);
     if let Some(prev) = slot.take() {
         prev.abort();
         tracing::info!("cloud-pull poller: stopped");
     }
     // Clear the seen-map too: a fresh login starts from 0 known versions.
-    scheduler.seen.lock().unwrap().clear();
+    lock(&scheduler.seen).clear();
 }
 
 /// Boot-time rehydration: if a cloud session is present on disk, start
@@ -235,7 +319,7 @@ pub fn stop(app: &AppHandle) {
 pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
     let signed_in = {
         let st = app.state::<crate::state::AppState>();
-        let has = st.cloud_account.lock().unwrap().is_some();
+        let has = lock(&st.cloud_account).is_some();
         has
     };
     if !signed_in {
@@ -245,14 +329,64 @@ pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The running agent's handle, or `None` when it hasn't been spawned yet.
+fn agent_handle(app: &AppHandle) -> Option<AgentHandle> {
+    app.try_state::<crate::state::AppState>()
+        .and_then(|s| lock(&s.agent).clone())
+}
+
+/// Push the freshest cloud head map the poller knows into the running agent.
+///
+/// The reconciliation sweep version-gates locally off this cache instead of
+/// each candidate re-fetching the same manifest — collapsing the old "poller
+/// GET + N sweep GETs" per interval down to the single GET the pull already
+/// did. Sent every tick (not just on deltas) so the cache never goes stale and
+/// a save we already pulled stays correctly gated; since ADR 0021 D.10 the
+/// agent also timestamps each feed, so a poller that stops feeding degrades to
+/// a visible `Hold{"cloud state stale"}` instead of a silent `converged`.
+///
+/// Called from two places on purpose: after every pull, and from `start_agent`
+/// once the handle exists. Without the second call a pull that lands before the
+/// agent is spawned — the normal cold-start order, since the poller's first
+/// tick fires immediately — dropped its whole manifest on the floor without a
+/// word, and the agent then ran on an empty version cache until the next tick.
+pub async fn feed_agent_versions(app: &AppHandle) {
+    let Some(scheduler) = app.try_state::<CloudPullScheduler>() else {
+        return;
+    };
+    let versions: HashMap<String, i64> = lock(&scheduler.seen)
+        .iter()
+        .map(|e| (e.save_id.clone(), e.version_num))
+        .collect();
+    if versions.is_empty() {
+        // Nothing pulled yet (or signed out): the next pull feeds the agent.
+        return;
+    }
+    let Some(h) = agent_handle(app) else {
+        tracing::debug!(
+            count = versions.len(),
+            "cloud-pull: no agent handle yet — version feed deferred to agent start"
+        );
+        return;
+    };
+    let count = versions.len();
+    match h.set_cloud_versions(versions).await {
+        Ok(()) => tracing::debug!(count, "cloud-pull: fed cloud version cache to agent"),
+        Err(e) => tracing::warn!(error = %e, "cloud-pull: couldn't feed version cache to agent"),
+    }
+}
+
 async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>) {
     let _ = app.emit("agent://cloud-pull-started", ());
 
     let creds = match crate::commands::cloud::load_active_creds() {
         Ok(Some(c)) => c,
         Ok(None) => {
-            // Session disappeared between polls (user logged out). Quiet
-            // exit; the logout path called `stop()` separately.
+            // Session disappeared between polls (user logged out). The logout
+            // path called `stop()` separately, so this is expected — but it
+            // still ends a tick without pulling, and every silent way to end a
+            // tick is a place D.10 could hide again.
+            tracing::debug!("cloud-pull: no cloud session on disk — nothing to pull");
             return;
         }
         Err(e) => {
@@ -363,7 +497,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
     };
 
     let (new_versions, new_bytes, advanced_ids) = {
-        let mut seen_guard = seen.lock().unwrap();
+        let mut seen_guard = lock(seen);
         let mut new_versions: usize = 0;
         let mut new_bytes: i64 = 0;
         let mut advanced_ids: Vec<String> = Vec::new();
@@ -423,28 +557,13 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
     // just swaps a shared `RwLock<String>`.
     crate::commands::agent::update_agent_token(&access_token);
 
-    // Grab the agent handle once: we use it both to refresh its cloud-version
-    // cache (every tick) and to force-restore advanced saves (sync global).
-    let handle = app
-        .try_state::<crate::state::AppState>()
-        .and_then(|s| s.agent.lock().unwrap().clone());
+    // Feed the agent the full latest-version map this manifest just gave us
+    // (reads it back out of the seen-map we just replaced, so the deferred
+    // re-feed below shares one code path with the live one).
+    feed_agent_versions(app).await;
 
-    // Feed the agent the full latest-version map this manifest just gave us.
-    // The reconciliation sweep then version-gates locally instead of each
-    // candidate re-fetching the same manifest — collapsing the old "poller GET
-    // + N sweep GETs" per interval down to the single GET we already did here.
-    // Sent every tick (not just on deltas) so the cache never goes stale and a
-    // save we already pulled stays correctly gated.
-    if let Some(h) = &handle {
-        let latest_versions: HashMap<String, i64> = manifest
-            .saves
-            .iter()
-            .map(|e| (e.save_id.clone(), e.latest_version_num))
-            .collect();
-        if let Err(e) = h.set_cloud_versions(latest_versions).await {
-            tracing::warn!(error = %e, "cloud-pull: couldn't feed version cache to agent");
-        }
-    }
+    // Grab the agent handle to force-restore advanced saves (sync global).
+    let handle = agent_handle(app);
 
     // Sync global: the poller is the cheap "is this device outdated?" detector.
     // When it's on and a save advanced server-side, ask the agent to pull it

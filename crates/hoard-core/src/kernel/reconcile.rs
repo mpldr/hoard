@@ -58,6 +58,32 @@ pub const STUCK_AFTER: u32 = 3;
 /// (ADR 0021 D.8.2).
 pub const BACKUP_FAILURE_BACKOFF_SECS: i64 = 10 * 60;
 
+/// Cadencia fija del poll airbag a `/v1/cloud/sync`. **Fuente de verdad del
+/// número**: `hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS` la re-exporta, para
+/// que el umbral de obsolescencia de abajo se derive de la cadencia real en vez
+/// de duplicar un literal que puede driftar.
+pub const CLOUD_POLL_INTERVAL_SECS: i64 = 60;
+
+/// Cuántos intervalos de poll pueden perderse antes de declarar ciega la
+/// observación de nube. Cinco: uno o dos fallos seguidos son un hipo de red o
+/// una suspensión corta y no merecen ruido; cinco minutos sin contacto ya no son
+/// un hipo, son una avería (ADR 0021 D.10 — el poller murió y estuvo 47 min sin
+/// que nada lo dijera).
+pub const CLOUD_STALE_AFTER_POLLS: i64 = 5;
+
+// Un solo poll perdido jamás puede declarar ciega la observación: la red hipa.
+// Chequeado en compilación, no en test, para que ni siquiera compile mal.
+const _: () = assert!(CLOUD_STALE_AFTER_POLLS >= 2);
+
+/// Edad a partir de la cual [`Observation::cloud_version_as_of`] deja de ser
+/// creíble y el reductor emite [`CLOUD_STALE_REASON`] en vez de `"converged"`.
+pub const CLOUD_STALE_AFTER_SECS: i64 = CLOUD_POLL_INTERVAL_SECS * CLOUD_STALE_AFTER_POLLS;
+
+/// Motivo del `Hold` cuando la caché de versiones de nube envejeció: no estamos
+/// convergidos, estamos **ciegos**. Mismo principio que loguear los vetos — un
+/// fallo invisible pasa a ser observable.
+pub const CLOUD_STALE_REASON: &str = "cloud state stale";
+
 /// Ventana de gracia (sticky) tras dejar de ver el proceso vivo antes de
 /// declararlo parado. 6 s — bajada desde los 90 s históricos
 /// (`agent::STRONG_STOP_GRACE_FLOOR_SECS`, "Was 90 s"): como el veto de sesión
@@ -173,7 +199,19 @@ pub fn reconcile(state: &State, obs: &Observation, world: World) -> (State, Vec<
 
     // ---- Decisión de backup (local → nube) ---------------------------------
     // Convergido si no hay nada que subir: nada que hacer (invariante base C.1).
-    decisions.push(decide_backup(&mut next, obs, now, false).unwrap_or_else(|| hold("converged")));
+    // Salvo que no estemos convergidos sino **ciegos**: si la marca del último
+    // feed de nube envejeció, `cloud_version` es una entrada mentirosa y el
+    // `cloud_ahead = false` de arriba no demuestra nada. Se dice con su propio
+    // motivo (ADR 0021 D.10) — el fallo del poller deja de disfrazarse de
+    // normalidad. Sólo cambia el motivo del reposo: la subida no se toca, que un
+    // poller muerto detenga los backups sería cambiar un fallo invisible por
+    // pérdida de datos.
+    let idle = if cloud_state_stale(obs, now) {
+        hold(CLOUD_STALE_REASON)
+    } else {
+        hold("converged")
+    };
+    decisions.push(decide_backup(&mut next, obs, now, false).unwrap_or(idle));
     (next, decisions)
 }
 
@@ -270,6 +308,18 @@ fn cloud_ahead(state: &State, obs: &Observation) -> bool {
         Some(latest) => state.known_version.is_none_or(|known| latest > known),
         None => false,
     }
+}
+
+/// ¿La caché de versiones de nube dejó de ser creíble? `true` cuando el último
+/// feed del poller es más viejo que [`CLOUD_STALE_AFTER_SECS`].
+///
+/// Sin marca (`None`) **no** hay obsolescencia que reportar: es el despliegue
+/// sin feed de nube (self-hosted, daemon CLI, o antes del primer poll), donde
+/// `cloud_version` tampoco afirma nada. Un `now` anterior a la marca (salto de
+/// reloj hacia atrás) tampoco es obsolescencia — la resta sale negativa.
+fn cloud_state_stale(obs: &Observation, now: OffsetDateTime) -> bool {
+    obs.cloud_version_as_of
+        .is_some_and(|as_of| (now - as_of).whole_seconds() > CLOUD_STALE_AFTER_SECS)
 }
 
 /// ¿El contenido local difiere del ya sincronizado? Con fingerprint L1 calculado,
@@ -1103,6 +1153,112 @@ mod tests {
         );
     }
 
+    // ==== Corpus D.10 (el poller de nube enmudece) ==========================
+
+    /// D.10 — «convergido» vs «ciego». Con la caché de versiones de nube
+    /// envejecida, el reposo deja de rotularse `converged` y pasa a decir por
+    /// qué no sabe nada: es el fallo invisible (poller muerto) hecho
+    /// observable. Sin marca de feed —self-hosted/CLI, sin poller— no se
+    /// reporta obsolescencia ninguna.
+    #[test]
+    fn d10_stale_cloud_cache_is_not_convergence() {
+        let state = State {
+            known_version: Some(120),
+            synced_fingerprint: Some(0xABCD),
+            ..base_state()
+        };
+        let fed_at = |off: i64| Observation {
+            local_fingerprint: Some(0xABCD),
+            cloud_version: Some(120),
+            cloud_version_as_of: Some(at(off)),
+            ..quiet_obs()
+        };
+
+        // Feed recién llegado: convergido de verdad.
+        let (_n, fresh) = reconcile(&state, &fed_at(0), world(1));
+        assert_eq!(fresh, vec![hold("converged")]);
+
+        // Justo en el umbral: todavía se le concede el beneficio de la duda
+        // (la comparación es estrictamente mayor, así que el tick que cae
+        // exacto sobre el deadline aún no acusa).
+        let (_n, edge) = reconcile(&state, &fed_at(0), world(CLOUD_STALE_AFTER_SECS));
+        assert_eq!(edge, vec![hold("converged")], "el umbral no muerde antes de tiempo");
+
+        // Un segundo más: ciego, con motivo propio.
+        let (_n, stale) = reconcile(&state, &fed_at(0), world(CLOUD_STALE_AFTER_SECS + 1));
+        assert_eq!(
+            stale,
+            vec![hold(CLOUD_STALE_REASON)],
+            "una caché de nube envejecida no es convergencia"
+        );
+        assert!(acts(&stale).is_empty(), "pero sigue sin inventarse acciones");
+
+        // Sin poller (self-hosted / daemon CLI): no hay nada que declarar
+        // obsoleto, por muy lejos que esté `now` del epoch.
+        let no_feed = Observation {
+            local_fingerprint: Some(0xABCD),
+            ..quiet_obs()
+        };
+        let (_n, headless) = reconcile(&state, &no_feed, world(100_000));
+        assert_eq!(
+            headless,
+            vec![hold("converged")],
+            "sin feed de nube no se reporta obsolescencia"
+        );
+    }
+
+    /// D.10 — el umbral se deriva de la cadencia del poll, no de un número
+    /// suelto: si mañana cambia el intervalo, el umbral lo sigue. (El suelo de
+    /// "más de un poll perdido" se chequea en compilación, junto a la
+    /// constante.)
+    #[test]
+    fn d10_stale_threshold_derives_from_the_poll_cadence() {
+        assert_eq!(
+            CLOUD_STALE_AFTER_SECS,
+            CLOUD_POLL_INTERVAL_SECS * CLOUD_STALE_AFTER_POLLS
+        );
+    }
+
+    /// D.10 — la obsolescencia **sólo** cambia el motivo del reposo. Un poller
+    /// muerto no puede frenar la subida: eso cambiaría un fallo invisible por
+    /// pérdida de datos (el progreso local se quedaría sin versionar). Ni frena
+    /// un restore que ya sabemos que toca.
+    #[test]
+    fn d10_stale_cloud_cache_does_not_stop_syncing() {
+        let ancient = Some(at(-10 * CLOUD_STALE_AFTER_SECS));
+
+        // Hay progreso local divergente: se sube igual.
+        let pending = State {
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            known_version: Some(120),
+            ..base_state()
+        };
+        let obs = Observation {
+            local_fingerprint: Some(2),
+            cloud_version: Some(120),
+            cloud_version_as_of: ancient,
+            ..quiet_obs()
+        };
+        let (_n, ds) = reconcile(&pending, &obs, world(0));
+        assert_eq!(
+            acts(&ds),
+            vec![&Action::Backup],
+            "una caché ciega no puede dejar el progreso local sin versionar: {ds:?}"
+        );
+
+        // Y la carpeta vacía sigue disparando el restore con la caché vieja: lo
+        // que sabemos sigue valiendo, sólo que sabemos que puede haber más.
+        let empty = Observation {
+            local_empty: true,
+            cloud_version: Some(121),
+            cloud_version_as_of: ancient,
+            ..quiet_obs()
+        };
+        let (_n, ds_empty) = reconcile(&base_state(), &empty, world(0));
+        assert_eq!(acts(&ds_empty), vec![&Action::Restore]);
+    }
+
     /// track-only: nunca sincroniza nada.
     #[test]
     fn track_only_never_acts() {
@@ -1188,6 +1344,9 @@ mod tests {
             local_fp in prop::option::of(0u64..8),
             process_alive in any::<bool>(),
             cloud_version in prop::option::of(0i64..20),
+            // Cubre el feed fresco, el rancio y el despliegue sin poller, para
+            // que los invariantes valgan también con la caché de nube ciega.
+            cloud_as_of in prop::option::of(-2 * CLOUD_STALE_AFTER_SECS..100),
             fs_event in any::<bool>(),
             retry in 0u32..600,
             has_op in any::<bool>(),
@@ -1214,6 +1373,7 @@ mod tests {
                 local_fingerprint: local_fp,
                 process_alive,
                 cloud_version,
+                cloud_version_as_of: cloud_as_of.map(at),
                 fs_event: if quiescent { false } else { fs_event },
                 op_result,
                 upload_landed: None,

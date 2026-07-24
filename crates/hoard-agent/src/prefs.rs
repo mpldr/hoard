@@ -25,7 +25,15 @@ use std::path::{Path, PathBuf};
 /// could hammer the server (2 s ≈ 43k req/day per client). Server cost is
 /// not a user knob. Was `cloud_poll_interval_secs` in prefs; old files
 /// keep loading because serde ignores unknown keys.
-pub const CLOUD_POLL_INTERVAL_SECS: u32 = 60;
+///
+/// The number itself lives in the kernel
+/// ([`hoard_core::kernel::reconcile::CLOUD_POLL_INTERVAL_SECS`]) and is
+/// re-exported here so call sites keep their old path. The kernel needs it to
+/// derive how long a cloud-version cache may age before it stops counting as
+/// convergence (ADR 0021 D.10), and two literals in two crates is exactly the
+/// drift that would make that threshold lie.
+pub const CLOUD_POLL_INTERVAL_SECS: u32 =
+    hoard_core::kernel::reconcile::CLOUD_POLL_INTERVAL_SECS as u32;
 
 /// Persisted user preferences. New fields default to safe values so older
 /// `prefs.json` files keep loading after an upgrade.

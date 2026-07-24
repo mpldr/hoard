@@ -248,6 +248,20 @@ pub struct Observation {
     /// Última versión cloud conocida para este save. `None` = desconocida
     /// (self-hosted sin poller, o antes del primer poll).
     pub cloud_version: Option<i64>,
+    /// **Desde cuándo** [`Self::cloud_version`] es la verdad: el instante del
+    /// último feed del poller de nube. Sin esta marca el kernel no puede
+    /// distinguir "convergido" de "ciego" —las dos cosas se ven como
+    /// `Hold{"converged"}`— y un poller muerto se disfraza de normalidad
+    /// (ADR 0021 D.10: el poller enmudeció y 47 min sin noticias parecieron
+    /// sanos). Cuando envejece más de
+    /// [`reconcile::CLOUD_STALE_AFTER_SECS`] el reductor lo dice en voz alta.
+    ///
+    /// `None` = **este despliegue no tiene feed de nube** (self-hosted, daemon
+    /// CLI headless, o antes del primer poll): no se afirma nada, así que
+    /// tampoco se reporta obsolescencia. Es una marca de *feed*, no de save:
+    /// el poller trae el manifest entero, así que un save ausente del manifest
+    /// tiene `cloud_version: None` pero la marca del feed igual de fresca.
+    pub cloud_version_as_of: Option<OffsetDateTime>,
 
     // ---- Señales puntuales ---------------------------------------------
     /// Llegó una escritura debounced en la carpeta este tick (hint que adelanta

@@ -1056,11 +1056,35 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.restore_failures = next.restore_failures;
 }
 
+/// La caché de cabezas de nube que alimenta el poller (`SetCloudVersions`),
+/// **con la marca de cuándo llegó**. El par va junto a propósito: una cabeza sin
+/// fecha no se puede distinguir de una cabeza congelada, y ésa fue justo la
+/// avería de ADR 0021 D.10 — el poller murió, `versions` se quedó clavado en la
+/// v120 y el reductor decidía bien sobre una entrada mentirosa, rotulándolo
+/// `converged`.
+#[derive(Debug, Clone, Default)]
+struct CloudHeads {
+    /// Última versión cloud por `save_id`, tal cual la trajo el manifest.
+    versions: HashMap<String, i64>,
+    /// Cuándo aterrizó ese feed. `None` = todavía ninguno (o despliegue sin
+    /// poller: self-hosted / daemon CLI headless), que el kernel trata como
+    /// "no hay feed que envejecer", no como obsolescencia.
+    as_of: Option<OffsetDateTime>,
+}
+
+impl CloudHeads {
+    /// Instala un feed nuevo y sella su marca de tiempo.
+    fn feed(&mut self, versions: HashMap<String, i64>, now: OffsetDateTime) {
+        self.versions = versions;
+        self.as_of = Some(now);
+    }
+}
+
 /// Muestrea el mundo para un slot y construye la [`kernel::Observation`] del
 /// tick (ADR 0021 C.1). L0 (mtime propio + vacío) es barato cada tick; L1 (el
 /// fingerprint) sólo se calcula cuando L0 cambió, el watcher marcó `needs_l1`,
 /// o un sweep/manual lo forzó — nunca re-hasheando todo cada tick.
-fn observe_slot(slot: &mut SaveSlot, latest_versions: &HashMap<String, i64>) -> kernel::Observation {
+fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation {
     let folder_mtime = folder_own_mtime(&slot.save.local_path);
     let local_empty = is_path_empty_or_missing(&slot.save.local_path);
     let l0_changed = folder_mtime != slot.last_l0_mtime;
@@ -1080,7 +1104,12 @@ fn observe_slot(slot: &mut SaveSlot, latest_versions: &HashMap<String, i64>) -> 
         // El estado de proceso lo posee `process_poll` (ya con su sticky de
         // 6 s); aquí es un passthrough para la stickiness del kernel.
         process_alive: slot.is_running,
-        cloud_version: latest_versions.get(&slot.save.save_id).copied(),
+        cloud_version: cloud.versions.get(&slot.save.save_id).copied(),
+        // La marca es del *feed*, no del save: el poller trae el manifest
+        // entero, así que un save ausente de él tiene `cloud_version: None` con
+        // la marca igual de fresca. Es lo que deja al kernel distinguir
+        // "convergido" de "ciego" (ADR 0021 D.10).
+        cloud_version_as_of: cloud.as_of,
         // El watcher fs marca `has_pending`/`last_fs_event_at` en el slot
         // directamente (ver la rama `fs_rx`), así que no hace falta re-marcar
         // por `fs_event` aquí; el reductor los lee del estado.
@@ -1107,7 +1136,7 @@ fn reconcile_all(
     cmd_tx: &mpsc::Sender<AgentCommand>,
     config: &AgentConfig,
     done_tx: &mpsc::Sender<BackupDone>,
-    latest_versions: &HashMap<String, i64>,
+    cloud: &CloudHeads,
 ) {
     let now = OffsetDateTime::now_utc();
     let ids: Vec<String> = slots.keys().cloned().collect();
@@ -1125,7 +1154,7 @@ fn reconcile_all(
             now,
             seed: seed_for(&id),
         };
-        let obs = observe_slot(slot, latest_versions);
+        let obs = observe_slot(slot, cloud);
         let state = state_from_slot(slot, config, now);
         let (next, decisions) = kernel::reconcile::reconcile(&state, &obs, world);
         apply_state_to_slot(slot, next);
@@ -1333,7 +1362,7 @@ async fn run_agent(
     // instead of having each `run_auto_restore` re-fetch the manifest. Empty
     // on self-hosted / headless CLI (no poller), where we fall back to the
     // per-save network fetch.
-    let mut latest_versions: HashMap<String, i64> = HashMap::new();
+    let mut cloud_heads = CloudHeads::default();
 
     // Channel used by every fs watcher — debounced events all funnel here
     // and we route them by path. mpsc::unbounded would be fine since the
@@ -1442,7 +1471,7 @@ async fn run_agent(
                         handle_add(&mut slots, *save, &fs_tx);
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::RearmWatcher(id)) => {
@@ -1497,7 +1526,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::SetAutoRestore(enabled)) => {
@@ -1514,7 +1543,7 @@ async fn run_agent(
                         if !was && enabled {
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                                &latest_versions,
+                                &cloud_heads,
                             );
                         }
                     }
@@ -1528,7 +1557,7 @@ async fn run_agent(
                         if !was && enabled {
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                                &latest_versions,
+                                &cloud_heads,
                             );
                         }
                     }
@@ -1545,7 +1574,7 @@ async fn run_agent(
                         // en el reductor; aquí no queda política.
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::SetCloudVersions(map)) => {
@@ -1560,12 +1589,17 @@ async fn run_agent(
                         // el `reconcile_all` de abajo al ver el `cloud_version`
                         // nuevo, y el evento "recovered" sale del delta de
                         // `restore_failures` como cualquier otro.
-                        latest_versions = map;
+                        //
+                        // La marca de tiempo del feed se sella aquí: es la que
+                        // permite al reductor decir "ciego" en vez de
+                        // "convergido" si el poller vuelve a enmudecer (ADR 0021
+                        // D.10).
+                        cloud_heads.feed(map, OffsetDateTime::now_utc());
                         // La nube pudo adelantarse: reconcilia para pulsar las
                         // actualizaciones que acaban de destrabarse.
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::SetProbeCandidates(dirs)) => {
@@ -1601,7 +1635,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::RetryBackupAfterFailure(id)) => {
@@ -1624,7 +1658,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::SweepAll { window_secs }) => {
@@ -1650,7 +1684,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &latest_versions,
+                            &cloud_heads,
                         );
                     }
                     Some(AgentCommand::QueryStatus(resp)) => {
@@ -1813,7 +1847,7 @@ async fn run_agent(
                 // flush final al cerrarse el juego, y el aterrizaje del pull
                 // diferido — todo level-triggered, sin política en el bucle.
                 reconcile_all(
-                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
                 );
 
                 // DETECCIÓN (fase 3, ADR 0020): sonda de candidatos. `sys` ya
@@ -1861,7 +1895,7 @@ async fn run_agent(
                     });
                 }
                 reconcile_all(
-                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
                 );
             }
 
@@ -1871,7 +1905,7 @@ async fn run_agent(
                 // nudges; los drenamos y reconciliamos una sola vez.
                 while nudge_rx.try_recv().is_ok() {}
                 reconcile_all(
-                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &latest_versions,
+                    &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
                 );
             }
         }

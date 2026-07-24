@@ -14,7 +14,8 @@ use uuid::Uuid;
 use crate::cloud::auth::CloudUser;
 use crate::cloud::errors::CloudError;
 use crate::cloud::state::CloudState;
-use crate::routes::logs::{level_rank, IngestResponse, LogBatch, MAX_BATCH_ENTRIES};
+use crate::routes::logs::{level_rank, MAX_BATCH_ENTRIES};
+use hoard_core::wire::{LogBatch, LogIngestResponse};
 
 /// Minimum level cloud will store. Entries below this are dropped silently.
 const CLOUD_MIN_RANK: u8 = 2; // INFO
@@ -23,7 +24,7 @@ pub async fn ingest(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
     Json(batch): Json<LogBatch>,
-) -> Result<(StatusCode, Json<IngestResponse>), CloudError> {
+) -> Result<(StatusCode, Json<LogIngestResponse>), CloudError> {
     if batch.entries.len() > MAX_BATCH_ENTRIES {
         return Err(CloudError::BadRequest(format!(
             "batch too large: {} entries (max {})",
@@ -34,17 +35,12 @@ pub async fn ingest(
 
     // Resolve the registered device (best-effort) so the log row can link to
     // it. Inline metadata is stored regardless, so a missing match is fine.
-    let device_id: Option<Uuid> = if let Some(fp) = batch
-        .device
-        .fingerprint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    let device_id: Option<Uuid> = if let Some(fp) = batch.device.fingerprint.as_ref() {
         sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM devices WHERE user_id = $1 AND fingerprint = $2",
         )
         .bind(user.user_id)
-        .bind(fp)
+        .bind(fp.as_str())
         .fetch_optional(&state.pool)
         .await?
     } else {
@@ -69,7 +65,7 @@ pub async fn ingest(
         .bind(device_id)
         .bind(&batch.device.name)
         .bind(&batch.device.os)
-        .bind(&batch.device.fingerprint)
+        .bind(batch.device.fingerprint.as_ref().map(|f| f.as_str()))
         .bind(&batch.device.app_version)
         .bind(&level)
         .bind(&entry.target)
@@ -82,5 +78,5 @@ pub async fn ingest(
         accepted += 1;
     }
 
-    Ok((StatusCode::OK, Json(IngestResponse { accepted })))
+    Ok((StatusCode::OK, Json(LogIngestResponse { accepted })))
 }

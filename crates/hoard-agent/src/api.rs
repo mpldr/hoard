@@ -1,10 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
+use hoard_core::ids::GameSlug;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
-use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
 /// How long a snapshot download may go without a single byte arriving before we
@@ -493,7 +493,10 @@ impl ApiClient {
             .http
             .put(self.url("/v1/me/max-versions"))
             .header("authorization", self.auth_header())
-            .json(&serde_json::json!({ "max_versions": max_versions }))
+            .json(&MaxVersionsBody {
+                max_versions,
+                dry_run: false,
+            })
             .send()
             .await?;
         Self::ok_or_err(resp).await?;
@@ -504,21 +507,19 @@ impl ApiClient {
     /// `max_versions` would delete right now. Nothing is written. Frontends
     /// call this first and ask for confirmation when the count is > 0.
     pub async fn preview_max_versions(&self, max_versions: i64) -> Result<i64> {
-        #[derive(Deserialize)]
-        struct Out {
-            #[serde(default)]
-            pruned: i64,
-        }
         let resp = self
             .http
             .put(self.url("/v1/me/max-versions"))
             .header("authorization", self.auth_header())
-            .json(&serde_json::json!({ "max_versions": max_versions, "dry_run": true }))
+            .json(&MaxVersionsBody {
+                max_versions: Some(max_versions),
+                dry_run: true,
+            })
             .send()
             .await?;
         let resp = Self::ok_or_err(resp).await?;
-        let out: Out = resp.json().await?;
-        Ok(out.pruned)
+        let out: MaxVersionsResponse = resp.json().await?;
+        Ok(out.pruned as i64)
     }
 
     /// `DELETE /v1/cloud/saves/:save_id` — remove a cloud save and all of its
@@ -743,13 +744,18 @@ impl ApiClient {
         display_name: Option<&str>,
         steam_app_id: Option<i64>,
     ) -> Result<Save> {
-        let mut body = serde_json::json!({ "game_slug": game_slug, "label": label });
-        if let Some(name) = display_name {
-            body["display_name"] = serde_json::Value::String(name.to_string());
-        }
-        if let Some(id) = steam_app_id {
-            body["steam_app_id"] = serde_json::Value::Number(id.into());
-        }
+        let body = CreateSaveRequest {
+            // La puerta de `GameSlug`: un slug envenenado no llega a crear una
+            // fila server-side (ADR 0021 C.3). Los slugs del cliente salen todos
+            // de `slugify`, así que esto sólo dispara con datos corruptos.
+            game_slug: GameSlug::parse(game_slug)
+                .with_context(|| format!("slug inválido al crear el save: {game_slug:?}"))?,
+            label: Some(label.to_string()),
+            local_path_hint: None,
+            client_os: None,
+            display_name: display_name.map(str::to_string),
+            steam_app_id,
+        };
         let resp = self
             .http
             .post(self.url("/v1/saves"))
@@ -799,7 +805,10 @@ impl ApiClient {
         if self.is_cloud().await {
             return self.cloud_rename_save_label(save_id, new_label).await;
         }
-        let body = serde_json::json!({ "label": new_label });
+        let body = PatchSaveRequest {
+            label: Some(new_label.to_string()),
+            ..PatchSaveRequest::default()
+        };
         let resp = self
             .http
             .patch(self.url(&format!("/v1/saves/{}", save_id)))
@@ -919,104 +928,17 @@ impl ApiClient {
 }
 
 // ---- DTOs ---------------------------------------------------------------
+//
+// El contrato self-hosted vive en `hoard_core::wire` (ADR 0021 C.6): el server
+// compila contra las mismas formas, así que un drift entre las dos puntas es un
+// error de compilación en vez de un 422 en producción. Se re-exportan aquí para
+// que `api::Save` y compañía sigan siendo las rutas públicas de siempre.
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Whoami {
-    pub user_id: String,
-    pub username: String,
-    pub is_admin: bool,
-    /// Bytes the user has stored on the server right now. Server-side
-    /// counter, kept in sync by the snapshot upload/delete pipeline.
-    /// Older servers (pre v0.3) omit this; default to 0 so onboarding
-    /// against a stale instance still works.
-    #[serde(default)]
-    pub storage_used_bytes: i64,
-    /// Total bytes the user is allowed to store. Default 100 GiB on a
-    /// fresh server. Pre-v0.3 servers omit this; default to 0 (the UI
-    /// reads this as "quota unknown" and falls back to MB display).
-    #[serde(default)]
-    pub storage_quota_bytes: i64,
-    /// Per-user cap on stored versions per save. `None` = unlimited (and
-    /// what a pre-cap server reports).
-    #[serde(default)]
-    pub max_versions: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Health {
-    pub status: String,
-    pub version: String,
-    #[serde(default)]
-    pub uptime_secs: u64,
-    /// Minimum log level the server accepts for client-log ingest. Absent on
-    /// pre-log-ingest servers — the client takes `None` to mean "this server
-    /// can't receive logs" and disables shipping.
-    #[serde(default)]
-    pub log_min_level: Option<String>,
-    /// `"cloud"` on the SaaS deployment, absent/`None` self-hosted. Selects
-    /// the ingest endpoint (`/v1/cloud/logs` vs `/v1/logs`).
-    #[serde(default)]
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Game {
-    pub slug: String,
-    pub display_name: String,
-    pub engine: Option<String>,
-    #[serde(default)]
-    pub save_paths_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Save {
-    pub id: String,
-    #[serde(default)]
-    pub user_id: Option<String>,
-    pub game_slug: String,
-    pub label: String,
-    pub latest_version_num: Option<i64>,
-    #[serde(default)]
-    pub snapshot_count: Option<i64>,
-    #[serde(default)]
-    pub total_size_bytes: Option<i64>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Snapshot {
-    pub id: String,
-    #[serde(default)]
-    pub save_id: Option<String>,
-    pub version_num: i64,
-    /// DAG parent (`None` = root). Older servers omit it → defaults to None.
-    #[serde(default)]
-    pub parent_version: Option<i64>,
-    pub file_count: i64,
-    pub total_size_bytes: i64,
-    pub is_pinned: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option", default)]
-    pub deleted_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SnapshotDetail {
-    #[serde(flatten)]
-    pub snapshot: Snapshot,
-    pub files: Vec<SnapshotFile>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SnapshotFile {
-    pub relative_path: String,
-    pub size_bytes: i64,
-    pub sha256: String,
-}
+pub use hoard_core::wire::{
+    CreateSaveRequest, Game, Health, MaxVersionsBody, MaxVersionsResponse, PatchSaveRequest, Save,
+    Snapshot, SnapshotDetail, SnapshotFile,
+};
+pub use hoard_core::wire::{LogBatch, LogEntry, LogIngestResponse, Whoami};
 
 // ---- Cloud (SaaS) protocol DTOs ----------------------------------------
 

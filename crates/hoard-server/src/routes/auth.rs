@@ -3,11 +3,12 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use hoard_core::wire::{MaxVersionsBody, MaxVersionsResponse, Whoami};
 use std::sync::Arc;
 
 use crate::auth::AuthUser;
 use crate::routes::health::ServerState;
+use crate::routes::repair_username;
 
 /// Identity + quota snapshot for the authenticated user.
 ///
@@ -15,21 +16,10 @@ use crate::routes::health::ServerState;
 /// the `users` table (kept in sync by the snapshot upload/delete paths,
 /// see `routes::snapshots`). The desktop app uses these for the quota
 /// progress bar — see Phase 5 of the v0.3 build plan.
-#[derive(Serialize)]
-pub struct WhoamiResponse {
-    pub user_id: String,
-    pub username: String,
-    pub is_admin: bool,
-    pub storage_used_bytes: i64,
-    pub storage_quota_bytes: i64,
-    /// Per-user cap on stored versions per save. `None` = unlimited.
-    pub max_versions: Option<i64>,
-}
-
 pub async fn whoami(
     Extension(user): Extension<AuthUser>,
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<WhoamiResponse>, StatusCode> {
+) -> Result<Json<Whoami>, StatusCode> {
     let user_id = user.user_id.to_string();
     // Runtime query (not the `query!` macro) so the new max_versions column
     // can be selected without regenerating the offline sqlx cache.
@@ -44,33 +34,18 @@ pub async fn whoami(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(WhoamiResponse {
+    Ok(Json(Whoami {
         user_id,
-        username: user.username,
+        // The `users` row is persisted state, so it goes through the lenient
+        // gate: a legacy username the strict `parse` would reject must not
+        // 500 `whoami` — that would lock the account out of the app entirely
+        // (ADR 0021 C.3).
+        username: repair_username(&user.username),
         is_admin: user.is_admin,
         storage_used_bytes: row.0,
         storage_quota_bytes: row.1,
         max_versions: row.2,
     }))
-}
-
-#[derive(Deserialize)]
-pub struct MaxVersionsBody {
-    /// `null` clears the cap (unlimited).
-    pub max_versions: Option<i64>,
-    /// When true, nothing is written or deleted: `pruned` reports how many
-    /// snapshots the given cap WOULD trash. The client shows that number in
-    /// a confirmation dialog before committing the real call.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-#[derive(Serialize)]
-pub struct MaxVersionsResponse {
-    pub max_versions: Option<i64>,
-    /// Snapshots soft-deleted right away because they were over the new cap
-    /// (or, on `dry_run`, how many would be).
-    pub pruned: u64,
 }
 
 /// `PUT /v1/me/max-versions` — set (or clear, with `null`) the per-user cap

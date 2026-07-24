@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::api::{ApiClient, CloudCasFileEntry, CloudCasInit, CloudCasMissingBlob, Snapshot};
 use crate::state::{CliState, SaveState};
+use hoard_core::ids::SaveId;
 
 /// Bounded fan-out for per-file work in the cloud path (hashing local files,
 /// PUTting missing blobs). Saves are mostly many small files, so per-file
@@ -617,9 +618,14 @@ where
     // self-hosted snapshot semantics.
     let snapshot = Snapshot {
         id: String::new(),
-        save_id: Some(commit.save_id),
+        // El id canónico lo devuelve el commit cloud; si viniera con una forma
+        // que la puerta no reconoce, el `Snapshot` sintético se queda sin él en
+        // vez de tumbar un backup que YA subió los bytes.
+        save_id: SaveId::parse(&commit.save_id).ok(),
         version_num: commit.version_num,
         parent_version: base_version,
+        device_name: None,
+        notes: None,
         file_count: file_count as i64,
         total_size_bytes: total_bytes as i64,
         is_pinned: false,
@@ -768,7 +774,7 @@ pub async fn remember_save(
             save_id.to_string(),
             SaveState {
                 local_path: local_path.to_path_buf(),
-                game_slug: save.game_slug,
+                game_slug: save.game_slug.into_inner(),
                 label: save.label,
                 last_backup_at: Some(OffsetDateTime::now_utc()),
                 last_version_num: Some(last_version_num),

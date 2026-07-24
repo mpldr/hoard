@@ -3,10 +3,12 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use hoard_core::wire::Game;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::routes::health::ServerState;
+use crate::routes::repair_slug;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -21,18 +23,10 @@ fn default_limit() -> i64 {
     20
 }
 
-#[derive(Serialize)]
-pub struct GameResponse {
-    slug: String,
-    display_name: String,
-    engine: Option<String>,
-    save_paths_json: Option<String>,
-}
-
 pub async fn list(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<SearchQuery>,
-) -> Result<Json<Vec<GameResponse>>, StatusCode> {
+) -> Result<Json<Vec<Game>>, StatusCode> {
     // We allow up to 1000 per page so the desktop client can sweep the full
     // catalog (~11k entries) in a handful of round-trips during auto-detection.
     // Smaller callers (the search bar) keep the default 20.
@@ -69,8 +63,8 @@ pub async fn list(
 
     Ok(Json(
         rows.into_iter()
-            .map(|r| GameResponse {
-                slug: r.slug,
+            .map(|r| Game {
+                slug: repair_slug(&r.slug),
                 display_name: r.display_name,
                 engine: r.engine,
                 save_paths_json: r.save_paths_json,
@@ -82,7 +76,7 @@ pub async fn list(
 pub async fn get_one(
     State(state): State<Arc<ServerState>>,
     Path(slug): Path<String>,
-) -> Result<Json<GameResponse>, StatusCode> {
+) -> Result<Json<Game>, StatusCode> {
     let row = sqlx::query_as!(
         GameRow,
         "SELECT slug, display_name, engine, save_paths_json FROM games WHERE slug = ?",
@@ -93,8 +87,8 @@ pub async fn get_one(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(GameResponse {
-        slug: row.slug,
+    Ok(Json(Game {
+        slug: repair_slug(&row.slug),
         display_name: row.display_name,
         engine: row.engine,
         save_paths_json: row.save_paths_json,

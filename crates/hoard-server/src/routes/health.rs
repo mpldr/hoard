@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, response::Json};
-use serde::Serialize;
+use hoard_core::wire::Health;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,40 +19,30 @@ pub struct ServerState {
     pub events: crate::routes::events::EventBus,
 }
 
-#[derive(Serialize)]
-pub struct HealthResponse {
-    status: &'static str,
-    version: &'static str,
-    uptime_secs: u64,
-    /// Minimum log level this server accepts for client-log ingest. The
-    /// client reads this on connect and filters at source. Self-hosted
-    /// keeps everything, so this is always `"debug"`.
-    log_min_level: &'static str,
+/// Build the body. `log_min_level` is always `"debug"` self-hosted (it keeps
+/// every level); `mode` stays absent — that's what tells the client to speak the
+/// self-hosted protocol instead of `/v1/cloud/*`.
+fn body(status: &str, uptime_secs: u64) -> Health {
+    Health {
+        status: status.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs,
+        log_min_level: Some("debug".to_string()),
+        mode: None,
+    }
 }
 
-pub async fn handler(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<HealthResponse>) {
+pub async fn handler(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<Health>) {
     // Quick DB ping
     let db_ok = sqlx::query("SELECT 1").execute(&state.pool).await.is_ok();
+    let uptime_secs = state.start_time.elapsed().as_secs();
 
     if !db_ok {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(HealthResponse {
-                status: "db_error",
-                version: env!("CARGO_PKG_VERSION"),
-                uptime_secs: state.start_time.elapsed().as_secs(),
-                log_min_level: "debug",
-            }),
+            Json(body("db_error", uptime_secs)),
         );
     }
 
-    (
-        StatusCode::OK,
-        Json(HealthResponse {
-            status: "ok",
-            version: env!("CARGO_PKG_VERSION"),
-            uptime_secs: state.start_time.elapsed().as_secs(),
-            log_min_level: "debug",
-        }),
-    )
+    (StatusCode::OK, Json(body("ok", uptime_secs)))
 }

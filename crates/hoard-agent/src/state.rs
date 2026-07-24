@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use hoard_core::ids::{canon_token, GameSlug, Repair, SaveId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -130,6 +131,22 @@ pub struct CliState {
     /// the other. `default` keeps older `state.json` files loading.
     #[serde(default)]
     pub playtime_excluded: HashSet<String>,
+    /// Slugs que [`cleanse`] marcó al cargar: bien formados pero **degenerados**
+    /// (tokens de fontanería o el nombre de usuario del sistema). No se
+    /// persiste (`skip`): se recalcula en cada carga a partir de lo que hay en
+    /// disco, así que el fichero de estado no cambia de forma y el Slice 5
+    /// —dueño de la limpieza durable— no hereda un campo que migrar.
+    ///
+    /// **Derivado**: lo recalcula [`cleanse`] en cada carga; escribirlo a mano
+    /// no tiene efecto duradero. Consultable con [`Self::is_slug_quarantined`].
+    #[serde(skip)]
+    pub quarantined_slugs: HashSet<String>,
+    /// Ids de save de `saves` que no son UUID canónicos. Mismo trato: se marcan
+    /// y se dejan donde están (borrarlos dejaría el save sin rastrear y sin
+    /// forma de recuperar su ruta local). **Derivado**, como
+    /// [`Self::quarantined_slugs`].
+    #[serde(skip)]
+    pub quarantined_save_ids: HashSet<String>,
 }
 
 /// On-disk shape of `device.json`: the machine-level prefs that are identical
@@ -230,6 +247,95 @@ fn migrate_legacy_state(device_path: &Path, context_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pasa el estado recién leído por la **puerta indulgente** de
+/// `hoard_core::ids` (ADR 0021, C.3).
+///
+/// El veneno ya está en disco —el save de `GSE Saves` quedó con el slug igual al
+/// nombre de usuario de Windows, y eso convirtió cualquier app del perfil en
+/// señal de "estás jugando"—, así que un `try_from` estricto aquí dejaría el
+/// motor sin arrancar. Tres desenlaces por valor, ninguno es un error:
+///
+/// - **Válido** → intacto.
+/// - **Recuperable** (mayúsculas, espacios, basura) → se re-deriva con el mismo
+///   `slugify` que lo mintó, se avisa, y se usa el reparado. Un slug así hoy ni
+///   siquiera podría subirse (la puerta del wire lo rechaza), así que repararlo
+///   es lo único que devuelve ese save al sync.
+/// - **Degenerado** (token de fontanería, nombre de usuario) → **no se toca**:
+///   ya está bien formado y es la identidad `(user, game_slug, label)` que el
+///   server conoce; renombrarlo crearía un save nuevo en la nube. Se marca en
+///   [`CliState::is_slug_quarantined`] para que la correlación lo ignore.
+///
+/// La limpieza durable (reescribir el estado migrado) es del Slice 5; esto es la
+/// reparación en memoria que hace que el motor arranque mientras tanto.
+fn cleanse(state: &mut CliState) {
+    // `repair` sólo conoce la lista estática de tokens de fontanería; el
+    // nombre de usuario real —el caso que rompió— lo aporta el shell.
+    let degenerate = |slug: &str| crate::agent::is_generic_identity_token(&canon_token(slug));
+
+    let mut quarantined: HashSet<String> = HashSet::new();
+
+    let mut triage = |raw: &str| -> Option<String> {
+        match GameSlug::repair(raw) {
+            Repair::Clean(v) => {
+                if degenerate(v.as_str()) {
+                    tracing::warn!(
+                        slug = raw,
+                        "state: slug degenerado (token genérico); en cuarentena para correlación"
+                    );
+                    quarantined.insert(raw.to_string());
+                }
+                None
+            }
+            Repair::Repaired { value, .. } => {
+                tracing::warn!(raw, repaired = %value, "state: slug inválido reparado al cargar");
+                let repaired = value.into_inner();
+                if degenerate(&repaired) {
+                    quarantined.insert(repaired.clone());
+                }
+                Some(repaired)
+            }
+            Repair::Quarantined { reason, .. } => {
+                tracing::warn!(slug = raw, %reason, "state: slug irrecuperable; en cuarentena");
+                quarantined.insert(raw.to_string());
+                None
+            }
+        }
+    };
+
+    for save in state.saves.values_mut() {
+        if let Some(fixed) = triage(&save.game_slug) {
+            save.game_slug = fixed;
+        }
+    }
+    // Las prefs de dispositivo van keyed por slug; el mismo veneno vale.
+    let manual: Vec<(String, PathBuf)> = state.manual_paths.drain().collect();
+    for (slug, path) in manual {
+        let key = triage(&slug).unwrap_or(slug);
+        state.manual_paths.insert(key, path);
+    }
+    for set in [&mut state.ignored_slugs, &mut state.playtime_excluded] {
+        let old: Vec<String> = set.drain().collect();
+        for slug in old {
+            set.insert(triage(&slug).unwrap_or(slug));
+        }
+    }
+
+    // Un id de save que no es UUID nunca existirá server-side (el churn de
+    // DOOM). Se marca, no se borra: la fila guarda la ruta local del save.
+    let bad_ids: HashSet<String> = state
+        .saves
+        .keys()
+        .filter(|id| SaveId::parse(id).is_err())
+        .cloned()
+        .collect();
+    for id in &bad_ids {
+        tracing::warn!(save_id = %id, "state: save_id que no es UUID; marcado");
+    }
+
+    state.quarantined_slugs = quarantined;
+    state.quarantined_save_ids = bad_ids;
+}
+
 impl CliState {
     /// Global `device.json` path: machine-level prefs shared across contexts.
     pub fn device_path() -> Result<PathBuf> {
@@ -253,15 +359,45 @@ impl CliState {
 
     /// Load by merging the global device prefs with one context's saves. Used
     /// by [`Self::load_default`]; exposed for tests with explicit paths.
+    ///
+    /// Lo cargado pasa por [`cleanse`] antes de devolverse: el estado en disco
+    /// es anterior a la puerta de `hoard_core::ids` y puede llevar veneno (así
+    /// entró la correlación fantasma), pero cargar **nunca** puede fallar por
+    /// eso — se repara o se marca (ADR 0021, C.3).
     pub fn load_split(device_path: &Path, context_path: &Path) -> Result<Self> {
         let prefs: DevicePrefs = load_json(device_path)?;
         let ctx: ContextSaves = load_json(context_path)?;
-        Ok(Self {
+        let mut state = Self {
             saves: ctx.saves,
             manual_paths: prefs.manual_paths,
             ignored_slugs: prefs.ignored_slugs,
             playtime_excluded: prefs.playtime_excluded,
-        })
+            quarantined_slugs: HashSet::new(),
+            quarantined_save_ids: HashSet::new(),
+        };
+        cleanse(&mut state);
+        Ok(state)
+    }
+
+    /// ¿Este slug quedó marcado al cargar? Un slug en cuarentena está bien
+    /// formado pero significa cualquier cosa (`users`, el nombre de usuario del
+    /// perfil…): quien lo use para **correlacionar** —casar procesos vivos con
+    /// un save— debe ignorarlo, o cualquier proceso del perfil pasa por "estás
+    /// jugando". Para todo lo demás (rutas, subidas, identidad server-side)
+    /// sigue siendo el slug de ese save y se usa tal cual.
+    pub fn is_slug_quarantined(&self, slug: &str) -> bool {
+        self.quarantined_slugs.contains(slug)
+    }
+
+    /// Los slugs marcados en la última carga (diagnóstico / UI).
+    pub fn quarantined_slugs(&self) -> &HashSet<String> {
+        &self.quarantined_slugs
+    }
+
+    /// Los ids de save marcados en la última carga: presentes en `saves` pero
+    /// sin forma de UUID canónico, así que el server nunca los reconocerá.
+    pub fn quarantined_save_ids(&self) -> &HashSet<String> {
+        &self.quarantined_save_ids
     }
 
     /// Write device prefs and the context's saves to their two files.
@@ -481,6 +617,127 @@ mod tests {
             Some(&PathBuf::from("/data/ck3"))
         );
         assert!(loaded.is_ignored("dwarf-fortress"));
+    }
+
+    /// **El test de no-brickeo (ADR 0021, C.3).** Un `state.json` con el veneno
+    /// que llegó a producción tiene que **cargar**, no reventar: el motor
+    /// arranca, los saves sanos siguen intactos, el slug recuperable sale
+    /// reparado y el degenerado sale marcado sin que le cambien la identidad.
+    ///
+    /// Si algún día alguien pone `#[serde(try_from)]` sobre el estado
+    /// persistido, este test cae — que es justo el punto.
+    #[test]
+    fn poisoned_state_json_loads_and_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts/cloud-poisoned.json");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+
+        // Estado real de julio 2026: un save sano, uno con el slug sin
+        // slugificar ("GSE Saves"), uno con el slug degenerado (el caso
+        // `slug == username`, aquí un token de fontanería que no depende del
+        // entorno de test) y un id local que no es UUID (el churn de DOOM).
+        std::fs::write(
+            &ctx,
+            r#"{ "saves": {
+                "3f2504e0-4f89-41d3-9a0c-0305e82c3301": {
+                    "local_path": "/saves/stardew", "game_slug": "stardew-valley",
+                    "label": "default", "last_version_num": 7
+                },
+                "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
+                    "local_path": "/saves/gse", "game_slug": "GSE Saves",
+                    "label": "default", "last_version_num": 2
+                },
+                "9d1b2c3e-1111-4222-8333-444455556666": {
+                    "local_path": "/saves/venom", "game_slug": "savedgames",
+                    "label": "default", "last_version_num": 1
+                },
+                "local-doom-4": {
+                    "local_path": "/saves/doom", "game_slug": "base",
+                    "label": "default", "last_version_num": null
+                }
+            } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &device,
+            r#"{ "manual_paths": { "Stardew Valley!": "/data/sdv" },
+                 "ignored_slugs": ["Dwarf Fortress"] }"#,
+        )
+        .unwrap();
+
+        // 1. Carga. Esto es lo que no puede fallar nunca.
+        let state = CliState::load_split(&device, &ctx).expect("el estado envenenado debe cargar");
+        assert_eq!(state.saves.len(), 4, "no se pierde ninguna fila");
+
+        // 2. El save sano sigue igual.
+        assert_eq!(
+            state.saves["3f2504e0-4f89-41d3-9a0c-0305e82c3301"].game_slug,
+            "stardew-valley"
+        );
+
+        // 3. El slug recuperable se re-deriva con el mismo `slugify` que lo
+        //    mintó — sin él ese save ni siquiera podría subirse hoy.
+        assert_eq!(
+            state.saves["7c9e6679-7425-40de-944b-e07fc1f90ae7"].game_slug,
+            "gse-saves"
+        );
+
+        // 4. El degenerado NO se renombra (es la identidad que el server ya
+        //    conoce), pero queda marcado para que la correlación lo ignore.
+        assert_eq!(
+            state.saves["9d1b2c3e-1111-4222-8333-444455556666"].game_slug,
+            "savedgames"
+        );
+        assert!(state.is_slug_quarantined("savedgames"));
+        assert!(!state.is_slug_quarantined("stardew-valley"));
+        assert!(!state.is_slug_quarantined("gse-saves"));
+
+        // 5. El id que no es UUID se marca, pero la fila se queda (guarda la
+        //    ruta local del save).
+        assert!(state.quarantined_save_ids().contains("local-doom-4"));
+        assert_eq!(state.quarantined_save_ids().len(), 1);
+
+        // 6. Las prefs de dispositivo van keyed por slug: mismo tratamiento.
+        assert!(state.manual_paths.contains_key("stardew-valley"));
+        assert!(state.is_ignored("dwarf-fortress"));
+
+        // 7. Y el estado reparado persiste y vuelve a cargar sin más avisos.
+        state.save_split(&device, &ctx).unwrap();
+        let again = CliState::load_split(&device, &ctx).unwrap();
+        assert_eq!(
+            again.saves["7c9e6679-7425-40de-944b-e07fc1f90ae7"].game_slug,
+            "gse-saves"
+        );
+        assert!(again.is_slug_quarantined("savedgames"));
+    }
+
+    /// Un estado sano no se toca: `cleanse` es un no-op sobre lo que ya es
+    /// canónico (si no, cada carga movería datos buenos).
+    #[test]
+    fn clean_state_is_untouched_by_the_cleanse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts/cloud-clean.json");
+
+        let mut state = CliState::default();
+        state.saves.insert(
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301".into(),
+            save_state("factorio"),
+        );
+        state.set_manual_path("stellaris", PathBuf::from("/data/stellaris"));
+        state.add_ignored_slug("dwarf-fortress".into());
+        state.save_split(&device, &ctx).unwrap();
+
+        let loaded = CliState::load_split(&device, &ctx).unwrap();
+        assert_eq!(
+            loaded.saves["3f2504e0-4f89-41d3-9a0c-0305e82c3301"].game_slug,
+            "factorio"
+        );
+        assert!(loaded.manual_paths.contains_key("stellaris"));
+        assert!(loaded.is_ignored("dwarf-fortress"));
+        assert!(loaded.quarantined_slugs().is_empty());
+        assert!(loaded.quarantined_save_ids().is_empty());
     }
 
     /// `clear_manual_path` removes the entry; subsequent saves no longer

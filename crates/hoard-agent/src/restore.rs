@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::StreamReader;
 
 use crate::api::{ApiClient, SnapshotDetail, SnapshotFile};
+use hoard_core::ids::Sha256 as Sha256Hex;
 
 /// Tunables for the restore flow.
 #[derive(Debug, Clone, Default)]
@@ -231,12 +232,11 @@ where
         if !options.skip_verify {
             if let Some(meta) = expected_file {
                 let got = hex::encode(hasher.finalize());
-                if got != meta.sha256 {
-                    bail!(
-                        "sha256 mismatch for {key}: expected {}, got {}",
-                        meta.sha256,
-                        got
-                    );
+                // `None` (digest desconocido) se compara contra "" igual que
+                // antes del newtype: falla cerrado, nunca salta la verificación.
+                let expected = meta.sha256.as_ref().map(Sha256Hex::as_str).unwrap_or("");
+                if got != expected {
+                    bail!("sha256 mismatch for {key}: expected {expected}, got {got}");
                 }
                 if (written as i64) != meta.size_bytes {
                     bail!(
@@ -635,7 +635,9 @@ pub async fn list_cloud_version_files(
             .map(|f| SnapshotFile {
                 relative_path: f.relative_path,
                 size_bytes: f.size_bytes,
-                sha256: f.sha256,
+                // Un sha con forma inválida entra como "desconocido", que la
+                // verificación trata como fallo — nunca como "sáltatela".
+                sha256: Sha256Hex::parse(&f.sha256).ok(),
             })
             .collect();
         files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -671,7 +673,9 @@ pub async fn list_cloud_version_files(
         files.push(SnapshotFile {
             relative_path: rel,
             size_bytes: size,
-            sha256: String::new(),
+            // Versión legacy de archivo entero: el tar no lleva digest por
+            // fichero. `None` es exactamente el `""` que emitía la release.
+            sha256: None,
         });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));

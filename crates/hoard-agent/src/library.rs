@@ -516,17 +516,17 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             let existing = client.list_saves(Some(&args.game_slug)).await?;
             existing
                 .into_iter()
-                .find(|s| s.game_slug == args.game_slug && s.label == label)
+                .find(|s| s.game_slug.as_str() == args.game_slug && s.label == label)
                 .context("Couldn't re-link the existing save on the server.")?
         }
     };
 
     let (mut cli_state, path) = CliState::load_default()?;
     cli_state.saves.insert(
-        save.id.clone(),
+        save.id.to_string(),
         SaveState {
             local_path: local_path.clone(),
-            game_slug: save.game_slug.clone(),
+            game_slug: save.game_slug.to_string(),
             label: save.label.clone(),
             last_backup_at: None,
             last_version_num: None,
@@ -539,8 +539,8 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     cli_state.save(&path)?;
 
     let watched = watched_save_from(
-        save.id.clone(),
-        save.game_slug.clone(),
+        save.id.to_string(),
+        save.game_slug.to_string(),
         args.game_slug.clone(),
         save.label.clone(),
         local_path.clone(),
@@ -550,8 +550,8 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
 
     Ok(TrackOutcome {
         tracked: TrackedSave {
-            save_id: save.id,
-            game_slug: save.game_slug,
+            save_id: save.id.into_inner(),
+            game_slug: save.game_slug.into_inner(),
             label: save.label,
             local_path: local_path.to_string_lossy().into_owned(),
             last_version_num: save.latest_version_num,
@@ -738,10 +738,10 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
     let (cli_state, _) = CliState::load_default()?;
     let mut out = Vec::with_capacity(saves.len());
     for s in saves {
-        match cli_state.saves.get(&s.id) {
+        match cli_state.saves.get(s.id.as_str()) {
             Some(st) => out.push(TrackedSave {
-                save_id: s.id,
-                game_slug: s.game_slug,
+                save_id: s.id.into_inner(),
+                game_slug: s.game_slug.into_inner(),
                 label: s.label,
                 local_path: st.local_path.to_string_lossy().into_owned(),
                 last_version_num: s.latest_version_num,
@@ -753,8 +753,8 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 preset: st.preset.clone(),
             }),
             None => out.push(TrackedSave {
-                save_id: s.id,
-                game_slug: s.game_slug,
+                save_id: s.id.into_inner(),
+                game_slug: s.game_slug.into_inner(),
                 label: s.label,
                 local_path: String::new(),
                 last_version_num: s.latest_version_num,
@@ -803,9 +803,9 @@ pub async fn rename_label(
 
     let watched = (!local_path_string.is_empty()).then(|| {
         watched_save_from(
-            updated.id.clone(),
-            updated.game_slug.clone(),
-            updated.game_slug.clone(),
+            updated.id.to_string(),
+            updated.game_slug.to_string(),
+            updated.game_slug.to_string(),
             updated.label.clone(),
             PathBuf::from(&local_path_string),
             preset.as_deref(),
@@ -815,8 +815,8 @@ pub async fn rename_label(
 
     Ok((
         TrackedSave {
-            save_id: updated.id,
-            game_slug: updated.game_slug,
+            save_id: updated.id.into_inner(),
+            game_slug: updated.game_slug.into_inner(),
             label: updated.label,
             local_path: local_path_string,
             last_version_num: updated.latest_version_num,

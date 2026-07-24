@@ -95,7 +95,7 @@ impl From<Whoami> for UserSection {
     fn from(w: Whoami) -> Self {
         Self {
             user_id: w.user_id,
-            username: w.username,
+            username: w.username.into_inner(),
             is_admin: w.is_admin,
         }
     }

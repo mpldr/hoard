@@ -5,7 +5,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use hoard_core::ids::Sha256 as Sha256Hex;
+use hoard_core::wire::{Snapshot, SnapshotDetail, SnapshotFile};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::path::{Component, PathBuf};
@@ -16,38 +18,12 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::routes::health::ServerState;
+use crate::routes::repair_ts;
 
 // ─── Response types ─────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct SnapshotSummary {
-    pub id: String,
-    pub version_num: i64,
-    /// The version this snapshot descends from. `None` = root (first version
-    /// of the save). The DAG edge that makes divergence detectable.
-    pub parent_version: Option<i64>,
-    pub device_name: Option<String>,
-    pub notes: Option<String>,
-    pub total_size_bytes: i64,
-    pub file_count: i64,
-    pub is_pinned: bool,
-    pub deleted_at: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Serialize)]
-pub struct SnapshotDetail {
-    #[serde(flatten)]
-    pub summary: SnapshotSummary,
-    pub files: Vec<FileEntry>,
-}
-
-#[derive(Serialize)]
-pub struct FileEntry {
-    pub relative_path: String,
-    pub size_bytes: i64,
-    pub sha256: String,
-}
+//
+// Las formas viven en `hoard_core::wire` (ADR 0021 C.6), compartidas con el
+// cliente: `Snapshot`, `SnapshotDetail` y `SnapshotFile`.
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -142,7 +118,7 @@ pub async fn create(
     Extension(user): Extension<AuthUser>,
     Path(save_id): Path<String>,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<SnapshotSummary>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<Snapshot>), (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
     let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
@@ -765,14 +741,11 @@ pub async fn create(
         },
     );
 
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
     Ok((
         StatusCode::CREATED,
-        Json(SnapshotSummary {
+        Json(Snapshot {
             id: snapshot_id,
+            save_id: None,
             version_num: new_version,
             parent_version,
             device_name,
@@ -781,7 +754,7 @@ pub async fn create(
             file_count,
             is_pinned: false,
             deleted_at: None,
-            created_at: now,
+            created_at: time::OffsetDateTime::now_utc(),
         }),
     ))
 }
@@ -793,7 +766,7 @@ pub async fn list(
     Extension(user): Extension<AuthUser>,
     Path(save_id): Path<String>,
     Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<SnapshotSummary>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<Vec<Snapshot>>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
     if ownership_check(&state.pool, &save_id, &user_id)
@@ -820,7 +793,7 @@ pub async fn list(
          FROM snapshots WHERE save_id=? AND deleted_at IS NULL
          ORDER BY version_num DESC LIMIT ? OFFSET ?"
     };
-    let rows: Vec<SnapshotSummary> = sqlx::query(sql)
+    let rows: Vec<Snapshot> = sqlx::query(sql)
         .bind(&save_id)
         .bind(limit)
         .bind(offset)
@@ -828,8 +801,9 @@ pub async fn list(
         .await
         .map_err(|_| internal())?
         .iter()
-        .map(|r| SnapshotSummary {
+        .map(|r| Snapshot {
             id: r.get("id"),
+            save_id: None,
             version_num: r.get("version_num"),
             parent_version: r.get("parent_version"),
             device_name: r.get("device_name"),
@@ -837,8 +811,11 @@ pub async fn list(
             total_size_bytes: r.get("total_size_bytes"),
             file_count: r.get("file_count"),
             is_pinned: r.get::<i64, _>("is_pinned") != 0,
-            deleted_at: r.get("deleted_at"),
-            created_at: r.get("created_at"),
+            deleted_at: r
+                .get::<Option<String>, _>("deleted_at")
+                .as_deref()
+                .map(repair_ts),
+            created_at: repair_ts(&r.get::<String, _>("created_at")),
         })
         .collect();
 
@@ -883,16 +860,29 @@ pub async fn detail(
     .await
     .map_err(|_| internal())?
     .into_iter()
-    .map(|r| FileEntry {
-        relative_path: r.relative_path,
-        size_bytes: r.size_bytes,
-        sha256: r.sha256,
+    .into_iter()
+    .map(|r| {
+        // El sha lo calcula el propio server al subir, así que uno inválido
+        // significa DB tocada a mano. Aquí NO se repara ni se omite: la lista de
+        // ficheros es lo que el cliente usa para restaurar y verificar, y
+        // servirla incompleta escribiría un save a medias. Se falla ruidosamente.
+        let sha = Sha256Hex::parse(&r.sha256).map_err(|e| {
+            tracing::error!(error = %e, path = %r.relative_path,
+                "snapshot_files: sha256 corrupto en la DB");
+            internal()
+        })?;
+        Ok(SnapshotFile {
+            relative_path: r.relative_path,
+            size_bytes: r.size_bytes,
+            sha256: Some(sha),
+        })
     })
-    .collect();
+    .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(SnapshotDetail {
-        summary: SnapshotSummary {
+        snapshot: Snapshot {
             id: snap.get("id"),
+            save_id: None,
             version_num: snap.get("version_num"),
             parent_version: snap.get("parent_version"),
             device_name: snap.get("device_name"),
@@ -900,8 +890,11 @@ pub async fn detail(
             total_size_bytes: snap.get("total_size_bytes"),
             file_count: snap.get("file_count"),
             is_pinned: snap.get::<i64, _>("is_pinned") != 0,
-            deleted_at: snap.get("deleted_at"),
-            created_at: snap.get("created_at"),
+            deleted_at: snap
+                .get::<Option<String>, _>("deleted_at")
+                .as_deref()
+                .map(repair_ts),
+            created_at: repair_ts(&snap.get::<String, _>("created_at")),
         },
         files,
     }))

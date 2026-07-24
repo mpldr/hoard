@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Game save-path manifest: curated game definitions + placeholder resolution"
 
 [dependencies]
+hoard-core = { path = "../hoard-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

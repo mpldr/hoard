@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use hoard_core::wire::{LogBatch, LogIngestResponse};
 use std::sync::Arc;
 
 use crate::auth::AuthUser;
@@ -22,44 +22,9 @@ pub const MAX_BATCH_ENTRIES: usize = 500;
 /// Per-request body cap for the logs endpoint (~256 KiB).
 pub const MAX_BATCH_BYTES: usize = 256 * 1024;
 
-/// Device metadata, sent once per batch (identical for every entry).
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeviceMeta {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub os: Option<String>,
-    #[serde(default)]
-    pub fingerprint: Option<String>,
-    #[serde(default)]
-    pub app_version: Option<String>,
-}
-
-/// A single log line.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LogEntry {
-    pub level: String,
-    #[serde(default)]
-    pub target: Option<String>,
-    pub message: String,
-    /// Structured fields as a JSON object. Optional.
-    #[serde(default)]
-    pub fields: Option<serde_json::Value>,
-    /// Client-side timestamp (RFC3339). Optional.
-    #[serde(default)]
-    pub ts: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LogBatch {
-    pub device: DeviceMeta,
-    pub entries: Vec<LogEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IngestResponse {
-    pub accepted: usize,
-}
+// El cuerpo (`LogBatch` / `LogEntry` / `DeviceMeta`) y la respuesta viven en
+// `hoard_core::wire` (ADR 0021 C.6). Este par era drift real: el cliente
+// declaraba `target` y `ts` obligatorios y el server los tenía `Option`.
 
 /// Rank a level string for filtering. Unknown levels rank as INFO so they're
 /// never silently dropped by the cloud filter.
@@ -77,7 +42,7 @@ pub async fn ingest(
     Extension(user): Extension<AuthUser>,
     State(state): State<Arc<ServerState>>,
     Json(batch): Json<LogBatch>,
-) -> Result<(StatusCode, Json<IngestResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<LogIngestResponse>), StatusCode> {
     if batch.entries.len() > MAX_BATCH_ENTRIES {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -100,7 +65,7 @@ pub async fn ingest(
         .bind(&user_id)
         .bind(&batch.device.name)
         .bind(&batch.device.os)
-        .bind(&batch.device.fingerprint)
+        .bind(batch.device.fingerprint.as_ref().map(|f| f.as_str()))
         .bind(&batch.device.app_version)
         .bind(&level)
         .bind(&entry.target)
@@ -119,7 +84,7 @@ pub async fn ingest(
         }
     }
 
-    Ok((StatusCode::OK, Json(IngestResponse { accepted })))
+    Ok((StatusCode::OK, Json(LogIngestResponse { accepted })))
 }
 
 #[cfg(test)]

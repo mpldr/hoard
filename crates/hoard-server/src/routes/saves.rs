@@ -3,53 +3,20 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use hoard_core::wire::{CreateSaveRequest, PatchSaveRequest, Save};
+use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::routes::health::ServerState;
+use crate::routes::{parse_save_id, repair_slug, repair_ts};
 
 // ─── Request/Response types ─────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct CreateSaveRequest {
-    pub game_slug: String,
-    pub label: Option<String>,
-    pub local_path_hint: Option<String>,
-    pub client_os: Option<String>,
-    /// Optional metadata supplied by newer clients. When the server's `games`
-    /// table doesn't know the slug yet (e.g. an older server seeded before
-    /// the game existed in the Ludusavi manifest), we use these fields to
-    /// upsert a stub games row instead of returning 422. Older clients omit
-    /// the fields and still get the 422 — but new clients self-heal the
-    /// catalog as they go.
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub steam_app_id: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub struct PatchSaveRequest {
-    pub label: Option<String>,
-    pub local_path_hint: Option<String>,
-    pub client_os: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct SaveResponse {
-    pub id: String,
-    pub game_slug: String,
-    pub label: String,
-    pub local_path_hint: Option<String>,
-    pub client_os: Option<String>,
-    pub latest_version_num: i64,
-    pub snapshot_count: i64,
-    pub total_size_bytes: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
+//
+// Las formas viven en `hoard_core::wire` (ADR 0021 C.6): el cliente compila
+// contra las mismas, así que un drift entre las dos puntas es un error de
+// compilación en vez de un 422 en producción.
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -62,15 +29,17 @@ pub async fn create(
     State(state): State<Arc<ServerState>>,
     Extension(user): Extension<AuthUser>,
     Json(body): Json<CreateSaveRequest>,
-) -> Result<(StatusCode, Json<SaveResponse>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<Save>), (StatusCode, Json<serde_json::Value>)> {
+    // `game_slug` ya pasó la puerta de `GameSlug` al deserializar el cuerpo, así
+    // que aquí sólo hace falta el `&str` para SQL y para las rutas de disco.
+    let slug_str = body.game_slug.as_str();
+
     // Validate game exists
-    let game_count: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) as cnt FROM games WHERE slug = ?",
-        body.game_slug
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| internal_err())?;
+    let game_count: i64 =
+        sqlx::query_scalar!("SELECT COUNT(*) as cnt FROM games WHERE slug = ?", slug_str)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| internal_err())?;
 
     if game_count == 0 {
         // Self-heal path: if the client supplied a display_name (newer
@@ -80,7 +49,7 @@ pub async fn create(
         // the user manually re-import the manifest on every server upgrade.
         if let Some(display) = body.display_name.as_deref().filter(|s| !s.is_empty()) {
             let display = display.to_string();
-            let slug_for_insert = body.game_slug.clone();
+            let slug_for_insert = slug_str.to_string();
             let res = sqlx::query!(
                 "INSERT INTO games (slug, display_name, steam_app_id, imported_from)
                  VALUES (?, ?, ?, 'client-supplied')
@@ -118,7 +87,7 @@ pub async fn create(
          VALUES (?,?,?,?,?,?)",
         id,
         user_id,
-        body.game_slug,
+        slug_str,
         label,
         body.local_path_hint,
         body.client_os
@@ -145,7 +114,7 @@ pub async fn create(
         .data_dir
         .join("data")
         .join(&user_id)
-        .join(&body.game_slug)
+        .join(slug_str)
         .join(&label);
     tokio::fs::create_dir_all(&save_dir).await.ok();
 
@@ -161,7 +130,7 @@ pub async fn list(
     State(state): State<Arc<ServerState>>,
     Extension(user): Extension<AuthUser>,
     Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<SaveResponse>>, StatusCode> {
+) -> Result<Json<Vec<Save>>, StatusCode> {
     let user_id = user.user_id.to_string();
 
     let rows = if let Some(slug) = q.game_slug {
@@ -181,17 +150,20 @@ pub async fn list(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
-        .map(|r| SaveResponse {
-            id: r.id,
-            game_slug: r.game_slug,
-            label: r.label,
-            local_path_hint: r.local_path_hint,
-            client_os: r.client_os,
-            latest_version_num: r.latest_version_num,
-            snapshot_count: r.snapshot_count.unwrap_or(0),
-            total_size_bytes: r.total_size_bytes.unwrap_or(0),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+        .filter_map(|r| {
+            Some(Save {
+                id: parse_save_id(&r.id)?,
+                user_id: None,
+                game_slug: repair_slug(&r.game_slug),
+                label: r.label,
+                local_path_hint: r.local_path_hint,
+                client_os: r.client_os,
+                latest_version_num: Some(r.latest_version_num),
+                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
+                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
+                created_at: repair_ts(&r.created_at),
+                updated_at: repair_ts(&r.updated_at),
+            })
         })
         .collect()
     } else {
@@ -210,17 +182,20 @@ pub async fn list(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
-        .map(|r| SaveResponse {
-            id: r.id,
-            game_slug: r.game_slug,
-            label: r.label,
-            local_path_hint: r.local_path_hint,
-            client_os: r.client_os,
-            latest_version_num: r.latest_version_num,
-            snapshot_count: r.snapshot_count.unwrap_or(0),
-            total_size_bytes: r.total_size_bytes.unwrap_or(0),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+        .filter_map(|r| {
+            Some(Save {
+                id: parse_save_id(&r.id)?,
+                user_id: None,
+                game_slug: repair_slug(&r.game_slug),
+                label: r.label,
+                local_path_hint: r.local_path_hint,
+                client_os: r.client_os,
+                latest_version_num: Some(r.latest_version_num),
+                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
+                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
+                created_at: repair_ts(&r.created_at),
+                updated_at: repair_ts(&r.updated_at),
+            })
         })
         .collect()
     };
@@ -232,7 +207,7 @@ pub async fn get_one(
     State(state): State<Arc<ServerState>>,
     Extension(user): Extension<AuthUser>,
     Path(save_id): Path<String>,
-) -> Result<Json<SaveResponse>, StatusCode> {
+) -> Result<Json<Save>, StatusCode> {
     let user_id = user.user_id.to_string();
     fetch_save(&state.pool, &save_id, &user_id)
         .await
@@ -246,7 +221,7 @@ pub async fn patch(
     Extension(user): Extension<AuthUser>,
     Path(save_id): Path<String>,
     Json(body): Json<PatchSaveRequest>,
-) -> Result<Json<SaveResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<Save>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
     // Verify ownership and fetch the current label so we can rename the
@@ -416,7 +391,7 @@ async fn fetch_save(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,
-) -> Result<Option<SaveResponse>, sqlx::Error> {
+) -> Result<Option<Save>, sqlx::Error> {
     sqlx::query!(
         r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
                   s.latest_version_num, s.created_at, s.updated_at,
@@ -432,17 +407,20 @@ async fn fetch_save(
     .fetch_optional(pool)
     .await
     .map(|opt| {
-        opt.map(|r| SaveResponse {
-            id: r.id,
-            game_slug: r.game_slug,
-            label: r.label,
-            local_path_hint: r.local_path_hint,
-            client_os: r.client_os,
-            latest_version_num: r.latest_version_num,
-            snapshot_count: r.snapshot_count.unwrap_or(0),
-            total_size_bytes: r.total_size_bytes.unwrap_or(0),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+        opt.and_then(|r| {
+            Some(Save {
+                id: parse_save_id(&r.id)?,
+                user_id: None,
+                game_slug: repair_slug(&r.game_slug),
+                label: r.label,
+                local_path_hint: r.local_path_hint,
+                client_os: r.client_os,
+                latest_version_num: Some(r.latest_version_num),
+                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
+                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
+                created_at: repair_ts(&r.created_at),
+                updated_at: repair_ts(&r.updated_at),
+            })
         })
     })
 }

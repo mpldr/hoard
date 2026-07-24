@@ -121,7 +121,9 @@ pub async fn save_snapshot_detail(
                 .map(|f| SnapshotFileWire {
                     relative_path: f.relative_path,
                     size_bytes: f.size_bytes,
-                    sha256: f.sha256,
+                    // `None` = versión legacy sin digest por fichero; el wire de
+                    // la UI lo representaba con la cadena vacía y sigue igual.
+                    sha256: f.sha256.map(|s| s.into_inner()).unwrap_or_default(),
                 })
                 .collect(),
             Err(e) => {
@@ -146,7 +148,7 @@ pub async fn save_snapshot_detail(
             .map(|f| SnapshotFileWire {
                 relative_path: f.relative_path,
                 size_bytes: f.size_bytes,
-                sha256: f.sha256,
+                sha256: f.sha256.map(|s| s.into_inner()).unwrap_or_default(),
             })
             .collect(),
     })
@@ -337,7 +339,7 @@ pub async fn restore_snapshot(
                 }
             } else if let Ok(server_save) = client.get_save(&save_id).await {
                 if entry.game_slug.is_empty() {
-                    entry.game_slug = server_save.game_slug;
+                    entry.game_slug = server_save.game_slug.into_inner();
                 }
                 if entry.label.is_empty() {
                     entry.label = server_save.label;

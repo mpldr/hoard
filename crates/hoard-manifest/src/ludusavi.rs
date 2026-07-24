@@ -582,36 +582,12 @@ fn normalise_os(s: &str) -> Option<&'static str> {
 /// fall back to a slug-based catalog lookup when the catalog entry lacks
 /// `steam_app_id`. **Never duplicate this algorithm** — divergence here
 /// silently breaks the cross-reference.
-pub fn slugify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_dash = true;
-    for ch in name.chars() {
-        let c = ch.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        out.push_str("game");
-    }
-    if out.len() > 96 {
-        out.truncate(96);
-        while out.ends_with('-') {
-            out.pop();
-        }
-    }
-    if !out.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        out.insert(0, 'g');
-    }
-    out
-}
+///
+/// The implementation moved to `hoard_core::ids::slugify` with the newtype
+/// gate (ADR 0021 C.3): `GameSlug::repair` re-derives a poisoned slug with
+/// exactly this function, so the two must be the same code, not two copies
+/// that agree today. This stays as the crate's public name.
+pub use hoard_core::ids::slugify;
 
 #[cfg(test)]
 mod tests {

@@ -385,6 +385,14 @@ es el contrato que cada agente lee antes de tocar nada.
 - **Invariantes como tests, no como comentarios.**
 - **No commitear** salvo petición explícita (cadencia del usuario). Al terminar:
   resumen de qué cambió y cuál es el siguiente slice.
+- **Producción no se toca sin permiso explícito.** Estas sesiones llevan MCP con
+  acceso a la Supabase de producción, incluidas `execute_sql` y
+  `apply_migration`. Regla: **nunca** escrituras ni migraciones contra
+  producción; lecturas sólo si el slice las pide, y siempre reportadas. (Añadido
+  tras el Slice 3, donde una consulta de *sólo lectura* a producción resultó
+  valiosa —calibró la puerta de los newtypes contra 576 saves reales— pero no
+  estaba autorizada. El resultado fue bueno; la regla existe para el agente que
+  no tenga ese criterio.)
 
 ### D.3 Slices (orden de entrega, riesgo creciente)
 
@@ -616,3 +624,47 @@ en el nudge del debounce fs. `CLOUD_POLL_INTERVAL_SECS = 60` es otra cosa: el
 airbag del push Realtime, que al llegar dispara `SetCloudVersions` + reconcile
 inmediato. Por eso la pérdida del pre-launch barrier (D.8) es de **segundos** y se
 decidió no compensarla.
+
+### D.10 — Slice 3 cerrado (newtypes + wire). Decisiones a no deshacer
+
+**Dos puertas, no una.** `hoard_core::ids` expone `parse` (estricta, la que usa
+`serde` vía `#[serde(try_from = "String")]`) y `repair` (indulgente, sólo para
+bytes **ya persistidos**). No fusionarlas: la primera protege el dato nuevo, la
+segunda existe porque el veneno ya está en disco y un `try_from` estricto sobre
+`state.json` o sobre la SQLite del server dejaría el motor sin arrancar. Los tres
+desenlaces de `repair` (`Clean` / `Repaired` / `Quarantined`) nunca son un error.
+
+**Un slug degenerado no se renombra.** `users`, `base` o el nombre de usuario del
+perfil son slugs bien formados; lo que está mal es que signifiquen cualquier
+cosa. Renombrarlos cambiaría la identidad `(user_id, game_slug, label)` que el
+server ya conoce y crearía un save nuevo en la nube. Se **marcan**
+(`CliState::is_slug_quarantined`) para que la correlación los ignore, y punto. Lo
+que sí se re-deriva es el slug sintácticamente inválido (`GSE Saves`), que desde
+este slice ni siquiera podría subirse.
+
+**La lista de tokens genéricos está partida a propósito.**
+`ids::GENERIC_IDENTITY_TOKENS` es estática y pura (el kernel no lee el entorno);
+`agent::is_generic_identity_token` la extiende con los componentes del home real
+—el username, que fue el caso que rompió—. No mover la parte dinámica al kernel.
+
+**`GameSlug` normaliza (trim + minúsculas), no sólo valida.** Es idempotente, no
+puede brickear, y mata la clase "el mismo juego con dos cajas". `SaveId` en
+cambio **no** normaliza más que la caja hex: un id es una clave contra el server,
+y "arreglarlo" apuntaría a otro sitio. Comprobado contra la DB de producción
+(576 saves, 0 slugs no canónicos) antes de endurecer la puerta.
+
+**`""` no es un sha malo, es "no aplica".** Las versiones legacy de archivo
+entero no tienen digest por fichero. Eso se modela con `Option<Sha256>` y un
+serializador que traduce `""` ↔ `None` (`wire::sha_opt`), **no** relajando la
+puerta de `Sha256`. La verificación trata `None` como fallo, igual que antes.
+
+**Alcance del wire:** el contrato self-hosted (`agent::api` ↔ `server::routes`)
+más `/v1/logs`, que era drift real (`target`/`ts` obligatorios en el cliente,
+`Option` en el server). Los DTO `Cloud*` (`agent::api` ↔ `server::cloud::routes`)
+siguen duplicados: son el siguiente incremento, no se hicieron aquí para que el
+diff fuera revisable.
+
+**El golden es el contrato entre despliegues.** `hoard-core/tests/golden/*.json`
+es el JSON byte a byte de la v1.0.4. Compilar juntos sólo garantiza coherencia
+dentro de un build; cliente y server se despliegan por separado. Al añadir un
+campo: `#[serde(default)]` y **no se toca el fixture**.

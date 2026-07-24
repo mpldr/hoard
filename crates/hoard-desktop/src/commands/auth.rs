@@ -96,7 +96,7 @@ pub async fn login(
 
     let user = UserInfo {
         user_id: who.user_id.clone(),
-        username: who.username.clone(),
+        username: who.username.to_string(),
         is_admin: who.is_admin,
         server_url: url.clone(),
         storage_used_bytes: who.storage_used_bytes,

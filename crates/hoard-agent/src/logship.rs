@@ -18,12 +18,12 @@
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
-use serde::Serialize;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 
 use crate::api::Health;
 use crate::credentials;
+use hoard_core::ids::MachineId;
 
 /// Channel capacity. Bursty startup logging can momentarily exceed the drain
 /// rate; past this we drop, which is fine for diagnostics.
@@ -33,41 +33,23 @@ const MAX_BATCH: usize = 500;
 /// How long to accumulate before flushing a non-empty batch.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A single captured event, pre-serialized into wire shape.
-#[derive(Debug, Clone, Serialize)]
-struct WireEntry {
-    level: String,
-    target: String,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fields: Option<serde_json::Value>,
-    ts: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DeviceMeta {
-    name: Option<String>,
-    os: Option<String>,
-    fingerprint: Option<String>,
-    app_version: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct Batch<'a> {
-    device: &'a DeviceMeta,
-    entries: Vec<WireEntry>,
-}
+// El cuerpo del lote (`LogEntry` / `DeviceMeta` / `LogBatch`) vive en
+// `hoard_core::wire`, compartido con `hoard_server::routes::logs` (ADR 0021
+// C.6). Este par era drift real: aquí `target` y `ts` eran obligatorios y en el
+// server eran `Option`, así que la forma "correcta" dependía del lado que
+// mirases.
+use hoard_core::wire::{DeviceMeta, LogBatch, LogEntry};
 
 /// `tracing` layer that forwards events onto the ship channel.
 pub struct LogShipLayer {
-    tx: SyncSender<WireEntry>,
+    tx: SyncSender<LogEntry>,
 }
 
 /// Build the layer and spawn the background shipper thread. Returns the layer
 /// to be `.with(...)`-ed onto the subscriber registry. Cheap and infallible —
 /// if the thread can't spawn, the layer simply drops everything.
 pub fn start() -> LogShipLayer {
-    let (tx, rx) = sync_channel::<WireEntry>(CHANNEL_CAPACITY);
+    let (tx, rx) = sync_channel::<LogEntry>(CHANNEL_CAPACITY);
     let _ = std::thread::Builder::new()
         .name("hoard-logship".into())
         .spawn(move || drain_loop(rx));
@@ -96,14 +78,14 @@ where
             Some(serde_json::Value::Object(visitor.fields))
         };
 
-        let entry = WireEntry {
+        let entry = LogEntry {
             level: meta.level().as_str().to_ascii_lowercase(),
-            target: target.to_string(),
+            target: Some(target.to_string()),
             message: visitor.message.unwrap_or_default(),
             fields,
             ts: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
+                .ok(),
         };
 
         // Drop-on-full: diagnostics must never block the app.
@@ -182,7 +164,7 @@ struct Policy {
     min_rank: u8,
 }
 
-fn drain_loop(rx: Receiver<WireEntry>) {
+fn drain_loop(rx: Receiver<LogEntry>) {
     // One current-thread runtime for all network I/O on this thread.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -225,8 +207,8 @@ fn drain_loop(rx: Receiver<WireEntry>) {
                 BatchResult::Closed => return,
                 BatchResult::Empty => {}
                 BatchResult::Entries(entries) => {
-                    let body = Batch {
-                        device: &device,
+                    let body = LogBatch {
+                        device: device.clone(),
                         entries,
                     };
                     let _ = rt.block_on(post_batch(client, &policy, &body));
@@ -244,14 +226,14 @@ fn drain_loop(rx: Receiver<WireEntry>) {
 }
 
 enum BatchResult {
-    Entries(Vec<WireEntry>),
+    Entries(Vec<LogEntry>),
     Empty,
     Closed,
 }
 
 /// Block up to `FLUSH_INTERVAL` for the first entry, then greedily drain up to
 /// `MAX_BATCH`, filtering by level.
-fn collect_batch(rx: &Receiver<WireEntry>, min_rank: u8) -> BatchResult {
+fn collect_batch(rx: &Receiver<LogEntry>, min_rank: u8) -> BatchResult {
     let first = match rx.recv_timeout(FLUSH_INTERVAL) {
         Ok(e) => e,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return BatchResult::Empty,
@@ -280,7 +262,7 @@ fn collect_batch(rx: &Receiver<WireEntry>, min_rank: u8) -> BatchResult {
     }
 }
 
-fn discard_available(rx: &Receiver<WireEntry>) {
+fn discard_available(rx: &Receiver<LogEntry>) {
     while rx.try_recv().is_ok() {}
 }
 
@@ -340,7 +322,7 @@ fn session_matches(policy: &Policy) -> bool {
 async fn post_batch(
     client: &reqwest::Client,
     policy: &Policy,
-    body: &Batch<'_>,
+    body: &LogBatch,
 ) -> Result<(), reqwest::Error> {
     client
         .post(&policy.url)
@@ -356,7 +338,10 @@ fn device_meta() -> DeviceMeta {
     DeviceMeta {
         name: id.name,
         os: Some(id.os),
-        fingerprint: Some(id.fingerprint),
+        // La huella la calcula `fingerprint()` con `hex::encode` de un SHA-256,
+        // así que siempre pasa la puerta; si algún día dejara de hacerlo, viaja
+        // como ausente en vez de mandar algo que el server no puede casar.
+        fingerprint: MachineId::parse(&id.fingerprint).ok(),
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }

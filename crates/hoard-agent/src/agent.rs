@@ -3596,21 +3596,12 @@ async fn run_backup_with_retry(
 /// Longitud mínima de un token de identidad para que cuente en el match
 /// genérico. Por debajo (`gta`, `ori`, `ff`) es demasiado corto y colisiona
 /// con carpetas o nombres de proceso cualesquiera.
-const MIN_IDENTITY_TOKEN_LEN: usize = 4;
+use hoard_core::ids::MIN_IDENTITY_TOKEN_LEN;
 
-/// Token canónico de identidad de un juego/proceso: solo alfanuméricos ASCII en
-/// minúscula, sin separadores ni extensión. Unifica las tres formas en las que
-/// el mismo juego aparece — slug (`victoria-3`), nombre visible (`Victoria 3`) y
-/// ejecutable (`victoria3.exe` → `victoria3`) — en una sola clave comparable.
-fn canon_token(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        }
-    }
-    out
-}
+/// Token canónico de identidad (ver [`hoard_core::ids::canon_token`]). Vive en
+/// el kernel leaf porque `GameSlug::repair` lo usa para detectar slugs
+/// degenerados y las dos comprobaciones tienen que ser la misma.
+use hoard_core::ids::canon_token;
 
 /// Tokens VETADOS en el match genérico de identidad: componentes del perfil de
 /// usuario y de la fontanería de instalación. Un slug degenerado igual a uno de
@@ -3621,29 +3612,7 @@ fn canon_token(s: &str) -> String {
 /// disparaba GameStarted (y el guard "un juego a la vez" apagaba de rebote los
 /// juegos reales). La lista estática cubre la fontanería común; los
 /// componentes del home real (username incluido) se añaden dinámicamente.
-fn is_generic_identity_token(tok: &str) -> bool {
-    const GENERIC: &[&str] = &[
-        "users",
-        "home",
-        "appdata",
-        "roaming",
-        "local",
-        "locallow",
-        "documents",
-        "savedgames",
-        "mygames",
-        "saves",
-        "games",
-        "programfiles",
-        "programfilesx86",
-        "steamapps",
-        "common",
-        "compatdata",
-        "drivec",
-        "windows",
-        "desktop",
-        "downloads",
-    ];
+pub(crate) fn is_generic_identity_token(tok: &str) -> bool {
     static HOME_TOKENS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let home = HOME_TOKENS.get_or_init(|| {
         directories::UserDirs::new()
@@ -3659,7 +3628,7 @@ fn is_generic_identity_token(tok: &str) -> bool {
             })
             .unwrap_or_default()
     });
-    GENERIC.contains(&tok) || home.iter().any(|h| h == tok)
+    hoard_core::ids::GENERIC_IDENTITY_TOKENS.contains(&tok) || home.iter().any(|h| h == tok)
 }
 
 /// Tokens de identidad de un save rastreado, derivados de datos que ya tenemos

@@ -84,6 +84,27 @@ pub const CLOUD_STALE_AFTER_SECS: i64 = CLOUD_POLL_INTERVAL_SECS * CLOUD_STALE_A
 /// fallo invisible pasa a ser observable.
 pub const CLOUD_STALE_REASON: &str = "cloud state stale";
 
+/// Edad de [`Observation::cloud_version_as_of`] a partir de la cual **el motor
+/// va a buscar la cabeza de nube él mismo** (ADR 0021 D.12), en vez de esperar
+/// a que el poller del cliente se la empuje.
+///
+/// Por encima de la cadencia del poller a propósito: un poller vivo rejuvenece
+/// la marca antes de llegar aquí, así que su feed *suprime* esta consulta y el
+/// coste se queda en UN manifiesto por intervalo, no dos. Cuando el poller muere
+/// —la avería de D.12, la tarea desaparecía sin un log— el motor cubre el hueco
+/// solo: la degradación es "tardo hasta el siguiente tick", no "ciego para
+/// siempre". Vive aquí, junto a la cadencia de la que se deriva, aunque quien
+/// hace la consulta sea el shell (el kernel no hace IO).
+pub const CLOUD_SELF_OBSERVE_AFTER_SECS: i64 = CLOUD_POLL_INTERVAL_SECS * 3 / 2;
+
+// El motor SIEMPRE intenta refrescar antes de declararse ciego. Si esta relación
+// se invirtiera, el `Hold{"cloud state stale"}` acusaría una obsolescencia que
+// nadie ha intentado remediar todavía. Chequeado en compilación.
+const _: () = assert!(CLOUD_SELF_OBSERVE_AFTER_SECS < CLOUD_STALE_AFTER_SECS);
+// Y nunca por debajo de la cadencia del poller: si no, un poller sano y el motor
+// se pisarían el manifiesto cada intervalo (dos GET donde debe haber uno).
+const _: () = assert!(CLOUD_SELF_OBSERVE_AFTER_SECS >= CLOUD_POLL_INTERVAL_SECS);
+
 /// Ventana de gracia (sticky) tras dejar de ver el proceso vivo antes de
 /// declararlo parado. 6 s — bajada desde los 90 s históricos
 /// (`agent::STRONG_STOP_GRACE_FLOOR_SECS`, "Was 90 s"): como el veto de sesión
@@ -199,8 +220,9 @@ pub fn reconcile(state: &State, obs: &Observation, world: World) -> (State, Vec<
 
     // ---- Decisión de backup (local → nube) ---------------------------------
     // Convergido si no hay nada que subir: nada que hacer (invariante base C.1).
-    // Salvo que no estemos convergidos sino **ciegos**: si la marca del último
-    // feed de nube envejeció, `cloud_version` es una entrada mentirosa y el
+    // Salvo que no estemos convergidos sino **ciegos**: si la observación de la
+    // nube envejeció —o nunca llegó, teniendo nube que observar—,
+    // `cloud_version` es una entrada mentirosa y el
     // `cloud_ahead = false` de arriba no demuestra nada. Se dice con su propio
     // motivo (ADR 0021 D.10) — el fallo del poller deja de disfrazarse de
     // normalidad. Sólo cambia el motivo del reposo: la subida no se toca, que un
@@ -310,16 +332,28 @@ fn cloud_ahead(state: &State, obs: &Observation) -> bool {
     }
 }
 
-/// ¿La caché de versiones de nube dejó de ser creíble? `true` cuando el último
-/// feed del poller es más viejo que [`CLOUD_STALE_AFTER_SECS`].
+/// ¿La observación de la nube dejó de ser creíble? `true` cuando lo último que
+/// sabemos de ella es más viejo que [`CLOUD_STALE_AFTER_SECS`].
 ///
-/// Sin marca (`None`) **no** hay obsolescencia que reportar: es el despliegue
-/// sin feed de nube (self-hosted, daemon CLI, o antes del primer poll), donde
-/// `cloud_version` tampoco afirma nada. Un `now` anterior a la marca (salto de
-/// reloj hacia atrás) tampoco es obsolescencia — la resta sale negativa.
+/// Dos formas de estar ciego, una sola cuenta atrás:
+///
+/// - **Feed rancio** — hubo cabezas y dejaron de llegar: envejece desde la
+///   marca ([`Observation::cloud_version_as_of`]).
+/// - **Nunca hubo feed** — la ceguera más grave, y la que se colaba como
+///   `converged` hasta el remate de D.11: envejece desde
+///   [`Observation::cloud_feed_expected_since`], el momento en que el motor
+///   empezó a esperar cabezas. Sin ese ancla (self-hosted, daemon CLI, contexto
+///   sin resolver) no hay nube que observar y no se reporta nada: la distinción
+///   es *contexto cloud vs self-hosted*, no `None` vs `Some`.
+///
+/// Un `now` anterior al ancla (salto de reloj hacia atrás) tampoco es
+/// obsolescencia — la resta sale negativa.
 fn cloud_state_stale(obs: &Observation, now: OffsetDateTime) -> bool {
-    obs.cloud_version_as_of
-        .is_some_and(|as_of| (now - as_of).whole_seconds() > CLOUD_STALE_AFTER_SECS)
+    let anchor = match obs.cloud_version_as_of {
+        Some(as_of) => Some(as_of),
+        None => obs.cloud_feed_expected_since,
+    };
+    anchor.is_some_and(|t| (now - t).whole_seconds() > CLOUD_STALE_AFTER_SECS)
 }
 
 /// ¿El contenido local difiere del ya sincronizado? Con fingerprint L1 calculado,
@@ -1193,8 +1227,8 @@ mod tests {
         );
         assert!(acts(&stale).is_empty(), "pero sigue sin inventarse acciones");
 
-        // Sin poller (self-hosted / daemon CLI): no hay nada que declarar
-        // obsoleto, por muy lejos que esté `now` del epoch.
+        // Sin nube que observar (self-hosted / daemon CLI): no hay nada que
+        // declarar obsoleto, por muy lejos que esté `now` del epoch.
         let no_feed = Observation {
             local_fingerprint: Some(0xABCD),
             ..quiet_obs()
@@ -1203,7 +1237,74 @@ mod tests {
         assert_eq!(
             headless,
             vec![hold("converged")],
-            "sin feed de nube no se reporta obsolescencia"
+            "sin contexto de nube no se reporta obsolescencia"
+        );
+    }
+
+    /// D.11, remate — «nunca supe nada de la nube» es la ceguera MÁS grave y
+    /// hasta aquí era la única que se colaba como `converged`: el viejo
+    /// `is_some_and` sobre la marca del feed dejaba pasar el `None`. Con
+    /// contexto cloud, la cuenta atrás corre desde que el motor empezó a
+    /// esperar cabezas.
+    #[test]
+    fn d11_never_heard_from_the_cloud_is_stale_too() {
+        let state = State {
+            known_version: Some(120),
+            synced_fingerprint: Some(0xABCD),
+            ..base_state()
+        };
+        // Contexto cloud, cero feeds: el motor arrancó en `at(0)`.
+        let blind = Observation {
+            local_fingerprint: Some(0xABCD),
+            cloud_feed_expected_since: Some(at(0)),
+            ..quiet_obs()
+        };
+
+        // Dentro del margen de arranque: silencio, todavía es normal.
+        let (_n, booting) = reconcile(&state, &blind, world(CLOUD_STALE_AFTER_SECS));
+        assert_eq!(
+            booting,
+            vec![hold("converged")],
+            "el margen de arranque no acusa antes de tiempo"
+        );
+
+        // Pasado el margen sin una sola cabeza: ciego, con el mismo motivo que
+        // un feed rancio (para la UI y el replay es la misma avería).
+        let (_n, blind_ds) = reconcile(&state, &blind, world(CLOUD_STALE_AFTER_SECS + 1));
+        assert_eq!(blind_ds, vec![hold(CLOUD_STALE_REASON)]);
+        assert!(acts(&blind_ds).is_empty(), "y sigue sin inventarse acciones");
+
+        // Un feed real manda sobre el ancla de arranque: la marca fresca
+        // rejuvenece la observación aunque el motor lleve horas arriba.
+        let fed = Observation {
+            cloud_version_as_of: Some(at(10_000)),
+            ..blind.clone()
+        };
+        let (_n, ds_fed) = reconcile(&state, &fed, world(10_001));
+        assert_eq!(ds_fed, vec![hold("converged")]);
+
+        // Y sin contexto cloud (self-hosted), el mismo silencio no acusa nunca:
+        // la distinción es el contexto, no `None` vs `Some`.
+        let selfhosted = Observation {
+            cloud_feed_expected_since: None,
+            ..blind
+        };
+        let (_n, ds_self) = reconcile(&state, &selfhosted, world(100_000));
+        assert_eq!(ds_self, vec![hold("converged")]);
+    }
+
+    /// D.12 — la relación "el motor refresca antes de declararse ciego" NO vive
+    /// aquí: es un `const _: () = assert!(…)` junto a
+    /// [`CLOUD_SELF_OBSERVE_AFTER_SECS`], que es estrictamente más fuerte que un
+    /// test (el crate no compila si alguien invierte los números). Este test
+    /// sólo fija que el umbral nuevo sigue derivándose de la cadencia real del
+    /// poll (como el de obsolescencia, ver el test de D.10) y no de un literal
+    /// suelto que pueda driftar.
+    #[test]
+    fn d12_self_observation_threshold_derives_from_the_poll_cadence() {
+        assert_eq!(
+            CLOUD_SELF_OBSERVE_AFTER_SECS,
+            CLOUD_POLL_INTERVAL_SECS * 3 / 2
         );
     }
 
@@ -1347,6 +1448,9 @@ mod tests {
             // Cubre el feed fresco, el rancio y el despliegue sin poller, para
             // que los invariantes valgan también con la caché de nube ciega.
             cloud_as_of in prop::option::of(-2 * CLOUD_STALE_AFTER_SECS..100),
+            // Ídem para el contexto: con nube que observar (dentro y fuera del
+            // margen de arranque) y sin ella.
+            cloud_expected in prop::option::of(-2 * CLOUD_STALE_AFTER_SECS..100),
             fs_event in any::<bool>(),
             retry in 0u32..600,
             has_op in any::<bool>(),
@@ -1374,6 +1478,7 @@ mod tests {
                 process_alive,
                 cloud_version,
                 cloud_version_as_of: cloud_as_of.map(at),
+                cloud_feed_expected_since: cloud_expected.map(at),
                 fs_event: if quiescent { false } else { fs_event },
                 op_result,
                 upload_landed: None,

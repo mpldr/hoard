@@ -226,32 +226,122 @@ pub fn start(app: &AppHandle) {
     let seen = scheduler.seen.clone();
     let gate = scheduler.gate.clone();
     let new_handle = tokio::task::spawn(async move {
-        tracing::info!(interval_secs = secs, "cloud-pull poller: started");
-
-        // First tick fires immediately so the user sees activity on
-        // sign-in without waiting a full interval. The built-in
-        // zero-delay first tick of `tokio::time::interval` is the right
-        // shape — we don't manually emit before the loop.
-        let mut ticker = interval(period);
-        // Fallback refresh for the Eye-panel devices + bell feeds when the
-        // Realtime socket is down. Immediacy comes from Realtime; this only
-        // needs to keep them *eventually* honest, so it's throttled to at
-        // most once per `FALLBACK_MIN_SECS`.
-        // Initialized in the past so the first tick primes both feeds.
-        let mut last_feed = tokio::time::Instant::now()
-            - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
-        loop {
-            ticker.tick().await;
-            guarded_pull(&app_for_task, &seen, &gate, "timer").await;
-            if last_feed.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS {
-                last_feed = tokio::time::Instant::now();
-                crate::commands::cloud_feed::kick_all(&app_for_task);
-            }
-        }
+        supervise(app_for_task, seen, gate, period).await;
     });
 
     let mut slot = lock(&scheduler.handle);
     *slot = Some(new_handle);
+}
+
+/// Backoff between poller restarts: a loop that dies on its first line must not
+/// spin, and one that dies of something transient must come back fast.
+const RESTART_BACKOFF_MIN_SECS: u64 = 5;
+const RESTART_BACKOFF_MAX_SECS: u64 = 5 * 60;
+
+/// A run this long counts as healthy, so the next death restarts from the
+/// bottom of the backoff instead of inheriting an old escalation.
+const HEALTHY_RUN_SECS: u64 = 10 * 60;
+
+/// Keep [`poll_loop`] alive: catch its death, say so out loud, restart with
+/// backoff (ADR 0021 D.12).
+///
+/// The loop is not supposed to be able to return — and it didn't; it *vanished*.
+/// A `tokio::spawn` that panics is reaped by the runtime and its `JoinHandle`
+/// silently holds the error nobody joins, so the poller stopped after two ticks
+/// and nothing in the log said so: no `gate busy`, no second `started`, no
+/// `stopped`. Chasing that one panic (a `state::<CloudFeed>()` on unmanaged
+/// state, fixed at its source) would only defer the next one. A background task
+/// that dies in silence is a bug by itself, so this supervisor treats **any**
+/// exit — panic or return — as an incident: logged at error and retried.
+///
+/// `catch_unwind` rather than a nested task on purpose: `start()`/`stop()` abort
+/// the handle they hold, and a nested `tokio::spawn` would outlive that abort as
+/// an orphan — two pollers racing, which is precisely the shape of bug this
+/// module keeps producing. One task means abort still kills everything.
+async fn supervise(
+    app: AppHandle,
+    seen: Arc<Mutex<Vec<ManifestSeenEntry>>>,
+    gate: Arc<Mutex<PullGate>>,
+    period: Duration,
+) {
+    use futures::FutureExt;
+
+    let mut backoff = Duration::from_secs(RESTART_BACKOFF_MIN_SECS);
+    loop {
+        let started = Instant::now();
+        let outcome = std::panic::AssertUnwindSafe(poll_loop(&app, &seen, &gate, period))
+            .catch_unwind()
+            .await;
+        // The gate is RAII (`GateGuard`), so it was released by the unwind; the
+        // seen-map is derived state that the next pull replaces wholesale. There
+        // is nothing to roll back before going again.
+        match outcome {
+            Ok(()) => tracing::error!(
+                ran_secs = started.elapsed().as_secs(),
+                "cloud-pull poller: loop returned unexpectedly — restarting"
+            ),
+            Err(payload) => tracing::error!(
+                ran_secs = started.elapsed().as_secs(),
+                panic = %panic_text(&payload),
+                "cloud-pull poller: task panicked — restarting"
+            ),
+        }
+        if started.elapsed() >= Duration::from_secs(HEALTHY_RUN_SECS) {
+            backoff = Duration::from_secs(RESTART_BACKOFF_MIN_SECS);
+        }
+        tracing::info!(
+            restart_in_secs = backoff.as_secs(),
+            "cloud-pull poller: restarting after backoff"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(RESTART_BACKOFF_MAX_SECS));
+    }
+}
+
+/// Best-effort text of a caught panic payload, for the supervisor's log line.
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// The poller proper: pull the manifest every `period`, and keep the devices +
+/// bell feeds eventually honest. Never returns; [`supervise`] owns its lifetime.
+async fn poll_loop(
+    app: &AppHandle,
+    seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>,
+    gate: &Arc<Mutex<PullGate>>,
+    period: Duration,
+) {
+    tracing::info!(
+        interval_secs = period.as_secs(),
+        "cloud-pull poller: started"
+    );
+
+    // First tick fires immediately so the user sees activity on
+    // sign-in without waiting a full interval. The built-in
+    // zero-delay first tick of `tokio::time::interval` is the right
+    // shape — we don't manually emit before the loop.
+    let mut ticker = interval(period);
+    // Fallback refresh for the Eye-panel devices + bell feeds when the
+    // Realtime socket is down. Immediacy comes from Realtime; this only
+    // needs to keep them *eventually* honest, so it's throttled to at
+    // most once per `FALLBACK_MIN_SECS`.
+    // Initialized in the past so the first tick primes both feeds.
+    let mut last_feed = tokio::time::Instant::now()
+        - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
+    loop {
+        ticker.tick().await;
+        guarded_pull(app, seen, gate, "timer").await;
+        if last_feed.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS {
+            last_feed = tokio::time::Instant::now();
+            crate::commands::cloud_feed::kick_all(app);
+        }
+    }
 }
 
 /// Fire a single manifest pull immediately, off the regular cadence.

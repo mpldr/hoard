@@ -51,6 +51,50 @@ use crate::commands::automatic::AutomaticScheduler;
 use crate::state::AppState;
 use crate::tray::{TrayController, TrayState};
 
+/// Route panics through `tracing` so they reach the log file, not just stderr.
+///
+/// A bundled GUI app has nowhere to print: the default hook writes the panic to
+/// stderr, which on a double-clicked desktop app is `/dev/null`. So a task that
+/// died of a panic left **no trace whatsoever** — the ADR 0021 D.12 poller was
+/// exactly that, a `tokio::spawn` that stopped existing between two log lines,
+/// and reading the log the failure was indistinguishable from a healthy loop
+/// that simply had nothing to say. A background task that dies in silence is a
+/// bug in its own right; this makes any future one land in the file the in-app
+/// Logs viewer reads.
+///
+/// Chains to the previous hook so `cargo tauri dev` still gets the usual stderr
+/// dump (and any backtrace `RUST_BACKTRACE` asks for).
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>").to_string();
+        tracing::error!(
+            location = %location,
+            thread = %thread,
+            message = %panic_message(info.payload()),
+            "PANIC — a task or thread died"
+        );
+        previous(info);
+    }));
+}
+
+/// Best-effort text of a panic payload (`panic!("literal")` and
+/// `panic!("{fmt}")` cover everything we throw in practice).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's DMABUF renderer breaks compositing on a number of setups
@@ -131,6 +175,8 @@ pub fn run() {
         Box::leak(Box::new(g));
     }
 
+    install_panic_logger();
+
     let app = tauri::Builder::default()
         // Single instance: clicking the launcher again brings the existing
         // window to the front instead of spawning a second copy.
@@ -177,6 +223,11 @@ pub fn run() {
         .manage(AutomaticScheduler::default())
         .manage(commands::cloud_pull::CloudPullScheduler::default())
         .manage(commands::cloud_realtime::RealtimeScheduler::default())
+        // Gates of the devices + bell feeds. Missing here until ADR 0021 D.12,
+        // and `app.state::<T>()` panics on unmanaged state: every `kick_*` call
+        // took its caller's task down with it — including the cloud-pull timer
+        // loop, which is why the poller died after exactly one tick.
+        .manage(commands::cloud_feed::CloudFeed::default())
         .manage(commands::selfhosted_events::SelfHostedEventsScheduler::default())
         .manage(commands::screen::ScreenProc::default())
         .invoke_handler(tauri::generate_handler![

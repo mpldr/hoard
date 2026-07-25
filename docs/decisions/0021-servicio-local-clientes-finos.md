@@ -818,3 +818,50 @@ la UI deja de ser proveedora de datos del motor y pasa a ser su cliente.
 en el merge de cabeza que asume D.8, esa recuperación está rota. Relacionado con
 la memoria `hoard-planet-s-windows-mistrack` (Windows trackea la carpeta
 equivocada), así que puede ser contenido divergente y no el 409 en sí.
+
+#### Resuelto (2026-07-25) — decisiones a no deshacer
+
+- **El motor observa la nube.** `observe_cloud_heads` (shell del agente) pide el
+  manifiesto **una vez por intervalo** y el resultado entra al reductor como
+  `Observation`; el kernel sigue sin IO, con `now`/`seed` inyectados. El disparo
+  vive en el tick del agente, no en una tarea de fondo de larga vida: **no hay
+  nada que pueda morir en silencio**, porque cada tick vuelve a evaluar el plazo.
+  El anti-relanzamiento es un `JoinHandle::is_finished()`, no un booleano — un
+  pánico o una cancelación no pueden dejar el hueco "ocupado" para siempre, que
+  es exactamente cómo se atascó el gate de D.11.
+- **El poller del cliente es un hint, y su feed suprime la consulta propia.**
+  `CLOUD_SELF_OBSERVE_AFTER_SECS = CLOUD_POLL_INTERVAL_SECS × 1,5`: un poller
+  vivo rejuvenece la marca antes de que venza, así que el coste se queda en UN
+  manifiesto por intervalo, no dos. `const _: () = assert!(SELF_OBSERVE <
+  STALE)` en compilación — el motor **siempre** intenta refrescar antes de poder
+  declararse ciego. No fusionar los dos umbrales ni fijar el de auto-observación
+  por debajo de la cadencia del poll: lo primero mata la garantía, lo segundo
+  duplica el GET.
+- **El pánico concreto: `CloudFeed` nunca estaba en `.manage()`.**
+  `app.state::<T>()` **panica** con estado no gestionado, así que `kick_all` se
+  llevaba por delante la tarea que lo llamara — el bucle del poller tras su
+  primer tick (dos ticks y silencio: el síntoma exacto de arriba) y el socket
+  Realtime en su `Resubscribed`. Arreglado en el origen (`.manage`) y con
+  `try_state` como red: un mis-wiring futuro degrada a un `warn!` y un feed
+  inerte, no a un bucle muerto. Los feeds de dispositivos/campana llevaban
+  muertos desde que se introdujeron.
+- **Supervisión + pánico al log.** `supervise()` envuelve el bucle del poller en
+  `catch_unwind` y reinicia con backoff (5 s → 5 min, reseteado tras 10 min
+  sanos); un solo task, sin `spawn` anidado, para que el `abort()` de
+  `start()`/`stop()` siga matándolo todo (un task anidado sobreviviría como
+  huérfano: dos pollers). Y un `panic hook` global en `lib.rs` manda todo pánico
+  al fichero de log: en una app empaquetada stderr es `/dev/null`, que es por lo
+  que esto fue invisible.
+- **Remate de D.11 cerrado.** `Observation::cloud_feed_expected_since`: en
+  contexto cloud, "nunca supe nada de la nube" envejece desde el arranque del
+  motor y se reporta `Hold{"cloud state stale"}` igual que un feed rancio. La
+  distinción es *contexto* (probe cacheado de `/v1/health`, vía
+  `ApiClient::probed_is_cloud` — que distingue self-hosted de "probe fallido",
+  cosa que `is_cloud()` no hace), no `None` vs `Some`. El probe manda sobre el
+  hint del poller: con el agente en self-hosted y una sesión cloud viva en disco,
+  las cabezas que empuja el poller no son de este motor.
+
+**Sigue abierto (misma clase, no tocado aquí):** `cloud_realtime::run_loop` no
+tiene supervisor propio — reconecta ante errores, pero un pánico se lleva la
+tarea entera para toda la sesión. Con `CloudFeed` gestionado desaparece la causa
+conocida y el hook deja el rastro; cerrar el hueco es copiar `supervise()`.

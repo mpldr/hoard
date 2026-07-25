@@ -635,7 +635,26 @@ enum AgentCommand {
     /// same manifest (cloud) / hitting `get_save` per candidate (the old N+1).
     /// Replaces the whole map each call. Only populated on cloud; self-hosted
     /// and headless CLI leave it empty and fall back to the network fetch.
+    ///
+    /// Desde ADR 0021 D.12 esto es un **hint de latencia**, no la fuente única:
+    /// el motor observa la cabeza por su cuenta ([`Self::CloudHeadsObserved`])
+    /// cuando este empujón se retrasa, así que un poller muerto ya no lo deja
+    /// ciego.
     SetCloudVersions(HashMap<String, i64>),
+    /// Interno (ADR 0021 D.12): resultado de la observación de la nube que el
+    /// **propio motor** dispara desde su tick. La consulta vive en el shell —el
+    /// kernel no hace IO— y entra al reductor como parte de la `Observation`.
+    CloudHeadsObserved {
+        /// `Some` = el manifiesto llegó (mapa completo `save_id` → versión, que
+        /// reemplaza la caché). `None` = el intento no produjo cabezas (red
+        /// caída, 401, self-hosted): la marca de frescura **no** se sella, así
+        /// que la ceguera sigue siendo visible en vez de disfrazarse de feed.
+        versions: Option<HashMap<String, i64>>,
+        /// Contexto del despliegue según el probe cacheado de `/v1/health`:
+        /// `Some(true)` cloud, `Some(false)` self-hosted, `None` sin resolver
+        /// (probe fallido). Sólo un valor definido mueve el latch.
+        is_cloud: Option<bool>,
+    },
     QueryStatus(oneshot::Sender<Vec<AgentSlotStatus>>),
     Shutdown,
 }
@@ -1056,28 +1075,141 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.restore_failures = next.restore_failures;
 }
 
-/// La caché de cabezas de nube que alimenta el poller (`SetCloudVersions`),
-/// **con la marca de cuándo llegó**. El par va junto a propósito: una cabeza sin
-/// fecha no se puede distinguir de una cabeza congelada, y ésa fue justo la
-/// avería de ADR 0021 D.10 — el poller murió, `versions` se quedó clavado en la
-/// v120 y el reductor decidía bien sobre una entrada mentirosa, rotulándolo
-/// `converged`.
-#[derive(Debug, Clone, Default)]
+/// La caché de cabezas de nube, **con la marca de cuándo llegó**. El par va
+/// junto a propósito: una cabeza sin fecha no se puede distinguir de una cabeza
+/// congelada, y ésa fue justo la avería de ADR 0021 D.10 — el poller murió,
+/// `versions` se quedó clavado en la v120 y el reductor decidía bien sobre una
+/// entrada mentirosa, rotulándolo `converged`.
+///
+/// Desde D.12 se llena por **dos** vías, y ése es el fix estructural: el motor
+/// consulta el manifiesto él mismo cada
+/// [`kernel::reconcile::CLOUD_SELF_OBSERVE_AFTER_SECS`]
+/// ([`Self::due_for_self_observation`]) y el push del cliente
+/// (`SetCloudVersions`, del poller del desktop o del `cloud_live` de la CLI)
+/// queda como *hint* de latencia. Un feed vivo rejuvenece la marca antes de que
+/// venza el plazo, así que suprime la consulta propia y el coste sigue siendo un
+/// manifiesto por intervalo; un poller muerto ya sólo cuesta latencia, no
+/// ceguera permanente.
+#[derive(Debug, Clone)]
 struct CloudHeads {
     /// Última versión cloud por `save_id`, tal cual la trajo el manifest.
     versions: HashMap<String, i64>,
-    /// Cuándo aterrizó ese feed. `None` = todavía ninguno (o despliegue sin
-    /// poller: self-hosted / daemon CLI headless), que el kernel trata como
-    /// "no hay feed que envejecer", no como obsolescencia.
+    /// Cuándo aterrizó ese feed, venga de donde venga. `None` = todavía ninguno.
     as_of: Option<OffsetDateTime>,
+    /// Último intento **propio** de observar la nube, con éxito o sin él. Marca
+    /// el ritmo de reintento: sin esta marca un servidor caído (o una sesión
+    /// 401) haría que cada tick —cada 2 s— relanzase la consulta.
+    last_attempt_at: Option<OffsetDateTime>,
+    /// ¿Hay nube que observar? `Some(true)` cloud, `Some(false)` self-hosted,
+    /// `None` = sin resolver (el probe de `/v1/health` no ha respondido aún).
+    /// Latcheado: una vez resuelto no se desdice, porque el `ApiClient` del
+    /// agente no cambia de servidor en vida.
+    is_cloud: Option<bool>,
+    /// Cuándo empezó este motor a esperar cabezas de nube. Es el ancla del
+    /// margen de arranque con el que el kernel reporta "nunca supe nada de la
+    /// nube" (ADR 0021 D.11, remate).
+    expecting_since: OffsetDateTime,
 }
 
 impl CloudHeads {
+    fn new(now: OffsetDateTime) -> Self {
+        Self {
+            versions: HashMap::new(),
+            as_of: None,
+            last_attempt_at: None,
+            is_cloud: None,
+            expecting_since: now,
+        }
+    }
+
     /// Instala un feed nuevo y sella su marca de tiempo.
     fn feed(&mut self, versions: HashMap<String, i64>, now: OffsetDateTime) {
         self.versions = versions;
         self.as_of = Some(now);
     }
+
+    /// El ancla del margen de arranque que va en la [`kernel::Observation`]:
+    /// sólo hay algo que esperar si sabemos que hay nube. Sin contexto resuelto
+    /// no se afirma nada — declarar ceguera sin saber si existe la nube sería
+    /// inventarse una avería.
+    fn expected_since(&self) -> Option<OffsetDateTime> {
+        (self.is_cloud == Some(true)).then_some(self.expecting_since)
+    }
+
+    /// ¿Toca que el motor vaya a buscar la cabeza él mismo? Dos frenos
+    /// independientes:
+    ///
+    /// - **Frescura**: con un feed reciente (del poller o nuestro) no hay nada
+    ///   que buscar. Es lo que hace que un cliente sano no duplique el GET.
+    /// - **Ritmo**: como mucho un intento por intervalo pase lo que pase, para
+    ///   que un backend caído reciba un intento por minuto y medio, no uno por
+    ///   tick.
+    ///
+    /// Con el contexto ya resuelto como self-hosted no hay nada que observar.
+    fn due_for_self_observation(&self, now: OffsetDateTime) -> bool {
+        if self.is_cloud == Some(false) {
+            return false;
+        }
+        let stale_enough = |t: OffsetDateTime| {
+            (now - t).whole_seconds() >= kernel::reconcile::CLOUD_SELF_OBSERVE_AFTER_SECS
+        };
+        self.as_of.is_none_or(stale_enough) && self.last_attempt_at.is_none_or(stale_enough)
+    }
+}
+
+/// **El motor observa la nube** (ADR 0021 D.12). Una sola llamada al manifiesto
+/// —no un GET por save y tick— cuyo resultado vuelve al bucle como
+/// [`AgentCommand::CloudHeadsObserved`] y de ahí a la [`kernel::Observation`].
+///
+/// Corre en su propia tarea para no bloquear el `select!` del agente: el probe
+/// de `/v1/health` y el manifiesto tienen minuto de timeout cada uno, y el bucle
+/// tiene que seguir atendiendo eventos fs, procesos y comandos mientras tanto.
+///
+/// Por qué el motor y no el cliente: la UI sabía de la v181 porque *ella*
+/// preguntaba al servidor; el agente no, porque dependía de que un proceso ajeno
+/// y frágil se la empujase. Muerto ese proceso, el motor quedaba ciego para
+/// siempre sin autorrecuperación. Observando él mismo, un poller muerto degrada
+/// a "tardo hasta el siguiente intervalo" — la propiedad level-triggered de C.1
+/// aplicada también al transporte.
+///
+/// Best-effort de principio a fin: cualquier fallo se reporta como
+/// `versions: None` (la marca de frescura no se sella y la ceguera sigue siendo
+/// visible) y se reintenta al siguiente plazo.
+async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>) {
+    // Probe cacheado tras el primer éxito; un fallo NO se cachea, así que el
+    // siguiente intento vuelve a preguntar.
+    let cloud = api.is_cloud().await;
+    // Se lee DESPUÉS del probe para distinguir "self-hosted" de "no se pudo
+    // resolver" — `is_cloud()` colapsa ambos en `false`.
+    let is_cloud = api.probed_is_cloud();
+    let versions = if cloud {
+        match api.cloud_sync().await {
+            Ok(manifest) => {
+                let map: HashMap<String, i64> = manifest
+                    .saves
+                    .into_iter()
+                    .map(|e| (e.save_id, e.latest_version_num))
+                    .collect();
+                tracing::debug!(count = map.len(), "agent: observed cloud heads");
+                Some(map)
+            }
+            Err(e) => {
+                // A warn, no debug: desde D.12 esto es la vía principal de
+                // observación de la nube, y que enmudezca es exactamente la
+                // avería que nos costó dos sesiones de dogfooding encontrar.
+                tracing::warn!(error = %e, "agent: couldn't observe the cloud head");
+                None
+            }
+        }
+    } else {
+        if is_cloud.is_none() {
+            tracing::debug!("agent: cloud head observation skipped — server mode unresolved");
+        }
+        None
+    };
+    let _ = cmd_tx
+        .send(AgentCommand::CloudHeadsObserved { versions, is_cloud })
+        .await;
 }
 
 /// Muestrea el mundo para un slot y construye la [`kernel::Observation`] del
@@ -1105,11 +1237,14 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
         // 6 s); aquí es un passthrough para la stickiness del kernel.
         process_alive: slot.is_running,
         cloud_version: cloud.versions.get(&slot.save.save_id).copied(),
-        // La marca es del *feed*, no del save: el poller trae el manifest
-        // entero, así que un save ausente de él tiene `cloud_version: None` con
-        // la marca igual de fresca. Es lo que deja al kernel distinguir
-        // "convergido" de "ciego" (ADR 0021 D.10).
+        // La marca es del *feed*, no del save: el manifest viene entero, así que
+        // un save ausente de él tiene `cloud_version: None` con la marca igual
+        // de fresca. Es lo que deja al kernel distinguir "convergido" de
+        // "ciego" (ADR 0021 D.10).
         cloud_version_as_of: cloud.as_of,
+        // Y esto es lo que deja distinguir "no hay nube que mirar" de "hay nube
+        // y llevo desde el arranque sin saber nada de ella" (D.11, remate).
+        cloud_feed_expected_since: cloud.expected_since(),
         // El watcher fs marca `has_pending`/`last_fs_event_at` en el slot
         // directamente (ver la rama `fs_rx`), así que no hace falta re-marcar
         // por `fs_event` aquí; el reductor los lee del estado.
@@ -1357,12 +1492,19 @@ async fn run_agent(
 ) {
     let mut slots: HashMap<String, SaveSlot> = HashMap::new();
 
-    // Latest cloud version per save id, fed by the `cloud_pull` poller via
-    // `SetCloudVersions`. Lets the reconciliation sweep version-gate locally
-    // instead of having each `run_auto_restore` re-fetch the manifest. Empty
-    // on self-hosted / headless CLI (no poller), where we fall back to the
-    // per-save network fetch.
-    let mut cloud_heads = CloudHeads::default();
+    // Latest cloud version per save id. Since ADR 0021 D.12 the engine keeps
+    // this fresh **itself** (`observe_cloud_heads`, one manifest call per
+    // interval); the client-side pollers' `SetCloudVersions` push is a latency
+    // hint on top. Lets the reconciliation sweep version-gate locally instead of
+    // having each `run_auto_restore` re-fetch the manifest. Stays empty on
+    // self-hosted, where we fall back to the per-save network fetch.
+    let mut cloud_heads = CloudHeads::new(OffsetDateTime::now_utc());
+    // La observación de nube en vuelo, si la hay. Es un `JoinHandle` y no un
+    // booleano a propósito: `is_finished()` es cierto también cuando la tarea
+    // muere por pánico o la cancelan, así que el hueco no se puede quedar
+    // "ocupado" para siempre — que es justo cómo enmudeció el poller del
+    // desktop (D.11) y cómo desapareció su tarea entera (D.12).
+    let mut cloud_probe: Option<JoinHandle<()>> = None;
 
     // Channel used by every fs watcher — debounced events all funnel here
     // and we route them by path. mpsc::unbounded would be fine since the
@@ -1595,8 +1737,45 @@ async fn run_agent(
                         // "convergido" si el poller vuelve a enmudecer (ADR 0021
                         // D.10).
                         cloud_heads.feed(map, OffsetDateTime::now_utc());
+                        // Un empujón sólo puede venir de un cliente cloud (el
+                        // poller del desktop o `cloud_live` de la CLI, ambos
+                        // detrás de una sesión cloud), así que sirve de
+                        // evidencia de contexto cuando el probe todavía no ha
+                        // podido correr — el caso del arranque sin red, donde
+                        // si no nunca sabríamos que hay nube que echar de menos.
+                        // Pero NO pisa un probe ya resuelto: con el agente
+                        // apuntando a un server self-hosted y una sesión cloud
+                        // viva en disco, el poller alimenta cabezas que no son
+                        // de este motor, y creerle nos haría reportar ceguera de
+                        // una nube que este agente no mira.
+                        cloud_heads.is_cloud.get_or_insert(true);
                         // La nube pudo adelantarse: reconcilia para pulsar las
                         // actualizaciones que acaban de destrabarse.
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads,
+                        );
+                    }
+                    Some(AgentCommand::CloudHeadsObserved { versions, is_cloud }) => {
+                        // El motor miró la nube por su cuenta (ADR 0021 D.12).
+                        // El latch de contexto sólo se mueve con una respuesta
+                        // definida: un probe fallido no puede degradar un
+                        // despliegue cloud a "aquí no hay nube que mirar".
+                        if let Some(c) = is_cloud {
+                            cloud_heads.is_cloud = Some(c);
+                        }
+                        // Sin cabezas (`None`) la marca de frescura NO se toca:
+                        // que el intento quede registrado (`last_attempt_at`,
+                        // sellado al lanzarlo) sólo marca el ritmo de reintento;
+                        // la obsolescencia sigue contando desde el último dato
+                        // real, que es lo que hace observable la ceguera.
+                        if let Some(map) = versions {
+                            tracing::debug!(
+                                count = map.len(),
+                                "agent: cloud version cache updated from the engine's own observation"
+                            );
+                            cloud_heads.feed(map, OffsetDateTime::now_utc());
+                        }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
                             &cloud_heads,
@@ -1809,6 +1988,24 @@ async fn run_agent(
 
             // ----- Process poll tick -----
             _ = poll.tick() => {
+                // Observar el mundo incluye observar la NUBE (ADR 0021 D.12), no
+                // sólo el disco y la tabla de procesos. El plazo lo pone
+                // `due_for_self_observation`: un cliente sano nos empuja las
+                // cabezas antes de que venza y esto no llega a dispararse, así
+                // que el coste en estado estable es cero y en el peor caso un
+                // manifiesto por intervalo. La consulta se va a su propia tarea
+                // (el bucle no puede bloquearse un minuto en un GET) y vuelve
+                // como `CloudHeadsObserved`.
+                let cloud_now = OffsetDateTime::now_utc();
+                let probe_free = cloud_probe.as_ref().is_none_or(JoinHandle::is_finished);
+                if probe_free && cloud_heads.due_for_self_observation(cloud_now) {
+                    cloud_heads.last_attempt_at = Some(cloud_now);
+                    cloud_probe = Some(tokio::spawn(observe_cloud_heads(
+                        api.clone(),
+                        cmd_tx.clone(),
+                    )));
+                }
+
                 // Refresca el índice de Steam si el TTL expiró (barato en estado
                 // estable) antes de que el poll atribuya horas por carpeta.
                 steam_index.refresh_if_stale();
@@ -4419,6 +4616,59 @@ mod tests {
         assert!(c.debounce_secs <= 120, "too sleepy");
         assert!(c.poll_secs >= 1);
         assert!(c.max_retries >= 1);
+    }
+
+    /// ADR 0021 D.12 — el motor observa la nube él mismo, pero un cliente sano
+    /// le ahorra el viaje: mientras el feed sea reciente no se dispara ninguna
+    /// consulta propia. Es lo que mantiene el coste en UN manifiesto por
+    /// intervalo en vez de dos.
+    #[test]
+    fn self_observation_is_suppressed_by_a_live_feed_and_paced_when_blind() {
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let secs = |n: i64| t0 + Duration::from_secs(n as u64);
+        let due = kernel::reconcile::CLOUD_SELF_OBSERVE_AFTER_SECS;
+
+        // Arranque en frío: sin feed y sin intentos, se observa ya (el motor no
+        // espera a que nadie le dé la papilla).
+        let mut heads = CloudHeads::new(t0);
+        assert!(heads.due_for_self_observation(t0));
+
+        // Con un feed recién llegado (poller vivo) no hay nada que buscar…
+        heads.feed(HashMap::new(), secs(10));
+        assert!(!heads.due_for_self_observation(secs(10 + due - 1)));
+        // …hasta que ese feed se hace viejo: el poller enmudeció y el motor
+        // cubre el hueco por su cuenta.
+        assert!(heads.due_for_self_observation(secs(10 + due)));
+
+        // Un intento propio que no trajo cabezas (red caída, 401) marca el
+        // ritmo: un reintento por plazo, no uno por tick de 2 s.
+        heads.last_attempt_at = Some(secs(100));
+        assert!(!heads.due_for_self_observation(secs(101)));
+        assert!(heads.due_for_self_observation(secs(100 + due)));
+
+        // Resuelto como self-hosted no hay nube que observar.
+        heads.is_cloud = Some(false);
+        assert!(!heads.due_for_self_observation(secs(100_000)));
+    }
+
+    /// ADR 0021 D.11 (remate) — el ancla del margen de arranque sólo existe con
+    /// nube que observar. Sin contexto resuelto no se afirma nada: declarar
+    /// ceguera sin saber si hay nube sería inventarse una avería.
+    #[test]
+    fn expected_since_is_anchored_only_in_cloud_context() {
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let mut heads = CloudHeads::new(t0);
+        assert_eq!(heads.expected_since(), None, "contexto sin resolver");
+
+        heads.is_cloud = Some(false);
+        assert_eq!(heads.expected_since(), None, "self-hosted: no hay feed");
+
+        heads.is_cloud = Some(true);
+        assert_eq!(
+            heads.expected_since(),
+            Some(t0),
+            "cloud: la cuenta atrás corre desde que el motor arrancó"
+        );
     }
 
     #[test]

@@ -221,7 +221,9 @@ pub struct State {
 ///   `local_fingerprint` (hash del set local). Nunca re-hashear todo cada tick.
 /// - **Evidencia de proceso**: `process_alive` (¿el proceso del juego está vivo
 ///   este tick?).
-/// - **Cabeza del server**: `cloud_version` (última versión cloud del save).
+/// - **Cabeza del server**: `cloud_version` (última versión cloud del save),
+///   que el shell del motor consulta él mismo cada intervalo — el poller del
+///   cliente es un *hint* de latencia, no la fuente única (ADR 0021 D.12).
 /// - **Señales puntuales**: `fs_event` (llegó una escritura debounced),
 ///   `op_result` (una op terminó), `upload_landed` (check content-addressed).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -256,12 +258,26 @@ pub struct Observation {
     /// sanos). Cuando envejece más de
     /// [`reconcile::CLOUD_STALE_AFTER_SECS`] el reductor lo dice en voz alta.
     ///
-    /// `None` = **este despliegue no tiene feed de nube** (self-hosted, daemon
-    /// CLI headless, o antes del primer poll): no se afirma nada, así que
-    /// tampoco se reporta obsolescencia. Es una marca de *feed*, no de save:
+    /// `None` = **todavía no ha llegado ningún feed**. Por sí solo no se
+    /// interpreta: lo que decide si eso es normalidad o ceguera es
+    /// [`Self::cloud_feed_expected_since`]. Es una marca de *feed*, no de save:
     /// el poller trae el manifest entero, así que un save ausente del manifest
     /// tiene `cloud_version: None` pero la marca del feed igual de fresca.
     pub cloud_version_as_of: Option<OffsetDateTime>,
+    /// Desde cuándo este despliegue **espera** cabezas de nube: el instante en
+    /// que el motor empezó a observarla. `None` = no hay nube que observar
+    /// (self-hosted, daemon CLI headless, o contexto aún sin resolver), y
+    /// entonces no hay feed que envejecer.
+    ///
+    /// Existe por el remate pendiente de ADR 0021 D.11: con sólo
+    /// [`Self::cloud_version_as_of`] la ceguera **más grave** —"nunca supe nada
+    /// de la nube"— era indistinguible del despliegue que legítimamente no tiene
+    /// feed, así que un `None` se colaba como `converged`. La distinción
+    /// correcta no es `None` vs `Some`, es *contexto cloud vs self-hosted*: con
+    /// contexto cloud y sin marca, la obsolescencia se mide desde aquí (el
+    /// margen de arranque), y pasado [`reconcile::CLOUD_STALE_AFTER_SECS`] se
+    /// dice en voz alta igual que un feed rancio.
+    pub cloud_feed_expected_since: Option<OffsetDateTime>,
 
     // ---- Señales puntuales ---------------------------------------------
     /// Llegó una escritura debounced en la carpeta este tick (hint que adelanta

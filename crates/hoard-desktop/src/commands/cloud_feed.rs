@@ -60,9 +60,34 @@ struct FeedGate {
     last_done: Option<Instant>,
 }
 
+/// The managed [`CloudFeed`], or `None` (logged) if it was never registered.
+///
+/// **This is the ADR 0021 D.12 panic.** `Manager::state::<T>()` panics when `T`
+/// was never `.manage()`d, and `CloudFeed` never was — so every `kick_*` call
+/// killed *its caller's task*, synchronously, before any of the spawn/gate
+/// machinery below ran. The cloud-pull poller calls `kick_all` right after its
+/// first pull, which is exactly the observed failure: two ticks in the first
+/// second, then a task that no longer exists — no `gate busy`, no `stopped`, no
+/// log line at all, and the engine blind for the rest of the session. The
+/// realtime socket died the same way on its (re)subscribe catch-up.
+///
+/// Registering it in `lib.rs` is the fix; going through `try_state` is the
+/// guard, so a future mis-wiring degrades to one warning and a dead feed
+/// instead of taking down whatever loop happened to call it.
+fn feed_state(app: &AppHandle) -> Option<tauri::State<'_, CloudFeed>> {
+    let state = app.try_state::<CloudFeed>();
+    if state.is_none() {
+        tracing::warn!("cloud-feed: state not managed — devices/bell feeds are inert");
+    }
+    state
+}
+
 /// Refresh the devices feed now (single-flight, spaced). Fire-and-forget.
 pub fn kick_devices(app: &AppHandle) {
-    let gate = app.state::<CloudFeed>().devices_gate.clone();
+    let Some(state) = feed_state(app) else {
+        return;
+    };
+    let gate = state.devices_gate.clone();
     let app = app.clone();
     tokio::task::spawn(async move {
         guarded(&gate, || fetch_devices_once(&app)).await;
@@ -71,7 +96,10 @@ pub fn kick_devices(app: &AppHandle) {
 
 /// Refresh the notifications feed now (single-flight, spaced). Fire-and-forget.
 pub fn kick_notifications(app: &AppHandle) {
-    let gate = app.state::<CloudFeed>().notif_gate.clone();
+    let Some(state) = feed_state(app) else {
+        return;
+    };
+    let gate = state.notif_gate.clone();
     let app = app.clone();
     tokio::task::spawn(async move {
         guarded(&gate, || fetch_notifications_once(&app)).await;

@@ -338,6 +338,21 @@ impl ApiClient {
         self.server_mode().await.as_deref() == Some("cloud")
     }
 
+    /// The deployment mode **already probed**, without touching the network:
+    /// `Some(true)` cloud, `Some(false)` self-hosted, `None` when no probe has
+    /// succeeded yet.
+    ///
+    /// [`Self::is_cloud`] collapses "self-hosted" and "the probe failed" into
+    /// the same `false`, which is fine for picking a protocol but not for
+    /// deciding whether this deployment *has* a cloud head worth watching: the
+    /// engine reports "cloud state stale" off that distinction (ADR 0021 D.11
+    /// remate), and a network blip must not be read as "self-hosted, nothing to
+    /// observe". Only a successful probe is cached, so `None` really means
+    /// unresolved.
+    pub fn probed_is_cloud(&self) -> Option<bool> {
+        self.mode.get().map(|m| m.as_deref() == Some("cloud"))
+    }
+
     // ---- Cloud (SaaS) protocol -----------------------------------------
 
     /// `POST /v1/cloud/saves` — declare upload intent. The server validates

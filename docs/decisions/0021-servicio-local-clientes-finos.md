@@ -898,3 +898,45 @@ SHA y salta, así que el atajo no puede corromper un restore.
 que se introdujeron los feeds, así que los usuarios ya desplegados probablemente
 tienen el auto-restore roto igual que lo estaba aquí. Publicar la corrección pesa
 más que hacerla rápida; esto es optimización, no correctness.
+
+#### Resuelto (2026-07-25) — decisiones a no deshacer
+
+- **El índice se construye contra una carpeta que se *pasa*, no contra `dest`.**
+  `RestoreOptions::reuse_from` es un `Option<PathBuf>` aparte porque los dos
+  llamantes difieren: el auto-restore extrae a un staging **vacío por
+  construcción** (indexar `dest` no encontraría nada), así que apunta a la
+  carpeta viva del save; el restore directo (desktop History, CLI) escribe en la
+  carpeta y pasa `dest`. `None` = todo se baja, comportamiento pre-D.13 exacto.
+  No colapsar el parámetro en `dest`: eso desactiva silenciosamente el dedup en
+  el único camino que importa (el automático).
+- **El emparejamiento es por SHA-256 y sólo por SHA-256.** `build_reuse_index`
+  (IO) + `plan_byte_sources` (puro) están separados para que el join sea
+  testeable sin red. Un fichero local con el mismo *nombre* pero otros bytes
+  hashea distinto y se baja; uno renombrado con los mismos bytes se reutiliza —
+  que es justo lo que hace que los autosaves rotatorios de Factorio dedupliquen.
+  Prefiltro por tamaño antes de hashear (un fichero de otra longitud no puede ser
+  el contenido buscado), así que el coste de leer disco está acotado por el
+  tamaño del propio snapshot.
+- **La verificación de hash de lo que aterriza se mantiene, y el fallo cae a la
+  red.** `copy_local_blob` hashea mientras copia y compara contra el manifiesto;
+  un fallo (índice rancio, fichero reescrito debajo) sólo hace `warn!` y baja el
+  blob. Esa red de seguridad es también lo que hace inocua la carrera del restore
+  directo, donde el origen de una reutilización puede ser el destino de otra
+  entrada: quien pierda la carrera no cuadra el SHA y baja. **No sustituir la
+  verificación por "ya sabemos el hash del índice"**: es la propiedad que
+  convierte el atajo en gratis en vez de en un riesgo de corrupción.
+- **No hay caché de hashes por fichero que reutilizar.** `state.json::set_hash`
+  es una firma **del conjunto** (rutas+tamaños+mtimes, más un hash de contenido
+  de la concatenación), no digests por fichero. Lo reutilizable eran las
+  primitivas: `backup::walk_source` (mismo walk que la subida, ya filtra symlinks
+  y locks transitorios) y `backup::hash_file`, ahora `pub(crate)`.
+- **El progreso cuenta bytes reutilizados igual que descargados.** Si la barra
+  sólo contara red se quedaría clavada al 2% en el caso Factorio y parecería
+  colgada. El desglose reutilizado/bajado va en `RestoreOutcome`
+  (`files_reused`/`bytes_reused`) y en el `info!` de cierre — que es la señal de
+  dogfooding: ~390 MB reutilizados / ~8 MB bajados.
+- **Sólo el camino cloud CAS.** El self-hosted (`download_snapshot` →
+  `snapshot_download`) sirve **un `tar.zst` monolítico** por snapshot: no hay GET
+  por fichero que saltarse, así que saber que un fichero ya está en disco no
+  ahorra nada. Intacto, igual que la versión cloud legacy de archivo entero
+  (`download_and_extract_cloud`); ambos reportan `files_reused = 0`.

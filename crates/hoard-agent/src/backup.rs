@@ -641,7 +641,14 @@ where
 }
 
 /// SHA-256 of a file's bytes, read in fixed-size chunks.
-async fn hash_file(path: &Path) -> Result<String> {
+///
+/// Shared with the restore side: the same whole-file digest that keys the
+/// upload's dedup against the server's blobs keys the download's dedup against
+/// the local disk (ADR 0021 D.13). There is no per-file hash *cache* to reuse —
+/// `state.json`'s `set_hash` is a signature over the whole set (paths + sizes +
+/// mtimes, plus a content hash of the concatenation), not per-file digests — so
+/// both sides hash on demand.
+pub(crate) async fn hash_file(path: &Path) -> Result<String> {
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("hashing {}", path.display()))?;

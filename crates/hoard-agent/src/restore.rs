@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_compression::tokio::bufread::ZstdDecoder;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -25,6 +25,16 @@ pub struct RestoreOptions {
     pub skip_verify: bool,
     /// Allow extracting into a non-empty destination directory.
     pub force: bool,
+    /// Directory to deduplicate the download against. Files already sitting
+    /// there whose SHA-256 matches a manifest entry are **copied locally**
+    /// instead of fetched over the network (cloud content-addressed path only).
+    /// `None` disables the shortcut and downloads everything.
+    ///
+    /// It's a separate path rather than just `dest` because the two callers
+    /// differ: a staged auto-restore extracts into an empty temp dir, so the
+    /// bytes worth reusing live in the *live save folder*, not in `dest`. A
+    /// direct restore writes straight into the save folder and passes `dest`.
+    pub reuse_from: Option<PathBuf>,
 }
 
 /// Result summary after a successful restore.
@@ -33,6 +43,12 @@ pub struct RestoreOutcome {
     pub files_extracted: usize,
     pub bytes_extracted: u64,
     pub destination: PathBuf,
+    /// Subset of `files_extracted` whose bytes came from an identical file
+    /// already on disk instead of the network. Always 0 on the paths that
+    /// can't dedup per file (self-hosted tar, legacy cloud archive).
+    pub files_reused: usize,
+    /// Subset of `bytes_extracted` that never crossed the network.
+    pub bytes_reused: u64,
 }
 
 /// Hard ceiling on the total bytes a single restore may write to disk —
@@ -95,6 +111,12 @@ pub async fn resolve_version(
 ///
 /// `progress(downloaded, total_or_zero)` is called as bytes flow from the
 /// server. `total_or_zero` is 0 if the server didn't send Content-Length.
+///
+/// `options.reuse_from` (dedup against the local disk) only applies to the
+/// cloud content-addressed path. Self-hosted ships **one monolithic
+/// `tar.zst`** per snapshot: the server streams the whole archive and there's
+/// no per-file GET to skip, so knowing a file is already on disk saves
+/// nothing. That path is left exactly as it was.
 pub async fn download_snapshot<F>(
     client: &ApiClient,
     save_id: &str,
@@ -257,6 +279,9 @@ where
         files_extracted,
         bytes_extracted,
         destination: dest.to_path_buf(),
+        // Whole-archive path: nothing to skip per file.
+        files_reused: 0,
+        bytes_reused: 0,
     })
 }
 
@@ -336,10 +361,199 @@ where
     result
 }
 
+/// Files already on disk, keyed by the SHA-256 of their contents. Built by
+/// [`build_reuse_index`] and consumed by [`plan_byte_sources`].
+type ReuseIndex = HashMap<String, PathBuf>;
+
+/// Where one manifest entry's bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ByteSource {
+    /// An identical file is already on disk at this path — copy it.
+    Reuse(PathBuf),
+    /// Nothing on disk carries these bytes — fetch the blob.
+    Download,
+}
+
+/// Index the files under `dir` by the SHA-256 of their contents.
+///
+/// Only files whose length is one the manifest actually wants get hashed: a
+/// file of a different size can't be the content we're looking for, so the
+/// filter keeps a save folder's unrelated multi-GB neighbours from being read.
+/// Worst case we read as much as the snapshot itself is big — a second or two
+/// of local IO against a minute of network.
+///
+/// Every failure degrades into a *smaller* index rather than an error: an
+/// unreadable file (a lock a running game holds, a permission we don't have)
+/// just means one more blob to download. Never fails the restore.
+async fn build_reuse_index(dir: &Path, wanted_sizes: &HashSet<u64>) -> ReuseIndex {
+    if wanted_sizes.is_empty() || !dir.exists() {
+        // Empty or missing destination: no index, everything downloads — the
+        // pre-dedup behaviour, bit for bit.
+        return ReuseIndex::new();
+    }
+    // `walk_source` is the same walk the backup side uses: sorted by relative
+    // path, symlinks and transient game locks already filtered out.
+    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir) {
+        Ok(files) => files
+            .into_iter()
+            .filter(|f| wanted_sizes.contains(&f.size_bytes))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(
+                dir = %dir.display(),
+                error = %format!("{e:#}"),
+                "cloud restore: couldn't walk the local folder; downloading everything"
+            );
+            return ReuseIndex::new();
+        }
+    };
+
+    // A few files hash in flight so per-file open latency overlaps. `buffered`
+    // rather than `buffer_unordered`: results stay in walk order, so when two
+    // files share content the index deterministically keeps the first by
+    // relative path.
+    let mut hash_futs = Vec::with_capacity(candidates.len());
+    for f in candidates {
+        hash_futs.push(
+            async move {
+                match crate::backup::hash_file(&f.absolute_path).await {
+                    Ok(sha) => Some((sha, f.absolute_path)),
+                    Err(e) => {
+                        tracing::debug!(
+                            path = %f.absolute_path.display(),
+                            error = %format!("{e:#}"),
+                            "cloud restore: couldn't hash local file; not a reuse candidate"
+                        );
+                        None
+                    }
+                }
+            }
+            .boxed(),
+        );
+    }
+    let hashed: Vec<Option<(String, PathBuf)>> = futures::stream::iter(hash_futs)
+        .buffered(RESTORE_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut index = ReuseIndex::new();
+    for (sha, path) in hashed.into_iter().flatten() {
+        index.entry(sha).or_insert(path);
+    }
+    index
+}
+
+/// Join the manifest's per-file SHAs against the on-disk index.
+///
+/// Pure: all the IO happened in [`build_reuse_index`]. Matching is by content
+/// hash *only* — a local file that shares a manifest entry's name but not its
+/// bytes hashes differently and simply isn't in the index, so it's downloaded.
+fn plan_byte_sources(shas: &[String], index: &ReuseIndex) -> Vec<ByteSource> {
+    shas.iter()
+        .map(|sha| match index.get(sha) {
+            Some(path) => ByteSource::Reuse(path.clone()),
+            None => ByteSource::Download,
+        })
+        .collect()
+}
+
+/// Copy an already-present local file into its restore destination, verifying
+/// that what landed hashes to the SHA-256 the manifest declares.
+///
+/// The check is the same one the download path runs, and it's what makes the
+/// shortcut safe rather than merely fast: a wrong reuse — stale index, a file
+/// rewritten under us — fails here and the caller falls back to the network.
+async fn copy_local_blob(
+    src: &Path,
+    dest_path: &Path,
+    file: &crate::api::CloudManifestFile,
+    options: &RestoreOptions,
+) -> Result<()> {
+    // On a direct restore the folder we indexed *is* `dest`, so the right bytes
+    // can already be at the right path. Nothing to copy — re-verify in place so
+    // "everything under dest was hash-checked this pass" still holds.
+    if src == dest_path {
+        if options.skip_verify {
+            return Ok(());
+        }
+        let got = crate::backup::hash_file(dest_path).await?;
+        if got != file.sha256 {
+            bail!(
+                "sha256 mismatch reusing {} for {}: expected {}, got {}",
+                src.display(),
+                file.relative_path,
+                file.sha256,
+                got
+            );
+        }
+        return Ok(());
+    }
+
+    let mut input = tokio::fs::File::open(src)
+        .await
+        .with_context(|| format!("opening local {} for reuse", src.display()))?;
+    let mut out = tokio::fs::File::create(dest_path)
+        .await
+        .with_context(|| format!("writing {}", dest_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = input
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("reading local {}", src.display()))?;
+        if n == 0 {
+            break;
+        }
+        if !options.skip_verify {
+            hasher.update(&buf[..n]);
+        }
+        out.write_all(&buf[..n])
+            .await
+            .with_context(|| format!("writing {}", dest_path.display()))?;
+    }
+    out.flush()
+        .await
+        .with_context(|| format!("writing {}", dest_path.display()))?;
+    drop(out);
+
+    if !options.skip_verify {
+        let got = hex::encode(hasher.finalize());
+        if got != file.sha256 {
+            bail!(
+                "sha256 mismatch reusing {} for {}: expected {}, got {}",
+                src.display(),
+                file.relative_path,
+                file.sha256,
+                got
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether a manifest entry's bytes were copied off the local disk or fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Reused,
+    Downloaded,
+}
+
+fn as_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 /// Content-addressed restore: each file in the manifest is its own R2 blob.
 /// Stream each to its destination path, verifying the whole-file sha256 and
 /// preserving the recorded mtime (so a cloud pull doesn't always win the
 /// conflict-aware diff). No temp archive — files land directly.
+///
+/// Before any blob is fetched, the folder named by `options.reuse_from` is
+/// indexed by content hash and every manifest entry whose SHA is already on
+/// disk is served by a local copy instead of a GET. Upload already dedups
+/// against the server's blobs; this is the same saving in the other direction
+/// (ADR 0021 D.13). Twelve 8 MB Factorio autosaves with one changed file go
+/// from ~400 MB of egress to ~8 MB.
 async fn restore_cloud_cas<F>(
     client: &ApiClient,
     dest: &Path,
@@ -377,6 +591,23 @@ where
         jobs.push((file, dest.join(safe_rel)));
     }
 
+    // Dedup against the disk before touching the network. Hashing the folder
+    // costs a couple of seconds; the blobs it lets us skip cost a minute of
+    // egress each time a save rotates one file out of a dozen.
+    let plan = match options.reuse_from.as_deref() {
+        Some(reuse_dir) => {
+            let wanted: HashSet<u64> = manifest
+                .files
+                .iter()
+                .map(|f| f.size_bytes.max(0) as u64)
+                .collect();
+            let index = build_reuse_index(reuse_dir, &wanted).await;
+            let shas: Vec<String> = manifest.files.iter().map(|f| f.sha256.clone()).collect();
+            plan_byte_sources(&shas, &index)
+        }
+        None => vec![ByteSource::Download; jobs.len()],
+    };
+
     // A few blobs download in flight at once — presigned-GET round-trip
     // latency dominates the many-small-files shape. Each blob writes to its
     // own dest path and verifies independently, so completion order doesn't
@@ -384,12 +615,18 @@ where
     // futures rather than `iter().map(closure)`: a closure over borrowed
     // items retained inside the stream trips rustc's "Send is not general
     // enough" false positive when the restore future crosses `tokio::spawn`.)
-    let downloaded = AtomicU64::new(0);
+    //
+    // `landed` counts *every* byte that reaches dest, copied or downloaded, so
+    // the bar still runs 0→total when most of the restore came off the local
+    // disk. Counting only network bytes would park it at 2% on the Factorio
+    // case and look hung; the reused/downloaded split is reported separately,
+    // in the outcome and the log line below.
+    let landed = AtomicU64::new(0);
     progress(0, total);
 
     let mut fetch_futs = Vec::with_capacity(jobs.len());
-    for (file, dest_path) in &jobs {
-        let downloaded = &downloaded;
+    for ((file, dest_path), planned) in jobs.iter().zip(plan.iter()) {
+        let landed = &landed;
         let progress = &progress;
         let options = &options;
         fetch_futs.push(async move {
@@ -397,6 +634,34 @@ where
                 tokio::fs::create_dir_all(parent)
                     .await
                     .with_context(|| format!("creating parent {}", parent.display()))?;
+            }
+
+            // Local shortcut first. On failure — including a sha that doesn't
+            // match, which is the whole point of keeping the check — we fall
+            // through to the network, so a bad reuse costs a wasted read, never
+            // a corrupt file or a failed restore. (That fallback is also what
+            // makes a direct restore safe when a source we indexed is itself
+            // some other entry's destination, as with rotating autosave names:
+            // whoever loses the race fails verification and downloads.)
+            if let ByteSource::Reuse(src) = planned {
+                match copy_local_blob(src, dest_path, file, options).await {
+                    Ok(()) => {
+                        // One bump on success rather than per chunk: a partial
+                        // copy that later falls back to the network must not
+                        // have its bytes counted twice.
+                        let n = file.size_bytes.max(0) as u64;
+                        let done = landed.fetch_add(n, Ordering::Relaxed) + n;
+                        progress(done, total);
+                        apply_manifest_mtime(file, dest_path);
+                        return Ok::<(u64, Origin), anyhow::Error>((n, Origin::Reused));
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %file.relative_path,
+                        source = %src.display(),
+                        error = %format!("{e:#}"),
+                        "cloud restore: local reuse failed verification — downloading the blob"
+                    ),
+                }
             }
 
             let presigned = file.download.as_ref().ok_or_else(|| {
@@ -428,7 +693,7 @@ where
                         out.write_all(&chunk)
                             .await
                             .with_context(|| format!("writing {}", dest_path.display()))?;
-                        let done = downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                        let done = landed.fetch_add(chunk.len() as u64, Ordering::Relaxed)
                             + chunk.len() as u64;
                         progress(done, total);
                     }
@@ -465,30 +730,74 @@ where
                 }
             }
 
-            // Preserve the recorded mtime — without it every cloud pull would look
-            // strictly newer than the local copy and silently win the auto-restore
-            // diff. Best-effort: a failure only degrades conflict resolution.
-            if let Some(secs) = file.modified_at {
-                if secs > 0 {
-                    let ft = filetime::FileTime::from_unix_time(secs, 0);
-                    let _ = filetime::set_file_mtime(&dest_path, ft);
-                }
-            }
+            apply_manifest_mtime(file, dest_path);
 
-            Ok::<u64, anyhow::Error>(file.size_bytes.max(0) as u64)
+            Ok::<(u64, Origin), anyhow::Error>((
+                file.size_bytes.max(0) as u64,
+                Origin::Downloaded,
+            ))
         }
         .boxed());
     }
-    let sizes: Vec<u64> = futures::stream::iter(fetch_futs)
+    let restored: Vec<(u64, Origin)> = futures::stream::iter(fetch_futs)
         .buffer_unordered(RESTORE_CONCURRENCY)
         .try_collect()
         .await?;
 
+    let mut files_reused = 0usize;
+    let mut bytes_reused = 0u64;
+    let mut files_downloaded = 0usize;
+    let mut bytes_downloaded = 0u64;
+    for (bytes, origin) in &restored {
+        match origin {
+            Origin::Reused => {
+                files_reused += 1;
+                bytes_reused += bytes;
+            }
+            Origin::Downloaded => {
+                files_downloaded += 1;
+                bytes_downloaded += bytes;
+            }
+        }
+    }
+    // The dogfooding check for D.13: on a save that rotated one file out of a
+    // dozen this should read ~390 MB reused / ~8 MB downloaded, not 400/0.
+    tracing::info!(
+        files_reused,
+        mib_reused = as_mib(bytes_reused),
+        files_downloaded,
+        mib_downloaded = as_mib(bytes_downloaded),
+        dedup_source = options
+            .reuse_from
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        "cloud restore: content-addressed restore finished"
+    );
+
     Ok(RestoreOutcome {
-        files_extracted: sizes.len(),
-        bytes_extracted: sizes.iter().sum(),
+        files_extracted: restored.len(),
+        bytes_extracted: bytes_reused + bytes_downloaded,
         destination: dest.to_path_buf(),
+        files_reused,
+        bytes_reused,
     })
+}
+
+/// Stamp the manifest's recorded mtime onto a file that just landed in `dest`.
+///
+/// Without it every cloud pull would look strictly newer than the local copy
+/// and silently win the auto-restore diff. Reused files get exactly the same
+/// treatment as downloaded ones — they're indistinguishable to the
+/// staging→merge step, which is what keeps `preserve_staging_mtime` honest.
+/// Best-effort: a failure only degrades conflict resolution.
+fn apply_manifest_mtime(file: &crate::api::CloudManifestFile, dest_path: &Path) {
+    if let Some(secs) = file.modified_at {
+        if secs > 0 {
+            let ft = filetime::FileTime::from_unix_time(secs, 0);
+            let _ = filetime::set_file_mtime(dest_path, ft);
+        }
+    }
 }
 
 async fn download_and_extract_cloud<F>(
@@ -607,6 +916,9 @@ where
         files_extracted,
         bytes_extracted,
         destination: dest.to_path_buf(),
+        // Legacy whole-archive cloud version: no per-file blobs to skip.
+        files_reused: 0,
+        bytes_reused: 0,
     })
 }
 
@@ -770,5 +1082,159 @@ mod tests {
         // 2 × 40 GiB = 80 GiB would exceed the 64 GiB hard cap.
         let declared = 40 * 1024 * 1024 * 1024;
         assert_eq!(restore_byte_cap(Some(declared)), MAX_RESTORE_BYTES);
+    }
+
+    // ---- D.13: restore dedups against the local disk ----
+
+    fn sha_of(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+
+    /// Write `contents` to `dir/name`, creating parents. Returns its sha256.
+    fn seed(dir: &Path, name: &str, contents: &[u8]) -> String {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        sha_of(contents)
+    }
+
+    /// The set of sizes a manifest of these blobs would declare.
+    fn sizes_of(blobs: &[Vec<u8>]) -> HashSet<u64> {
+        blobs.iter().map(|b| b.len() as u64).collect()
+    }
+
+    /// N manifest entries, N-1 of them already on disk → exactly one download.
+    /// The Factorio shape: a dozen autosaves, one of them rotated.
+    #[tokio::test]
+    async fn present_files_are_reused_and_only_the_new_one_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        const N: usize = 12;
+
+        // Distinct contents of distinct lengths — one per autosave slot.
+        let blobs: Vec<Vec<u8>> = (0..N).map(|i| vec![b'a' + i as u8; 4096 + i]).collect();
+        let manifest_shas: Vec<String> = blobs.iter().map(|b| sha_of(b)).collect();
+
+        // Everything but the last entry is already sitting in the destination.
+        for (i, blob) in blobs.iter().take(N - 1).enumerate() {
+            seed(dir.path(), &format!("_autosave{i}.zip"), blob);
+        }
+
+        let index = build_reuse_index(dir.path(), &sizes_of(&blobs)).await;
+        let plan = plan_byte_sources(&manifest_shas, &index);
+
+        assert_eq!(plan.len(), N);
+        let downloads = plan
+            .iter()
+            .filter(|s| **s == ByteSource::Download)
+            .count();
+        assert_eq!(downloads, 1, "only the rotated file should be fetched");
+        // And each reuse points at the local file that actually holds those bytes.
+        for (i, source) in plan.iter().take(N - 1).enumerate() {
+            let expected = dir.path().join(format!("_autosave{i}.zip"));
+            assert_eq!(*source, ByteSource::Reuse(expected));
+        }
+    }
+
+    /// Same relative path, different bytes: reuse is keyed on content, never on
+    /// the name, so a locally-modified file must not shortcut the download.
+    #[tokio::test]
+    async fn same_name_different_content_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = b"the version the server has".to_vec();
+        // Same length so the size prefilter can't be what saves us — the hash
+        // has to be the thing that rejects it.
+        let local = b"a different local edition!".to_vec();
+        assert_eq!(remote.len(), local.len());
+
+        seed(dir.path(), "save.dat", &local);
+
+        let index = build_reuse_index(dir.path(), &sizes_of(&[remote.clone()])).await;
+        let plan = plan_byte_sources(&[sha_of(&remote)], &index);
+
+        assert_eq!(plan, vec![ByteSource::Download]);
+    }
+
+    /// Empty or missing destination: no index, everything downloads. This is the
+    /// pre-D.13 behaviour and it must stay byte-for-byte the same.
+    #[tokio::test]
+    async fn empty_or_missing_destination_downloads_everything() {
+        let blobs: Vec<Vec<u8>> = vec![b"one".to_vec(), b"two!".to_vec(), b"three".to_vec()];
+        let shas: Vec<String> = blobs.iter().map(|b| sha_of(b)).collect();
+        let wanted = sizes_of(&blobs);
+
+        let empty = tempfile::tempdir().unwrap();
+        let index = build_reuse_index(empty.path(), &wanted).await;
+        assert!(index.is_empty());
+        assert_eq!(
+            plan_byte_sources(&shas, &index),
+            vec![ByteSource::Download; 3]
+        );
+
+        let missing = empty.path().join("not-created-yet");
+        let index = build_reuse_index(&missing, &wanted).await;
+        assert!(index.is_empty());
+        assert_eq!(
+            plan_byte_sources(&shas, &index),
+            vec![ByteSource::Download; 3]
+        );
+    }
+
+    /// The index looks at content, not layout: a file that moved or was renamed
+    /// still serves its bytes. This is what makes rotating autosave names dedup.
+    #[tokio::test]
+    async fn reuse_follows_content_across_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![7u8; 8192];
+        seed(dir.path(), "nested/old-name.zip", &blob);
+
+        let index = build_reuse_index(dir.path(), &sizes_of(&[blob.clone()])).await;
+        let plan = plan_byte_sources(&[sha_of(&blob)], &index);
+
+        assert_eq!(
+            plan,
+            vec![ByteSource::Reuse(dir.path().join("nested/old-name.zip"))]
+        );
+    }
+
+    /// A reused file must land verified. `copy_local_blob` is the shortcut's
+    /// safety gate: right bytes copy through, wrong bytes error out (and the
+    /// caller falls back to the network).
+    #[tokio::test]
+    async fn copy_local_blob_verifies_what_it_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let blob = b"exactly these bytes".to_vec();
+        seed(dir.path(), "src.dat", &blob);
+
+        let src = dir.path().join("src.dat");
+        let dest = staging.path().join("landed.dat");
+        let options = RestoreOptions::default();
+
+        let good = crate::api::CloudManifestFile {
+            relative_path: "landed.dat".to_string(),
+            sha256: sha_of(&blob),
+            size_bytes: blob.len() as i64,
+            modified_at: None,
+            download: None,
+        };
+        copy_local_blob(&src, &dest, &good, &options).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), blob);
+
+        // Same source, a manifest claiming other content: must not pass.
+        let wrong = crate::api::CloudManifestFile {
+            sha256: sha_of(b"something else entirely"),
+            ..good
+        };
+        let err = copy_local_blob(&src, &dest, &wrong, &options)
+            .await
+            .expect_err("a mismatched reuse has to fail verification");
+        assert!(
+            format!("{err:#}").contains("sha256 mismatch"),
+            "unexpected error: {err:#}"
+        );
     }
 }

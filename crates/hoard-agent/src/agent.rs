@@ -2751,6 +2751,12 @@ async fn run_auto_restore(
         crate::restore::RestoreOptions {
             skip_verify: false,
             force: false,
+            // Dedup against the *live* folder, not `staging`: staging is empty
+            // by construction, so indexing it would find nothing to reuse.
+            // Files already on disk are copied into staging instead of pulled
+            // from R2, and the merge below treats them exactly like downloaded
+            // ones (ADR 0021 D.13).
+            reuse_from: Some(save.local_path.clone()),
         },
         |_, _| {},
     )

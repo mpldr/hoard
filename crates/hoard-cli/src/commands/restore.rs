@@ -69,6 +69,9 @@ pub async fn apply(
     let options = RestoreOptions {
         skip_verify: no_verify,
         force,
+        // Extraction goes straight into `dest`, so that's also the folder worth
+        // deduping against: identical bytes already there aren't downloaded again.
+        reuse_from: Some(dest.clone()),
     };
     let outcome = download_snapshot(&client, &save_id, version, &dest, options, on_progress)
         .await
@@ -85,6 +88,13 @@ pub async fn apply(
         fmt_bytes(outcome.bytes_extracted),
         outcome.destination.display()
     );
+    if outcome.files_reused > 0 {
+        println!(
+            "  {} of them ({}) were already on disk — copied, not downloaded",
+            outcome.files_reused,
+            fmt_bytes(outcome.bytes_reused)
+        );
+    }
     Ok(())
 }
 

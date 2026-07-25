@@ -420,6 +420,10 @@ pub async fn restore_snapshot(
         RestoreOptions {
             skip_verify: false,
             force: true,
+            // Files land straight into the save folder here, so the folder we
+            // dedup against is the destination itself: anything already there
+            // with the right bytes is copied (or left) instead of re-downloaded.
+            reuse_from: Some(local_path.clone()),
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(

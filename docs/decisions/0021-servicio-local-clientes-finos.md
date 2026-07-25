@@ -771,3 +771,50 @@ grave — **no** se reporta obsoleto. La distinción correcta es *contexto cloud
 self-hosted*, no `None` vs `Some`: en contexto cloud, `None` pasado un margen de
 arranque debería ser `stale`. Mitigado en la práctica porque
 `feed_agent_versions()` desde `start_agent` cierra la carrera que lo producía.
+
+---
+
+### D.12 — El motor debe observar la nube, no esperar la papilla (dogfooding 2026-07-25)
+
+Con el fix D.11 desplegado (7.7.14), el dogfooding dio el veredicto:
+
+- **Lo que funcionó:** `Hold{"cloud state stale"}` salió **3015 veces** — el
+  kernel ya no disfraza la ceguera de `converged`. `gate busy: 0`: el gate
+  atascado está muerto. La observabilidad que añadimos es lo que permitió
+  diagnosticar esto en una lectura de log.
+- **Lo que no:** el poller registró **dos ticks en el primer segundo**
+  (`timer` a las 03:25:48.017, `kick` a las .416) y **cero en los 36 minutos
+  siguientes**. Sin `gate busy`, sin segundo `poller: started`, sin `stopped`:
+  la tarea de `tokio::spawn` **desaparece**, casi seguro por un panic que no
+  llega al fichero de log. Encaja con el síntoma observado: reiniciar la app →
+  un único feed → el agente aprende → restaura una vez → el poller muere →
+  ciego el resto de la sesión (15 subidas posteriores, cero restauraciones).
+
+**El fallo de diseño (lo diagnosticó el usuario):** la UI sabe de la v181 porque
+*ella* consulta al servidor; el agente no, porque son caminos separados. **El
+motor no observa el mundo: espera a que un proceso ajeno y frágil le dé la
+papilla.** Muere una tarea y el motor queda ciego para siempre, sin
+autorrecuperación. Cazar este panic concreto sólo aplaza el siguiente.
+
+**Fix estructural:** aplicar al **transporte** el principio que ya rige las
+decisiones. El agente **consulta él mismo la cabeza de la nube** como parte de
+observar el mundo (ya tiene `ApiClient`); el poller del desktop pasa a ser un
+**hint de latencia**, no la única fuente de verdad. Un poller muerto degrada
+entonces a "tardo hasta el siguiente tick" en vez de "ciego para siempre" — la
+propiedad level-triggered que perseguimos desde C.1. Coste a controlar: no
+convertirlo en un GET por save y tick — una sola llamada al manifiesto por
+intervalo, con la observación L0/L1 gateando el resto.
+
+**Además:** una tarea de fondo que muere en silencio es un bug por sí misma.
+Supervisar (detectar salida y reiniciar con backoff) y que el panic acabe en el
+log, no sólo en stderr.
+
+**Refuerza el Slice 4.** Que UI y motor tengan caminos distintos a la verdad es
+exactamente la duplicación que el daemon elimina: con `hoardd` dueño del motor,
+la UI deja de ser proveedora de datos del motor y pasa a ser su cliente.
+
+**Aparte, sin perseguir:** Planet S falla siempre en Windows con
+`cloud cas init: conflict (409): non-fast-forward`. Si el 409 no está aterrizando
+en el merge de cabeza que asume D.8, esa recuperación está rota. Relacionado con
+la memoria `hoard-planet-s-windows-mistrack` (Windows trackea la carpeta
+equivocada), así que puede ser contenido divergente y no el 409 en sí.

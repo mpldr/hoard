@@ -845,13 +845,18 @@ equivocada), así que puede ser contenido divergente y no el 409 en sí.
   `try_state` como red: un mis-wiring futuro degrada a un `warn!` y un feed
   inerte, no a un bucle muerto. Los feeds de dispositivos/campana llevaban
   muertos desde que se introdujeron.
-- **Supervisión + pánico al log.** `supervise()` envuelve el bucle del poller en
-  `catch_unwind` y reinicia con backoff (5 s → 5 min, reseteado tras 10 min
-  sanos); un solo task, sin `spawn` anidado, para que el `abort()` de
+- **Supervisión + pánico al log.** `commands::supervisor::supervise()` envuelve
+  el bucle en `catch_unwind` y reinicia con backoff (5 s → 5 min, reseteado tras
+  10 min sanos); un solo task, sin `spawn` anidado, para que el `abort()` de
   `start()`/`stop()` siga matándolo todo (un task anidado sobreviviría como
-  huérfano: dos pollers). Y un `panic hook` global en `lib.rs` manda todo pánico
-  al fichero de log: en una app empaquetada stderr es `/dev/null`, que es por lo
-  que esto fue invisible.
+  huérfano: dos pollers). Lo usan **el poller y el subscriptor Realtime**: éste
+  reconectaba ante errores pero un pánico lo mataba para toda la sesión, que es
+  justo como murió en `kick_all`. Terminar a propósito es una *declaración* — el
+  cuerpo devuelve `supervisor::Finished`—, así que un bucle que no puede
+  retornar (el poller) tampoco puede pararse por accidente: el caso "returned
+  unexpectedly" se cierra por construcción, no con un log. Y un `panic hook`
+  global en `lib.rs` manda todo pánico al fichero de log: en una app empaquetada
+  stderr es `/dev/null`, que es por lo que esto fue invisible.
 - **Remate de D.11 cerrado.** `Observation::cloud_feed_expected_since`: en
   contexto cloud, "nunca supe nada de la nube" envejece desde el arranque del
   motor y se reporta `Hold{"cloud state stale"}` igual que un feed rancio. La
@@ -861,7 +866,7 @@ equivocada), así que puede ser contenido divergente y no el 409 en sí.
   hint del poller: con el agente en self-hosted y una sesión cloud viva en disco,
   las cabezas que empuja el poller no son de este motor.
 
-**Sigue abierto (misma clase, no tocado aquí):** `cloud_realtime::run_loop` no
-tiene supervisor propio — reconecta ante errores, pero un pánico se lleva la
-tarea entera para toda la sesión. Con `CloudFeed` gestionado desaparece la causa
-conocida y el hook deja el rastro; cerrar el hueco es copiar `supervise()`.
+**Regla para tareas de fondo nuevas:** si vive más que una petición, va bajo
+`supervisor::supervise`. Las tres piezas de este incidente —poller, Realtime y
+los feeds de `cloud_feed`— eran `tokio::spawn` sueltos, y las tres fallaron en
+silencio por el mismo pánico.

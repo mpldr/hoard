@@ -36,6 +36,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::commands::cloud;
 use crate::commands::cloud_feed;
 use crate::commands::cloud_pull;
+use crate::commands::supervisor;
 use crate::state::AppState;
 
 /// App-level heartbeat cadence. Supabase Realtime closes idle sockets after
@@ -88,9 +89,14 @@ pub fn start(app: &AppHandle) {
 
     let app = app.clone();
     let new_handle = tokio::task::spawn(async move {
-        tracing::info!("cloud-realtime: subscriber started");
-        run_loop(app).await;
-        tracing::info!("cloud-realtime: subscriber stopped (signed out)");
+        // Supervised like the poller (ADR 0021 D.12). `run_loop` already
+        // reconnects around *errors*, but a panic unwound straight through it
+        // and took the task with it — permanently, since nothing restarts it —
+        // so one bad frame cost the session its push channel with no trace in
+        // the log. That is exactly how it died on `kick_all` before `CloudFeed`
+        // was managed. Signing out still ends it for good (`Finished`); the
+        // login path starts a fresh one.
+        supervisor::supervise("cloud-realtime subscriber", || run_loop(&app)).await;
     });
 
     let mut slot = scheduler.handle.lock().unwrap();
@@ -124,13 +130,19 @@ fn signed_in(app: &AppHandle) -> bool {
 
 /// Outer reconnect loop. Exits only when the user is signed out; every other
 /// failure backs off and retries.
-async fn run_loop(app: AppHandle) {
+///
+/// Its own backoff covers *connection* failures (socket dropped, join refused);
+/// [`supervisor::supervise`] covers the loop itself dying, which this one
+/// cannot: an unwind blows past every `match` here.
+async fn run_loop(app: &AppHandle) -> supervisor::Finished {
+    tracing::info!("cloud-realtime: subscriber started");
     let mut backoff = BACKOFF_MIN_SECS;
     loop {
-        if !signed_in(&app) {
-            return;
+        if !signed_in(app) {
+            tracing::info!("cloud-realtime: subscriber stopped (signed out)");
+            return supervisor::Finished;
         }
-        match connect_once(&app).await {
+        match connect_once(app).await {
             Ok(()) => {
                 // Clean lifecycle end (lifetime cap or graceful close).
                 // Reconnect promptly with the floor backoff.
@@ -140,8 +152,9 @@ async fn run_loop(app: AppHandle) {
                 tracing::debug!(error = %e, "cloud-realtime: connection ended, will retry");
             }
         }
-        if !signed_in(&app) {
-            return;
+        if !signed_in(app) {
+            tracing::info!("cloud-realtime: subscriber stopped (signed out)");
+            return supervisor::Finished;
         }
         sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(BACKOFF_MAX_SECS);

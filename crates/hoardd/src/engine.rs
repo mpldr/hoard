@@ -111,12 +111,21 @@ struct Inner {
     status: EngineStatus,
     /// Paramos a propósito (`Request::Shutdown`): el keeper no debe resucitarlo.
     stopping: bool,
+    /// Un cliente pidió levantar el motor de cero (cambió la sesión en disco), y
+    /// por qué. Lo atiende el keeper, que es el único dueño del ciclo de vida.
+    restart_requested: Option<String>,
 }
 
 /// Ranura compartida del motor. Cheap to clone.
 #[derive(Clone, Default)]
 pub struct Engine {
     inner: Arc<Mutex<Inner>>,
+    /// Despierta al keeper de su espera. Sin esto, un motor caído tras varios
+    /// fallos duerme hasta [`START_BACKOFF_MAX`], y un login recién hecho
+    /// tardaría hasta cinco minutos en sincronizar aunque el cliente ya haya
+    /// avisado. `Notify` guarda el permiso si nadie escucha, así que un aviso
+    /// que llega mientras el keeper trabaja no se pierde.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl Engine {
@@ -227,6 +236,68 @@ impl Engine {
         guard.running = None;
     }
 
+    /// Espera `for_` o hasta que alguien pida atención, lo que llegue antes.
+    async fn nap(&self, for_: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(for_) => {}
+            _ = self.wake.notified() => {}
+        }
+    }
+
+    /// Pide que el motor se levante de cero con la sesión que haya ahora en
+    /// disco. Responde a [`hoard_core::ipc::Request::RestartEngine`].
+    ///
+    /// **Lo pide, no lo hace.** El único que arranca y para el motor es el
+    /// keeper: si el reinicio se ejecutara aquí, entre soltar el motor viejo y
+    /// terminar su apagado el keeper vería la ranura vacía y arrancaría otro —
+    /// dos `AgentLock` vivos en el mismo proceso (el `Drop` del viejo borra el
+    /// pidfile del nuevo) y, durante esa ventana, dos rotadores del mismo
+    /// refresh token. Dejarlo en una petición mantiene un solo dueño del ciclo
+    /// de vida.
+    ///
+    /// El aviso vale aunque no haya motor: el caso típico es justo ése —no
+    /// arrancaba por falta de sesión y el usuario acaba de entrar—, y esperar el
+    /// backoff sería no enterarse.
+    pub fn request_restart(&self, reason: &str) {
+        self.lock().restart_requested = Some(reason.to_string());
+        self.wake.notify_one();
+    }
+
+    fn take_restart_request(&self) -> Option<String> {
+        self.lock().restart_requested.take()
+    }
+
+    /// Apagado limpio del motor vivo para volver a arrancarlo. Sólo el keeper.
+    async fn stop_for_restart(&self, reason: &str) {
+        let running = {
+            let mut guard = self.lock();
+            let taken = guard.running.take();
+            if taken.is_some() {
+                guard.status.running = false;
+                guard.status.last_error = Some(reason.to_string());
+                guard.status.blocked_by_pid = None;
+            }
+            taken
+        };
+        let Some(mut running) = running else { return };
+        tracing::info!(reason, "hoardd: restarting the engine");
+        // Último latido de presencia con el token viejo, que aún vale: deja este
+        // equipo en gris en el panel de las otras máquinas en vez de que se
+        // apague sin decir nada.
+        running.presence.closing().await;
+        if let Err(err) = running.handle.shutdown().await {
+            tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge the restart");
+        }
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut running.task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("hoardd: the engine didn't stop in time; aborting it");
+        }
+        // Al soltar `running` aquí se abortan sus tareas auxiliares y se suelta
+        // el pidfile, así que el arranque siguiente no convive con el anterior.
+    }
+
     /// Para el motor. Marca `stopping` **antes** de nada para que el keeper no lo
     /// resucite mientras se apaga.
     pub async fn shutdown(&self) {
@@ -279,8 +350,15 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             tokio::time::sleep(KEEPER_TICK).await;
             continue;
         }
+        // Un cambio de sesión pedido por un cliente. Se atiende **antes** que
+        // nada: el motor vivo que haya está hablando con la cuenta que ya no es.
+        // Sin `continue`, para caer en el arranque de abajo en la misma vuelta.
+        if let Some(reason) = engine.take_restart_request() {
+            engine.stop_for_restart(&reason).await;
+            backoff = START_BACKOFF_MIN;
+        }
         if engine.alive() {
-            tokio::time::sleep(KEEPER_TICK).await;
+            engine.nap(KEEPER_TICK).await;
             continue;
         }
         if engine.status().running {
@@ -300,7 +378,7 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
                 );
             }
             engine.note_blocked(pid);
-            tokio::time::sleep(BLOCKED_RECHECK).await;
+            engine.nap(BLOCKED_RECHECK).await;
             continue;
         }
 
@@ -323,7 +401,7 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
                 let text = format!("{err:#}");
                 tracing::warn!(error = %text, retry_in_secs = backoff.as_secs(), "hoardd: couldn't start the engine");
                 engine.note_error(text);
-                tokio::time::sleep(backoff).await;
+                engine.nap(backoff).await;
                 backoff = (backoff * 2).min(START_BACKOFF_MAX);
             }
         }

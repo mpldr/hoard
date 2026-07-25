@@ -128,7 +128,8 @@ export const activityFeed: Writable<FeedEntry[]> = writable([]);
 export const liveStatus: Readable<"ok" | "warn" | "error" | "unknown"> =
   derived([watcher, cloudLoop], ([$w, $c]) => {
     if (!$w.armed && $c.status === "unknown") return "unknown";
-    if ($c.status === "offline") return "armed" in $w && $w.armed ? "warn" : "error";
+    if ($c.status === "offline")
+      return "armed" in $w && $w.armed ? "warn" : "error";
     if ($c.status === "throttled") return "warn";
     if (!$w.armed) return "warn";
     return "ok";
@@ -148,15 +149,155 @@ export function seedWatcher(count: number) {
 }
 
 let nextId = 1;
-function pushEntry(entry: Omit<FeedEntry, "id" | "at">) {
+/** `at` defaults to now; the journal replay passes the real timestamp so a
+ *  recovered row doesn't claim to have just happened. */
+function pushEntry(
+  entry: Omit<FeedEntry, "id" | "at">,
+  at: number = Date.now(),
+) {
   activityFeed.update((rows) => {
-    const next: FeedEntry[] = [
-      { id: nextId++, at: Date.now(), ...entry },
-      ...rows,
-    ];
+    const next: FeedEntry[] = [{ id: nextId++, at, ...entry }, ...rows];
     if (next.length > MAX_FEED_ENTRIES) next.length = MAX_FEED_ENTRIES;
     return next;
   });
+}
+
+/** One row of the sync service's journal (ADR 0021 D.14.2), as relayed by the
+ *  Rust side on `agent://backlog`. */
+type BacklogRow = { at: number; event: AgentEvent };
+
+/** Rebuild feed rows from what the service journalled while nobody was
+ *  listening — the app was closed, or we reconnected. Same mapping as the live
+ *  listeners below; the pair that only exists as a *live* alias
+ *  (`agent://throttled`) is deliberately left out, since "queued, waiting" is a
+ *  momentary state and not history worth resurrecting.
+ *
+ *  The feed is **not** cleared on `resync`: rows only ever arrive newer than
+ *  our cursor, and it also holds rows from other sources (cloud pulls, gate
+ *  flips) that a wipe would throw away. */
+function applyBacklogRow({ at, event: p }: BacklogRow) {
+  switch (p.type) {
+    case "game_started":
+      pushEntry(
+        { kind: "game_started", save_id: p.save_id, game_slug: p.game_slug },
+        at,
+      );
+      break;
+    case "game_stopped":
+      pushEntry(
+        { kind: "game_stopped", save_id: p.save_id, game_slug: p.game_slug },
+        at,
+      );
+      break;
+    case "backup_started":
+      pushEntry(
+        { kind: "upload_started", save_id: p.save_id, game_slug: p.game_slug },
+        at,
+      );
+      break;
+    case "backup_success":
+      pushEntry(
+        {
+          kind: "upload_completed",
+          save_id: p.save_id,
+          version: p.version_num,
+          bytes: p.total_bytes,
+        },
+        at,
+      );
+      break;
+    case "backup_failed":
+      pushEntry(
+        {
+          kind: "upload_failed",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          error: p.error,
+        },
+        at,
+      );
+      break;
+    case "backup_throttled":
+      pushEntry(
+        {
+          kind: "bandwidth_throttled",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          retry_in: p.retry_after_secs,
+        },
+        at,
+      );
+      break;
+    case "save_auto_restored":
+      pushEntry(
+        {
+          kind: "auto_restored",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          version: p.version_num,
+          bytes: p.bytes_extracted,
+        },
+        at,
+      );
+      break;
+    case "backup_too_large":
+      pushEntry(
+        {
+          kind: "backup_too_large",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          bytes: p.actual_bytes,
+          limit_bytes: p.limit_bytes,
+        },
+        at,
+      );
+      break;
+    case "backup_trimmed":
+      pushEntry(
+        {
+          kind: "backup_trimmed",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          count: p.omitted_files,
+          bytes: p.omitted_bytes,
+        },
+        at,
+      );
+      break;
+    case "save_auto_restore_failed":
+      pushEntry(
+        {
+          kind: "auto_restore_failed",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          error: p.error,
+        },
+        at,
+      );
+      break;
+    case "save_auto_restore_stuck":
+      pushEntry(
+        {
+          kind: "auto_restore_stuck",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+          failures: p.failures,
+          error: p.error,
+        },
+        at,
+      );
+      break;
+    case "save_auto_restore_recovered":
+      pushEntry(
+        {
+          kind: "auto_restore_recovered",
+          save_id: p.save_id,
+          game_slug: p.game_slug,
+        },
+        at,
+      );
+      break;
+  }
 }
 
 /** Type for the `agent://watcher-armed` payload. Mirrors the Rust struct. */
@@ -176,6 +317,17 @@ const seenArmed = new Set<string>();
 
 export async function subscribeLive() {
   await unsubscribeLive();
+
+  // Catch-up first: whatever the service journalled while nobody was listening.
+  unlisteners.push(
+    await listen<{ rows: BacklogRow[]; resync: boolean }>(
+      "agent://backlog",
+      (e) => {
+        // Oldest first, so prepending leaves the newest on top.
+        for (const row of e.payload.rows) applyBacklogRow(row);
+      },
+    ),
+  );
 
   unlisteners.push(
     await listen<WatcherArmedPayload>("agent://watcher-armed", (e) => {
@@ -438,10 +590,7 @@ let lastGateState: "locked" | "unlocked" | null = null;
  *  between locked and unlocked. `reasonKey` is an i18n key naming the cause
  *  (fetch failed, Free plan, trial ended, Pro plan, …). Deduped on state so a
  *  healthy re-poll never spams the panel. */
-export function noteGateTransition(
-  locked: boolean,
-  reasonKey: string,
-): void {
+export function noteGateTransition(locked: boolean, reasonKey: string): void {
   const state = locked ? "locked" : "unlocked";
   if (state === lastGateState) return;
   lastGateState = state;

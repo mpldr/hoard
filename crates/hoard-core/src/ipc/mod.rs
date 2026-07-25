@@ -215,6 +215,26 @@ pub enum Request {
     /// **avisa**, no manda la lista — un `WatchedSave` por el cable sería el
     /// cliente decidiendo qué vigila el motor.
     Reload,
+    /// Carpetas candidatas (detectadas pero no rastreadas) que el motor debe
+    /// sondear para correlacionar proceso↔escritura. Es lo único que un cliente
+    /// **sí** manda como lista: la detección vive en el frontend (Slice 8 la
+    /// mueve) y el motor no puede adivinarla.
+    ///
+    /// Van como `String` porque el cable es JSON: una ruta que no sea UTF-8 no
+    /// cabe y se queda fuera en el cliente, que es donde se puede decir.
+    SetProbeCandidates {
+        dirs: Vec<String>,
+    },
+    /// La sesión en disco cambió (el usuario entró con otra cuenta Cloud, o
+    /// cerró sesión): tira el motor y deja que el keeper lo levante resolviendo
+    /// las credenciales de nuevo.
+    ///
+    /// Distinto de [`Request::Reload`], que sólo re-hidrata el conjunto de
+    /// saves: un cambio de cuenta invalida el `ApiClient`, el contexto de
+    /// `state.json` y el rotador del token, y ninguno de los tres se arregla
+    /// añadiendo y quitando slots. Y distinto de [`Request::Shutdown`]: el
+    /// servicio sigue vivo, sólo cambia de sesión.
+    RestartEngine,
     /// Para el motor y el daemon. Es una orden explícita del usuario
     /// (`hoard sync stop`), no un efecto de cerrar un cliente: cerrar la app
     /// nunca puede matar el sync, que es el punto de todo el slice.
@@ -246,23 +266,24 @@ pub enum Payload {
 
 /// Error de aplicación. La conexión sigue viva (a diferencia de
 /// [`FrameError`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Implementa `Error` (y por tanto `Display`) a propósito: el cliente lo
+/// propaga tal cual y el mensaje acaba en un toast del desktop o en el stdout de
+/// la CLI. Volcarlo con `{:?}` enseñaría `EngineDown { reason: … }` al usuario.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "error", rename_all = "snake_case")]
 pub enum IpcError {
     /// El daemon está arriba pero el motor no. `reason` lo explica (sin sesión,
     /// otro agente tiene el motor, arranque fallando) — un cliente que sólo
     /// viera "error" volvería a intentarlo para siempre sin poder decirle nada
     /// al usuario.
-    EngineDown {
-        reason: String,
-    },
+    #[error("the Hoard service has no engine: {reason}")]
+    EngineDown { reason: String },
     /// Esa petición no existe en esta versión del protocolo.
-    Unsupported {
-        op: String,
-    },
-    Internal {
-        message: String,
-    },
+    #[error("this Hoard service doesn't support `{op}`")]
+    Unsupported { op: String },
+    #[error("the Hoard service couldn't do it: {message}")]
+    Internal { message: String },
 }
 
 /// Estado del daemon. Lo que un cliente necesita para pintar sin haber visto
@@ -397,6 +418,32 @@ mod tests {
         let json = serde_json::to_value(&frame).unwrap();
         assert_eq!(json["frame"], "rejected");
         assert_eq!(json["daemon_protocol"], PROTOCOL_VERSION);
+    }
+
+    /// El nombre por cable de cada petición es contrato: el daemon despacha por
+    /// `op`, así que renombrar una variante rompe a un cliente ya instalado sin
+    /// que el handshake se entere (la versión sólo sube ante un cambio
+    /// incompatible, y añadir variantes no lo es).
+    #[test]
+    fn request_op_names_are_frozen() {
+        let cases: Vec<(Request, &str)> = vec![
+            (Request::Ping, "ping"),
+            (Request::Status, "status"),
+            (Request::Subscribe { since: Some(7) }, "subscribe"),
+            (Request::Reload, "reload"),
+            (
+                Request::SetProbeCandidates {
+                    dirs: vec!["/tmp/x".into()],
+                },
+                "set_probe_candidates",
+            ),
+            (Request::RestartEngine, "restart_engine"),
+            (Request::Shutdown, "shutdown"),
+        ];
+        for (request, op) in cases {
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(json["op"], op, "wire name changed for {request:?}");
+        }
     }
 
     /// Campos nuevos con `default`: un daemon viejo que no emite `blocked_by_pid`

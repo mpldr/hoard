@@ -314,11 +314,9 @@ fn update_tokens(access: &str, refresh: &str) -> Result<()> {
             })
         }
     }
-    // Keep the long-lived agent client's bearer token in lock-step with the
-    // rotated JWT. Without this the agent (spawned once with the token current
-    // at login) keeps 401'ing on every auto-restore/backup once the JWT expires,
-    // even though the poller has already refreshed the on-disk token.
-    crate::commands::agent::update_agent_token(access);
+    // El motor ya no vive aquí (ADR 0021, Slice 4b): el `ApiClient` de larga
+    // vida es del servicio, que rota su propio JWT desde `hoardd::session`. Lo
+    // que se escribe en disco es lo que ambos leen.
     write_session(&session)
 }
 
@@ -367,11 +365,6 @@ pub async fn refresh_active_session() -> Result<CloudCreds> {
     // freshly-rotated creds instead of replaying our now-stale token.
     if let Some((at, creds)) = last.as_ref() {
         if at.elapsed() < REFRESH_REUSE_WINDOW {
-            // Reuse the just-rotated creds, but still push them at the agent:
-            // its client may have been registered after the flight that minted
-            // them (so it never saw that `update_tokens`), and the agent never
-            // re-reads creds on its own.
-            crate::commands::agent::update_agent_token(&creds.access_token);
             return Ok(creds.clone());
         }
     }
@@ -394,9 +387,6 @@ pub async fn refresh_active_session() -> Result<CloudCreds> {
                 .filter(|c| !c.refresh_token.trim().is_empty() && c.refresh_token != attempted);
             if let Some(c) = healed {
                 tracing::debug!("cloud: refresh token was rotated elsewhere; adopting disk creds");
-                // This path skips `update_tokens`, so push the adopted token at
-                // the agent here too or it keeps 401'ing on the stale one.
-                crate::commands::agent::update_agent_token(&c.access_token);
                 *last = Some((Instant::now(), c.clone()));
                 return Ok(c);
             }
@@ -561,21 +551,15 @@ pub async fn cloud_complete_login(
     let prev_ctx = hoard_agent::state::current_context_id();
     let new_ctx = hoard_agent::state::cloud_context(&me.user_id);
     hoard_agent::state::set_active_context(Some(new_ctx.clone()));
+    // El servicio tiene el motor, y ese motor está hablando con la cuenta
+    // anterior: su `ApiClient`, su contexto de `state.json` y su rotador de token
+    // son de la sesión que acaba de dejar de valer. Se le avisa siempre, no sólo
+    // "si estaba corriendo": puede llevar minutos caído por no haber sesión, y
+    // este login es justo lo que lo arregla.
     if prev_ctx != new_ctx {
-        // A running agent still holds the previous context's slots (and their
-        // version cursors) in memory — cloud logout doesn't stop it, so pointing
-        // the on-disk state at a new file wouldn't reach it until the next app
-        // launch. Restart it so it re-hydrates from this account's context.
-        // Only when it was actually running: a login shouldn't spin up watching
-        // where there was none.
-        let running = state.agent.lock().unwrap().is_some();
-        if running {
-            let _ = crate::commands::agent::stop_agent(app.clone(), app.state()).await;
-            if let Err(e) = crate::commands::agent::start_agent(app.clone(), app.state()).await {
-                tracing::warn!(error = %e, "cloud: agent restart after context switch failed");
-            }
-        }
+        tracing::info!("cloud: sync context changed; asking the service to re-resolve its session");
     }
+    crate::commands::agent::notify_session_changed(&app);
 
     // Bring the Modo Automático schedulers up for this session if the user left
     // the toggle on. On a cold start Tauri's `setup()` runs `restart_if_enabled`;
@@ -684,6 +668,9 @@ pub fn cloud_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     // `load_active_creds` and quietly do nothing forever.
     cloud_pull::stop(&app);
     crate::commands::cloud_realtime::stop(&app);
+    // Las credenciales ya no están: que el servicio tire el motor y resuelva de
+    // nuevo en vez de seguir usando un token que acabamos de borrar.
+    crate::commands::agent::notify_session_changed(&app);
     Ok(())
 }
 

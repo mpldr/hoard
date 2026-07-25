@@ -216,11 +216,23 @@ mod imp {
             // falla con ACCESS_DENIED y quien pierde se conecta al que ganó. No
             // hay ventana entre "comprobar" y "crear" porque no hay comprobación.
             match create(&name, &security, true) {
-                Ok(pending) => Ok(Self {
-                    name,
-                    security,
-                    pending: Some(pending),
-                }),
+                Ok(pending) => {
+                    let listener = Self {
+                        name,
+                        security,
+                        pending: Some(pending),
+                    };
+                    // Del objeto vivo, no del descriptor que le pasamos: así la
+                    // ACL con la que de verdad corre esta máquina queda escrita
+                    // en el log en vez de deducirse del código.
+                    match listener.dacl_sddl() {
+                        Ok(sddl) => tracing::info!(dacl = %sddl, "hoardd: named pipe ACL"),
+                        Err(err) => {
+                            tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't read back the pipe ACL")
+                        }
+                    }
+                    Ok(listener)
+                }
                 Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                     Err(BindError::AlreadyRunning { address: name })
                 }
@@ -228,6 +240,19 @@ mod imp {
                     anyhow::Error::new(err).context(format!("creating the named pipe {name}")),
                 )),
             }
+        }
+
+        /// DACL con el que el SO creó **este** pipe, en SDDL. Lo usan el log del
+        /// arranque y el test que afirma que `Everyone` no está dentro.
+        pub fn dacl_sddl(&self) -> Result<String> {
+            use std::os::windows::io::AsRawHandle;
+            let pipe = self
+                .pending
+                .as_ref()
+                .context("the named pipe listener has no pending instance")?;
+            // SAFETY: el handle es de un `NamedPipeServer` vivo (`pipe` lo
+            // mantiene prestado durante toda la llamada).
+            unsafe { crate::winsec::dacl_sddl(pipe.as_raw_handle() as _) }
         }
 
         pub async fn accept(&mut self) -> Result<ServerStream> {
@@ -282,6 +307,42 @@ pub async fn connect_with_deadline(
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+/// Lo que el Slice 4a no pudo comprobar: que la ACL del named pipe es la que
+/// creemos. Corre sólo en Windows, contra un pipe de verdad.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Ni `Everyone` (`WD`) ni "usuarios autenticados" (`AU`) en el DACL del
+    /// pipe. Por ahí viajan nombres de juego, rutas locales y los comandos del
+    /// sync: sin descriptor explícito Windows le da lectura a `Everyone`, que es
+    /// exactamente lo que este test impide que vuelva.
+    #[tokio::test]
+    async fn the_pipe_acl_excludes_everyone() {
+        let dir = std::env::temp_dir();
+        let endpoint = Endpoint::scoped(&dir, &format!("acl-{}", std::process::id()));
+        let listener = Listener::bind(&endpoint).expect("bind");
+        let sddl = listener.dacl_sddl().expect("read the pipe DACL back");
+
+        assert!(
+            !sddl.contains(";;;WD)"),
+            "Everyone must not be in the pipe DACL: {sddl}"
+        );
+        assert!(
+            !sddl.contains(";;;AU)"),
+            "authenticated users must not be in the pipe DACL: {sddl}"
+        );
+        // Y lo que sí: nosotros (SID numérico) y LocalSystem.
+        assert!(sddl.contains(";;;S-1-5-21"), "the user's own SID: {sddl}");
+        assert!(sddl.contains(";;;SY)"), "SYSTEM keeps access: {sddl}");
+        // DACL protegido: sin herencia que reabra lo que acabamos de cerrar.
+        assert!(
+            sddl.starts_with("D:P"),
+            "the DACL must be protected: {sddl}"
+        );
     }
 }
 

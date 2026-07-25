@@ -10,9 +10,11 @@
 //! the user disabled the launcher entry from outside Hoard.
 
 use hoard_agent::prefs::{Prefs, SyncMode};
+use hoard_core::ipc::Request;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
+use crate::commands::agent::push_pref;
 use crate::commands::automatic;
 use crate::commands::error::AppError;
 use crate::state::AppState;
@@ -30,13 +32,12 @@ pub fn get_prefs() -> Result<Prefs, String> {
 /// object so there's nothing to lose, and partial-update semantics tend to
 /// surprise users who edit prefs.json by hand.
 ///
-/// Side-effect: if `auto_restore` changed and the live agent is running,
-/// push the new value into it via `AgentHandle::set_auto_restore`. The
-/// agent applies it to its config and, on a `false → true` flip, kicks
-/// an immediate reconciliation sweep so the user doesn't have to restart
-/// the app to see the new behaviour. Failures here are non-fatal —
-/// prefs.json is already saved, and the change will take effect the
-/// next time the agent reads its config (worst case, on next boot).
+/// Side-effect: if `auto_restore` changed, push the new value into the sync
+/// service's engine (`Request::SetAutoRestore`). The engine applies it to its
+/// config and, on a `false → true` flip, kicks an immediate reconciliation
+/// sweep so the user doesn't have to restart anything to see the new
+/// behaviour. Failures here are non-fatal — prefs.json is already saved, and
+/// the service reads the same file the next time it starts its engine.
 #[tauri::command]
 pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Prefs, String> {
     let path = Prefs::default_path().map_err(|e| e.to_string())?;
@@ -50,15 +51,13 @@ pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Pref
         None => true,
     };
     if auto_restore_changed {
-        let handle = state.agent.lock().unwrap().clone();
-        if let Some(h) = handle {
-            if let Err(e) = h.set_auto_restore(prefs.auto_restore).await {
-                tracing::warn!(
-                    error = %e,
-                    "couldn't push auto_restore preference to live agent"
-                );
-            }
-        }
+        push_pref(
+            &state,
+            Request::SetAutoRestore {
+                enabled: prefs.auto_restore,
+            },
+        )
+        .await;
     }
 
     let global_sync_changed = match &prev {
@@ -66,15 +65,13 @@ pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Pref
         None => true,
     };
     if global_sync_changed {
-        let handle = state.agent.lock().unwrap().clone();
-        if let Some(h) = handle {
-            if let Err(e) = h.set_global_sync(prefs.global_sync).await {
-                tracing::warn!(
-                    error = %e,
-                    "couldn't push global_sync preference to live agent"
-                );
-            }
-        }
+        push_pref(
+            &state,
+            Request::SetGlobalSync {
+                enabled: prefs.global_sync,
+            },
+        )
+        .await;
     }
     Ok(prefs)
 }
@@ -82,8 +79,8 @@ pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Pref
 /// Flip the sidebar's "Sync" toggle (sync global). Distinct from
 /// `set_automatic_mode`: it doesn't start any scheduler and doesn't cascade
 /// `auto_restore`. It just persists `global_sync` and pushes it into the
-/// live agent so the change takes effect without a restart. On a
-/// `false → true` flip the agent sweeps immediately, pulling any outdated
+/// service's engine so the change takes effect without a restart. On a
+/// `false → true` flip the engine sweeps immediately, pulling any outdated
 /// save even mid-session.
 #[tauri::command]
 pub async fn set_global_sync(state: State<'_, AppState>, enabled: bool) -> Result<Prefs, AppError> {
@@ -94,15 +91,7 @@ pub async fn set_global_sync(state: State<'_, AppState>, enabled: bool) -> Resul
         .save(&path)
         .map_err(|e| AppError::plain(e.to_string()))?;
 
-    let handle = state.agent.lock().unwrap().clone();
-    if let Some(h) = handle {
-        if let Err(e) = h.set_global_sync(enabled).await {
-            tracing::warn!(
-                error = %e,
-                "couldn't push global_sync preference to live agent"
-            );
-        }
-    }
+    push_pref(&state, Request::SetGlobalSync { enabled }).await;
 
     Ok(prefs)
 }
@@ -110,12 +99,12 @@ pub async fn set_global_sync(state: State<'_, AppState>, enabled: bool) -> Resul
 /// Set the single user-facing operating mode (`backup_only` / `full_sync`).
 /// This is the onboarding + Settings radio: it maps the chosen [`SyncMode`]
 /// onto the internal `global_sync` / `auto_restore` flags, persists prefs, and
-/// hot-reconfigures the live agent so the change takes effect without a
+/// hot-reconfigures the service's engine so the change takes effect without a
 /// restart. Per-save presets still override as exceptions.
 ///
-/// We push *both* `set_global_sync` and `set_auto_restore` into the agent when
-/// either changed, mirroring what `save_prefs` does field-by-field — on a flip
-/// into `FullSync` the agent sweeps immediately and pulls any outdated save.
+/// We push *both* flags when either changed, mirroring what `save_prefs` does
+/// field-by-field — on a flip into `FullSync` the engine sweeps immediately and
+/// pulls any outdated save.
 #[tauri::command]
 pub async fn set_sync_mode(state: State<'_, AppState>, mode: SyncMode) -> Result<Prefs, AppError> {
     let path = Prefs::default_path().map_err(|e| AppError::plain(e.to_string()))?;
@@ -128,18 +117,23 @@ pub async fn set_sync_mode(state: State<'_, AppState>, mode: SyncMode) -> Result
         .save(&path)
         .map_err(|e| AppError::plain(e.to_string()))?;
 
-    let handle = state.agent.lock().unwrap().clone();
-    if let Some(h) = handle {
-        if prefs.global_sync != prev_global_sync {
-            if let Err(e) = h.set_global_sync(prefs.global_sync).await {
-                tracing::warn!(error = %e, "couldn't push global_sync from set_sync_mode");
-            }
-        }
-        if prefs.auto_restore != prev_auto_restore {
-            if let Err(e) = h.set_auto_restore(prefs.auto_restore).await {
-                tracing::warn!(error = %e, "couldn't push auto_restore from set_sync_mode");
-            }
-        }
+    if prefs.global_sync != prev_global_sync {
+        push_pref(
+            &state,
+            Request::SetGlobalSync {
+                enabled: prefs.global_sync,
+            },
+        )
+        .await;
+    }
+    if prefs.auto_restore != prev_auto_restore {
+        push_pref(
+            &state,
+            Request::SetAutoRestore {
+                enabled: prefs.auto_restore,
+            },
+        )
+        .await;
     }
 
     Ok(prefs)
@@ -247,20 +241,18 @@ pub async fn set_automatic_mode(
         .save(&path)
         .map_err(|e| AppError::plain(e.to_string()))?;
 
-    // Push the new auto_restore into the live agent if it cascaded on. We
+    // Push the new auto_restore into the service's engine if it cascaded on. We
     // mirror the side-effect that `save_prefs` performs for the same field
     // so toggling Modo Automático behaves identically to flipping the
     // auto-restore checkbox in Settings.
     if auto_restore_changed && prefs.auto_restore != prev_auto_restore {
-        let handle = state.agent.lock().unwrap().clone();
-        if let Some(h) = handle {
-            if let Err(e) = h.set_auto_restore(prefs.auto_restore).await {
-                tracing::warn!(
-                    error = %e,
-                    "couldn't push auto_restore preference to live agent from set_automatic_mode"
-                );
-            }
-        }
+        push_pref(
+            &state,
+            Request::SetAutoRestore {
+                enabled: prefs.auto_restore,
+            },
+        )
+        .await;
     }
 
     if enabled {

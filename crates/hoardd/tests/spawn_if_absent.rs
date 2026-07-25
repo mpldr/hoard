@@ -26,8 +26,20 @@ fn ensure_env() {
     });
 }
 
+/// Endpoint propio de cada test. En Windows el namespace de pipes es global a la
+/// máquina, así que la unicidad tiene que estar en el nombre y no en el
+/// directorio temporal.
 fn endpoint_in(dir: &std::path::Path) -> Endpoint {
-    Endpoint::new(dir.join("hoardd.sock").to_string_lossy().into_owned())
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    Endpoint::scoped(
+        dir,
+        &format!(
+            "spawn-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+    )
 }
 
 /// Dos clientes que arrancan a la vez acaban hablando con **el mismo** daemon.

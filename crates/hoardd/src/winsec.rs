@@ -18,13 +18,15 @@ use std::ptr;
 
 use anyhow::{bail, Result};
 use windows_sys::core::{PCWSTR, PWSTR};
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -88,6 +90,54 @@ impl SecurityDescriptor {
             bInheritHandle: 0,
         }
     }
+}
+
+/// DACL efectivo de un objeto del kernel, en SDDL.
+///
+/// Se lee **del objeto ya creado**, no del descriptor que le pasamos: la ADR
+/// pide permisos solo-usuario y hasta el Slice 4b eso estaba verificado a nivel
+/// de tipos (compilaba), no de ejecución. Esto es lo que permite afirmarlo —
+/// tanto en un test como en el log del arranque, donde queda escrito qué ACL
+/// tiene de verdad el pipe de esta máquina.
+///
+/// # Safety
+/// `handle` debe ser un handle válido a un objeto del kernel vivo.
+pub(crate) unsafe fn dacl_sddl(handle: HANDLE) -> Result<String> {
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let rc = GetSecurityInfo(
+        handle,
+        SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        &mut dacl,
+        ptr::null_mut(),
+        &mut psd,
+    );
+    if rc != ERROR_SUCCESS {
+        bail!("GetSecurityInfo failed with {rc}");
+    }
+    let mut text: PWSTR = ptr::null_mut();
+    let mut len: u32 = 0;
+    let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        psd,
+        SDDL_REVISION_1,
+        DACL_SECURITY_INFORMATION,
+        &mut text,
+        &mut len,
+    );
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        LocalFree(psd as HLOCAL);
+        bail!("rendering the security descriptor as SDDL failed: {err}");
+    }
+    let out = wide_to_string(text);
+    LocalFree(text as HLOCAL);
+    // `psd` lo asignó `GetSecurityInfo`, que documenta `LocalFree`. `dacl`
+    // apunta *dentro* de ese bloque: no se libera aparte.
+    LocalFree(psd as HLOCAL);
+    Ok(out)
 }
 
 impl Drop for SecurityDescriptor {
@@ -171,7 +221,7 @@ fn current_user_sid() -> Result<String> {
 ///
 /// # Safety
 /// `ptr` debe apuntar a una cadena UTF-16 válida terminada en NUL.
-unsafe fn wide_to_string(ptr: PWSTR) -> String {
+pub(crate) unsafe fn wide_to_string(ptr: PWSTR) -> String {
     let mut len = 0usize;
     while *ptr.add(len) != 0 {
         len += 1;

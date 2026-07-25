@@ -93,6 +93,30 @@ impl Endpoint {
         let user = std::env::var("USERNAME").unwrap_or_default();
         Ok(Self::new(windows_pipe_name(&user)))
     }
+
+    /// Endpoint aislado con nombre propio: el del usuario, pero sin pisarlo.
+    ///
+    /// En unix cuelga de `dir` (un temporal, típicamente); en Windows el
+    /// namespace de pipes es **plano y global a la máquina**, así que `dir` no
+    /// pinta nada y la unicidad va en el nombre. Que la firma acepte las dos
+    /// cosas es lo que permite escribir **un** test que corra igual en los dos
+    /// sitios: el Slice 4a no lo tenía —sus tests componían rutas de fichero— y
+    /// por eso la ruta del pipe se quedó verificada sólo a nivel de tipos.
+    pub fn scoped(dir: &std::path::Path, name: &str) -> Self {
+        #[cfg(unix)]
+        {
+            Self::new(
+                dir.join(format!("hoardd-{name}.sock"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            Self::new(windows_pipe_name(&format!("test-{name}")))
+        }
+    }
 }
 
 /// Directorio del socket en unix: `$XDG_RUNTIME_DIR/hoard` cuando existe (tmpfs,

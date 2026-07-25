@@ -229,15 +229,21 @@ async fn handle_event(app: &AppHandle, ev_type: &str, data: &str) {
             if !global_sync {
                 return;
             }
-            let handle = app
-                .try_state::<AppState>()
-                .and_then(|s| s.agent.lock().unwrap().clone());
-            if let Some(h) = handle {
-                tracing::debug!(save_id = %save_id, "selfhosted-events: push → force-restore");
-                if let Err(e) = h.force_restore(save_id).await {
-                    tracing::warn!(error = %e, "selfhosted-events: force-restore failed");
-                }
-            }
+            // El motor está en el servicio desde el Slice 4b, así que esto va
+            // por IPC. Sigue siendo el único empuje servidor→cliente que tiene
+            // el self-hosted: `hoardd` monta Realtime sólo para Cloud, y la SSE
+            // necesita las credenciales self-hosted que vive aquí.
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            tracing::debug!(save_id = %save_id, "selfhosted-events: push → force-restore");
+            state
+                .daemon
+                .tell(
+                    "force-restore a save the server just advanced",
+                    hoard_core::ipc::Request::ForceRestore { save_id },
+                )
+                .await;
         }
         "lagged" => {
             tracing::debug!("selfhosted-events: lagged — relying on agent sweep to reconcile");

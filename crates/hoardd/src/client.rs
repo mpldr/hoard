@@ -132,8 +132,10 @@ impl Client {
                 Some(ServerFrame::Reply { id: got, reply }) if got == id => {
                     return match reply {
                         Reply::Ok(payload) => Ok(payload),
-                        Reply::Error(err) => Err(anyhow::anyhow!("{err:?}")),
-                    }
+                        // Tipado, no `{err:?}`: este mensaje acaba delante del
+                        // usuario (un toast del desktop, una línea de la CLI).
+                        Reply::Error(err) => Err(anyhow::Error::new(err)),
+                    };
                 }
                 Some(ServerFrame::Event(entry)) => self.pushes.push_back(Push::Event(entry)),
                 Some(ServerFrame::Resync { cursor, dropped }) => {

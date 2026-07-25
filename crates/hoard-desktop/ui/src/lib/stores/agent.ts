@@ -1,10 +1,23 @@
 /**
  * Live-agent store.
  *
- * The Rust live agent emits events through the `agent://*` Tauri event
+ * The sync engine emits events through the `agent://*` Tauri event
  * channels. This store subscribes to them once at app boot, keeps a
  * per-save activity status in memory, and lets pages reactively render
  * "backing up…", "next in 30s", "failed (will retry)", etc.
+ *
+ * Since ADR 0021 slice 4b the engine no longer lives inside this process: it
+ * runs in the `hoardd` service and the Rust side relays its events onto the
+ * same channels. **This store's public surface is unchanged on purpose** — the
+ * screens must not notice the backend swap. What's new is internal:
+ *
+ *  - `agent://backlog` — what the service journalled while we weren't
+ *    connected (the app was closed, or we reconnected). Applied like any other
+ *    event, but *silently*: replaying yesterday's backups must not fire today's
+ *    toasts and notifications.
+ *  - `agent://daemon-status` — the engine went up or down inside the service.
+ *    Engine liveness isn't an event in the journal, so this is how the tray
+ *    stops lying when the service starts its engine 20s after we attached.
  *
  * Activity is keyed by `save_id`; pages look up their saves by id.
  *
@@ -132,7 +145,14 @@ async function ensureNotificationPermission() {
   }
 }
 
+/** True while we're replaying the service's journal. A backlog row is
+ *  history, not news: it must rebuild the on-screen state without popping a
+ *  toast or a system notification for something that happened while the app
+ *  was closed. */
+let replaying = false;
+
 function notify(title: string, body: string) {
+  if (replaying) return;
   if (!notificationsAllowed) return;
   try {
     sendNotification({ title, body });
@@ -148,10 +168,14 @@ function patch(save_id: string, partial: Partial<SaveActivity>) {
   });
 }
 
-function applyEvent(ev: AgentEvent) {
+/** Apply one event. `at` is when it actually happened (epoch ms) — it defaults
+ *  to "now" for live events and carries the journal's timestamp when we're
+ *  replaying, so a session that started two hours ago reads as two hours and
+ *  not as zero. */
+function applyEvent(ev: AgentEvent, at: number = Date.now()) {
   switch (ev.type) {
     case "game_started":
-      patch(ev.save_id, { state: "running", running_since: Date.now() });
+      patch(ev.save_id, { state: "running", running_since: at });
       break;
     case "game_stopped":
       patch(ev.save_id, { state: "idle", running_since: undefined });
@@ -159,7 +183,7 @@ function applyEvent(ev: AgentEvent) {
     case "backup_scheduled":
       patch(ev.save_id, {
         state: "scheduled",
-        next_backup_at: Date.now() + ev.delay_ms,
+        next_backup_at: at + ev.delay_ms,
         reason: ev.reason,
       });
       break;
@@ -210,16 +234,20 @@ function applyEvent(ev: AgentEvent) {
       // surface a toast so the user notices files appeared under `~`. The
       // `game_slug` is what we have to hand; resolving to display_name would
       // require another store dependency just for cosmetics.
-      const t = get(i18n);
-      toastSuccess(
-        t("library.auto_restored_toast", {
-          values: {
-            name: ev.game_slug,
-            version: ev.version_num,
-            count: ev.files_extracted,
-          },
-        }),
-      );
+      // Not while replaying the journal: a restore that landed last night is
+      // history, and the Library row already shows its version.
+      if (!replaying) {
+        const t = get(i18n);
+        toastSuccess(
+          t("library.auto_restored_toast", {
+            values: {
+              name: ev.game_slug,
+              version: ev.version_num,
+              count: ev.files_extracted,
+            },
+          }),
+        );
+      }
       break;
     }
     case "save_auto_restore_failed": {
@@ -309,7 +337,11 @@ function applyEvent(ev: AgentEvent) {
       // reflect the save as idle. Users who want the cloud copy pulled into an
       // empty folder enable "Restore from cloud when a save folder is empty"
       // in Settings.
-      patch(ev.save_id, { state: "idle", error: undefined, will_retry: undefined });
+      patch(ev.save_id, {
+        state: "idle",
+        error: undefined,
+        will_retry: undefined,
+      });
       break;
     }
   }
@@ -320,6 +352,30 @@ function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(0)} MB`;
   return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+/** The service's journal, replayed. `resync` means we can't claim continuity
+ *  with what we already had — the ring dropped rows, or the service restarted —
+ *  so the event-derived state is rebuilt instead of patched. */
+type BacklogRow = { at: number; event: AgentEvent };
+type BacklogPayload = { rows: BacklogRow[]; resync: boolean };
+
+function applyBacklog(payload: BacklogPayload) {
+  if (payload.resync) {
+    // Rebuild rather than pretend: a gap means some of what we hold may never
+    // get its closing event. Both maps are derived purely from the event
+    // stream, so replaying the journal restores them.
+    activity.set({});
+    restoreStuck.set({});
+  }
+  replaying = true;
+  try {
+    // Chronological order, oldest first: the last event per save wins, exactly
+    // as if we'd been connected the whole time.
+    for (const row of payload.rows) applyEvent(row.event, row.at);
+  } finally {
+    replaying = false;
+  }
 }
 
 /** Subscribe to all `agent://*` channels. Idempotent — safe to call from
@@ -347,6 +403,20 @@ export async function subscribeAgent() {
     ),
   );
 
+  // Catch-up + engine liveness. Both come from the service through the Rust
+  // side; the screens see only the same stores as before.
+  unlisteners.push(
+    await listen<BacklogPayload>("agent://backlog", (e) =>
+      applyBacklog(e.payload),
+    ),
+  );
+  unlisteners.push(
+    await listen<AgentStatus>("agent://daemon-status", (e) => {
+      status.set(e.payload);
+      seedWatcher(e.payload.watched_count);
+    }),
+  );
+
   // Mirror the derived tray state into Rust whenever it changes. We only
   // push when the value actually flips so the tray doesn't repaint every
   // tick of the FS-event firehose.
@@ -355,9 +425,19 @@ export async function subscribeAgent() {
     lastTrayState = s;
     api.setTrayState(s).catch((e) => console.warn("setTrayState failed:", e));
   });
+
+  // Only now, with every listener registered, ask Rust to relay the service's
+  // journal and live events. Do it the other way round and the backlog lands
+  // before anyone is listening.
+  await api
+    .attachAgentEvents()
+    .catch((e) => console.warn("attachAgentEvents failed:", e));
 }
 
 export async function unsubscribeAgent() {
+  await api
+    .detachAgentEvents()
+    .catch((e) => console.warn("detachAgentEvents failed:", e));
   for (const u of unlisteners) {
     try {
       u();
@@ -375,26 +455,29 @@ export async function unsubscribeAgent() {
 
 /** In-flight `bootAgent` promise. Both `hydrateAuth` (self-hosted) and
  *  `hydrateCloud` (cloud) can race to boot the agent on a cold start where the
- *  user has both sessions; `start_agent` guards against a double spawn but has
- *  an `await` between its "already running?" check and setting the handle, so
- *  two concurrent calls could slip through. Deduping here closes that window. */
+ *  user has both sessions, and each would otherwise redo the whole boot.
+ *  Deduping here collapses them into one. */
 let bootInFlight: Promise<void> | null = null;
 
-/** Start the agent and subscribe. Idempotent and safe to call from every login
- *  path (self-hosted or cloud) and from the cold-start hydrate; concurrent
- *  calls share a single boot. */
+/** Subscribe and make sure the sync service is up. Idempotent and safe to call
+ *  from every login path (self-hosted or cloud) and from the cold-start
+ *  hydrate; concurrent calls share a single boot. */
 export async function bootAgent() {
   if (bootInFlight) return bootInFlight;
   bootInFlight = (async () => {
     await ensureNotificationPermission();
+    // Subscribing first is deliberate: it registers the listeners *and* starts
+    // the relay, which retries on its own. Doing it after `startAgent` would
+    // mean that a service that's briefly unreachable (an update restarting it)
+    // leaves the UI deaf for the rest of the session, because the throw would
+    // skip the subscription entirely.
+    await subscribeAgent();
     const s = await api.startAgent();
     status.set(s);
-    // Seed the live header's watcher dot from the boot status. The
-    // `agent://watcher-armed` events fire inside `start_agent` before
-    // `subscribeLive()` is wired, so without this the header stays on
-    // "watcher off" for the whole session even though saves are watched.
+    // Seed the live header's watcher dot from the boot status: `watcher-armed`
+    // is emitted per slot by the relay, and this is the number the service
+    // reports right now, so the dot is honest from the first paint.
     seedWatcher(s.watched_count);
-    await subscribeAgent();
   })();
   try {
     await bootInFlight;

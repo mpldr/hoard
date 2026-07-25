@@ -321,17 +321,9 @@ pub async fn run_scan(app: &AppHandle) {
         tracing::warn!(error = %e, "automatic scan: couldn't boot agent");
     }
 
-    // Hand the (now-running) agent the untracked candidates to probe for
+    // Hand the service's engine the untracked candidates to probe for
     // process↔write correlation. Empty list is fine — it just clears the set.
-    let handle = app.state::<AppState>().agent.lock().unwrap().clone();
-    if let Some(h) = handle {
-        let n = probe_dirs.len();
-        if let Err(e) = h.set_probe_candidates(probe_dirs).await {
-            tracing::warn!(error = %e, "automatic scan: couldn't set probe candidates");
-        } else {
-            tracing::debug!(count = n, "automatic scan: probe candidates sent to agent");
-        }
-    }
+    crate::commands::agent::set_probe_candidates(app, probe_dirs).await;
 
     emit_phase(app, "idle", None, None);
     let _ = app.emit(
@@ -345,7 +337,7 @@ pub async fn run_scan(app: &AppHandle) {
 
 /// Headless backup sweep — re-hashes every tracked save through the agent's
 /// staggered window. Replaces the frontend's `runBackupSweep`. No-op (not an
-/// error) when the agent isn't running; the next scan boots it.
+/// error) when the service has no engine; the next tick sweeps.
 pub async fn run_backup_sweep(app: &AppHandle) {
     if let Err(e) = crate::commands::agent::sweep_backups(app.state::<AppState>()).await {
         tracing::warn!(error = %e, "automatic backup sweep failed");

@@ -37,11 +37,9 @@
 //!   The LiveStatus widget downgrades to the red "Server unreachable"
 //!   dot until the next successful pull.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use hoard_agent::agent::AgentHandle;
 use hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -354,53 +352,6 @@ pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The running agent's handle, or `None` when it hasn't been spawned yet.
-fn agent_handle(app: &AppHandle) -> Option<AgentHandle> {
-    app.try_state::<crate::state::AppState>()
-        .and_then(|s| lock(&s.agent).clone())
-}
-
-/// Push the freshest cloud head map the poller knows into the running agent.
-///
-/// The reconciliation sweep version-gates locally off this cache instead of
-/// each candidate re-fetching the same manifest — collapsing the old "poller
-/// GET + N sweep GETs" per interval down to the single GET the pull already
-/// did. Sent every tick (not just on deltas) so the cache never goes stale and
-/// a save we already pulled stays correctly gated; since ADR 0021 D.10 the
-/// agent also timestamps each feed, so a poller that stops feeding degrades to
-/// a visible `Hold{"cloud state stale"}` instead of a silent `converged`.
-///
-/// Called from two places on purpose: after every pull, and from `start_agent`
-/// once the handle exists. Without the second call a pull that lands before the
-/// agent is spawned — the normal cold-start order, since the poller's first
-/// tick fires immediately — dropped its whole manifest on the floor without a
-/// word, and the agent then ran on an empty version cache until the next tick.
-pub async fn feed_agent_versions(app: &AppHandle) {
-    let Some(scheduler) = app.try_state::<CloudPullScheduler>() else {
-        return;
-    };
-    let versions: HashMap<String, i64> = lock(&scheduler.seen)
-        .iter()
-        .map(|e| (e.save_id.clone(), e.version_num))
-        .collect();
-    if versions.is_empty() {
-        // Nothing pulled yet (or signed out): the next pull feeds the agent.
-        return;
-    }
-    let Some(h) = agent_handle(app) else {
-        tracing::debug!(
-            count = versions.len(),
-            "cloud-pull: no agent handle yet — version feed deferred to agent start"
-        );
-        return;
-    };
-    let count = versions.len();
-    match h.set_cloud_versions(versions).await {
-        Ok(()) => tracing::debug!(count, "cloud-pull: fed cloud version cache to agent"),
-        Err(e) => tracing::warn!(error = %e, "cloud-pull: couldn't feed version cache to agent"),
-    }
-}
-
 async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>) {
     let _ = app.emit("agent://cloud-pull-started", ());
 
@@ -521,11 +472,10 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         }
     };
 
-    let (new_versions, new_bytes, advanced_ids) = {
+    let (new_versions, new_bytes) = {
         let mut seen_guard = lock(seen);
         let mut new_versions: usize = 0;
         let mut new_bytes: i64 = 0;
-        let mut advanced_ids: Vec<String> = Vec::new();
         for entry in &manifest.saves {
             let prev_version = seen_guard
                 .iter()
@@ -535,7 +485,6 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
                 Some(prev) if entry.latest_version_num > prev => {
                     new_versions += 1;
                     new_bytes += entry.latest_size_bytes.max(0);
-                    advanced_ids.push(entry.save_id.clone());
                 }
                 None => {
                     // First time we see this save in this session. We
@@ -558,7 +507,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
                 version_num: entry.latest_version_num,
             });
         }
-        (new_versions, new_bytes, advanced_ids)
+        (new_versions, new_bytes)
     };
 
     let _ = app.emit(
@@ -570,47 +519,11 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         },
     );
 
-    // Keep the agent's long-lived client token in lock-step with the JWT we
-    // just proved works (this request succeeded). The targeted
-    // refresh→`update_agent_token` push can miss — the agent client may be
-    // registered after a refresh already ran, or `refresh_active_session` can
-    // return via its reuse-window / healed-disk short-circuits without touching
-    // the agent — and the agent never re-reads creds from disk on its own. When
-    // that happens it 401s on *every* auto-restore/backup/CAS until the app is
-    // restarted, even though the poller (which reloads disk each tick) keeps
-    // working. This per-tick resync caps that drift at one interval. Cheap: it
-    // just swaps a shared `RwLock<String>`.
-    crate::commands::agent::update_agent_token(&access_token);
-
-    // Feed the agent the full latest-version map this manifest just gave us
-    // (reads it back out of the seen-map we just replaced, so the deferred
-    // re-feed below shares one code path with the live one).
-    feed_agent_versions(app).await;
-
-    // Grab the agent handle to force-restore advanced saves (sync global).
-    let handle = agent_handle(app);
-
-    // Sync global: the poller is the cheap "is this device outdated?" detector.
-    // When it's on and a save advanced server-side, ask the agent to pull it
-    // right now — "en el momento", even if the game is running. This is the
-    // low-latency complement to the agent's own sweep (which would catch the
-    // same delta within its cooldown). Off by default and version-gated on the
-    // agent side, so this is a no-op cost when nothing actually changed.
-    if !advanced_ids.is_empty() {
-        let global_sync = hoard_agent::prefs::Prefs::load_default()
-            .map(|(p, _)| p.global_sync)
-            .unwrap_or(false);
-        if global_sync {
-            if let Some(h) = &handle {
-                for id in advanced_ids {
-                    if let Err(e) = h.force_restore(id).await {
-                        tracing::warn!(
-                            error = %e,
-                            "cloud-pull: couldn't request force-restore for sync global"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // Aquí acababa el trabajo de motor de este bucle: empujarle al agente el
+    // token rotado, alimentarle el mapa de versiones y pedirle el force-restore
+    // de lo que hubiera avanzado. Desde el Slice 4b nada de eso es del cliente:
+    // el motor vive en `hoardd`, que corre su propio `cloud_live` (Realtime +
+    // poll de respaldo) y hace las tres cosas con menos latencia que nosotros.
+    // Este poller se queda con lo que siempre fue suyo, **pintar**: de él salen
+    // el dot de nube, el contador de versiones y las filas del feed.
 }

@@ -111,6 +111,21 @@ impl Daemon {
                 Ok(_) => Reply::Ok(Payload::Ack),
                 Err(err) => self.engine_error(err),
             },
+            Request::SetProbeCandidates { dirs } => {
+                let dirs: Vec<std::path::PathBuf> =
+                    dirs.into_iter().map(std::path::PathBuf::from).collect();
+                self.with_engine(|h| async move { h.set_probe_candidates(dirs).await })
+                    .await
+            }
+            // No pasa por `with_engine`: reiniciar un motor caído es
+            // precisamente lo que puede hacer que vuelva (el keeper resuelve la
+            // sesión otra vez), así que un `EngineDown` aquí sería contestar
+            // "no puedo arreglarlo porque está roto".
+            Request::RestartEngine => {
+                self.engine
+                    .request_restart("a client reported a session change");
+                Reply::Ok(Payload::Ack)
+            }
             Request::BackupNow { save_id } => {
                 self.with_engine(|h| async move { h.backup_now(save_id).await })
                     .await

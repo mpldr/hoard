@@ -1,0 +1,568 @@
+//! El enlace del desktop con `hoardd` (ADR 0021, Parte A — Slice 4b).
+//!
+//! Hasta el 4a el desktop **embebía** el motor (`agent::spawn` dentro de
+//! `start_agent`), y el árbitro para que no corriera a la vez que el de la CLI
+//! era el pidfile de `hoard_agent::instance`, con sus tres fallos de diseño:
+//! carrera de arranque, cero reclaim y el ciclo de vida del sync atado a una
+//! ventana. Desde este slice el desktop **no tiene motor**: es un cliente del
+//! servicio, le manda comandos por el socket local y pinta lo que el servicio
+//! reporta. Cerrar la app ya no puede parar el sync — que es el punto de todo el
+//! Slice 4.
+//!
+//! ## Dos conexiones, a propósito
+//!
+//! - **Comandos** ([`DaemonLink::request`]): una conexión perezosa bajo mutex.
+//!   Cada `#[tauri::command]` que antes tocaba el `AgentHandle` manda aquí su
+//!   petición.
+//! - **Eventos** ([`pump`]): una conexión dedicada que sólo escucha.
+//!
+//! No es una por comodidad: `read_frame` lee cabecera y cuerpo en dos pasos, así
+//! que **no es cancel-safe**. Una sola conexión obligaría a un `select!` entre
+//! "espera un push" y "manda una petición", y cancelar la lectura a medias
+//! dejaría el flujo desincronizado. Dos conexiones cuestan al daemon una task
+//! más por cliente y nos dan lecturas que nunca se cancelan.
+//!
+//! ## Journal + push (D.14.2)
+//!
+//! Al conectar se pide el backlog desde el cursor y luego se escucha en vivo. El
+//! cursor vive **en memoria**: una ejecución nueva de la app arranca con la UI
+//! vacía, así que pedir el anillo entero es justo lo que reconstruye la historia
+//! que no vio. Dentro de una misma ejecución, el cursor evita repetir lo ya
+//! pintado al reconectar.
+//!
+//! Y cuando no se puede afirmar continuidad —el anillo perdió filas (`gap`), el
+//! daemon se reinició (`epoch` distinto) o el canal de push nos dejó atrás
+//! (`Resync`)— se le dice a la UI que **resincronice** en vez de coserlo en
+//! silencio. Fingir continuidad ahí es el bug de las campanas mudas otra vez.
+//!
+//! ## Quién enciende el relevo: la UI, y no antes
+//!
+//! [`attach`] lo llama el store cuando **ya** tiene sus `listen()` puestos, no
+//! `start_agent`. Es deliberado: `start_agent` también lo llama el escaneo de
+//! Modo Automático, que corre en Rust y puede ganarle al montaje del webview —
+//! y un backlog emitido antes de que exista el oyente es un historial que se
+//! pierde en silencio, exactamente el bug que el journal existe para no tener.
+//! Con el relevo atado a la suscripción, la primera emisión no puede llegar
+//! pronto. (La conexión de comandos es independiente: el escaneo levanta el
+//! servicio igual, sólo que sin nadie escuchando todavía.)
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use hoard_agent::agent::{AgentConfig, AgentEvent};
+use hoard_agent::state::CliState;
+use hoard_agent::supervisor::{self, Finished};
+use hoard_core::ipc::{AgentSlotStatus, DaemonStatus, IpcError, Payload, Request};
+use hoardd::client::{Client, Push};
+use hoardd::endpoint::Endpoint;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::task::JoinHandle;
+
+use crate::state::AppState;
+
+/// Cómo nos presentamos en el log del daemon.
+fn client_name(role: &str) -> String {
+    format!("hoard-desktop {} ({role})", env!("CARGO_PKG_VERSION"))
+}
+
+/// Espera entre reconexiones del bombeo de eventos. El caso normal es que el
+/// daemon siga vivo y esto no llegue a usarse; cubre el reinicio del servicio
+/// (una actualización) sin que la UI se quede muda para siempre.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+/// Tope de una petición ya conectada. Generoso para el peor caso real (el
+/// `Status` pregunta al motor, que puede estar hasheando), pero finito: sin él,
+/// un servicio atascado colgaría el comando de la UI y, tras él, todos los que
+/// esperan la conexión de comandos.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Cada cuánto se re-pregunta el estado del motor.
+///
+/// El motor arriba/abajo **no es un evento del journal** (`AgentEvent` no tiene
+/// esa variante), así que sin esto la UI se quedaría con el estado del instante
+/// en que conectó: un motor que arranca 20 s más tarde —lo normal, el daemon
+/// resuelve la sesión primero— dejaría el icono en "parado" toda la sesión. Es
+/// un round-trip por socket local; el push sigue siendo quien trae los eventos.
+const STATUS_EVERY: Duration = Duration::from_secs(20);
+
+/// Lo que la UI conoce como `AgentStatus`. Su forma es contrato con los stores
+/// (`ui/src/lib/stores/agent.ts`), que no deben notar que detrás ya no hay un
+/// motor embebido sino un servicio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentStatus {
+    pub running: bool,
+    pub watched_count: usize,
+}
+
+impl AgentStatus {
+    /// Lo que la UI debe pintar cuando no sabemos nada del motor.
+    pub fn down() -> Self {
+        Self {
+            running: false,
+            watched_count: 0,
+        }
+    }
+}
+
+/// Una fila del journal camino de la UI.
+#[derive(Debug, Clone, Serialize)]
+struct BacklogRow {
+    /// Cuándo pasó, en ms de época. Va incluido porque **la hora importa** al
+    /// reproducir: un `game_started` de hace dos horas tiene que pintar dos
+    /// horas de sesión, no arrancar el contador de cero. Es la última ocurrencia
+    /// (`last_at`), que en una fila colapsada es la que sigue siendo cierta.
+    at: i64,
+    event: AgentEvent,
+}
+
+/// Backlog del journal, tal como lo recibe la UI.
+#[derive(Debug, Clone, Serialize)]
+struct BacklogPayload {
+    /// En orden cronológico (lo más viejo primero), como salió del journal.
+    rows: Vec<BacklogRow>,
+    /// No hay continuidad que respetar: el cliente debe reconstruir su estado
+    /// desde este backlog en vez de parchear el que tenía.
+    resync: bool,
+}
+
+impl From<hoard_core::ipc::JournalEntry> for BacklogRow {
+    fn from(entry: hoard_core::ipc::JournalEntry) -> Self {
+        Self {
+            at: entry.last_at.unix_timestamp() * 1000,
+            event: entry.event,
+        }
+    }
+}
+
+/// Cursor del journal dentro de **una** ejecución del daemon.
+#[derive(Debug, Clone)]
+struct Cursor {
+    /// Identidad de la ejecución del daemon. Un `seq` sólo es comparable dentro
+    /// del mismo epoch: si cambió, el daemon se reinició y el cursor no vale.
+    epoch: String,
+    seq: u64,
+}
+
+/// Estado del enlace, vivo mientras viva la app.
+#[derive(Default)]
+pub struct DaemonLink {
+    /// Conexión de comandos. Perezosa: no se abre hasta que hay algo que pedir,
+    /// y se vuelve a abrir sola si el daemon se reinicia.
+    cmd: tokio::sync::Mutex<Option<Client>>,
+    /// Bombeo de eventos y refresco de estado. No vacío mientras la UI está
+    /// escuchando (entre [`attach`] y [`detach`]).
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    cursor: Arc<Mutex<Option<Cursor>>>,
+    /// Último estado publicado a la UI. Está aquí y no dentro del bucle de
+    /// estado porque hay **dos** emisores —el bucle y el bombeo, que sabe antes
+    /// que nadie que se cayó el socket— y con una memoria por emisor el segundo
+    /// nunca se entera de lo que publicó el primero: el bombeo pinta "parado", el
+    /// bucle sigue creyendo que ya publicó "arriba" y la UI se queda en parado
+    /// hasta que el motor cambie de estado por su cuenta.
+    last_status: Mutex<Option<AgentStatus>>,
+}
+
+impl DaemonLink {
+    /// Endpoint del usuario (o el de `HOARDD_SOCKET`). Se resuelve en cada uso:
+    /// es leer una variable de entorno y componer una ruta, y así un override no
+    /// se queda cacheado de un arranque anterior.
+    fn endpoint() -> Result<Endpoint> {
+        Endpoint::resolve().context("resolving the hoardd endpoint")
+    }
+
+    /// Manda una petición al daemon, levantándolo si no lo hay.
+    ///
+    /// Un fallo de **transporte** tira la conexión y reintenta una vez: el caso
+    /// real es un servicio que se actualizó y reinició entre dos comandos, y
+    /// quien pulsó el botón no tiene por qué enterarse.
+    ///
+    /// Un [`IpcError`] **no** se reintenta: es un daemon sano contestando "no
+    /// puedo, y por esto". Reintentarlo reconectaría en cada `EngineDown` —dos
+    /// conexiones y dos líneas de log por cada comando mientras no hay motor—
+    /// para volver a recibir exactamente la misma respuesta.
+    pub async fn request(&self, request: Request) -> Result<Payload> {
+        match self.request_once(request.clone()).await {
+            Ok(payload) => Ok(payload),
+            Err(err) if err.downcast_ref::<IpcError>().is_some() => Err(err),
+            Err(err) => {
+                tracing::debug!(error = %format!("{err:#}"), "daemon: retrying on a fresh connection");
+                *self.cmd.lock().await = None;
+                self.request_once(request).await
+            }
+        }
+    }
+
+    async fn request_once(&self, request: Request) -> Result<Payload> {
+        let mut guard = self.cmd.lock().await;
+        if guard.is_none() {
+            let endpoint = Self::endpoint()?;
+            // `ensure_running` no comprueba "¿hay daemon?" antes de lanzar: eso
+            // es un TOCTOU y produce dos motores. Lanza y reconecta; si dos
+            // clientes lo hacen a la vez, uno gana el bind y el otro sale.
+            *guard = Some(
+                Client::ensure_running(&endpoint, &client_name("commands"))
+                    .await
+                    .with_context(|| format!("connecting to the Hoard service at {endpoint}"))?,
+            );
+        }
+        let client = guard.as_mut().expect("just connected");
+        // Con tope: un servicio que acepta la conexión y luego no contesta
+        // colgaría el botón que la disparó **para siempre**, y con él a todos los
+        // comandos que esperan este mutex. Cortar la lectura a medias desordena
+        // el flujo, así que la conexión se tira en el mismo gesto.
+        let result = match tokio::time::timeout(REQUEST_TIMEOUT, client.request(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "the Hoard service didn't answer in {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )),
+        };
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.downcast_ref::<IpcError>().is_none())
+        {
+            // Un fallo que no es del protocolo casi siempre es la conexión: que
+            // la siguiente petición empiece por reconectar. Un `IpcError` no lo
+            // es —la conexión funcionó y trajo una respuesta— y tirarla sería
+            // reconectar por cada comando que llega con el motor caído.
+            *guard = None;
+        }
+        result
+    }
+
+    /// Estado del daemon: motor, slots y cursor.
+    pub async fn status(&self) -> Result<DaemonStatus> {
+        match self.request(Request::Status).await? {
+            Payload::Status(status) => Ok(status),
+            other => Err(anyhow!("unexpected answer to status: {other:?}")),
+        }
+    }
+
+    /// Petición best-effort: la loguea y sigue. Para los sitios donde el fallo
+    /// no debe abortar lo que el usuario pidió (persistir una preferencia,
+    /// re-hidratar tras añadir un juego).
+    pub async fn tell(&self, what: &'static str, request: Request) {
+        if let Err(err) = self.request(request).await {
+            tracing::warn!(error = %format!("{err:#}"), "daemon: couldn't {what}");
+        }
+    }
+
+    /// El conjunto de saves vigilados cambió en disco: que el daemon lo relea.
+    /// El cliente **avisa**, no manda la lista — el dueño del estado es el
+    /// servicio.
+    pub async fn notify_reload(&self) {
+        self.tell("ask the service to reload its watch list", Request::Reload)
+            .await;
+    }
+
+    fn cursor(&self) -> Option<Cursor> {
+        self.cursor.lock().unwrap().clone()
+    }
+
+    fn set_cursor(&self, epoch: &str, seq: u64) {
+        *self.cursor.lock().unwrap() = Some(Cursor {
+            epoch: epoch.to_string(),
+            seq,
+        });
+    }
+}
+
+/// Empieza a relevar los eventos del servicio a la UI. Lo llama el store cuando
+/// sus oyentes ya están puestos. Idempotente.
+pub fn attach(app: &AppHandle) {
+    let link = app.state::<AppState>();
+    let mut tasks = link.daemon.tasks.lock().unwrap();
+    if !tasks.is_empty() {
+        return;
+    }
+    // Regla de D.12: si vive más que una petición, va supervisado. Un pánico
+    // aquí dejaría la UI muda sin una línea de log, que es exactamente el fallo
+    // invisible que costó dos sesiones.
+    tasks.push(tokio::spawn({
+        let app = app.clone();
+        supervisor::supervise("desktop daemon event pump", move || pump(app.clone()))
+    }));
+    tasks.push(tokio::spawn({
+        let app = app.clone();
+        supervisor::supervise("desktop daemon status", move || status_loop(app.clone()))
+    }));
+}
+
+/// Deja de relevar eventos: para las tasks y cierra la conexión de eventos.
+///
+/// **No** manda `Shutdown` ni toca el motor. Que el desktop pueda parar el
+/// servicio sería volver al ciclo de vida atado a una ventana; parar el sync es
+/// una orden explícita del usuario (`hoard sync stop`), no un efecto de cerrar
+/// sesión o la app.
+///
+/// El cursor **se conserva**: si la UI se vuelve a suscribir dentro de la misma
+/// ejecución, pedir desde él evita repetirle lo que ya pintó.
+pub fn detach(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *state.daemon.tasks.lock().unwrap());
+    for task in tasks {
+        task.abort();
+    }
+}
+
+/// Conecta, pide el backlog y reenvía el push en vivo. No retorna nunca: una
+/// conexión que se cae se reintenta, porque el servicio puede reiniciarse
+/// (actualización) sin que la app se entere de otra forma.
+async fn pump(app: AppHandle) -> Finished {
+    loop {
+        if let Err(err) = pump_once(&app).await {
+            tracing::warn!(error = %format!("{err:#}"), "daemon: the event stream ended");
+        }
+        // La UI no puede quedarse creyendo que el motor sigue: si perdimos el
+        // socket, no sabemos nada de él.
+        emit_status(&app, &AgentStatus::down());
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn pump_once(app: &AppHandle) -> Result<()> {
+    let endpoint = DaemonLink::endpoint()?;
+    let mut client = Client::ensure_running(&endpoint, &client_name("events"))
+        .await
+        .with_context(|| format!("connecting to the Hoard service at {endpoint}"))?;
+    let epoch = client.welcome().epoch.clone();
+    tracing::info!(
+        pid = client.welcome().pid,
+        version = %client.welcome().daemon_version,
+        "desktop: attached to the Hoard service"
+    );
+
+    let state = app.state::<AppState>();
+    // Un cursor de otra ejecución del daemon no es un cursor: pedir desde él
+    // dejaría a la UI esperando eventos que ya pasaron.
+    let since = state
+        .daemon
+        .cursor()
+        .filter(|c| c.epoch == epoch)
+        .map(|c| c.seq);
+    let fresh = since.is_none();
+    // Con tope, como los comandos: si el servicio acepta y luego calla, la UI se
+    // quedaría sin backlog y sin push, y sin una línea que lo dijera. Al fallar,
+    // el bucle de arriba tira esta conexión y reconecta.
+    let backlog = tokio::time::timeout(REQUEST_TIMEOUT, client.subscribe(since))
+        .await
+        .map_err(|_| anyhow!("the Hoard service didn't answer the subscribe"))??;
+    state.daemon.set_cursor(&epoch, backlog.cursor);
+    let resync = fresh || backlog.gap;
+    if backlog.gap {
+        tracing::warn!(
+            requested = since.unwrap_or(0),
+            cursor = backlog.cursor,
+            "desktop: the service no longer has the journal rows we asked for; resyncing"
+        );
+    }
+    emit_backlog(
+        app,
+        backlog.entries.into_iter().map(BacklogRow::from).collect(),
+        resync,
+    );
+
+    while let Some(push) = client.next_push().await? {
+        match push {
+            Push::Event(entry) => {
+                state.daemon.set_cursor(&epoch, entry.seq);
+                emit_event(app, &entry.event);
+            }
+            // Nos hemos retrasado y el canal descartó filas. El daemon lo
+            // confiesa en vez de dejar el hueco invisible; nosotros volvemos a
+            // pedir desde nuestro cursor.
+            Push::Resync { cursor, dropped } => {
+                tracing::warn!(
+                    dropped,
+                    cursor,
+                    "desktop: fell behind the service's event push; re-reading the journal"
+                );
+                let since = state.daemon.cursor().map(|c| c.seq);
+                let backlog = tokio::time::timeout(REQUEST_TIMEOUT, client.subscribe(since))
+                    .await
+                    .map_err(|_| anyhow!("the Hoard service didn't answer the re-subscribe"))??;
+                state.daemon.set_cursor(&epoch, backlog.cursor);
+                emit_backlog(
+                    app,
+                    backlog.entries.into_iter().map(BacklogRow::from).collect(),
+                    true,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-pregunta el estado y lo publica cuando cambia. La primera vuelta va sin
+/// esperar: es la que pone el dot del watcher en su sitio justo después de que
+/// la UI se suscriba.
+async fn status_loop(app: AppHandle) -> Finished {
+    let mut armed: HashSet<String> = HashSet::new();
+    loop {
+        let state = app.state::<AppState>();
+        match state.daemon.status().await {
+            Ok(status) => {
+                announce_slots(&app, &status.slots, &mut armed);
+                let now = AgentStatus {
+                    running: status.engine.running,
+                    watched_count: status.slots.len().max(status.engine.watched),
+                };
+                if !now.running {
+                    tracing::debug!(
+                        reason = status.engine.last_error.as_deref().unwrap_or("starting"),
+                        "desktop: the service has no engine"
+                    );
+                }
+                emit_status(&app, &now);
+            }
+            // Sin servicio no sabemos nada del motor, así que la UI tampoco debe
+            // creer que sigue: el icono no puede quedarse en verde por inercia.
+            Err(err) => {
+                tracing::debug!(error = %format!("{err:#}"), "desktop: couldn't read the service status");
+                emit_status(&app, &AgentStatus::down());
+            }
+        }
+        tokio::time::sleep(STATUS_EVERY).await;
+    }
+}
+
+/// Publica el estado del motor con la forma que la UI ya conoce, **si cambió**.
+/// Repetirlo cada 20 s despertaría al webview para no decirle nada.
+pub fn emit_status(app: &AppHandle, status: &AgentStatus) {
+    let state = app.state::<AppState>();
+    {
+        let mut last = state.daemon.last_status.lock().unwrap();
+        if last.as_ref() == Some(status) {
+            return;
+        }
+        *last = Some(status.clone());
+    }
+    let _ = app.emit("agent://daemon-status", status);
+}
+
+/// Anuncia los slots que el servicio dice estar vigilando.
+///
+/// El slug lo resuelve el cliente contra `state.json` porque es cosa de
+/// presentación: el daemon reporta por `save_id`, que es su identidad real.
+pub fn announce_slots(app: &AppHandle, slots: &[AgentSlotStatus], seen: &mut HashSet<String>) {
+    let fresh: Vec<&AgentSlotStatus> = slots
+        .iter()
+        .filter(|s| !seen.contains(&s.save_id))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let slugs = CliState::load_default()
+        .map(|(state, _)| state)
+        .ok()
+        .map(|state| {
+            state
+                .saves
+                .into_iter()
+                .map(|(id, save)| (id, save.game_slug))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for slot in fresh {
+        seen.insert(slot.save_id.clone());
+        let _ = app.emit(
+            "agent://watcher-armed",
+            WatcherArmed {
+                save_id: slot.save_id.clone(),
+                game_slug: slugs
+                    .get(&slot.save_id)
+                    .cloned()
+                    .unwrap_or_else(|| slot.display_name.clone()),
+            },
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatcherArmed {
+    save_id: String,
+    game_slug: String,
+}
+
+fn emit_backlog(app: &AppHandle, rows: Vec<BacklogRow>, resync: bool) {
+    if rows.is_empty() && !resync {
+        return;
+    }
+    tracing::debug!(
+        count = rows.len(),
+        resync,
+        "desktop: seeding the UI from the service's journal"
+    );
+    let _ = app.emit("agent://backlog", BacklogPayload { rows, resync });
+}
+
+/// Reenvía un evento del motor a la UI por su canal Tauri de siempre.
+///
+/// Este mapeo es el contrato con los stores: cambia el backend (motor embebido →
+/// servicio) sin que las pantallas se enteren, que es la restricción dura de
+/// D.3. Sólo los eventos **en vivo** pasan por aquí; el backlog va por su propio
+/// canal para que un historial recuperado no dispare toasts ni escaneos.
+fn emit_event(app: &AppHandle, ev: &AgentEvent) {
+    let topic = match ev {
+        AgentEvent::GameStarted { .. } => "agent://game-started",
+        AgentEvent::GameStopped { .. } => "agent://game-stopped",
+        AgentEvent::BackupScheduled { .. } => "agent://backup-scheduled",
+        AgentEvent::BackupStarted { .. } => "agent://backup-started",
+        AgentEvent::BackupSuccess { .. } => "agent://backup-success",
+        AgentEvent::BackupFailed { .. } => "agent://backup-failed",
+        AgentEvent::BackupThrottled { .. } => "agent://backup-throttled",
+        AgentEvent::BackupTooLarge { .. } => "agent://backup-too-large",
+        AgentEvent::BackupTrimmed { .. } => "agent://backup-trimmed",
+        AgentEvent::SaveAutoRestored { .. } => "agent://save-auto-restored",
+        AgentEvent::SaveAutoRestoreFailed { .. } => "agent://save-auto-restore-failed",
+        AgentEvent::BackupSkippedEmpty { .. } => "agent://backup-skipped-empty",
+        AgentEvent::SaveConflictsBackedUp { .. } => "agent://save-conflicts-backed-up",
+        AgentEvent::HeavyProcessDetected { .. } => "agent://heavy-process-detected",
+        AgentEvent::RestoreDeferred { .. } => "agent://restore-deferred",
+        AgentEvent::SaveAutoRestoreStuck { .. } => "agent://save-auto-restore-stuck",
+        AgentEvent::SaveAutoRestoreRecovered { .. } => "agent://save-auto-restore-recovered",
+    };
+    let _ = app.emit(topic, ev);
+
+    // Un juego pesado sin rastrear acaba de aparecer: adelanta el escaneo en vez
+    // de esperar al temporizador. `request_scan` no hace nada si Modo Automático
+    // está apagado, y agrupa ráfagas.
+    if let AgentEvent::HeavyProcessDetected { name } = ev {
+        tracing::info!(process = %name, "desktop: heavy untracked game suspected; requesting immediate scan");
+        crate::commands::automatic::request_scan(app.clone());
+    }
+
+    // Alias con nombres semánticos para la superficie LiveStatus/ActivityFeed.
+    // Mismo payload, canal más legible; los canales originales siguen vivos.
+    match ev {
+        AgentEvent::BackupStarted { .. } => {
+            let _ = app.emit("agent://upload-started", ev);
+        }
+        AgentEvent::BackupSuccess { .. } => {
+            let _ = app.emit("agent://upload-completed", ev);
+        }
+        AgentEvent::BackupScheduled {
+            reason: hoard_agent::agent::BackupReason::FilesystemSettled,
+            delay_ms,
+            ..
+        } if *delay_ms > debounce_ms() => {
+            // Sólo cuando el min-interval aplazó la subida más allá del debounce
+            // hay una espera de verdad que enseñar; el debounce rutinario de
+            // cada autosave no es "en cola — esperando".
+            let _ = app.emit("agent://throttled", ev);
+        }
+        _ => {}
+    }
+}
+
+/// Debounce con el que corre el motor del servicio. El daemon construye su
+/// `AgentConfig` con `..AgentConfig::default()` para este campo, así que el
+/// default **es** el valor vivo; si algún día lo hace configurable, esto tiene
+/// que venir del `Status` en vez de calcularse aquí.
+fn debounce_ms() -> u64 {
+    AgentConfig::default().debounce_secs.saturating_mul(1000)
+}

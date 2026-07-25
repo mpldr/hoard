@@ -5,6 +5,7 @@
 //! we're desktop-only.
 
 mod commands;
+mod daemon;
 mod state;
 mod tray;
 
@@ -266,6 +267,8 @@ pub fn run() {
             commands::library::detected_paths_for_game,
             commands::agent::start_agent,
             commands::agent::stop_agent,
+            commands::agent::attach_agent_events,
+            commands::agent::detach_agent_events,
             commands::agent::backup_now,
             commands::agent::sweep_backups,
             commands::agent::agent_status,

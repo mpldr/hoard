@@ -506,7 +506,7 @@ export type AgentEvent =
       game_slug: string;
     };
 
-/** Boot the live agent and start emitting `agent://*` events. */
+/** Ensure the sync service is up and report its engine status. */
 export function startAgent(): Promise<AgentStatus> {
   return invoke<AgentStatus>("start_agent");
 }
@@ -514,6 +514,21 @@ export function startAgent(): Promise<AgentStatus> {
 /** Cleanly stop the agent (logout, app exit). */
 export function stopAgent(): Promise<void> {
   return invoke<void>("stop_agent");
+}
+
+/** Start relaying the sync service's events onto the `agent://*` channels.
+ *
+ *  Called by the agent store once its `listen()`s are registered — deliberately
+ *  *not* folded into `startAgent`, which Rust background work also calls and
+ *  which can therefore run before the webview has mounted. A journal replayed
+ *  into a page with no listeners would be a history lost in silence. */
+export function attachAgentEvents(): Promise<void> {
+  return invoke<void>("attach_agent_events");
+}
+
+/** Stop the relay (the service keeps running — it owns the sync engine). */
+export function detachAgentEvents(): Promise<void> {
+  return invoke<void>("detach_agent_events");
 }
 
 /** Force a backup right now, bypassing debounce. */

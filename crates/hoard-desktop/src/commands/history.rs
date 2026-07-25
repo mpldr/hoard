@@ -494,7 +494,7 @@ pub fn list_save_presets() -> Vec<String> {
 
 /// Pin (or clear) the sync preset for a save. Passing `null`/`"standard"`
 /// clears the override back to the global defaults. Persists to `state.json`
-/// and reseats the live agent so the new policy (interval, debounce, restore
+/// and reseats the watched set so the new policy (interval, debounce, restore
 /// behaviour) takes effect within a tick without an app restart.
 #[tauri::command]
 pub async fn set_save_preset(

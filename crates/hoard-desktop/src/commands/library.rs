@@ -251,7 +251,7 @@ fn persist_scan(state: &State<'_, AppState>, report: DetectionReport) {
 /// the local path into the agent's state file. Returns the resulting
 /// `TrackedSave` so the UI can append it to the list without a re-fetch. All
 /// the business logic (cloud vs self-hosted, dedup, 409 re-link) lives in
-/// `hoard_agent::library`; this wrapper just talks to the live agent and
+/// `hoard_agent::library`; this wrapper just tells the sync service and
 /// prettifies errors.
 #[tauri::command]
 pub async fn add_game_to_tracking(
@@ -287,7 +287,7 @@ pub async fn adopt_save(
 /// the source of truth for `latest_version_num`; the local path comes from
 /// `CliState`. Logic (dedup self-heal, orphan detection, local sizes) lives in
 /// `hoard_agent::library::list_tracked`; this wrapper detaches any duplicate
-/// rows the self-heal pruned from the live agent.
+/// rows the self-heal pruned from the watched set.
 #[tauri::command]
 pub async fn list_tracked_saves(state: State<'_, AppState>) -> Result<Vec<TrackedSave>, String> {
     let client = current_client(&state)?;

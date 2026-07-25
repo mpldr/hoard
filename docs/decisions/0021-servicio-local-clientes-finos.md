@@ -1068,3 +1068,114 @@ la ADR lo declara obligatorio "con el Slice 4": no se ha hecho en 4a. Reiniciar 
 daemon aún no es rutina (nadie depende de él), pero **debe entrar antes de cerrar
 el Slice 4**, porque con el servicio en marcha `in_flight` deja de sobrevivir a
 los reinicios.
+
+---
+
+### D.16 — Slice 4b cerrado: el desktop es un cliente (2026-07-25)
+
+El desktop ya no tiene motor. `agent::spawn`, el `AgentHandle` de `AppState`, el
+latido de presencia y el `AgentLock` del pidfile salen de `hoard-desktop`; en su
+sitio queda `DaemonLink` (`crates/hoard-desktop/src/daemon.rs`), que habla con
+`hoardd` por la IPC del 4a. Cerrar la app ya no puede parar el sync — el punto de
+todo el Slice 4. **La CLI no se toca**: sigue con su motor embebido y su pidfile
+hasta el 4c.
+
+La restricción dura de D.3 se cumple: la interfaz pública de los stores TS es la
+misma export por export (`activity`, `restoreStuck`, `status`, `trayState`,
+`subscribeAgent`, `bootAgent`, `shutdownAgent`, `activityFeed`, `liveStatus`…) y
+las pantallas no cambian ni una línea. Lo que cambió está **dentro**: el Rust
+releva los eventos del servicio a los mismos canales `agent://*` de siempre.
+
+**Decisiones a no deshacer:**
+
+- **Dos conexiones por cliente, comandos y eventos.** `read_frame` lee cabecera y
+  cuerpo en dos pasos, así que no es cancel-safe: con una sola conexión haría
+  falta un `select!` entre "espera un push" y "manda una petición", y cancelar la
+  lectura a medias desordena el flujo. Dos conexiones cuestan una task por
+  cliente en el daemon y a cambio ninguna lectura se cancela nunca.
+- **El relevo lo enciende quien escucha, no `start_agent`.** `attach_agent_events`
+  lo llama el store desde `subscribeAgent()`, con los `listen()` ya puestos. A
+  `start_agent` también lo llama el escaneo de Modo Automático desde Rust, y le
+  gana al montaje del webview — medido en la máquina Windows: el sweep del
+  scheduler conectó al servicio **antes** de que existiera la UI. Un backlog
+  emitido antes que el oyente es un historial perdido en silencio, que es
+  exactamente lo que el journal existe para evitar.
+- **El backlog viaja con su hora.** Cada fila lleva `at` (el `last_at` del
+  journal). Reproducir un `game_started` de hace dos horas tiene que pintar dos
+  horas de sesión, no arrancar el contador de cero.
+- **Reproducir no notifica.** El store aplica el backlog con una bandera
+  `replaying` que silencia toasts y notificaciones nativas: una copia de anoche no
+  puede sonar hoy. El estado en pantalla sí se reconstruye.
+- **Resync es reconstruir, no parchear.** Con `gap`, epoch nuevo o `Resync` del
+  push, el store vacía `activity` y `restoreStuck` y los rehace desde el journal.
+  El **feed no se vacía**: sus filas sólo llegan más nuevas que el cursor (nunca
+  duplican) y además tiene filas de otras fuentes que un borrado tiraría.
+- **El cursor vive en memoria y no se persiste.** Una ejecución nueva de la app
+  arranca con la UI vacía, así que pedir el anillo entero *es* la reconstrucción
+  correcta; dentro de una ejecución el cursor evita repetir lo ya pintado al
+  reconectar. Persistirlo sería estado nuevo en disco justo antes del Slice 5.
+- **Un `IpcError` no se reintenta ni tira la conexión.** Sólo los fallos de
+  transporte reconectan. Reintentar un error de aplicación son dos conexiones y
+  dos líneas de log por cada comando mientras no hay motor, para recibir la misma
+  respuesta (observado en el humo de Windows antes de arreglarlo). El `IpcError`
+  implementa `Error`, así que el motivo llega legible al toast; un `{:?}` le
+  enseñaría `EngineDown { reason: … }` al usuario.
+- **El desktop nunca manda `Shutdown`.** Cerrar sesión o cerrar la app es
+  `detach`: se sueltan las tareas de esta ventana y el servicio sigue. Parar el
+  sync es una orden explícita del usuario.
+- **Dos peticiones nuevas, ambas espejo de algo que el desktop hacía a mano.**
+  `SetProbeCandidates` (la detección vive en el frontend hasta el Slice 8, así que
+  el motor no puede adivinar las candidatas; van como `String` porque el cable es
+  JSON y una ruta no-UTF-8 se descarta en el cliente, que es donde se puede decir)
+  y `RestartEngine` (un cambio de cuenta invalida `ApiClient`, contexto y rotador
+  a la vez, y eso sólo se arregla resolviendo la sesión de cero).
+- **`RestartEngine` se *pide*, no se ejecuta en el despacho.** El único dueño del
+  ciclo de vida del motor es el keeper: si el servidor IPC lo hiciera, entre
+  soltar el motor viejo y terminar su apagado el keeper vería la ranura vacía y
+  arrancaría otro — dos `AgentLock` vivos en el mismo proceso (el `Drop` del viejo
+  borra el pidfile del nuevo) y dos rotadores del mismo refresh token durante esa
+  ventana. Y el keeper duerme con un `Notify`, así que un login no espera el
+  backoff de hasta cinco minutos.
+- **El desktop deja de tomar el pidfile.** Es requisito, no limpieza: si lo
+  siguiera tomando, el keeper del daemon vería un dueño vivo y **nunca** arrancaría
+  motor. `instance.rs` sigue existiendo para la CLI y muere en el 4d.
+- **El poller de nube del desktop sólo pinta.** Se le quitan el empuje de token,
+  el `set_cloud_versions` y el `force_restore`: el daemon corre su propio
+  `cloud_live` (Realtime + poll) y hace las tres cosas con menos latencia. Lo que
+  sí se queda es el SSE self-hosted, que no tiene equivalente en el daemon y ahora
+  pide el `force_restore` por IPC.
+- **Un solo publicador del estado del motor.** El estado arriba/abajo no es un
+  evento del journal, así que lo refresca un bucle cada 20 s (round-trip local) y
+  el bombeo lo baja a "parado" en cuanto pierde el socket. La memoria de lo último
+  publicado vive en `DaemonLink`, no en cada emisor: con una memoria por emisor, el
+  bucle seguiría creyendo que ya publicó "arriba" y la UI se quedaría en "parado"
+  hasta que el motor cambiara de estado por su cuenta.
+
+**Windows, ya ejecutado (cierra el punto abierto de D.15).** Compilado y corrido
+por SSH en la máquina del usuario (`cargo test -p hoardd` verde: 12 unitarios + 9
+de IPC + 3 de "spawn if absent" con procesos de verdad). Comprobado a mano contra
+el pipe real:
+
+- se crea `\\.\pipe\hoardd-<usuario>-<hash>`;
+- un segundo arranque pierde el bind, lo dice y **sale 0**;
+- un cliente ajeno (PowerShell, ni una línea de nuestro Rust) completa el
+  handshake y recibe el `Welcome`;
+- la ACL efectiva —leída del objeto vivo, no del descriptor que le pasamos— es
+  `D:P(A;;FA;;;S-1-5-21-…)(A;;FA;;;SY)`: **sin `Everyone`**, sin usuarios
+  autenticados y con el DACL protegido. Ahora es un test (`the_pipe_acl_excludes_everyone`)
+  y una línea de log en cada arranque, no una deducción del código;
+- y el desktop de este slice, con su webview montado en la sesión interactiva,
+  engancha las dos conexiones (`(commands)` y `(events)`), siembra la UI desde el
+  journal y reporta el motor ausente con su motivo.
+
+**Lo que queda del Slice 4:** 4c (la CLI, que además mata el duplicado de
+`session.rs`), 4d (borrar `instance.rs`), el empaquetado —hoy `daemon_binary()`
+busca el hermano del ejecutable y luego el `PATH`, así que **el bundle tiene que
+llevar `hoardd`** o el desktop se queda sin servicio— y las notificaciones
+nativas. Sigue abierto D.8.3 (`upload_landed`).
+
+**Deuda consciente:** siguen existiendo dos rotadores del refresh token. El
+servicio rota para el motor y el desktop rota para sus propias llamadas REST;
+`cloud_auth::refresh_freshest` sana la rotación ajena releyendo disco, así que no
+rompe, pero el "un único rotador" de la Parte A no está cerrado hasta que el
+desktop pida el token al servicio (encaja en el Slice 7, cliente cloud único).

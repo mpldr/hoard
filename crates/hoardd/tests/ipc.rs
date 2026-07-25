@@ -18,6 +18,17 @@ use hoardd::server::{accept_loop, Daemon};
 use hoardd::transport::{self, Listener};
 use time::OffsetDateTime;
 
+/// Sufijo irrepetible para el endpoint de un test.
+fn unique(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Un daemon sirviendo en un socket temporal, con su journal a mano.
 struct Fixture {
     endpoint: Endpoint,
@@ -29,12 +40,9 @@ struct Fixture {
 impl Fixture {
     fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let endpoint = Endpoint::new(
-            dir.path()
-                .join("hoardd.sock")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        // Nombre único: en Windows los pipes comparten un namespace global, así
+        // que dos tests en paralelo (o dos `cargo test` a la vez) chocarían.
+        let endpoint = Endpoint::scoped(dir.path(), &unique("ipc"));
         let listener = Listener::bind(&endpoint).expect("bind");
         let log = Arc::new(EventLog::new());
         let daemon = Arc::new(Daemon::new(log.clone(), Engine::new()));
@@ -210,7 +218,46 @@ async fn commands_without_an_engine_say_why() {
         })
         .await
         .expect_err("no engine, no backup");
-    assert!(err.to_string().contains("EngineDown"), "{err}");
+    // El motivo viaja **dentro del mensaje**, no sólo en la variante: este texto
+    // acaba en un toast del desktop o en el stdout de la CLI, así que un
+    // `EngineDown { reason: … }` volcado con `{:?}` sería lo que leería el
+    // usuario.
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+    assert!(
+        !text.contains("EngineDown"),
+        "leaked the Debug shape: {text}"
+    );
+}
+
+/// Pedir el reinicio del motor **no** se contesta con `EngineDown` cuando no hay
+/// motor: es justo la petición que puede hacer que vuelva (el keeper resuelve la
+/// sesión otra vez). Contestar "no puedo porque está roto" dejaría al desktop sin
+/// forma de decirle al servicio que el usuario acaba de entrar.
+#[tokio::test]
+async fn restarting_the_engine_is_accepted_even_without_one() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+    assert!(matches!(
+        client.request(Request::RestartEngine).await.unwrap(),
+        Payload::Ack
+    ));
+}
+
+/// Las candidatas de sondeo sí necesitan motor, y sin él se dice por qué. Este
+/// test existe sobre todo como cable: es la única petición que manda una lista
+/// del cliente al motor, y si alguien la saca del despacho, aquí se ve.
+#[tokio::test]
+async fn probe_candidates_need_an_engine_and_say_so() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+    let err = client
+        .request(Request::SetProbeCandidates {
+            dirs: vec!["/tmp/candidate".into()],
+        })
+        .await
+        .expect_err("no engine, no probing");
+    assert!(err.to_string().contains("no engine"), "{err}");
 }
 
 /// El estado se sirve aunque el journal esté vacío: es el snapshot con el que un

@@ -122,6 +122,10 @@ pub async fn login(
     if let Err(e) = crate::commands::automatic::restart_if_enabled(&app).await {
         tracing::warn!(error = %e, "login: couldn't rehydrate automatic schedulers");
     }
+    // Hay sesión nueva en disco: que el servicio resuelva con ella. Sin esto, un
+    // motor que llevaba minutos caído por no tener sesión seguiría esperando su
+    // backoff (hasta 5 min) después de que el usuario ya haya entrado.
+    crate::commands::agent::notify_session_changed(&app);
     Ok(user)
 }
 
@@ -140,11 +144,14 @@ pub fn current_user(state: State<'_, AppState>) -> Option<UserInfo> {
 
 /// Clear stored credentials and the in-memory cache.
 #[tauri::command]
-pub fn logout(state: State<'_, AppState>) -> Result<(), String> {
+pub fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     credentials::clear().map_err(|e| format!("Couldn't clear credentials: {e}"))?;
     *state.user.lock().unwrap() = None;
     // Repoint at whatever session remains (a cloud login, or none).
     crate::commands::library::sync_active_context(state.inner());
+    // El motor es del servicio (ADR 0021, Slice 4b) y acaba de quedarse sin las
+    // credenciales que estaba usando: que las resuelva otra vez.
+    crate::commands::agent::notify_session_changed(&app);
     Ok(())
 }
 

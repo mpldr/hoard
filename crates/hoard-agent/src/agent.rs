@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
 use crate::api::{ApiClient, ApiError};
-use crate::backup::{upload_directory_checked, BackupResult};
+use crate::backup::{upload_directory_checked, BackupResult, ServerHead};
 
 /// Configuration for the live agent. Defaults are tuned for v0.3's
 /// "instant feel" priority:
@@ -412,6 +412,11 @@ enum AgentCommand {
         /// caída, 401, self-hosted): la marca de frescura **no** se sella, así
         /// que la ceguera sigue siendo visible en vez de disfrazarse de feed.
         versions: Option<HashMap<String, i64>>,
+        /// Qué contenido tiene cada cabeza (digest del manifiesto), para el
+        /// chequeo anti-relanzamiento de D.8.3. Viaja junto a `versions` y de
+        /// la misma pasada del manifiesto, así que los dos describen el mismo
+        /// instante del server.
+        digests: Option<HashMap<String, ServerHead>>,
         /// Contexto del despliegue según el probe cacheado de `/v1/health`:
         /// `Some(true)` cloud, `Some(false)` self-hosted, `None` sin resolver
         /// (probe fallido). Sólo un valor definido mueve el latch.
@@ -573,10 +578,17 @@ struct BackupDone {
     /// flush its progress before the game closed (R.E.P.O. regression).
     committed: bool,
     /// Version number of the snapshot just uploaded (`Some` only when
-    /// `committed`). The agent advances the slot's `known_version` to this so
-    /// the reconciliation sweep won't re-download a version this device itself
-    /// just produced. `None` on skip/empty.
+    /// `committed`, o cuando el contenido ya estaba arriba — ver
+    /// [`Self::landed`]). The agent advances the slot's `known_version` to this
+    /// so the reconciliation sweep won't re-download a version this device
+    /// itself just produced. `None` on skip/empty.
     version_num: Option<i64>,
+    /// **No se subió nada porque ya estaba subido** (ADR 0021 D.8.3): el
+    /// contenido local es el de la versión que el server publica como cabeza.
+    /// Viaja hasta la `Observation` como `upload_landed`, donde el reductor lo
+    /// usa para distinguir este no-op del 409 asentado a la cabeza: aquél
+    /// escribió en la carpeta (y sella `last_restore_at`), éste no tocó nada.
+    landed: bool,
 }
 
 /// Internal per-save bookkeeping.
@@ -707,6 +719,11 @@ struct SaveSlot {
     /// es una *entrada* del reductor, no un evento que muta estado por su
     /// cuenta. Mapea a [`kernel::Observation::op_result`].
     pending_op_result: Option<kernel::OpResult>,
+    /// Respuesta del chequeo content-addressed anti-relanzamiento, en cola junto
+    /// al `pending_op_result` de una subida que no subió nada porque el
+    /// contenido **ya estaba** en el server (ADR 0021 D.8.3). Mapea a
+    /// [`kernel::Observation::upload_landed`].
+    pending_upload_landed: Option<bool>,
     /// La cadena de error del último restore fallido, en cola junto a un
     /// `pending_op_result` = `Failed`. El reductor no la transporta (su
     /// `OpResult::Failed` no lleva string), así que el shell la guarda para el
@@ -856,6 +873,12 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
 struct CloudHeads {
     /// Última versión cloud por `save_id`, tal cual la trajo el manifest.
     versions: HashMap<String, i64>,
+    /// **Qué contenido** tiene esa cabeza, por `save_id`: el digest del
+    /// manifiesto que publica el server (ADR 0021 D.8.3). Sólo lo llena la
+    /// observación propia del motor —el empujón del cliente trae versiones, no
+    /// digests—, así que puede ir por detrás de [`Self::versions`]; por eso
+    /// [`Self::head_for`] exige que la versión coincida antes de creérselo.
+    digests: HashMap<String, ServerHead>,
     /// Cuándo aterrizó ese feed, venga de donde venga. `None` = todavía ninguno.
     as_of: Option<OffsetDateTime>,
     /// Último intento **propio** de observar la nube, con éxito o sin él. Marca
@@ -877,6 +900,7 @@ impl CloudHeads {
     fn new(now: OffsetDateTime) -> Self {
         Self {
             versions: HashMap::new(),
+            digests: HashMap::new(),
             as_of: None,
             last_attempt_at: None,
             is_cloud: None,
@@ -884,10 +908,33 @@ impl CloudHeads {
         }
     }
 
-    /// Instala un feed nuevo y sella su marca de tiempo.
-    fn feed(&mut self, versions: HashMap<String, i64>, now: OffsetDateTime) {
+    /// Instala un feed nuevo y sella su marca de tiempo. `digests` sólo viene
+    /// de la observación propia; un empujón de cliente pasa `None` y deja los
+    /// que hubiera (que [`Self::head_for`] descartará si la versión ya no casa).
+    fn feed(
+        &mut self,
+        versions: HashMap<String, i64>,
+        digests: Option<HashMap<String, ServerHead>>,
+        now: OffsetDateTime,
+    ) {
         self.versions = versions;
+        if let Some(digests) = digests {
+            self.digests = digests;
+        }
         self.as_of = Some(now);
+    }
+
+    /// La cabeza de un save **con su contenido**, para el chequeo
+    /// anti-relanzamiento de D.8.3.
+    ///
+    /// Sólo se devuelve si el digest que tenemos es el de la versión que ahora
+    /// mismo es la cabeza: un digest emparejado con una versión vieja
+    /// describiría un contenido que ya no es el del server, y creérselo sería
+    /// saltarse una subida que sí hace falta. Emparejar en vez de mantener dos
+    /// mapas sueltos es lo que hace imposible ese fallo.
+    fn head_for(&self, save_id: &str) -> Option<&ServerHead> {
+        let head = self.digests.get(save_id)?;
+        (self.versions.get(save_id) == Some(&head.version_num)).then_some(head)
     }
 
     /// El ancla del margen de arranque que va en la [`kernel::Observation`]:
@@ -944,16 +991,27 @@ async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>)
     // Se lee DESPUÉS del probe para distinguir "self-hosted" de "no se pudo
     // resolver" — `is_cloud()` colapsa ambos en `false`.
     let is_cloud = api.probed_is_cloud();
-    let versions = if cloud {
+    let observed = if cloud {
         match api.cloud_sync().await {
             Ok(manifest) => {
-                let map: HashMap<String, i64> = manifest
-                    .saves
-                    .into_iter()
-                    .map(|e| (e.save_id, e.latest_version_num))
-                    .collect();
-                tracing::debug!(count = map.len(), "agent: observed cloud heads");
-                Some(map)
+                // Dos mapas de la misma pasada: la versión (la cabeza) y qué
+                // contenido tiene (el digest de su manifiesto, D.8.3). Salen
+                // juntos a propósito — un digest de una pasada distinta
+                // describiría un contenido que ya no es el de esa versión.
+                let mut versions: HashMap<String, i64> = HashMap::new();
+                let mut digests: HashMap<String, ServerHead> = HashMap::new();
+                for e in manifest.saves {
+                    versions.insert(e.save_id.clone(), e.latest_version_num);
+                    digests.insert(
+                        e.save_id,
+                        ServerHead {
+                            version_num: e.latest_version_num,
+                            digest: e.latest_sha256,
+                        },
+                    );
+                }
+                tracing::debug!(count = versions.len(), "agent: observed cloud heads");
+                Some((versions, digests))
             }
             Err(e) => {
                 // A warn, no debug: desde D.12 esto es la vía principal de
@@ -969,8 +1027,16 @@ async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>)
         }
         None
     };
+    let (versions, digests) = match observed {
+        Some((versions, digests)) => (Some(versions), Some(digests)),
+        None => (None, None),
+    };
     let _ = cmd_tx
-        .send(AgentCommand::CloudHeadsObserved { versions, is_cloud })
+        .send(AgentCommand::CloudHeadsObserved {
+            versions,
+            digests,
+            is_cloud,
+        })
         .await;
 }
 
@@ -1012,9 +1078,13 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
         // por `fs_event` aquí; el reductor los lee del estado.
         fs_event: false,
         op_result: slot.pending_op_result.take(),
-        // El check content-addressed anti-relaunch (existencia en blobs/chunks)
-        // no se cablea en 2b; el anti-relaunch por `in_flight` basta.
-        upload_landed: None,
+        // El chequeo content-addressed anti-relanzamiento (ADR 0021 D.8.3): lo
+        // contesta el ejecutor de la subida —es IO, y el kernel no hace IO—
+        // comparando el contenido local con el digest de la cabeza del server.
+        // `Some(true)` = la subida que un reinicio dejó a medias sí aterrizó, así
+        // que no hay nada que resubir y el reductor sólo tiene que apuntar la
+        // versión. `None` = no se comprobó (nadie subió nada este tick).
+        upload_landed: slot.pending_upload_landed.take(),
     }
 }
 
@@ -1086,7 +1156,15 @@ fn reconcile_all(
         for decision in decisions {
             match decision {
                 kernel::Decision::Act(action) => execute_action(
-                    slots, &id, action, api, events_tx, cmd_tx, config, done_tx,
+                    slots,
+                    &id,
+                    action,
+                    api,
+                    events_tx,
+                    cmd_tx,
+                    config,
+                    done_tx,
+                    cloud.head_for(&id).cloned(),
                 ),
                 kernel::Decision::Hold { reason } => {
                     tracing::debug!(save_id = %id, reason, "agent: reconcile hold");
@@ -1111,10 +1189,11 @@ fn execute_action(
     cmd_tx: &mpsc::Sender<AgentCommand>,
     config: &AgentConfig,
     done_tx: &mpsc::Sender<BackupDone>,
+    head: Option<ServerHead>,
 ) {
     match action {
         kernel::Action::Backup => {
-            execute_backup(slots, id, api, events_tx, cmd_tx, config, done_tx);
+            execute_backup(slots, id, api, events_tx, cmd_tx, config, done_tx, head);
         }
         // Pull y Restore: intents distintos del kernel, ejecutor único.
         kernel::Action::Restore | kernel::Action::Pull => {
@@ -1163,6 +1242,10 @@ fn execute_backup(
     cmd_tx: &mpsc::Sender<AgentCommand>,
     config: &AgentConfig,
     done_tx: &mpsc::Sender<BackupDone>,
+    // Qué contenido publica el server como cabeza de este save, si lo sabemos:
+    // es lo que deja detectar que la subida que un reinicio del daemon dejó a
+    // medias ya había aterrizado (ADR 0021 D.8.3).
+    head: Option<ServerHead>,
 ) {
     let Some(slot) = slots.get_mut(id) else {
         return;
@@ -1200,6 +1283,7 @@ fn execute_backup(
             save,
             prev_set_hash,
             base_version,
+            head,
             events_tx,
             done_tx,
             cmd_tx,
@@ -1498,7 +1582,7 @@ async fn run_agent(
                         // permite al reductor decir "ciego" en vez de
                         // "convergido" si el poller vuelve a enmudecer (ADR 0021
                         // D.10).
-                        cloud_heads.feed(map, OffsetDateTime::now_utc());
+                        cloud_heads.feed(map, None, OffsetDateTime::now_utc());
                         // Un empujón sólo puede venir de un cliente cloud (el
                         // poller del desktop o `cloud_live` de la CLI, ambos
                         // detrás de una sesión cloud), así que sirve de
@@ -1518,7 +1602,7 @@ async fn run_agent(
                             &cloud_heads,
                         );
                     }
-                    Some(AgentCommand::CloudHeadsObserved { versions, is_cloud }) => {
+                    Some(AgentCommand::CloudHeadsObserved { versions, digests, is_cloud }) => {
                         // El motor miró la nube por su cuenta (ADR 0021 D.12).
                         // El latch de contexto sólo se mueve con una respuesta
                         // definida: un probe fallido no puede degradar un
@@ -1536,7 +1620,7 @@ async fn run_agent(
                                 count = map.len(),
                                 "agent: cloud version cache updated from the engine's own observation"
                             );
-                            cloud_heads.feed(map, OffsetDateTime::now_utc());
+                            cloud_heads.feed(map, digests, OffsetDateTime::now_utc());
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
@@ -1852,6 +1936,14 @@ async fn run_agent(
                         fingerprint: done.new_set_hash.as_deref().map(fingerprint_from_set_hash),
                         wrote: done.committed,
                     });
+                    // La respuesta del chequeo content-addressed (D.8.3) viaja
+                    // en la misma observación que el resultado de la op: es lo
+                    // que deja al reductor distinguir este no-op —nada se subió
+                    // y nada se escribió en la carpeta— del 409 asentado a la
+                    // cabeza, que sí escribió y por eso sella `last_restore_at`.
+                    if done.landed {
+                        slot.pending_upload_landed = Some(true);
+                    }
                 }
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
@@ -1942,6 +2034,7 @@ fn handle_add(
         last_l0_mtime: None,
         needs_l1: false,
         pending_op_result: None,
+        pending_upload_landed: None,
         last_restore_error: None,
         known_version,
         pull_pending: false,
@@ -3055,6 +3148,10 @@ async fn run_backup_with_retry(
     // `None` only for a save never synced from this device (no head yet) and the
     // empty/missing-folder restore path, which never uploads.
     mut base_version: Option<i64>,
+    // Cabeza del server (versión + digest de su contenido) para el chequeo
+    // anti-relanzamiento de D.8.3: si lo que íbamos a subir ya es esa cabeza, la
+    // subida anterior aterrizó y volver a subir sólo crea una versión duplicada.
+    head: Option<ServerHead>,
     events_tx: mpsc::Sender<AgentEvent>,
     done_tx: mpsc::Sender<BackupDone>,
     cmd_tx: mpsc::Sender<AgentCommand>,
@@ -3081,6 +3178,7 @@ async fn run_backup_with_retry(
             new_set_hash: None,
             committed: false,
             version_num: None,
+            landed: false,
         });
         if !auto_restore {
             let _ = events_tx
@@ -3119,6 +3217,7 @@ async fn run_backup_with_retry(
             // which the `ApiError::Conflict` arm below catches to reconcile +
             // retry instead of clobbering the newer remote version.
             base_version,
+            head.as_ref(),
             |_, _| {},
             // Emit "uploading…" only once the signature checks have decided a
             // real upload is happening — a Skipped/Unchanged settle stays
@@ -3150,6 +3249,7 @@ async fn run_backup_with_retry(
                     new_set_hash: None,
                     committed: false,
                     version_num: None,
+                    landed: false,
                 });
                 return;
             }
@@ -3167,6 +3267,49 @@ async fn run_backup_with_retry(
                     new_set_hash: Some(signature),
                     committed: false,
                     version_num: None,
+                    landed: false,
+                });
+                return;
+            }
+            // El contenido ya estaba en el server (ADR 0021 D.8.3): la subida
+            // que un reinicio del daemon dejó a medias sí había aterrizado. No
+            // se sube nada; sólo se adopta la versión que ya lo tiene.
+            //
+            // Se emite `BackupSuccess` —con `already_landed`— y no un evento
+            // propio porque para el usuario el hecho **es** "está guardado en la
+            // versión N", y porque es lo que hace que el servicio persista
+            // `last_version_num`/`set_hash` en `state.json`. Sin esa fila, el
+            // siguiente arranque vería la nube por delante y se bajaría su propio
+            // contenido.
+            Ok(BackupResult::AlreadyLanded {
+                version_num,
+                signature,
+            }) => {
+                tracing::info!(
+                    save_id = %save.save_id,
+                    version_num,
+                    "agent: nothing to upload — this content is already the server's head"
+                );
+                let _ = events_tx
+                    .send(AgentEvent::BackupSuccess {
+                        save_id: save.save_id.clone(),
+                        version_num,
+                        // Cero bytes porque cero bytes viajaron: el tamaño que la
+                        // UI enseña es el de la subida, y aquí no la hubo.
+                        total_bytes: 0,
+                        set_hash: Some(signature.clone()),
+                        already_landed: true,
+                    })
+                    .await;
+                let _ = done_tx.try_send(BackupDone {
+                    save_id: save.save_id.clone(),
+                    new_set_hash: Some(signature),
+                    // **No** es un commit: nada llegó al server en esta pasada, y
+                    // mover el ancla del min-interval con un no-op es la
+                    // regresión R.E.P.O. (D.8.2). La versión sí se adopta.
+                    committed: false,
+                    version_num: Some(version_num),
+                    landed: true,
                 });
                 return;
             }
@@ -3180,6 +3323,7 @@ async fn run_backup_with_retry(
                         version_num: o.snapshot.version_num,
                         total_bytes: o.total_bytes,
                         set_hash: Some(signature.clone()),
+                        already_landed: false,
                     })
                     .await;
                 // Partial upload: the save was over the plan's per-save cap so
@@ -3210,6 +3354,7 @@ async fn run_backup_with_retry(
                     new_set_hash: Some(signature),
                     committed: true,
                     version_num: Some(o.snapshot.version_num),
+                    landed: false,
                 });
                 return;
             }
@@ -3339,6 +3484,7 @@ async fn run_backup_with_retry(
                                         new_set_hash: outcome.disk_set_hash.clone(),
                                         committed: false,
                                         version_num: Some(outcome.version_num),
+                                        landed: false,
                                     })
                                     .await;
                                 return;
@@ -3421,6 +3567,7 @@ async fn run_backup_with_retry(
                         new_set_hash: None,
                         committed: false,
                         version_num: None,
+                        landed: false,
                     });
                     let _ = events_tx
                         .send(AgentEvent::BackupSkippedEmpty {
@@ -3453,6 +3600,7 @@ async fn run_backup_with_retry(
                         new_set_hash: None,
                         committed: false,
                         version_num: None,
+                        landed: false,
                     });
                     return;
                 }
@@ -3482,6 +3630,7 @@ async fn run_backup_with_retry(
                         new_set_hash: None,
                         committed: false,
                         version_num: None,
+                        landed: false,
                     });
                     let _ = events_tx
                         .send(AgentEvent::BackupTooLarge {
@@ -4402,7 +4551,7 @@ mod tests {
         assert!(heads.due_for_self_observation(t0));
 
         // Con un feed recién llegado (poller vivo) no hay nada que buscar…
-        heads.feed(HashMap::new(), secs(10));
+        heads.feed(HashMap::new(), None, secs(10));
         assert!(!heads.due_for_self_observation(secs(10 + due - 1)));
         // …hasta que ese feed se hace viejo: el poller enmudeció y el motor
         // cubre el hueco por su cuenta.
@@ -4510,6 +4659,7 @@ mod tests {
                 last_l0_mtime: None,
                 needs_l1: false,
                 pending_op_result: None,
+                pending_upload_landed: None,
                 last_restore_error: None,
                 known_version: None,
                 pull_pending: false,
@@ -4698,7 +4848,7 @@ mod tests {
 
         // `max_retries: 0` → the first failure is already the last.
         run_backup_with_retry(
-            api, save, None, None, events_tx, done_tx, cmd_tx, 0, false, None, 14,
+            api, save, None, None, None, events_tx, done_tx, cmd_tx, 0, false, None, 14,
         )
         .await;
 

@@ -64,6 +64,19 @@ pub enum AgentEvent {
         /// `state.json` so the next session can skip a no-op re-upload of the
         /// same bytes. `None` only if the agent couldn't compute it.
         set_hash: Option<String>,
+        /// **No se subió nada: el contenido ya era la cabeza del server** (ADR
+        /// 0021 D.8.3). Pasa cuando el daemon se reinicia con una subida en
+        /// vuelo que sí llegó a comprometerse: el `in_flight` en memoria se
+        /// perdió, pero los bytes están arriba, y el chequeo content-addressed
+        /// lo detecta en vez de crear una versión duplicada.
+        ///
+        /// Sigue siendo un `BackupSuccess` porque el hecho que le importa a
+        /// quien mira es el mismo —"está guardado en la versión N"— y porque de
+        /// él cuelga la persistencia de `state.json`. `total_bytes` es 0: no
+        /// viajó ni un byte. Campo nuevo con `default`, así que un cliente
+        /// anterior lo lee como `false` (ADR 0021 C.6: append-only).
+        #[serde(default)]
+        already_landed: bool,
     },
     BackupFailed {
         save_id: String,

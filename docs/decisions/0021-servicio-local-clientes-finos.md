@@ -1282,3 +1282,154 @@ prestado.
 bundle tiene que llevar `hoardd` y las units deberían apuntar a él en vez de a
 `hoard sync run`) y las notificaciones nativas. Sigue abierto D.8.3
 (`upload_landed`).
+
+---
+
+### D.18 — Slice 4d cerrado: sin pidfile, empaquetado y con despedida (2026-07-25)
+
+Cuatro cosas, y con ellas el Slice 4 queda cerrado salvo las notificaciones
+nativas: muere `instance.rs`, el bundle lleva `hoardd` y lo arranca el gestor de
+servicios del usuario, se cierra D.8.3 (`upload_landed`) y se cierra el hueco del
+4c (un cliente enganchado resucitaba el servicio tras un `Shutdown` ajeno).
+
+**1. El pidfile, borrado.** `hoard_agent::instance` ya no existe: el árbitro es la
+propiedad del socket (un `flock` con liveness real en unix,
+`FILE_FLAG_FIRST_PIPE_INSTANCE` en Windows). Con él se van `AgentLock` del motor
+del daemon y `EngineStatus::blocked_by_pid` del cable — un campo que sólo
+describía la convivencia 4a–4c. Quitar un campo con `#[serde(default)]` es
+compatible en las dos direcciones y hay test que lo fija. El daemon además borra
+el `agent.pid` que dejaran las versiones anteriores: dejarlo en disco sólo sirve
+para que dentro de un año alguien lo mire y crea que significa algo.
+
+**2. Empaquetado.**
+
+- **`hoardd` viaja en el bundle** como `externalBin`, igual que `hoard-screen`:
+  `scripts/build-sidecar.sh` compila los dos y los deja junto a
+  `tauri.conf.json`, el bundler los aplana al lado del ejecutable, y ahí es donde
+  `client::daemon_binary()` mira primero. Un bundle sin `hoardd` es una app que no
+  puede sincronizar, así que los tres jobs de CI que compilan el desktop crean
+  también su placeholder.
+- **Arranque en boot como servicio de usuario**, en `hoardd::autostart`: systemd
+  *user unit* (Linux), *LaunchAgent* (macOS), tarea por-usuario del Task Scheduler
+  (Windows). Nunca system-wide — el token Cloud vive en el almacén de secretos de
+  *tu* sesión, que un servicio de root no puede leer.
+- **La unidad ejecuta `hoardd`, no `hoard sync run`.** Desde el 4b/4c ese comando
+  es un cliente, y supervisar a un espectador significa que `systemctl --user
+  stop` no para el sync. Hay test de que el `ExecStart` es el daemon y de que la
+  unidad y "spawn if absent" resuelven **el mismo binario**: dos vías de arranque
+  que ejecutaran binarios distintos serían dos versiones del servicio según quién
+  lo arrancara.
+- **El traspaso es obligatorio, no cosmético.** Si ya hay daemon (lo levantó la
+  app al abrirse), el que lance systemd pierde el bind y sale con 0 → unidad
+  muerta, sync vivo: el peor de los dos mundos para diagnosticar. Por eso
+  `install`/`restart` paran el que haya, esperan a que **suelte el socket**
+  —sondeando el bind, no el handshake— y sólo entonces arrancan la unidad, y luego
+  confirman que alguien escucha.
+- **Quién instala.** `hoard sync start` (explícito) y el desktop, atado al
+  interruptor que ya existía: "arranca al iniciar sesión" registra **dos**
+  entradas (la app y el servicio) y apagarlo quita las dos. Reafirmar en cada
+  arranque es lo mismo que la app ya hacía con la suya (una actualización mueve el
+  binario), y es barato: no se reescribe nada si la unidad no cambió.
+  *Contrapartida asumida:* tras un `hoard sync stop`, abrir la app con el
+  interruptor puesto vuelve a instalar la unidad. La preferencia de la app es la
+  intención persistente; el `stop` de la CLI es de ahora.
+- **AppImage no puede arrancar en boot y se dice.** Su binario vive en un montaje
+  efímero (`/tmp/.mount_*`) que desaparece al cerrar la app: una unidad apuntando
+  ahí fallaría en el siguiente login contra una ruta inexistente. `declare()`
+  aborta con el motivo y la salida (`.deb`/`.rpm`, o la CLI). El sync sigue
+  corriendo con la app abierta.
+- `hoard-cli/src/commands/service.rs` queda como lo que debe ser un frontend:
+  traduce lo que el usuario teclea y **enseña** (estado y logs del gestor, tal
+  cual él los da). La definición de la unidad y su ciclo de vida son de `hoardd`,
+  que es quien la ejecuta.
+
+**3. D.8.3 cerrado: `upload_landed` contra la verdad del server.**
+
+El caso real es de este slice: con el daemon, **reiniciar el proceso es rutina**,
+y `in_flight` vive en memoria. Un reinicio con una subida en vuelo que sí llegó a
+comprometerse deja al motor creyendo que no subió nada: vuelve a subir y crea una
+versión **duplicada** — mismo contenido, número nuevo, cuota gastada, ops de R2 y
+un pull inútil en todos los demás equipos.
+
+- **La pregunta se le hace al server, no a un flag local.** El almacenamiento es
+  content-addressed, así que la identidad del contenido de una versión es un
+  número: el digest de su manifiesto (`save_versions.sha256`, que el manifiesto de
+  la nube publica como `latest_sha256`). Si el digest de lo que íbamos a subir es
+  el de la cabeza, ya aterrizó.
+- **No cuesta ni una petición ni una lectura.** El chequeo vive dentro del camino
+  de subida cloud, justo después de hashear los ficheros —que es trabajo que ese
+  camino ya hacía para el CAS— y el digest de la cabeza viene del manifiesto que
+  el motor ya observa por su cuenta (D.12). Cero IO extra; lo que se ahorra es la
+  subida entera.
+- **El digest se calcula igual que el server o no vale para nada.** Un fallo aquí
+  no da error, sólo factura: no habría coincidencia nunca y volveríamos a subir de
+  más en silencio. Por eso `manifest_digest` tiene un vector fijo calculado aparte
+  y tests de que el orden, el tamaño y la ruta cuentan.
+- **La respuesta entra al kernel como observación** (`Observation::upload_landed`),
+  que es lo que el campo llevaba esperando desde el Slice 2. El reductor la usa
+  para distinguir dos no-op que hasta ahora eran el mismo: el 409 asentado a la
+  cabeza **escribió** en la carpeta (y sella `last_restore_at` para no auto-vetar
+  el siguiente pull) y éste no tocó nada, así que sellar un toque inexistente
+  falsearía la ventana de gracia del veto. Ninguno de los dos mueve el ancla del
+  min-interval: nada se subió (R.E.P.O., D.8.2).
+- **Emparejar digest y versión, no dos mapas sueltos.** El empujón del cliente
+  (`SetCloudVersions`) trae versiones sin digests, así que `head_for` sólo entrega
+  la cabeza si el digest que tenemos es el de la versión que ahora es cabeza. Un
+  digest emparejado con una versión vieja describiría contenido que ya no está, y
+  creérselo sería saltarse una subida que sí hace falta.
+- **Sólo el motor lo usa.** `hoard backup` (orden puntual del usuario) y la copia
+  de seguridad previa al restore pasan `None`: la primera no va a pedir el
+  manifiesto para adivinar si puede ahorrárselo, y la segunda **tiene** que existir
+  como versión propia aunque su contenido coincida con la cabeza.
+- **Se reporta como `BackupSuccess { already_landed: true }`**, campo nuevo con
+  `default` (append-only, sin subir la versión de protocolo). Y no como evento
+  propio: el hecho que le importa a quien mira es el mismo —"está guardado en la
+  versión N"— y de ese evento cuelga la persistencia de `state.json`. Sin esa
+  fila, el arranque siguiente vería la nube por delante y se bajaría su propio
+  contenido. `total_bytes` es 0 porque no viajó un byte; la UI no pisa el tamaño
+  de la última copia real y no manda notificación (avisar de una copia que no ha
+  ocurrido es la misma mentira que sonar al reproducir el journal).
+
+**4. El hueco del 4c cerrado: `ServerFrame::Goodbye`.**
+
+Un cliente enganchado resucitaba el servicio ~3 s después de un `Shutdown` ajeno
+porque su reconexión es "spawn if absent" y no podía distinguir "lo pararon" de
+"se cayó". Se implementa la salida que el propio 4c señalaba: **que el daemon se
+despida**.
+
+- **Se despiden las dos vías deliberadas**, `Request::Shutdown` y la señal
+  (`systemctl --user stop`), y **sólo** ésas: un daemon que muere de verdad
+  (pánico, OOM, `kill -9`) no manda nada, así que ahí el cliente sigue
+  levantándolo, que es lo correcto.
+- **Y también a quien llegue tarde.** El adiós se guarda además de emitirse: el
+  apagado no es instantáneo (el motor manda su último latido de presencia por
+  red), y un cliente que conectara en esa ventana recibía un saludo normal, daba
+  por buena la despedida anterior y relanzaba el servicio al perder el socket. El
+  handshake contesta con el adiós. *Este agujero lo encontró el test*, no la
+  lectura del código.
+- **El testigo es de proceso y se cura solo.** Mientras esté puesto,
+  `ensure_running` degrada a "conéctate" y explica el error; cualquier handshake
+  con éxito lo borra, porque si hay servicio al que saludar "está parado" ya no es
+  verdad. **No** es un fichero-marcador: eso es el error del pidfile otra vez.
+  Consecuencia asumida y coherente con la ADR: el que no se queda apagado es un
+  proceso **nuevo** (abrir la app tras pararlo lo levanta), que es exactamente la
+  vía "on-demand" de la Parte A.
+- **Qué hace cada cliente.** `hoard sync run` **termina** (su trabajo era seguir un
+  sync que ya no corre); el desktop pinta el motor parado y espacia los reintentos
+  a 30 s, sin relanzar, para engancharse solo si alguien lo arranca. `hoard sync
+  run` sigue parando el servicio al recibir **su** señal: quien lo teclea pidió que
+  el sync corriera, y las unidades instaladas por versiones anteriores todavía lo
+  usan de `ExecStart`.
+- **`ServerFrame` gana `#[serde(other)] Unknown`.** Añadir una trama dentro de la
+  misma versión de protocolo sólo es compatible si el otro lado puede ignorarla;
+  sin eso, la primera trama desconocida rompe el **encuadre**, y el encuadre roto
+  tira la conexión — un castigo desproporcionado para "no sé qué es esto".
+
+**Lo que queda del Slice 4:** las notificaciones nativas del SO (D.14.1),
+empezando por Linux. Después, el Slice 5 (estado en SQLite).
+
+**Sin verificar en máquina real:** el empaquetado se ha comprobado a nivel de
+tipos y de tests (unidad, plist y XML de la tarea son funciones puras con tests;
+el traspaso y la despedida, con procesos de verdad en Linux). Falta un humo real
+de `hoard sync start` en las tres plataformas y un bundle de verdad que confirme
+que `hoardd` aterriza junto al ejecutable.

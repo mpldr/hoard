@@ -387,6 +387,10 @@ pub async fn restore_snapshot(
                 // Pre-restore safety backup is an explicit user action; don't
                 // gate it on fast-forward.
                 None,
+                // Ni chequeo anti-relanzamiento (ADR 0021 D.8.3): esta copia de
+                // seguridad tiene que existir como versión propia antes de pisar
+                // la carpeta, aunque su contenido coincida con la cabeza.
+                None,
                 move |uploaded, total| {
                     let _ = app_for_progress.emit(
                         "restore://progress",

@@ -8,23 +8,25 @@
 //! **proceso propio de vida larga**: exactamente uno por usuario, que sobrevive
 //! al cierre de la app y con el que desktop y CLI hablan por un socket local.
 //!
-//! ## Qué hay y qué no (tras el Slice 4c)
+//! ## Qué hay y qué no (tras el Slice 4d)
 //!
 //! **Hay:** el binario, la IPC (socket con permisos solo-usuario + handshake
 //! versionado + journal con cursor y push en vivo), el arranque y la supervisión
-//! del motor, "spawn if absent" idempotente, y **el único rotador del refresh
-//! token** — que además lo presta por IPC a quien lo necesite
-//! (`Request::CloudToken`). Desde el 4b el desktop no tiene motor; desde el 4c
-//! tampoco la CLI: `hoard sync` asegura este servicio y se engancha a su journal.
+//! del motor, "spawn if absent" idempotente, **el único rotador del refresh
+//! token** —que además lo presta por IPC a quien lo necesite
+//! (`Request::CloudToken`)—, el arranque en boot como servicio de usuario
+//! ([`autostart`]) y la despedida explícita ([`hoard_core::ipc::ServerFrame::Goodbye`])
+//! que distingue "lo pararon" de "se cayó". Desde el 4b el desktop no tiene
+//! motor; desde el 4c tampoco la CLI: `hoard sync` asegura este servicio y se
+//! engancha a su journal. Desde el 4d no queda pidfile: el árbitro es el socket.
 //!
-//! **No hay todavía:** borrar `instance.rs` es 4d (aquí sólo se sigue *tomando*
-//! el pidfile, para que un frontend de una versión anterior no arranque un motor
-//! contra nosotros); el empaquetado (systemd user unit / launchd / Task Scheduler
-//! apuntando a este binario, y el sidecar del bundle) y las notificaciones
-//! nativas cierran el Slice 4.
+//! **No hay todavía:** las notificaciones nativas del SO (empezando por Linux)
+//! cierran el Slice 4.
 //!
 //! ## Mapa
 //!
+//! - [`autostart`] — arranque en boot como servicio de usuario (systemd user /
+//!   launchd agent / Task Scheduler por-usuario). Nunca system-wide.
 //! - [`endpoint`] — dónde escucha (socket por usuario / named pipe).
 //! - [`transport`] — bind exclusivo (el socket **es** el árbitro), permisos,
 //!   accept y connect.
@@ -39,6 +41,7 @@
 //! `hoard_agent::session`: el Slice 4a la tenía duplicada aquí para no tocar la
 //! CLI, y el 4c dejó una sola implementación compartida.
 
+pub mod autostart;
 pub mod client;
 pub mod codec;
 pub mod endpoint;
@@ -67,6 +70,11 @@ use crate::transport::{BindError, Listener};
 /// un evento es perder una fila del journal, y el journal es lo que sostiene el
 /// catch-up de los clientes.
 const EVENT_CHANNEL: usize = 256;
+
+/// Respiro que se le da al socket para que la despedida salga antes de que el
+/// proceso empiece a desmontarse. Es una trama de decenas de bytes a un socket
+/// local: sobra de largo, y sólo se paga una vez, al parar.
+const GOODBYE_FLUSH: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Cómo arrancar el daemon.
 pub struct Options {
@@ -119,6 +127,7 @@ pub async fn run(options: Options) -> Result<Outcome> {
         engine = options.with_engine,
         "hoardd: listening"
     );
+    sweep_legacy_pidfile();
 
     let log = Arc::new(EventLog::new());
     let engine = Engine::new();
@@ -164,9 +173,22 @@ pub async fn run(options: Options) -> Result<Outcome> {
     }));
 
     tokio::select! {
-        _ = daemon.wait_for_shutdown() => tracing::info!("hoardd: stopping on request"),
-        _ = shutdown_signal() => tracing::info!("hoardd: stopping on signal"),
+        _ = daemon.wait_for_shutdown() => {
+            tracing::info!("hoardd: stopping on request");
+            daemon.say_goodbye("stopped on request");
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("hoardd: stopping on signal");
+            daemon.say_goodbye("the service manager stopped it");
+        }
     }
+    // Las dos vías son deliberadas, así que las dos se despiden: un cliente
+    // enganchado tiene que poder distinguirlas de una caída, o su reconexión
+    // ("spawn if absent") deshace el apagado a los tres segundos. El respiro es
+    // para que la trama salga por el socket antes de que el proceso se vaya;
+    // `engine.shutdown()` de abajo suele tardar bastante más (habla con la red),
+    // pero no *garantiza* tardar nada si no hay motor.
+    tokio::time::sleep(GOODBYE_FLUSH).await;
 
     // Orden del apagado: primero el motor (su último latido de presencia necesita
     // el token vivo y su `shutdown` es limpio), luego las tareas, luego el socket.
@@ -181,6 +203,28 @@ pub async fn run(options: Options) -> Result<Outcome> {
     // arranque tenga que barrerlo.
     drop(listener);
     Ok(Outcome::Served)
+}
+
+/// Borra el `agent.pid` que dejaran las versiones anteriores al Slice 4d.
+///
+/// Ya no lo lee nadie —el árbitro es la propiedad del socket—, así que dejarlo en
+/// disco sólo sirve para que alguien lo vuelva a mirar dentro de un año y crea
+/// que significa algo. Se hace con el bind ya ganado (somos *el* servicio de este
+/// usuario) y es best-effort de principio a fin: si no se puede, no pasa nada.
+fn sweep_legacy_pidfile() {
+    let Ok(dir) = hoard_agent::config::CliConfig::state_dir() else {
+        return;
+    };
+    let path = dir.join("agent.pid");
+    if !path.exists() {
+        return;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!(path = %path.display(), "hoardd: removed the legacy agent pidfile"),
+        Err(err) => {
+            tracing::debug!(error = %err, path = %path.display(), "hoardd: couldn't remove the legacy agent pidfile")
+        }
+    }
 }
 
 /// Se resuelve cuando el SO nos pide parar: Ctrl-C, más SIGTERM en unix — la

@@ -17,15 +17,19 @@
 //! historial de ayer. (El hueco entre el `Welcome` y el `Subscribe` sí viaja: el
 //! cursor es del `Welcome`, no del momento de suscribirse.)
 //!
-//! ## Parar esto sí para el sync
+//! ## Parar esto sí para el sync; que paren el sync termina esto
 //!
-//! Es la excepción a "cerrar un cliente nunca mata el motor", y es deliberada:
-//! este proceso es el `ExecStart` del servicio de usuario, así que para systemd /
-//! launchd / Task Scheduler **es** el servicio. Si un `systemctl --user stop`
-//! dejara a `hoardd` sincronizando, "parar el sync" habría dejado de significar
-//! nada — y un `hoard sync restart` tras `hoard upgrade` no relevaría el binario
-//! nuevo. Así que al recibir la señal se manda `Shutdown` por IPC, que es
-//! exactamente lo que la ADR llama "una orden explícita del usuario".
+//! Al recibir la señal se manda `Shutdown` por IPC. Es la excepción a "cerrar un
+//! cliente nunca mata el motor", y sigue siendo deliberada: quien escribe
+//! `hoard sync run` y lo corta pidió parar el sync — y hasta el Slice 4d este
+//! proceso *era* el `ExecStart` de la unidad, así que las unidades instaladas por
+//! versiones anteriores siguen dependiendo de ello (desde el 4d la unidad apunta
+//! a `hoardd`, que atiende la señal él mismo).
+//!
+//! Y al revés, desde el 4d: si el servicio se despide
+//! ([`hoard_core::ipc::ServerFrame::Goodbye`]) este comando **termina** en vez de
+//! reconectar. Seguir reconectando sería relanzarlo —la reconexión es "spawn if
+//! absent"—, o sea deshacer el `hoard sync stop` que alguien acaba de dar.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -131,15 +135,22 @@ pub async fn run(backup_only: bool) -> Result<()> {
     }
     println!("Ctrl-C (or `hoard sync stop`) to stop.\n");
 
-    tokio::select! {
-        _ = shutdown_signal() => {}
-        // No retorna nunca: reconecta sola, porque el servicio puede reiniciarse
-        // (una actualización) sin que este proceso tenga otra forma de enterarse.
-        _ = follow() => {}
-    }
+    // Dos formas de acabar, y sólo una para el servicio: si nos paran a nosotros
+    // (Ctrl-C, o el `systemctl --user stop` de una unidad heredada que todavía
+    // apunta a este comando) el usuario pidió parar el sync; si el que se para es
+    // el servicio, ya está parado y no hay nada que pedirle.
+    let stop_the_service = tokio::select! {
+        _ = shutdown_signal() => true,
+        // Sólo retorna si el servicio se despide; una conexión caída la
+        // reintenta sola, porque el servicio puede reiniciarse (una
+        // actualización) sin que este proceso tenga otra forma de enterarse.
+        _ = follow() => false,
+    };
 
-    println!("\nstopping the Hoard service…");
-    stop_service().await;
+    if stop_the_service {
+        println!("\nstopping the Hoard service…");
+        stop_service().await;
+    }
     Ok(())
 }
 
@@ -195,20 +206,32 @@ async fn apply_backup_only() {
     }
 }
 
-/// Sigue el journal del servicio e imprime lo que llega. No retorna: una
-/// conexión caída se reintenta, porque el servicio puede reiniciarse (una
-/// actualización) sin que este proceso tenga otra forma de enterarse.
+/// Sigue el journal del servicio e imprime lo que llega. Sólo retorna cuando el
+/// servicio se **despide**: una conexión caída se reintenta, porque el servicio
+/// puede reiniciarse (una actualización) sin que este proceso tenga otra forma de
+/// enterarse.
 async fn follow() {
     loop {
         match follow_once().await {
-            Ok(()) => eprintln!("warning: the Hoard service closed the connection; reconnecting…"),
+            Ok(Followed::Farewell) => return,
+            Ok(Followed::Disconnected) => {
+                eprintln!("warning: the Hoard service closed the connection; reconnecting…")
+            }
             Err(err) => eprintln!("warning: lost the Hoard service ({err:#}); reconnecting…"),
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
 }
 
-async fn follow_once() -> Result<()> {
+/// Por qué se acabó el seguimiento.
+enum Followed {
+    /// Se perdió la conexión: hay que reintentar.
+    Disconnected,
+    /// El servicio dijo que lo paraban. No hay nada que seguir ni que relanzar.
+    Farewell,
+}
+
+async fn follow_once() -> Result<Followed> {
     let mut events = link::ensure("events").await?;
     // Desde el cursor del `Welcome`: seguir, no releer. Lo que ocurra entre el
     // saludo y la suscripción sí viene en el backlog, así que no hay hueco.
@@ -235,9 +258,16 @@ async fn follow_once() -> Result<()> {
                 )
                 .await?;
             }
+            // Lo pararon a propósito. Seguir reconectando sería esperar eventos
+            // de un sync que ya no corre, y relanzarlo (nuestra reconexión es
+            // "spawn if absent") sería deshacer un `hoard sync stop`.
+            Push::Goodbye { reason } => {
+                println!("the Hoard service stopped ({reason}).");
+                return Ok(Followed::Farewell);
+            }
         }
     }
-    Ok(())
+    Ok(Followed::Disconnected)
 }
 
 fn print_event(event: &AgentEvent) {
@@ -294,6 +324,14 @@ fn render(ev: &AgentEvent) -> Option<String> {
         GameStarted { game_slug, .. } => format!("▶  {game_slug} running"),
         GameStopped { game_slug, .. } => format!("■  {game_slug} closed"),
         BackupStarted { label, .. } => format!("…  backing up {label}"),
+        // `already_landed`: el contenido ya era la cabeza del server, así que no
+        // se subió nada (D.8.3). Decir "backup 0B" sería confuso; lo que pasó es
+        // que no hacía falta.
+        BackupSuccess {
+            version_num,
+            already_landed: true,
+            ..
+        } => format!("✓  already on the server as v{version_num}"),
         BackupSuccess {
             version_num,
             total_bytes,

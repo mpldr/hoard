@@ -433,6 +433,14 @@ export type AgentEvent =
       version_num: number;
       total_bytes: number;
       set_hash: string | null;
+      /**
+       * Nada se subió: el contenido ya era la cabeza del servidor (ADR 0021
+       * D.8.3, tras reiniciarse el servicio con una subida en vuelo que sí
+       * llegó a comprometerse). El hecho —"está guardado en la versión N"— es
+       * el mismo, pero `total_bytes` es 0 porque no viajó ni un byte.
+       * Opcional: un servicio anterior no lo manda.
+       */
+      already_landed?: boolean;
     }
   | {
       type: "backup_failed";

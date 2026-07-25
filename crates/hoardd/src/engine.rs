@@ -13,22 +13,19 @@
 //! - [`pump`]: bucle supervisado que consume `AgentEvent`s, los persiste en
 //!   `state.json` y los mete en el journal (que es quien empuja a los clientes).
 //!
-//! ## El pidfile, ya sin arbitrar (Slice 4c)
+//! ## El pidfile, muerto (Slice 4d)
 //!
 //! Mientras el desktop (4b) y `hoard sync` (4c) embebían `agent::spawn`, el
-//! árbitro entre daemon y motor embebido era el pidfile de
-//! `hoard_agent::instance`: si otro lo tenía tomado, el keeper no arrancaba motor
-//! y lo reportaba (`EngineStatus::blocked_by_pid`). Ya no queda ningún motor
-//! embebido, así que **ese chequeo se ha ido**, y no por limpieza: `is_alive`
-//! acepta cualquier proceso cuyo nombre contenga "hoard", y ahora todos los
-//! clientes lo contienen (`hoard sync run`, `hoard-desktop`). Un `agent.pid`
-//! rancio cuyo pid reciclara un cliente habría dejado al servicio **sin motor
-//! para siempre y en silencio** — la clase de fallo invisible de D.11/D.12.
+//! árbitro entre daemon y motor embebido era un pidfile (`agent.pid`,
+//! `hoard_agent::instance`): el keeper lo consultaba y, si otro lo tenía tomado,
+//! no arrancaba motor. El 4c le quitó el chequeo (aceptaba como dueño vivo
+//! cualquier proceso cuyo nombre contuviera "hoard", y desde el 4b todos los
+//! clientes lo contienen) y este slice borra el fichero entero: **el árbitro es
+//! la propiedad del socket**, un mutex con liveness real que el kernel suelta al
+//! morir el proceso, no un fichero que hay que adivinar si miente.
 //!
-//! Se sigue *tomando* el lock mientras haya motor: es gratis y hace que un
-//! frontend de una versión anterior a los slices 4b/4c se aparte en vez de
-//! arrancar un segundo motor. El fichero entero muere en el 4d; el árbitro
-//! definitivo es la propiedad del socket.
+//! Por eso [`Running`] ya no guarda ningún lock: lo único que impide dos motores
+//! es que sólo hay un daemon, y de eso responde el bind (`transport::Listener`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,7 +33,6 @@ use std::time::Duration;
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
-use hoard_agent::instance::AgentLock;
 use hoard_agent::prefs::Prefs;
 use hoard_agent::presence::PresenceHandle;
 use hoard_agent::state::CliState;
@@ -86,9 +82,6 @@ struct Running {
     presence: PresenceHandle,
     /// Tareas auxiliares del motor (presencia, empuje Cloud, refresher del JWT).
     aux: Vec<JoinHandle<()>>,
-    /// El pidfile viejo, tomado mientras nosotros tengamos el motor para que el
-    /// desktop y `hoard sync` se aparten. Muere con el Slice 4d.
-    _lock: AgentLock,
 }
 
 impl Drop for Running {
@@ -197,7 +190,6 @@ impl Engine {
             watched,
             since: Some(OffsetDateTime::now_utc()),
             last_error: None,
-            blocked_by_pid: None,
         };
         // Un motor previo (por ejemplo el que murió y estamos reemplazando) se
         // tira aquí: `Running::aux` aborta sus tareas al soltarse.
@@ -211,13 +203,9 @@ impl Engine {
         guard.running = None;
     }
 
-    /// Suelta un motor que ya está muerto **antes** de arrancar otro.
-    ///
-    /// Load-bearing por el pidfile: dos `AgentLock` vivos en el mismo proceso
-    /// escriben el mismo pid, así que si el viejo se soltara *después* de que el
-    /// nuevo tomara el lock, su `Drop` borraría el pidfile del nuevo (el
-    /// contenido coincide) y el desktop dejaría de ver dueño — justo el escenario
-    /// de dos motores que la convivencia 4a–4c evita.
+    /// Suelta un motor que ya está muerto **antes** de arrancar otro: su `Drop`
+    /// aborta las tareas auxiliares (rotador del token, poller, presencia), y
+    /// dos juegos de ésas vivos a la vez es la familia 401 que este slice mata.
     fn forget(&self) {
         let mut guard = self.lock();
         guard.status.running = false;
@@ -238,10 +226,9 @@ impl Engine {
     /// **Lo pide, no lo hace.** El único que arranca y para el motor es el
     /// keeper: si el reinicio se ejecutara aquí, entre soltar el motor viejo y
     /// terminar su apagado el keeper vería la ranura vacía y arrancaría otro —
-    /// dos `AgentLock` vivos en el mismo proceso (el `Drop` del viejo borra el
-    /// pidfile del nuevo) y, durante esa ventana, dos rotadores del mismo
-    /// refresh token. Dejarlo en una petición mantiene un solo dueño del ciclo
-    /// de vida.
+    /// y durante esa ventana habría dos motores en el mismo proceso, con dos
+    /// rotadores del mismo refresh token. Dejarlo en una petición mantiene un
+    /// solo dueño del ciclo de vida.
     ///
     /// El aviso vale aunque no haya motor: el caso típico es justo ése —no
     /// arrancaba por falta de sesión y el usuario acaba de entrar—, y esperar el
@@ -263,7 +250,6 @@ impl Engine {
             if taken.is_some() {
                 guard.status.running = false;
                 guard.status.last_error = Some(reason.to_string());
-                guard.status.blocked_by_pid = None;
             }
             taken
         };
@@ -282,8 +268,8 @@ impl Engine {
         {
             tracing::warn!("hoardd: the engine didn't stop in time; aborting it");
         }
-        // Al soltar `running` aquí se abortan sus tareas auxiliares y se suelta
-        // el pidfile, así que el arranque siguiente no convive con el anterior.
+        // Al soltar `running` aquí se abortan sus tareas auxiliares, así que el
+        // arranque siguiente no convive con el anterior.
     }
 
     /// Para el motor. Marca `stopping` **antes** de nada para que el keeper no lo
@@ -312,8 +298,8 @@ impl Engine {
         {
             tracing::warn!("hoardd: the engine didn't stop in time; aborting it");
         }
-        // Al soltarse `running`: se abortan sus tareas auxiliares y se suelta el
-        // pidfile, así que el desktop puede retomar el motor embebido.
+        // Al soltarse `running` se abortan sus tareas auxiliares: nada del motor
+        // sobrevive al apagado del servicio.
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -353,7 +339,7 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             // Estaba arriba y su task ha muerto: eso es un incidente, no una
             // transición normal.
             tracing::error!("hoardd: the engine task is gone; restarting it");
-            // Suelta el cadáver (y su pidfile) antes de intentar otro arranque.
+            // Suelta el cadáver (y sus tareas) antes de intentar otro arranque.
             engine.forget();
         }
         match start(events_tx.clone()).await {
@@ -436,7 +422,6 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
             task,
             presence: presence_handle,
             aux,
-            _lock: AgentLock::acquire(),
         },
         server: active.server,
         is_cloud: active.is_cloud,

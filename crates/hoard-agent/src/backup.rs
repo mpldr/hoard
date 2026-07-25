@@ -82,6 +82,33 @@ pub struct UploadOutcome {
     /// `Some` when the save was too big for the plan's per-save cap and only
     /// its newest files were uploaded; `None` when the whole save went up.
     pub trimmed: Option<TrimInfo>,
+    /// **Nada se subió: este contenido ya estaba en el server** y `snapshot`
+    /// describe la versión que ya lo tenía (ADR 0021 D.8.3). Ver
+    /// [`ServerHead`].
+    pub landed: bool,
+}
+
+/// La cabeza que el server publica para un save: qué versión es y **qué
+/// contenido tiene**, como digest de su manifiesto.
+///
+/// Es lo que hace posible el anti-relanzamiento robusto a caídas de ADR 0021
+/// C.1: un flag local de "subida en curso" no sobrevive a un reinicio del
+/// daemon —y con el servicio, reiniciar es rutina—, así que la pregunta "¿hace
+/// falta subir esto?" se le hace **a la verdad del server**, que es
+/// content-addressed. Si el digest de lo que íbamos a subir es el de la cabeza,
+/// la subida anterior *aterrizó* y volver a subir sólo crearía una versión
+/// duplicada: mismo contenido, número nuevo, cuota gastada y un pull inútil en
+/// todos los demás equipos.
+///
+/// El digest lo trae el manifiesto de la nube (`latest_sha256`), que el motor ya
+/// pide por su cuenta (D.12), así que el chequeo no cuesta ni una petición.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHead {
+    pub version_num: i64,
+    /// Digest del manifiesto de esa versión, tal y como lo calcula el server.
+    /// Vacío = versión antigua (archivo entero, sin manifiesto por fichero): no
+    /// se puede comparar y no se compara.
+    pub digest: String,
 }
 
 /// Outcome of a skip-aware backup ([`upload_directory_checked`]).
@@ -105,6 +132,15 @@ pub enum BackupResult {
         outcome: UploadOutcome,
         signature: String,
     },
+    /// **Ya estaba en el server**: el contenido local es, byte por byte, el de
+    /// la versión que la nube publica como cabeza (ADR 0021 D.8.3). No se subió
+    /// nada; el llamante adopta `version_num` como la versión a la que está
+    /// sincronizado y persiste `signature`.
+    ///
+    /// El caso que lo produce es un reinicio del daemon con una subida en
+    /// vuelo que sí llegó a comprometerse: el `in_flight` en memoria se perdió,
+    /// pero el contenido está arriba.
+    AlreadyLanded { version_num: i64, signature: String },
 }
 
 /// Cheap signature over the sorted `(relative_path, size, mtime)` set.
@@ -127,6 +163,34 @@ pub fn compute_set_signature(files: &[UploadFile]) -> String {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         h.update(mtime_nanos.to_le_bytes());
+        h.update([0u8]);
+    }
+    hex::encode(h.finalize())
+}
+
+/// Digest del manifiesto de una versión: **la identidad de contenido que el
+/// server publica** (`save_versions.sha256` de una versión content-addressed, y
+/// por tanto el `latest_sha256` del manifiesto de la nube).
+///
+/// Tiene que casar byte por byte con lo que hace el server al comprometer
+/// (`cas_commit`): sha256 sobre las filas del manifiesto ordenadas por ruta,
+/// cada una `ruta \0 sha \0 tamaño(le) \0`. Si esto se desviara, el chequeo de
+/// D.8.3 no encontraría nunca una coincidencia y volveríamos a subir de más — un
+/// fallo silencioso y caro, así que hay un test con un vector fijo.
+///
+/// `files` debe venir ordenado por ruta (es lo que devuelve [`walk_source`]).
+/// Ordenar en Rust es orden de bytes y el server ordena en la base de datos, así
+/// que una intercalación distinta puede darles digests distintos para el mismo
+/// contenido: eso produce un falso negativo (subimos igual), nunca un falso
+/// positivo (dos digests iguales sólo salen del mismo flujo de bytes).
+pub fn manifest_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, i64)>) -> String {
+    let mut h = Sha256::new();
+    for (path, sha, size) in files {
+        h.update(path.as_bytes());
+        h.update([0u8]);
+        h.update(sha.as_bytes());
+        h.update([0u8]);
+        h.update(size.to_le_bytes());
         h.update([0u8]);
     }
     hex::encode(h.finalize())
@@ -259,6 +323,7 @@ pub fn walk_source(root: &Path) -> Result<Vec<UploadFile>> {
 /// `game_slug` and `label` are only consulted on the Hoard Cloud path, where
 /// the server keys the save row on `(user_id, game_slug, label)` and the
 /// snapshot list endpoints don't exist. They're ignored self-hosted.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_directory<F>(
     client: &ApiClient,
     save_id: &str,
@@ -266,6 +331,7 @@ pub async fn upload_directory<F>(
     label: &str,
     source: &Path,
     base_version: Option<i64>,
+    head: Option<&ServerHead>,
     progress: F,
 ) -> Result<UploadOutcome>
 where
@@ -300,6 +366,7 @@ where
             &files,
             total_bytes,
             base_version,
+            head,
             progress,
         )
         .await;
@@ -384,6 +451,7 @@ where
         total_bytes,
         // The self-hosted multipart path has no per-save cap trim.
         trimmed: None,
+        landed: false,
     })
 }
 
@@ -403,6 +471,7 @@ async fn upload_directory_cloud<F>(
     files: &[UploadFile],
     total_bytes: u64,
     base_version: Option<i64>,
+    head: Option<&ServerHead>,
     progress: F,
 ) -> Result<UploadOutcome>
 where
@@ -433,6 +502,37 @@ where
         .buffer_unordered(TRANSFER_CONCURRENCY)
         .try_collect()
         .await?;
+
+    // 1b. **¿Ya está arriba?** (ADR 0021 D.8.3.) Con los hashes ya calculados,
+    // preguntarle a la verdad del server si este contenido exacto es su cabeza
+    // no cuesta ni una petición ni una lectura más — y si lo es, la subida que
+    // un reinicio del daemon dejó a medias sí llegó a comprometerse, así que
+    // subir otra vez sólo crearía una versión duplicada (cuota, ops de R2 y un
+    // pull inútil en los demás equipos). Anti-relanzamiento contra el server,
+    // no contra un flag local que no sobrevive a un reinicio.
+    if let Some(head) = head.filter(|h| !h.digest.is_empty()) {
+        let digest = manifest_digest(files.iter().map(|f| {
+            (
+                f.relative_path.as_str(),
+                sha_by_path[f.relative_path.as_str()].as_str(),
+                f.size_bytes as i64,
+            )
+        }));
+        if digest == head.digest {
+            tracing::info!(
+                save_id,
+                version_num = head.version_num,
+                "cloud upload skipped — this exact content is already the server's head"
+            );
+            return Ok(UploadOutcome {
+                snapshot: landed_snapshot(save_id, head, files.len(), total_bytes),
+                file_count: files.len(),
+                total_bytes,
+                trimmed: None,
+                landed: true,
+            });
+        }
+    }
 
     // Working set, newest first, so if the save is too big for the plan's
     // per-save cap we keep the most recent saves and drop the oldest — a
@@ -637,7 +737,34 @@ where
         file_count,
         total_bytes,
         trimmed,
+        landed: false,
     })
+}
+
+/// El `Snapshot` que describe una subida que **ya había aterrizado**: la versión
+/// es la del server (no una inventada) y el recuento, el del contenido local,
+/// que por definición es el mismo. No se pide al server: la gracia de D.8.3 es
+/// ahorrarse el viaje, y lo único que el llamante necesita es a qué versión
+/// quedamos sincronizados.
+fn landed_snapshot(
+    save_id: &str,
+    head: &ServerHead,
+    file_count: usize,
+    total_bytes: u64,
+) -> Snapshot {
+    Snapshot {
+        id: String::new(),
+        save_id: SaveId::parse(save_id).ok(),
+        version_num: head.version_num,
+        parent_version: None,
+        device_name: None,
+        notes: None,
+        file_count: file_count as i64,
+        total_size_bytes: total_bytes as i64,
+        is_pinned: false,
+        created_at: OffsetDateTime::now_utc(),
+        deleted_at: None,
+    }
 }
 
 /// SHA-256 of a file's bytes, read in fixed-size chunks.
@@ -697,6 +824,7 @@ pub async fn upload_directory_checked<F, G>(
     source: &Path,
     prev_signature: Option<&str>,
     base_version: Option<i64>,
+    head: Option<&ServerHead>,
     progress: F,
     on_upload_start: G,
 ) -> Result<BackupResult>
@@ -741,9 +869,20 @@ where
         label,
         &canonical,
         base_version,
+        head,
         progress,
     )
     .await?;
+    // El contenido ya estaba arriba (D.8.3): no hubo subida, pero sí una versión
+    // a la que quedamos sincronizados. Se distingue de `Uploaded` porque el
+    // llamante NO debe contarlo como backup con commit — mover el ancla del
+    // min-interval con algo que no se subió es la regresión R.E.P.O.
+    if outcome.landed {
+        return Ok(BackupResult::AlreadyLanded {
+            version_num: outcome.snapshot.version_num,
+            signature: join_signature(&cheap, &content),
+        });
+    }
     Ok(BackupResult::Uploaded {
         outcome,
         signature: join_signature(&cheap, &content),
@@ -851,6 +990,49 @@ mod tests {
             split_signature(Some(&composite)),
             (Some("cheap"), Some("content"))
         );
+    }
+
+    /// El digest del manifiesto tiene que ser **el mismo número** que calcula el
+    /// server al comprometer una versión content-addressed
+    /// (`hoard-server/src/cloud/routes/saves.rs`, `cas_commit`): sha256 de
+    /// `ruta \0 sha \0 tamaño(i64 le) \0` por fila, ordenadas por ruta. Si
+    /// nuestra mitad se desviara, el chequeo de D.8.3 no encontraría nunca una
+    /// coincidencia y volveríamos a subir de más **en silencio** — no hay error
+    /// que mirar, sólo factura. Por eso el vector va fijo y calculado aparte, no
+    /// derivado de esta misma función.
+    #[test]
+    fn manifest_digest_matches_the_servers_algorithm() {
+        let rows = [
+            ("saves/autosave.sav", "9f".repeat(32), 4096i64),
+            ("saves/slot1.sav", "ab".repeat(32), 12i64),
+        ];
+        let digest = manifest_digest(rows.iter().map(|(p, sha, size)| (*p, sha.as_str(), *size)));
+        assert_eq!(
+            digest, "729ed0eaf73d058e463dea699aa20a6d131b9a347d5ace1c4f93fdda86cac9fe",
+            "the manifest digest drifted from the server's"
+        );
+    }
+
+    /// Y las tres cosas que lo componen cuentan: el orden, el tamaño y la ruta.
+    /// Un digest que ignorase cualquiera de ellas podría dar por "ya subido" un
+    /// contenido que no está arriba, que es la única forma en que este chequeo
+    /// puede perder datos.
+    #[test]
+    fn manifest_digest_is_sensitive_to_order_size_and_path() {
+        let sha_a = "11".repeat(32);
+        let sha_b = "22".repeat(32);
+        let base =
+            manifest_digest([("a", sha_a.as_str(), 1i64), ("b", sha_b.as_str(), 2i64)].into_iter());
+        let swapped =
+            manifest_digest([("b", sha_b.as_str(), 2i64), ("a", sha_a.as_str(), 1i64)].into_iter());
+        let resized =
+            manifest_digest([("a", sha_a.as_str(), 9i64), ("b", sha_b.as_str(), 2i64)].into_iter());
+        let renamed = manifest_digest(
+            [("a2", sha_a.as_str(), 1i64), ("b", sha_b.as_str(), 2i64)].into_iter(),
+        );
+        assert_ne!(base, swapped);
+        assert_ne!(base, resized);
+        assert_ne!(base, renamed);
     }
 
     #[tokio::test]

@@ -174,7 +174,48 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     prefs.autostart = actually_enabled;
     prefs.save(&path).map_err(|e| e.to_string())?;
 
+    // El servicio de sync sigue al mismo interruptor que la app: desde el Slice 4
+    // son dos procesos, así que "arranca al iniciar sesión" tiene dos entradas
+    // que registrar, y apagarlo tiene que quitar las dos — si no, el usuario
+    // apaga el arranque automático y el sync sigue arrancando solo.
+    sync_service_autostart(actually_enabled);
+
     Ok(actually_enabled)
+}
+
+/// Registra (o quita) el arranque en boot del **servicio de sync**: la unidad de
+/// usuario que ejecuta `hoardd` (ADR 0021, Slice 4d).
+///
+/// Va en segundo plano y best-effort a propósito: son subprocesos del gestor de
+/// servicios (`systemctl`, `launchctl`, `schtasks`) y ni el arranque de la app ni
+/// el interruptor de Ajustes pueden quedarse esperándolos. Si falla, el sync
+/// sigue funcionando por "spawn if absent" (la app levanta el servicio al
+/// abrirse); lo que se pierde es arrancar sin abrir la ventana, y eso queda
+/// dicho en el log.
+pub(crate) fn sync_service_autostart(enabled: bool) {
+    tauri::async_runtime::spawn(async move {
+        let outcome = if enabled {
+            hoardd::autostart::ensure_installed().await.map(|i| {
+                tracing::info!(
+                    manager = i.manager,
+                    unit = i.id,
+                    "sync service set to start at login"
+                );
+            })
+        } else {
+            hoardd::autostart::uninstall().await.map(|removed| {
+                if removed {
+                    tracing::info!("sync service removed from login start");
+                }
+            })
+        };
+        if let Err(err) = outcome {
+            // Incluye el caso esperado del AppImage (sin ruta estable que
+            // ejecutar al iniciar sesión). El mensaje explica la degradación y
+            // qué sigue funcionando; no hay nada que arreglar en caliente.
+            tracing::warn!(error = %format!("{err:#}"), enabled, "the sync service won't start at login");
+        }
+    });
 }
 
 /// Best-effort creation of the XDG autostart directory

@@ -40,13 +40,14 @@ crates/hoard-desktop/ui/node_modules/
 crates/hoard-desktop/ui/dist/
 crates/hoard-desktop/ui/.vite/
 
-# Compiled Pro sidecar (`hoard-screen-<triple>`), built from the in-repo
-# `crates/hoard-screen` crate and dropped here by the build so the bundler
-# flattens it adjacent to the app exe (the runtime sidecar resolver finds it
+# Compiled sidecars (`hoard-screen-<triple>`, `hoardd-<triple>`), built from the
+# in-repo crates by `scripts/build-sidecar.sh` and dropped here so the bundler
+# flattens them adjacent to the app exe (the runtime sidecar resolver finds them
 # there; the old `binaries/` subdir broke runtime resolution). The compiled
-# artifact is never committed — the source lives in `crates/hoard-screen`.
+# artifacts are never committed — the sources live under `crates/`.
 crates/hoard-desktop/binaries/
 crates/hoard-desktop/hoard-screen-*
+crates/hoard-desktop/hoardd-*
 
 # This project uses pnpm — npm/yarn lockfiles dropped in by accident
 # (e.g. running `npm install` against the same package.json) shouldn't

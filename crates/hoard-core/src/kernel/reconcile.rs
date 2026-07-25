@@ -424,19 +424,26 @@ fn ingest_op_result(
                         // es el carril de los backoffs de error.
                         next.last_backup_at = Some(now);
                     } else {
-                        // No-op (skip por firma, vacío, archived, too-large, o el
-                        // 409 asentado a la cabeza): **no** es un backup, así que
-                        // no mueve el ancla del min-interval — hacerlo empujaría
-                        // la siguiente subida real un intervalo entero y una
-                        // sesión corta nunca volcaría su progreso (regresión
-                        // R.E.P.O., D.8.2).
+                        // No-op (skip por firma, vacío, archived, too-large, el
+                        // 409 asentado a la cabeza, o la subida que ya había
+                        // aterrizado): **no** es un backup, así que no mueve el
+                        // ancla del min-interval — hacerlo empujaría la siguiente
+                        // subida real un intervalo entero y una sesión corta
+                        // nunca volcaría su progreso (regresión R.E.P.O., D.8.2).
                         //
-                        // Un no-op CON versión es el 409 non-fast-forward
-                        // asentado a la cabeza: el merge escribió en la carpeta
-                        // igual que un restore, así que se sella
-                        // `last_restore_at` para que ese toque nuestro no vete el
-                        // siguiente pull.
-                        if version.is_some() {
+                        // Un no-op CON versión es normalmente el 409
+                        // non-fast-forward asentado a la cabeza: el merge
+                        // escribió en la carpeta igual que un restore, así que se
+                        // sella `last_restore_at` para que ese toque nuestro no
+                        // vete el siguiente pull.
+                        //
+                        // Salvo que la respuesta del chequeo content-addressed
+                        // diga que el contenido **ya estaba** arriba (D.8.3): ahí
+                        // no se escribió un solo byte en la carpeta, y sellar un
+                        // toque que no existió falsearía la ventana de gracia del
+                        // veto — el kernel se creería autor de una escritura
+                        // ajena y dejaría pasar un pull que debía esperar.
+                        if version.is_some() && obs.upload_landed != Some(true) {
                             next.last_restore_at = Some(now);
                         }
                     }
@@ -1057,6 +1064,72 @@ mod tests {
             settled.last_backup_at.is_none(),
             "asentarse a la cabeza no es un commit propio"
         );
+    }
+
+    /// D.8.3 — anti-relanzamiento **contra la verdad del server**.
+    ///
+    /// El caso real: el daemon se reinicia (rutina desde el Slice 4) con una
+    /// subida en vuelo que sí llegó a comprometerse. El `in_flight` en memoria se
+    /// perdió, así que el motor vuelve a lanzar la subida; el chequeo
+    /// content-addressed descubre que ese contenido **ya es la cabeza** y no sube
+    /// nada. Lo que el reductor tiene que hacer con esa respuesta:
+    ///
+    /// - adoptar la versión y la firma (converger),
+    /// - **no** anclar el min-interval (no hubo commit propio: R.E.P.O.),
+    /// - y **no** sellar `last_restore_at`, porque a diferencia del 409 asentado
+    ///   a la cabeza aquí no se escribió un solo byte en la carpeta.
+    #[test]
+    fn d8_3_an_upload_that_already_landed_converges_without_faking_a_local_touch() {
+        let state = State {
+            in_flight: Some(Op::Backup),
+            has_pending: true,
+            min_backup_interval_secs: 600,
+            known_version: Some(8),
+            synced_fingerprint: Some(1),
+            ..base_state()
+        };
+        let obs = Observation {
+            local_fingerprint: Some(2),
+            cloud_version: Some(9),
+            op_result: Some(OpResult::Ok {
+                version: Some(9),
+                fingerprint: Some(2),
+                wrote: false,
+            }),
+            upload_landed: Some(true),
+            ..quiet_obs()
+        };
+
+        let (next, ds) = reconcile(&state, &obs, world(0));
+        assert_eq!(next.in_flight, None, "la op terminó");
+        assert!(!next.has_pending, "el contenido está en una versión");
+        assert_eq!(next.known_version, Some(9), "adopta la versión que ya lo tenía");
+        assert_eq!(next.synced_fingerprint, Some(2));
+        assert!(
+            next.last_backup_at.is_none(),
+            "no se subió nada: anclar el suelo aquí es la regresión R.E.P.O."
+        );
+        assert!(
+            next.last_restore_at.is_none(),
+            "y no se escribió en la carpeta: sellar un toque que no existió \
+             falsearía la ventana de gracia del veto"
+        );
+        assert!(
+            !acts(&ds).iter().any(|a| matches!(a, Action::Backup)),
+            "y sobre todo: no se relanza la subida ({ds:?})"
+        );
+
+        // El tick siguiente, ya sin op en vuelo y con el mismo contenido:
+        // convergido ⇒ cero acciones. Es la mitad que importa — si el reductor no
+        // hubiera adoptado versión y firma, aquí volvería a emitir `Backup` y
+        // tendríamos el bucle que D.8.3 viene a matar.
+        let quiet = Observation {
+            local_fingerprint: Some(2),
+            cloud_version: Some(9),
+            ..quiet_obs()
+        };
+        let (_after, ds_after) = reconcile(&next, &quiet, world(1));
+        assert_eq!(ds_after, vec![hold("converged")]);
     }
 
     /// D.8.1/D.8.2 — el flush que destraba un pull cross-device se salta el suelo

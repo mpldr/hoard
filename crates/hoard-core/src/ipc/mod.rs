@@ -178,6 +178,29 @@ pub enum ServerFrame {
         cursor: u64,
         dropped: u64,
     },
+    /// **El servicio se está parando a propósito** y se despide antes de cerrar
+    /// el socket (ADR 0021 D.17 → 4d).
+    ///
+    /// Sin esto, un cliente enganchado no puede distinguir "lo pararon" de "se
+    /// cayó", y como su reconexión es "spawn if absent", un `hoard sync stop`
+    /// resucitaba el servicio ~3 s después: el apagado deliberado no se quedaba
+    /// apagado. Con la despedida, el cliente sigue reconectando —si alguien lo
+    /// vuelve a arrancar, se engancha— pero **no lo arranca él**. Un daemon que
+    /// muere de verdad (pánico, OOM, kill -9) no manda nada, así que ahí el
+    /// cliente sigue levantándolo, que es lo correcto.
+    Goodbye {
+        reason: String,
+    },
+    /// Trama que este cliente no conoce: la manda un daemon más nuevo.
+    ///
+    /// Hay 2+ artefactos que se actualizan por separado, así que un daemon puede
+    /// aprender una trama antes que el cliente. Sin esta variante, la primera
+    /// trama desconocida sería un error de encuadre —y el encuadre roto **tira la
+    /// conexión**, que es un fallo desproporcionado para "no sé qué es esto".
+    /// Ignorarla es lo que permite añadir tramas dentro de la misma versión de
+    /// protocolo, que es justo lo que [`ServerFrame::Goodbye`] acaba de hacer.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Peticiones. Espejo de la superficie pública de `AgentHandle`: el IPC es el
@@ -371,12 +394,6 @@ pub struct EngineStatus {
     /// D.11/D.12 costaron dos sesiones.
     #[serde(default)]
     pub last_error: Option<String>,
-    /// PID del agente embebido (desktop o `hoard sync`) que tiene el motor
-    /// tomado por el pidfile viejo. Transitorio: durante los Slices 4a–4c el
-    /// motor embebido y el daemon conviven, y `instance.rs` sigue siendo el
-    /// árbitro entre ellos hasta que se borra en el 4d.
-    #[serde(default)]
-    pub blocked_by_pid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -435,11 +452,27 @@ mod tests {
             version_num: 42,
             total_bytes: 1024,
             set_hash: Some("cheap:content".into()),
+            already_landed: false,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "backup_success");
         assert_eq!(json["version_num"], 42);
         assert_eq!(json["set_hash"], "cheap:content");
+
+        // Campo nuevo con `default` (D.8.3): el payload de un daemon anterior,
+        // sin `already_landed`, sigue deserializando — la disciplina append-only
+        // es lo que permite añadirlo sin subir la versión de protocolo.
+        let legacy: AgentEvent = serde_json::from_str(
+            r#"{"type":"backup_success","save_id":"s1","version_num":7,"total_bytes":10,"set_hash":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentEvent::BackupSuccess {
+                already_landed: false,
+                ..
+            }
+        ));
 
         let scheduled = AgentEvent::BackupScheduled {
             save_id: "s1".into(),
@@ -455,6 +488,28 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(deferred, AgentEvent::RestoreDeferred { .. }));
+    }
+
+    /// La despedida viaja con su motivo: el cliente la enseña ("lo paró
+    /// `hoard sync stop`") en vez de reportar una conexión perdida.
+    #[test]
+    fn the_farewell_carries_its_reason() {
+        let frame = ServerFrame::Goodbye {
+            reason: "stopped on request".into(),
+        };
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["frame"], "goodbye");
+        assert_eq!(json["reason"], "stopped on request");
+    }
+
+    /// Una trama de un daemon más nuevo se ignora en vez de romper el encuadre
+    /// (y con él la conexión). Es lo que hace que añadir tramas —como la
+    /// despedida— no sea un cambio incompatible de protocolo.
+    #[test]
+    fn an_unknown_frame_degrades_instead_of_breaking_the_connection() {
+        let frame: ServerFrame =
+            serde_json::from_str(r#"{"frame":"invented_in_2027","payload":{"a":1}}"#).unwrap();
+        assert!(matches!(frame, ServerFrame::Unknown));
     }
 
     /// El handshake dice **su** versión al rechazar, para que el cliente pueda
@@ -498,14 +553,20 @@ mod tests {
         }
     }
 
-    /// Campos nuevos con `default`: un daemon viejo que no emite `blocked_by_pid`
-    /// sigue deserializando en un cliente nuevo.
+    /// Campos nuevos con `default`: un daemon viejo que no emite `server` ni
+    /// `since` sigue deserializando en un cliente nuevo. Y al revés — el campo
+    /// que el 4d borró (`blocked_by_pid`, el pidfile) llega como sobrante de un
+    /// daemon anterior y se ignora en vez de romper la conexión.
     #[test]
     fn older_payloads_still_deserialize() {
         let engine: EngineStatus = serde_json::from_str(r#"{"running":true}"#).unwrap();
         assert!(engine.running);
-        assert!(engine.blocked_by_pid.is_none());
+        assert!(engine.server.is_none());
         assert!(engine.since.is_none());
+
+        let legacy: EngineStatus =
+            serde_json::from_str(r#"{"running":false,"blocked_by_pid":4242}"#).unwrap();
+        assert!(!legacy.running);
     }
 
     /// El préstamo del token: el `rejected` es opcional en el cable (un cliente

@@ -194,12 +194,18 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
       patch(ev.save_id, {
         state: "ok",
         last_version: ev.version_num,
-        last_bytes: ev.total_bytes,
+        // Con `already_landed` no viajó ni un byte —el contenido ya estaba
+        // arriba—, así que pintar 0 B borraría el tamaño de la última copia de
+        // verdad. El número de versión sí es nuevo y sí se adopta.
+        ...(ev.already_landed ? {} : { last_bytes: ev.total_bytes }),
         error: undefined,
         will_retry: undefined,
       });
       const $prefs = get(prefs);
-      if ($prefs?.notify_on_success) {
+      // Avisar de una copia que no ha ocurrido ahora es la misma clase de
+      // mentira que sonar al reproducir el journal: el estado sí se actualiza,
+      // el aviso no se manda.
+      if ($prefs?.notify_on_success && !ev.already_landed) {
         notify(
           "Backup saved",
           `${ev.save_id.slice(0, 8)} · v${ev.version_num} (${formatBytes(

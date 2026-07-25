@@ -16,9 +16,9 @@
 //! - **Cambia** quién hace el trabajo: el conjunto vigilado, la persistencia de
 //!   `state.json` y la presencia son del servicio. El cliente **avisa** de los
 //!   cambios ([`hoard_core::ipc::Request::Reload`]), no manda listas de saves.
-//! - **Desaparece** el pidfile del lado del desktop: ya no hay motor que
-//!   arbitrar aquí. `hoard_agent::instance` sigue existiendo mientras la CLI
-//!   embeba el suyo (el daemon lo respeta); se borra en el 4d.
+//! - **Desaparece** el pidfile: ya no hay motor que arbitrar aquí, y desde el
+//!   Slice 4d tampoco en ningún otro sitio — `hoard_agent::instance` está
+//!   borrado y el árbitro es la propiedad del socket del servicio.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -67,15 +67,7 @@ pub async fn start_agent(
     let mut seen = HashSet::new();
     daemon::announce_slots(&app, &status.slots, &mut seen);
 
-    if let Some(pid) = status.engine.blocked_by_pid {
-        // Convivencia 4b–4c: `hoard sync` sigue embebiendo su motor y tiene el
-        // pidfile. El servicio no arranca un segundo motor y lo dice; el sync
-        // funciona, sólo que lo lleva la CLI.
-        tracing::warn!(
-            pid,
-            "another Hoard agent owns the engine; the service is serving without one"
-        );
-    } else if !status.engine.running {
+    if !status.engine.running {
         tracing::info!(
             reason = status.engine.last_error.as_deref().unwrap_or("starting"),
             "the Hoard service has no engine yet"

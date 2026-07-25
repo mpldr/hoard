@@ -69,6 +69,12 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
         &source,
         prev_sig.as_deref(),
         base_version,
+        // Sin cabeza que comparar: el chequeo anti-relanzamiento de D.8.3 existe
+        // para el motor, que reinicia solo y ya trae el manifiesto observado.
+        // Un `hoard backup` es una orden explícita y puntual del usuario; pedir
+        // el manifiesto sólo para adivinar si puede ahorrársela sería una
+        // petición extra en el camino de un comando que ya sabe lo que quiere.
+        None,
         on_progress,
         || {},
     )
@@ -93,6 +99,21 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
             return Ok(());
         }
         BackupResult::Uploaded { outcome, signature } => (outcome, signature),
+        // Inalcanzable con `head: None` (arriba), pero el compilador no lo sabe
+        // y el día que lo sea, decirlo es la respuesta correcta.
+        BackupResult::AlreadyLanded {
+            version_num,
+            signature,
+        } => {
+            pb.finish_and_clear();
+            println!("already on the server as v{version_num} — nothing to upload");
+            if let Some(s) = state.saves.get_mut(&save_id) {
+                s.set_hash = Some(signature);
+                s.last_version_num = Some(version_num);
+            }
+            state.save(&state_path)?;
+            return Ok(());
+        }
     };
     pb.finish_with_message("uploaded");
 

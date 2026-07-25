@@ -73,6 +73,11 @@ fn client_name(role: &str) -> String {
 /// (una actualización) sin que la UI se quede muda para siempre.
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
+/// Espera entre reintentos cuando al servicio lo pararon **a propósito**. Ya no
+/// lo relanzamos (ADR 0021 4d), así que reintentar rápido sólo sirve para llenar
+/// el log; sigue reintentándose para engancharse solo si alguien lo arranca.
+const STOPPED_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 /// Tope de una petición ya conectada. Generoso para el peor caso real (el
 /// `Status` pregunta al motor, que puede estar hasheando), pero finito: sin él,
 /// un servicio atascado colgaría el comando de la UI y, tras él, todos los que
@@ -338,7 +343,18 @@ async fn pump(app: AppHandle) -> Finished {
         // La UI no puede quedarse creyendo que el motor sigue: si perdimos el
         // socket, no sabemos nada de él.
         emit_status(&app, &AgentStatus::down());
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::time::sleep(reconnect_delay()).await;
+    }
+}
+
+/// Cuánto esperar antes de volver a intentarlo. Con el servicio parado a
+/// propósito no hay prisa: nadie va a contestar hasta que alguien lo arranque, y
+/// nosotros ya no lo arrancamos. Sondear cada 3 s sólo llenaría el log.
+fn reconnect_delay() -> Duration {
+    if hoardd::client::stopped_on_purpose() {
+        STOPPED_RETRY_DELAY
+    } else {
+        RECONNECT_DELAY
     }
 }
 
@@ -409,6 +425,15 @@ async fn pump_once(app: &AppHandle) -> Result<()> {
                     backlog.entries.into_iter().map(BacklogRow::from).collect(),
                     true,
                 );
+            }
+            // Lo pararon a propósito (`hoard sync stop`, `systemctl --user
+            // stop`). El cliente ya se ha anotado la despedida, así que el
+            // reintento de abajo se limitará a mirar si vuelve: cerrar esta
+            // ventana no puede parar el sync, pero abrirla tampoco puede
+            // deshacer una orden de pararlo.
+            Push::Goodbye { reason } => {
+                tracing::info!(reason, "desktop: the Hoard service was stopped on purpose");
+                return Ok(());
             }
         }
     }

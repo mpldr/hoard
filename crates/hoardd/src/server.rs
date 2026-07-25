@@ -36,6 +36,10 @@ use crate::transport::Listener;
 /// se llena, en vez de hacer crecer la memoria del daemon.
 const OUTBOX: usize = 512;
 
+/// Despedidas en cola. Sólo se manda una en toda la vida del proceso; el canal
+/// existe para repartirla a las conexiones vivas, no para acumular.
+const FAREWELL_CHANNEL: usize = 1;
+
 /// Estado compartido que ve cada conexión.
 pub struct Daemon {
     pub version: String,
@@ -48,6 +52,17 @@ pub struct Daemon {
     pub engine: Engine,
     /// Se dispara con `Request::Shutdown`; `main` lo espera.
     shutdown: tokio::sync::Notify,
+    /// Reparte la despedida a las conexiones vivas cuando el apagado es
+    /// deliberado. Cada conexión tiene una tarea esperando aquí que mete el
+    /// [`ServerFrame::Goodbye`] en su cola de salida.
+    farewell: broadcast::Sender<String>,
+    /// El motivo, una vez dicho. El canal sólo alcanza a quien ya estaba
+    /// conectado; esto alcanza a **quien llegue después**, durante el rato que
+    /// tardamos en apagarnos (el motor manda su último latido por red, así que
+    /// no es instantáneo). Sin ello, un cliente que conectara en esa ventana
+    /// recibiría un saludo normal, daría por buena la despedida anterior y
+    /// relanzaría el servicio al perder el socket: el bug entero otra vez.
+    said: std::sync::OnceLock<String>,
 }
 
 impl Daemon {
@@ -60,12 +75,33 @@ impl Daemon {
             log,
             engine,
             shutdown: tokio::sync::Notify::new(),
+            farewell: broadcast::channel(FAREWELL_CHANNEL).0,
+            said: std::sync::OnceLock::new(),
         }
     }
 
     /// Espera la orden de apagado.
     pub async fn wait_for_shutdown(&self) {
         self.shutdown.notified().await;
+    }
+
+    /// Despídete de todo cliente enganchado: **esto es un apagado deliberado**.
+    ///
+    /// Se manda antes de tocar el motor, y el llamante le da un respiro al socket
+    /// para que salga (ver `run`). Un daemon que muere de verdad no pasa por
+    /// aquí, y eso es exactamente la distinción que el cliente necesita para
+    /// decidir si relanzarlo (ADR 0021 D.17 → 4d).
+    pub fn say_goodbye(&self, reason: &str) {
+        let _ = self.said.set(reason.to_string());
+        let listeners = self.farewell.send(reason.to_string()).unwrap_or(0);
+        tracing::info!(reason, listeners, "hoardd: saying goodbye to its clients");
+    }
+
+    /// El motivo de la despedida si ya la dijimos. Lo consulta el handshake: a
+    /// quien llegue después del adiós se le contesta con el adiós, no con un
+    /// saludo que dentro de un segundo será mentira.
+    fn farewell_said(&self) -> Option<&str> {
+        self.said.get().map(String::as_str)
     }
 
     fn welcome(&self) -> Welcome {
@@ -257,7 +293,21 @@ where
         }
     });
 
+    // La despedida no puede esperar a que este cliente mande algo: el bucle de
+    // abajo está bloqueado leyendo, y el apagado ocurre sin que nadie escriba.
+    // Por eso va en su propia tarea, encolando en el mismo escritor único.
+    let farewell_task = tokio::spawn({
+        let mut farewell = daemon.farewell.subscribe();
+        let out = out_tx.clone();
+        async move {
+            if let Ok(reason) = farewell.recv().await {
+                let _ = out.send(ServerFrame::Goodbye { reason }).await;
+            }
+        }
+    });
+
     let result = handshake_and_serve(&mut reader, &out_tx, &daemon).await;
+    farewell_task.abort();
     drop(out_tx);
     let _ = writer_task.await;
     result
@@ -300,6 +350,18 @@ where
                 daemon_protocol: PROTOCOL_VERSION,
                 daemon_version: daemon.version.clone(),
             }))
+            .await;
+        return Ok(());
+    }
+    // Nos estamos apagando: la verdad que este cliente necesita no es "hola",
+    // es "adiós" — si no, tomaría por sano un servicio que se va y lo relanzaría
+    // en cuanto perdiera el socket.
+    if let Some(reason) = daemon.farewell_said() {
+        tracing::info!(client = %hello.client, "hoardd: a client connected while stopping; sending the farewell");
+        let _ = out
+            .send(ServerFrame::Goodbye {
+                reason: reason.to_string(),
+            })
             .await;
         return Ok(());
     }

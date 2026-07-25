@@ -109,7 +109,10 @@ jobs:
             libpipewire-0.3-dev \
             clang
 
-      - name: Build overlay sidecar (hoard-screen)
+      # Both sidecars the bundle ships: the overlay (hoard-screen) and the sync
+      # service (hoardd). Without the second one the app installs without an
+      # engine — it's a thin client of the daemon since ADR 0021's Slice 4.
+      - name: Build sidecars (hoard-screen, hoardd)
         shell: bash
         run: bash scripts/build-sidecar.sh
 

@@ -11,8 +11,24 @@
 //! daemon; este lado se limita a lanzar el proceso y volver a conectar. Lanzar
 //! dos daemons a la vez es **correcto**: uno gana el socket y el otro sale sin
 //! hacer nada.
+//!
+//! ## La excepción: un apagado deliberado se queda apagado (4d)
+//!
+//! "Arráncalo si no hay" tiene un caso en el que está mal: el servicio no está
+//! porque **lo acaban de parar a propósito**. Hasta el 4c un cliente enganchado
+//! lo resucitaba ~3 s después de un `hoard sync stop`, porque su reconexión es
+//! `ensure_running` y no tenía forma de distinguir "lo pararon" de "se cayó". La
+//! diferencia la dice ahora el daemon ([`ServerFrame::Goodbye`]) y este módulo la
+//! recuerda ([`stopped_on_purpose`]): mientras esté puesta, los clientes siguen
+//! reconectando pero **no arrancan** nada.
+//!
+//! Es memoria **de proceso**, no un fichero: un marcador en disco sería el error
+//! del pidfile otra vez (queda rancio, nadie sabe si miente). Y se cura sola —
+//! cualquier handshake con éxito la borra, porque si hay servicio al que
+//! saludar, "está parado" ya no es verdad.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +50,37 @@ pub const DAEMON_BIN_ENV: &str = "HOARDD_BIN";
 /// Cuánto se espera a que un daemon recién lanzado abra su socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// El servicio se despidió: alguien lo paró a propósito y este proceso no debe
+/// resucitarlo. Ver el encabezado del módulo.
+static STOPPED_ON_PURPOSE: AtomicBool = AtomicBool::new(false);
+
+/// ¿Nos consta que el servicio está parado a propósito?
+///
+/// Los clientes que reconectan en bucle (el relevo de eventos del desktop, el
+/// `follow` de `hoard sync run`) lo consultan para espaciar los reintentos: no
+/// hay nadie a quien conectarse hasta que alguien lo arranque a mano.
+pub fn stopped_on_purpose() -> bool {
+    STOPPED_ON_PURPOSE.load(Ordering::Relaxed)
+}
+
+/// Anota la despedida del daemon.
+fn note_farewell(reason: &str) {
+    if !STOPPED_ON_PURPOSE.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            reason,
+            "the Hoard service said goodbye; it won't be restarted from here"
+        );
+    }
+}
+
+/// Olvida la despedida. La llama el handshake: si hemos podido saludar a un
+/// daemon, "está parado" dejó de ser verdad.
+fn clear_farewell() {
+    if STOPPED_ON_PURPOSE.swap(false, Ordering::Relaxed) {
+        tracing::info!("the Hoard service is up again");
+    }
+}
+
 /// Algo que el daemon empuja sin que se lo pidan.
 #[derive(Debug, Clone)]
 pub enum Push {
@@ -42,6 +89,10 @@ pub enum Push {
     /// Nos hemos retrasado y el canal descartó filas: hay que volver a pedir el
     /// backlog desde `cursor`. Se avisa en vez de dejar un hueco invisible.
     Resync { cursor: u64, dropped: u64 },
+    /// El servicio se para a propósito. Quien escucha decide qué hacer: la CLI
+    /// termina (su trabajo era seguir un sync que ya no corre), el desktop pinta
+    /// el motor parado y espera. Ninguno de los dos lo relanza.
+    Goodbye { reason: String },
 }
 
 /// Conexión con el daemon.
@@ -67,9 +118,20 @@ impl Client {
     }
 
     /// Conéctate; si no hay servicio, lánzalo y vuelve a conectar.
+    ///
+    /// Salvo que nos hayan dicho que lo pararon a propósito: entonces esto es un
+    /// [`Client::connect`] a secas y el error explica que hay que arrancarlo. Un
+    /// cliente enganchado no puede deshacer un `hoard sync stop` por el mero
+    /// hecho de reconectar.
     pub async fn ensure_running(endpoint: &Endpoint, client_name: &str) -> Result<Self> {
         if let Ok(stream) = transport::connect(endpoint).await {
             return Self::handshake(stream, client_name).await;
+        }
+        if stopped_on_purpose() {
+            bail!(
+                "the Hoard service is stopped (someone stopped it on purpose); \
+                 start it again with `hoard sync start`"
+            );
         }
         spawn_daemon(endpoint)?;
         let stream = transport::connect_with_deadline(endpoint, Instant::now() + SPAWN_TIMEOUT)
@@ -93,13 +155,27 @@ impl Client {
         .context("sending the hello")?;
         let mut reader = reader;
         match read_frame::<_, ServerFrame>(&mut reader).await? {
-            Some(ServerFrame::Welcome(welcome)) => Ok(Self {
-                reader,
-                writer,
-                next_id: 1,
-                welcome,
-                pushes: VecDeque::new(),
-            }),
+            Some(ServerFrame::Welcome(welcome)) => {
+                // Hay servicio al que saludar: la despedida que recordáramos ya
+                // no describe la realidad (alguien lo volvió a arrancar).
+                clear_farewell();
+                Ok(Self {
+                    reader,
+                    writer,
+                    next_id: 1,
+                    welcome,
+                    pushes: VecDeque::new(),
+                })
+            }
+            // Saludamos a un servicio que se está apagando a propósito. No es un
+            // servicio con el que hablar, pero tampoco una caída: anotarlo aquí
+            // es lo que impide que el reintento de dentro de tres segundos lo
+            // relance (la ventana de apagado dura lo que tarde el último latido
+            // de presencia, que va por red).
+            Some(ServerFrame::Goodbye { reason }) => {
+                note_farewell(&reason);
+                bail!("the Hoard service is stopping: {reason}")
+            }
             // El handshake versionado en acción: el daemon dice su versión, así
             // que el cliente puede pedir que se actualice o se reinicie el
             // servicio en vez de mostrar un error de parseo.
@@ -141,8 +217,16 @@ impl Client {
                 Some(ServerFrame::Resync { cursor, dropped }) => {
                     self.pushes.push_back(Push::Resync { cursor, dropped })
                 }
-                // Respuesta a otra petición en vuelo, o un handshake repetido:
-                // ni lo uno ni lo otro es asunto de esta espera.
+                // La despedida se anota **aquí mismo**, no al consumir el push:
+                // esta conexión está a punto de cerrarse y quien esperaba una
+                // respuesta puede no llegar a leer la cola nunca.
+                Some(ServerFrame::Goodbye { reason }) => {
+                    note_farewell(&reason);
+                    self.pushes.push_back(Push::Goodbye { reason });
+                }
+                // Respuesta a otra petición en vuelo, un handshake repetido o una
+                // trama de un daemon más nuevo: nada de eso es asunto de esta
+                // espera.
                 Some(_) => continue,
                 None => bail!("the daemon closed the connection"),
             }
@@ -198,6 +282,10 @@ impl Client {
                 Some(ServerFrame::Event(entry)) => return Ok(Some(Push::Event(entry))),
                 Some(ServerFrame::Resync { cursor, dropped }) => {
                     return Ok(Some(Push::Resync { cursor, dropped }))
+                }
+                Some(ServerFrame::Goodbye { reason }) => {
+                    note_farewell(&reason);
+                    return Ok(Some(Push::Goodbye { reason }));
                 }
                 Some(_) => continue,
                 None => return Ok(None),

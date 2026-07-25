@@ -398,6 +398,17 @@ pub fn run() {
                     let _ = prefs.save(&path);
                 }
 
+                // Y la otra mitad de "arranca al iniciar sesión": el servicio de
+                // sync (ADR 0021, Slice 4d). La app y el servicio son dos
+                // procesos desde el Slice 4, así que registrar sólo la app
+                // significaría que el sync no corre hasta que alguien abra la
+                // ventana — justo lo que este slice viene a arreglar. Se reafirma
+                // en cada arranque por las mismas razones que la entrada de la
+                // app (una actualización mueve el binario), es idempotente y
+                // barata (no reescribe nada si la unidad ya está igual), y **no**
+                // toca un servicio que ya esté corriendo.
+                commands::prefs::sync_service_autostart(prefs.autostart);
+
                 // Hide the main window before it paints only on a *silent* boot:
                 // the autostart entry launches Hoard with `--silent` (see the
                 // plugin init above), so login starts quiet (tray only) while a

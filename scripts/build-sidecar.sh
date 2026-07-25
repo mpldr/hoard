@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Build the `hoard-screen` overlay sidecar from the in-repo crate and drop it
-# into the desktop src-tauri root as a Tauri `externalBin`, named with the host
-# target triple (+ `.exe` on Windows) exactly as Tauri's bundler expects.
+# Build the desktop's sidecar binaries from the in-repo crates and drop them into
+# the desktop src-tauri root as Tauri `externalBin`s, named with the host target
+# triple (+ `.exe` on Windows) exactly as Tauri's bundler expects.
 #
-# `bundle.externalBin = ["hoard-screen"]` in tauri.conf.json means every desktop
-# bundle needs this binary present first — run this before `tauri build`. The
-# compiled artifact is gitignored (only the source in `crates/hoard-screen` is
-# tracked). Run once per matrix OS in CI, or locally before a desktop build.
+# Two of them:
+#   - `hoard-screen` — the in-game overlay (Pro layer).
+#   - `hoardd`       — the local sync service that owns the engine (ADR 0021).
+#                      The desktop is a thin client of it and starts it when it's
+#                      absent, so a bundle without `hoardd` is an app that can't
+#                      sync at all.
+#
+# `bundle.externalBin` in tauri.conf.json lists both, which means every desktop
+# bundle needs them present first — run this before `tauri build`. The compiled
+# artifacts are gitignored (only the sources under `crates/` are tracked). Run
+# once per matrix OS in CI, or locally before a desktop build.
 #
 #   scripts/build-sidecar.sh   (run from anywhere)
 set -euo pipefail
@@ -21,19 +28,28 @@ case "$triple" in
   *)              features="runtime wayland" ; ext="" ;;
 esac
 
-echo "Building hoard-screen sidecar ($triple, features: $features)"
-cargo build --manifest-path "$HOARD/Cargo.toml" --release -p hoard-screen --features "$features"
-
-# Place the sidecar in the src-tauri root (next to tauri.conf.json), NOT a
+# Place each sidecar in the src-tauri root (next to tauri.conf.json), NOT a
 # `binaries/` subdir: the bundler flattens externalBin adjacent to the app exe,
 # while the shell plugin resolves a sidecar as `exe_dir.join(name)`. A subdir
-# prefix in the name makes runtime look for `<exe_dir>/binaries/hoard-screen`,
-# which doesn't exist → ENOENT on spawn. externalBin is just `hoard-screen`.
-cp "$HOARD/target/release/hoard-screen$ext" "$DESK/hoard-screen-$triple$ext"
-echo "Placed sidecar: $DESK/hoard-screen-$triple$ext"
+# prefix in the name makes runtime look for `<exe_dir>/binaries/<name>`, which
+# doesn't exist → ENOENT on spawn. externalBin is just the bare name.
+#
+# A plain `cargo build --release` (no bundle) needs no copy at all: both binaries
+# already land in `target/release`, next to `hoard-desktop`, which is the first
+# place the sidecar lookup and `hoardd::client::daemon_binary` look.
+place() {
+  local name="$1"
+  cp "$HOARD/target/release/$name$ext" "$DESK/$name-$triple$ext"
+  echo "Placed sidecar: $DESK/$name-$triple$ext"
+}
 
-# Next to the desktop exe too, so a plain `cargo build --release` run (no bundle)
-# resolves the sidecar at runtime without a full `tauri build`.
-if [ -d "$HOARD/target/release" ]; then
-  cp "$HOARD/target/release/hoard-screen$ext" "$HOARD/target/release/hoard-screen$ext" 2>/dev/null || true
-fi
+echo "Building hoard-screen sidecar ($triple, features: $features)"
+cargo build --manifest-path "$HOARD/Cargo.toml" --release -p hoard-screen --features "$features"
+place hoard-screen
+
+# The sync service. It's also what the per-user autostart unit execs, so the copy
+# that ships next to the app is the one the OS runs at login — the client
+# resolves the daemon as its own sibling first and only then falls back to PATH.
+echo "Building hoardd sidecar ($triple)"
+cargo build --manifest-path "$HOARD/Cargo.toml" --release -p hoardd
+place hoardd

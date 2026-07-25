@@ -940,3 +940,39 @@ más que hacerla rápida; esto es optimización, no correctness.
   por fichero que saltarse, así que saber que un fichero ya está en disco no
   ahorra nada. Intacto, igual que la versión cloud legacy de archivo entero
   (`download_and_extract_cloud`); ambos reportan `files_reused = 0`.
+
+---
+
+### D.14 — Decisiones cerradas del Slice 4 (2026-07-25)
+
+Las dos casillas que la Parte A dejaba abiertas, decididas por el usuario.
+
+**1. Notificaciones: opción (b) — las manda el daemon.** El daemon es el dueño
+del sync, así que es coherente que avise él, y es la única forma de enterarse con
+la app cerrada. Se asume el coste: notificación nativa por SO (dbus/notify-send
+en Linux, toast en Windows, macOS aparte). **Va al final del Slice 4**, con el
+daemon ya funcionando, y **empezando por Linux** (donde se dogfoodea). El tray
+sigue siendo del desktop; lo que cambia es quién origina el aviso.
+
+**2. Entrega de eventos: journal + push, no una cosa u otra.** Resuelven
+horizontes distintos y hacen falta los dos:
+
+- **Push por el socket** → el cliente conectado *ahora*: latencia mínima, sin
+  disco.
+- **Journal append-only con cursor** → el cliente que **no estaba**. Sólo-push
+  significa que quien arranca tarde se pierde el historial: es exactamente el bug
+  de las campanas mudas (la UI sin snapshot ni backlog).
+
+Protocolo: el cliente conecta → pide "todo lo posterior al cursor N" → luego
+escucha en vivo. Misma forma que ya tienen Realtime + el airbag del poll.
+**Ese journal es el log de decisiones de C.5** (tabla-anillo en la SQLite del
+daemon): una sola tabla sirve al replay y al catch-up de clientes. No construir
+dos.
+
+**Coste real: no es "mandar vs guardar", es cuánto guardas.** Mandar es una
+escritura a socket. Guardar eventos de verdad (backup, restore, juego
+arranca/para) es trivial: son pocos. Lo que amplifica escritura es guardar **cada
+decisión de cada tick** — medido en este repo el 2026-07-25: **3015
+`cloud state stale` en 36 minutos** (~84/min, >100k/día) con tick de 2 s. Regla:
+**guardar transiciones y acciones, no reposos repetidos**; y colapsar rachas del
+mismo motivo de `Hold` en una fila con contador. Crítico en el SSD del Deck.

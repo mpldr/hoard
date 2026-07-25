@@ -7,6 +7,7 @@ members = [
     "crates/hoard-admin",
     "crates/hoard-agent",
     "crates/hoard-desktop",
+    "crates/hoardd",
     "crates/hoard-manifest",
     "crates/hoard-watcher",
     "crates/hoard-screen",
@@ -15,7 +16,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "7.7.15"
+version = "7.7.16"
 authors = ["insider <raileonoliva@gmail.com>"]
 license = "AGPL-3.0"
 # Self-hosted app, never published to crates.io. Marking the members private

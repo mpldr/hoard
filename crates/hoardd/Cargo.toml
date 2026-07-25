@@ -1,0 +1,53 @@
+[package]
+name = "hoardd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hoard local sync service: owns the engine, speaks IPC to thin clients"
+
+[lib]
+name = "hoardd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hoardd"
+path = "src/main.rs"
+
+[dependencies]
+hoard-core = { path = "../hoard-core" }
+hoard-agent = { path = "../hoard-agent" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# `flock` sobre el fichero de lock: el mutex real con liveness que sustituye al
+# pidfile como árbitro (ADR 0021, Parte A). El kernel lo suelta al morir el
+# proceso, así que un daemon que crashea no bloquea al siguiente — que es
+# exactamente lo que `agent.pid` no sabía hacer.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# ACL del named pipe: sin descriptor de seguridad explícito Windows le da a
+# `Everyone` acceso de lectura al pipe, y por ahí viajan nombres de juego, rutas
+# y comandos del sync. La ADR pide permisos solo-usuario (0600 / ACL), así que
+# construimos un SD con SDDL desde el SID del usuario actual.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

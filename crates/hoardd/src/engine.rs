@@ -1,0 +1,589 @@
+//! El motor dentro del daemon: arrancarlo, mantenerlo vivo y bombear sus
+//! eventos al journal.
+//!
+//! Un motor por usuario, propiedad de este proceso. Tres piezas:
+//!
+//! - [`Engine`]: la ranura compartida. El servidor IPC pregunta por el
+//!   `AgentHandle` y por el estado; nunca arranca ni para el motor por su cuenta.
+//! - [`keeper`]: bucle supervisado que **asegura** que el motor está arriba —
+//!   resuelve la sesión, hace `agent::spawn`, y si el motor muere lo vuelve a
+//!   levantar. Nada aquí puede morir en silencio (D.12): el keeper detecta un
+//!   `JoinHandle` terminado en vez de fiarse de un booleano, que es exactamente
+//!   cómo se quedó clavado el gate del poller.
+//! - [`pump`]: bucle supervisado que consume `AgentEvent`s, los persiste en
+//!   `state.json` y los mete en el journal (que es quien empuja a los clientes).
+//!
+//! ## Convivencia con el motor embebido (transitorio, Slices 4a–4c)
+//!
+//! Mientras el desktop y `hoard sync` sigan embebiendo `agent::spawn`, dos
+//! motores a la vez causarían el ping-pong de backup/restore y la
+//! reuse-detection del refresh token que la ADR describe. El árbitro entre
+//! daemon y motor embebido sigue siendo el pidfile de `hoard_agent::instance`:
+//! si el desktop lo tiene tomado, el keeper **no** arranca el motor y lo reporta
+//! (`EngineStatus::blocked_by_pid`) en vez de pelearse por los saves. Cuando el
+//! daemon sí lo toma, el desktop y la CLI se apartan solos, que es su
+//! comportamiento de siempre. El pidfile se borra en el Slice 4d, cuando ya no
+//! quede motor embebido; el árbitro definitivo es la propiedad del socket.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
+use hoard_agent::api::ApiClient;
+use hoard_agent::config::CliConfig;
+use hoard_agent::instance::AgentLock;
+use hoard_agent::prefs::Prefs;
+use hoard_agent::presence::PresenceHandle;
+use hoard_agent::state::CliState;
+use hoard_agent::supervisor::Finished;
+use hoard_agent::{cloud_live, library, presence};
+use hoard_core::ipc::EngineStatus;
+use time::OffsetDateTime;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::journal::EventLog;
+
+/// Cada cuánto comprueba el keeper que el motor sigue vivo.
+const KEEPER_TICK: Duration = Duration::from_secs(5);
+
+/// Espera del keeper cuando el motor embebido de otro proceso tiene el pidfile.
+/// Largo a propósito: es una situación estable (el usuario tiene la app abierta),
+/// no un fallo que reintentar a toda prisa.
+const BLOCKED_RECHECK: Duration = Duration::from_secs(30);
+
+/// Backoff tras un arranque fallido del motor (sin sesión, red caída).
+const START_BACKOFF_MIN: Duration = Duration::from_secs(5);
+const START_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// Cada cuánto se comprueba que las tareas del empuje Cloud siguen vivas.
+const CLOUD_LIVE_CHECK: Duration = Duration::from_secs(15);
+
+/// Margen que se le da al motor para atender su `shutdown` antes de abortarlo.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Espera máxima a que el motor conteste una consulta de estado. Sin tope, un
+/// motor atascado colgaría al cliente que preguntó (y a la UI detrás).
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Aborta un grupo de tareas al soltarse. Sin esto, reiniciar el empuje Cloud
+/// dejaría las tareas viejas corriendo: dos pollers es justo el fallo que D.12
+/// documenta.
+struct AbortOnDrop(Vec<JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Lo que compone un motor vivo. Todo se tira junto.
+struct Running {
+    handle: AgentHandle,
+    task: JoinHandle<()>,
+    presence: PresenceHandle,
+    /// Tareas auxiliares del motor (presencia, empuje Cloud, refresher del JWT).
+    aux: Vec<JoinHandle<()>>,
+    /// El pidfile viejo, tomado mientras nosotros tengamos el motor para que el
+    /// desktop y `hoard sync` se aparten. Muere con el Slice 4d.
+    _lock: AgentLock,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // Soltar un `JoinHandle` **no** cancela su task: detachearlas dejaría el
+        // poller, el latido de presencia y el rotador del token del motor viejo
+        // corriendo junto a los del nuevo. Dos pollers y dos rotadores del mismo
+        // refresh token es la familia de bugs que D.12 y la Parte A documentan, así
+        // que morir del todo es parte del contrato de este tipo.
+        for task in &self.aux {
+            task.abort();
+        }
+        self.task.abort();
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    running: Option<Running>,
+    status: EngineStatus,
+    /// Paramos a propósito (`Request::Shutdown`): el keeper no debe resucitarlo.
+    stopping: bool,
+}
+
+/// Ranura compartida del motor. Cheap to clone.
+#[derive(Clone, Default)]
+pub struct Engine {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Handle del motor, si está arriba.
+    pub fn handle(&self) -> Option<AgentHandle> {
+        self.lock().running.as_ref().map(|r| r.handle.clone())
+    }
+
+    pub fn presence(&self) -> Option<PresenceHandle> {
+        self.lock().running.as_ref().map(|r| r.presence.clone())
+    }
+
+    pub fn status(&self) -> EngineStatus {
+        self.lock().status.clone()
+    }
+
+    /// Motivo legible de que no haya motor, para el `IpcError::EngineDown` que
+    /// recibe el cliente. Un cliente que sólo ve "error" reintenta para siempre
+    /// sin poder decirle nada al usuario.
+    pub fn down_reason(&self) -> String {
+        let guard = self.lock();
+        if let Some(pid) = guard.status.blocked_by_pid {
+            return format!("another Hoard agent (pid {pid}) owns the engine");
+        }
+        if guard.stopping {
+            return "the daemon is shutting down".to_string();
+        }
+        guard
+            .status
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "the engine is still starting".to_string())
+    }
+
+    pub fn set_watched(&self, count: usize) {
+        self.lock().status.watched = count;
+    }
+
+    /// Marca que no habrá motor y por qué (`--no-engine`). El motivo viaja al
+    /// cliente en `EngineDown`: un motor ausente **a propósito** tiene que
+    /// distinguirse de uno que no arranca.
+    pub fn disable(&self, reason: &str) {
+        let mut guard = self.lock();
+        guard.status.running = false;
+        guard.status.last_error = Some(reason.to_string());
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.lock().stopping
+    }
+
+    /// ¿Motor arriba **y** su task viva? La segunda mitad importa: un pánico
+    /// dentro del bucle del agente deja el handle intacto y los comandos se
+    /// tragarían en un canal que nadie lee.
+    pub fn alive(&self) -> bool {
+        self.lock()
+            .running
+            .as_ref()
+            .is_some_and(|r| !r.task.is_finished())
+    }
+
+    fn install(&self, running: Running, server: String, is_cloud: bool, watched: usize) {
+        let mut guard = self.lock();
+        guard.status = EngineStatus {
+            running: true,
+            server: Some(server),
+            is_cloud,
+            watched,
+            since: Some(OffsetDateTime::now_utc()),
+            last_error: None,
+            blocked_by_pid: None,
+        };
+        // Un motor previo (por ejemplo el que murió y estamos reemplazando) se
+        // tira aquí: `Running::aux` aborta sus tareas al soltarse.
+        guard.running = Some(running);
+    }
+
+    fn note_error(&self, error: String) {
+        let mut guard = self.lock();
+        guard.status.running = false;
+        guard.status.blocked_by_pid = None;
+        guard.status.last_error = Some(error);
+        guard.running = None;
+    }
+
+    fn note_blocked(&self, pid: u32) {
+        let mut guard = self.lock();
+        guard.status.running = false;
+        guard.status.blocked_by_pid = Some(pid);
+        guard.status.last_error = None;
+        guard.running = None;
+    }
+
+    /// Suelta un motor que ya está muerto **antes** de arrancar otro.
+    ///
+    /// Load-bearing por el pidfile: dos `AgentLock` vivos en el mismo proceso
+    /// escriben el mismo pid, así que si el viejo se soltara *después* de que el
+    /// nuevo tomara el lock, su `Drop` borraría el pidfile del nuevo (el
+    /// contenido coincide) y el desktop dejaría de ver dueño — justo el escenario
+    /// de dos motores que la convivencia 4a–4c evita.
+    fn forget(&self) {
+        let mut guard = self.lock();
+        guard.status.running = false;
+        guard.running = None;
+    }
+
+    /// Para el motor. Marca `stopping` **antes** de nada para que el keeper no lo
+    /// resucite mientras se apaga.
+    pub async fn shutdown(&self) {
+        let running = {
+            let mut guard = self.lock();
+            guard.stopping = true;
+            guard.status.running = false;
+            guard.running.take()
+        };
+        let Some(mut running) = running else { return };
+        // Último latido de presencia mientras el token vale: pone este equipo en
+        // gris en el panel de las otras máquinas al instante.
+        running.presence.closing().await;
+        if let Err(err) = running.handle.shutdown().await {
+            tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge shutdown");
+        }
+        // `shutdown` sólo *manda* el comando: hay que darle al bucle del agente la
+        // vuelta que necesita para atenderlo, o el `abort` del `Drop` lo cortaría
+        // a media limpieza. Acotado, para que un motor colgado no bloquee el
+        // apagado del servicio.
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut running.task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("hoardd: the engine didn't stop in time; aborting it");
+        }
+        // Al soltarse `running`: se abortan sus tareas auxiliares y se suelta el
+        // pidfile, así que el desktop puede retomar el motor embebido.
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // Igual que en el journal: un pánico ajeno no puede dejar la ranura del
+        // motor inaccesible para siempre.
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("hoardd: the engine mutex was poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+}
+
+/// Bucle que mantiene el motor arriba. No retorna nunca (por eso no puede
+/// producir un [`Finished`] por accidente); `supervise` lo reinicia si entra en
+/// pánico y el `abort()` del apagado lo mata.
+pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Finished {
+    let mut backoff = START_BACKOFF_MIN;
+    loop {
+        if engine.stopping() {
+            // No se retorna `Finished`: apagar es cosa de `main`, que aborta esta
+            // task. Dormir aquí evita quemar CPU en la ventana del apagado.
+            tokio::time::sleep(KEEPER_TICK).await;
+            continue;
+        }
+        if engine.alive() {
+            tokio::time::sleep(KEEPER_TICK).await;
+            continue;
+        }
+        if engine.status().running {
+            // Estaba arriba y su task ha muerto: eso es un incidente, no una
+            // transición normal.
+            tracing::error!("hoardd: the engine task is gone; restarting it");
+            // Suelta el cadáver (y su pidfile) antes de intentar otro arranque.
+            engine.forget();
+        }
+        // Convivencia 4a–4c: si otro agente (desktop / `hoard sync`) tiene el
+        // pidfile, no arrancamos un segundo motor.
+        if let Some(pid) = hoard_agent::instance::live_owner() {
+            if engine.status().blocked_by_pid != Some(pid) {
+                tracing::warn!(
+                    pid,
+                    "hoardd: another Hoard agent owns the engine; serving IPC without one"
+                );
+            }
+            engine.note_blocked(pid);
+            tokio::time::sleep(BLOCKED_RECHECK).await;
+            continue;
+        }
+
+        match start(events_tx.clone()).await {
+            Ok(started) => {
+                tracing::info!(
+                    server = %started.server,
+                    watched = started.watched,
+                    "hoardd: engine up"
+                );
+                engine.install(
+                    started.running,
+                    started.server,
+                    started.is_cloud,
+                    started.watched,
+                );
+                backoff = START_BACKOFF_MIN;
+            }
+            Err(err) => {
+                let text = format!("{err:#}");
+                tracing::warn!(error = %text, retry_in_secs = backoff.as_secs(), "hoardd: couldn't start the engine");
+                engine.note_error(text);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(START_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+struct Started {
+    running: Running,
+    server: String,
+    is_cloud: bool,
+    watched: usize,
+}
+
+/// Arranca el motor: sesión → saves → `agent::spawn` → presencia, empuje Cloud y
+/// refresher del JWT.
+async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
+    let active = crate::session::resolve().await?;
+    let (state, _path) = CliState::load_default()?;
+    // Sin saves rastreados el motor arranca igual (a diferencia de `hoard sync`,
+    // que es un comando y puede abortar): un servicio residente tiene que estar
+    // ahí cuando el usuario rastree el primero, y `Request::Reload` lo recoge.
+    let saves = library::watched_saves_from_state(&state);
+    let watched = saves.len();
+    let config = engine_config();
+
+    let (presence_handle, presence_task) = presence::spawn(active.client.clone());
+    // Dos clones antes de que `agent::spawn` consuma el cliente. `ApiClient`
+    // comparte su celda de token entre clones, así que el JWT que rote el
+    // refresher llega también al motor y al empuje Cloud.
+    let live_client = active.client.clone();
+    let refresh_client = active.client.clone();
+    let global_sync = config.global_sync;
+    let (handle, task) = agent::spawn(active.client, config, saves, events_tx);
+
+    let mut aux = vec![presence_task];
+    // Empuje Cloud de baja latencia (Realtime + poll de respaldo), igual que el
+    // daemon CLI. Sólo en Cloud y con sync global: `backup_only` nunca escribe.
+    if active.is_cloud && global_sync {
+        aux.push(spawn_cloud_live(live_client, handle.clone()));
+    }
+    // Un solo rotador del refresh token: éste.
+    if let Some(session) = active.cloud {
+        let shared = Arc::new(tokio::sync::Mutex::new(session));
+        aux.push(tokio::spawn(hoard_agent::supervisor::supervise(
+            "hoardd cloud refresh",
+            move || crate::session::refresh_loop(refresh_client.clone(), shared.clone()),
+        )));
+    }
+
+    Ok(Started {
+        running: Running {
+            handle,
+            task,
+            presence: presence_handle,
+            aux,
+            _lock: AgentLock::acquire(),
+        },
+        server: active.server,
+        is_cloud: active.is_cloud,
+        watched,
+    })
+}
+
+/// Config del motor a partir de las preferencias del usuario.
+///
+/// Mismas prefs que lee el desktop (`prefs.json` es del usuario, no del
+/// frontend), con una excepción deliberada: si **no hay** fichero de prefs, la
+/// máquina nunca ha visto la app de escritorio y estamos en el caso headless, que
+/// es el que `hoard sync` sirve hoy con sync global y auto-restore encendidos. Un
+/// servidor casero que sólo tiene la CLI no puede acabar en "sólo subo" por leer
+/// unos defaults pensados para la GUI.
+fn engine_config() -> AgentConfig {
+    let (prefs, path) = Prefs::load_default()
+        .map(|(p, path)| (p, Some(path)))
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "hoardd: couldn't read prefs; using defaults");
+            (Prefs::default(), None)
+        });
+    let headless = path.map(|p| !p.exists()).unwrap_or(false);
+    AgentConfig {
+        auto_restore: prefs.auto_restore || headless,
+        global_sync: prefs.global_sync || headless,
+        conflict_retention_days: prefs.conflict_retention_days,
+        min_snapshot_interval_secs: agent::min_snapshot_interval_for(prefs.data_saving),
+        // Aparca la copia local antes de dejar que una remota más nueva la pise
+        // (nunca destruye datos en silencio).
+        conflict_root: CliConfig::state_dir().ok().map(|d| d.join("conflicts")),
+        ..AgentConfig::default()
+    }
+}
+
+/// Empuje Cloud bajo supervisión. `cloud_live::spawn` monta dos `tokio::spawn`
+/// sueltos (poll + Realtime) que sobreviven a errores pero no a un pánico; hasta
+/// que el Slice 4c mate el daemon CLI y esa función se pueda cambiar sin tocar su
+/// otro llamante, el keeper lo cubre desde fuera: si alguna de las dos tareas
+/// termina, se tira el par y se rearma.
+fn spawn_cloud_live(client: ApiClient, handle: AgentHandle) -> JoinHandle<()> {
+    tokio::spawn(hoard_agent::supervisor::supervise(
+        "hoardd cloud-live",
+        move || {
+            let client = client.clone();
+            let handle = handle.clone();
+            async move {
+                let mut tasks = AbortOnDrop(spawn_cloud_live_pair(&client, &handle));
+                loop {
+                    tokio::time::sleep(CLOUD_LIVE_CHECK).await;
+                    if tasks.0.iter().any(|t| t.is_finished()) {
+                        tracing::warn!("hoardd: a cloud-live task ended; restarting the pair");
+                        // La asignación suelta el grupo anterior, que aborta lo que
+                        // quedara vivo. Nunca dos pollers.
+                        tasks = AbortOnDrop(spawn_cloud_live_pair(&client, &handle));
+                    }
+                }
+            }
+        },
+    ))
+}
+
+fn spawn_cloud_live_pair(client: &ApiClient, handle: &AgentHandle) -> Vec<JoinHandle<()>> {
+    cloud_live::spawn(
+        client.clone(),
+        handle.clone(),
+        cloud_live::Config {
+            poll_interval: Duration::from_secs(hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS as u64),
+            global_sync: true,
+        },
+    )
+}
+
+/// Estado de los slots vigilados, con tope de espera. Lo usa el `Status` del IPC.
+pub async fn slot_status(engine: &Engine) -> Vec<hoard_core::ipc::AgentSlotStatus> {
+    let Some(handle) = engine.handle() else {
+        return Vec::new();
+    };
+    match tokio::time::timeout(STATUS_TIMEOUT, handle.status()).await {
+        Ok(Ok(slots)) => slots,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "hoardd: the engine didn't answer a status query");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("hoardd: the engine took too long to answer a status query");
+            Vec::new()
+        }
+    }
+}
+
+/// Bombea los eventos del motor: presencia, `state.json` y journal.
+///
+/// El canal es **del daemon**, no del motor: se crea una vez y cada arranque del
+/// motor recibe un clon del emisor. Así este bucle puede reiniciarse bajo
+/// `supervise` sin perder el receptor, y un motor reiniciado sigue escribiendo en
+/// el mismo journal (los cursores de los clientes no se rompen porque el motor
+/// haya rebotado).
+pub async fn pump(
+    engine: Engine,
+    log: Arc<EventLog>,
+    events_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<AgentEvent>>>,
+) -> Finished {
+    let mut rx = events_rx.lock().await;
+    while let Some(event) = rx.recv().await {
+        // Presencia (panel Eye): espeja las transiciones de juego.
+        match &event {
+            AgentEvent::GameStarted { game_slug, .. } => {
+                if let Some(p) = engine.presence() {
+                    p.game_started(game_slug.clone());
+                }
+            }
+            AgentEvent::GameStopped { game_slug, .. } => {
+                if let Some(p) = engine.presence() {
+                    p.game_stopped(game_slug.clone());
+                }
+            }
+            _ => {}
+        }
+        persist(&event);
+        log.record(OffsetDateTime::now_utc(), event);
+    }
+    // El canal sólo se cierra cuando ya no queda ningún emisor, y el daemon
+    // guarda uno vivo mientras corre. Llegar aquí es el apagado.
+    tracing::info!("hoardd: the event channel closed");
+    Finished
+}
+
+/// Persiste en `state.json` lo que el motor sólo tiene en memoria: el cursor de
+/// versión y la firma anti-resubida. Sin esto, cada reinicio del daemon
+/// re-subiría snapshots idénticos y re-bajaría para diferenciar.
+fn persist(event: &AgentEvent) {
+    let (save_id, version, set_hash) = match event {
+        AgentEvent::BackupSuccess {
+            save_id,
+            version_num,
+            set_hash,
+            ..
+        } => (save_id, Some(*version_num), set_hash.clone()),
+        // Tras un restore el slot está sincronizado a esa versión: recordarlo es
+        // lo que hace que el version-gate sobreviva a un reinicio.
+        AgentEvent::SaveAutoRestored {
+            save_id,
+            version_num,
+            ..
+        } => (save_id, Some(*version_num), None),
+        _ => return,
+    };
+
+    let (mut state, path) = match CliState::load_default() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(error = %err, "hoardd: couldn't load state.json to persist an event");
+            return;
+        }
+    };
+    let Some(entry) = state.saves.get_mut(save_id) else {
+        // Un save de la nube respaldado antes de adoptarlo no tiene fila local.
+        return;
+    };
+    if let Some(v) = version {
+        entry.last_version_num = Some(v);
+    }
+    if let Some(hash) = set_hash {
+        entry.set_hash = Some(hash);
+    }
+    if matches!(event, AgentEvent::BackupSuccess { .. }) {
+        entry.last_backup_at = Some(OffsetDateTime::now_utc());
+    }
+    if let Err(err) = state.save(&path) {
+        tracing::warn!(error = %err, "hoardd: couldn't write state.json");
+    }
+}
+
+/// Re-hidrata el conjunto de saves vigilados desde `state.json` y le pasa al
+/// motor la diferencia. Es lo que responde a [`hoard_core::ipc::Request::Reload`]:
+/// el cliente avisa de que el conjunto cambió y el daemon —dueño del estado—
+/// decide qué vigilar.
+pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
+    let Some(handle) = engine.handle() else {
+        anyhow::bail!("the engine isn't running");
+    };
+    let (state, _path) = CliState::load_default()?;
+    let desired = library::watched_saves_from_state(&state);
+    let current: std::collections::HashSet<String> =
+        tokio::time::timeout(STATUS_TIMEOUT, handle.status())
+            .await
+            .map_err(|_| anyhow::anyhow!("the engine didn't answer in {STATUS_TIMEOUT:?}"))??
+            .into_iter()
+            .map(|s| s.save_id)
+            .collect();
+    let desired_ids: std::collections::HashSet<String> =
+        desired.iter().map(|s| s.save_id.clone()).collect();
+
+    for save in desired
+        .into_iter()
+        .filter(|s| !current.contains(&s.save_id))
+    {
+        handle.add_save(save).await?;
+    }
+    for gone in current.difference(&desired_ids) {
+        handle.remove_save(gone.clone()).await?;
+    }
+    let watched = desired_ids.len();
+    engine.set_watched(watched);
+    Ok(watched)
+}

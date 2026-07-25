@@ -976,3 +976,95 @@ decisión de cada tick** — medido en este repo el 2026-07-25: **3015
 `cloud state stale` en 36 minutos** (~84/min, >100k/día) con tick de 2 s. Regla:
 **guardar transiciones y acciones, no reposos repetidos**; y colapsar rachas del
 mismo motivo de `Hold` en una fila con contador. Crítico en el SSD del Deck.
+
+---
+
+### D.15 — Slice 4a cerrado: el daemon existe (2026-07-25)
+
+El Slice 4 se parte en sub-slices. **4a: extraer el daemon y su IPC, conviviendo
+con el motor embebido.** Desktop y CLI siguen funcionando exactamente como antes
+—nadie depende del servicio todavía—; 4b y 4c los convierten en clientes, 4d
+borra `instance.rs`, y el empaquetado + las notificaciones nativas cierran el
+Slice 4.
+
+Crate nuevo `crates/hoardd` (lib + binario). Protocolo en `hoard_core::ipc`
+(serde-only): encuadre, sobres, journal y —movidos verbatim desde
+`hoard_agent::agent`— `AgentEvent`/`BackupReason`/`AgentSlotStatus`, que es la
+ADR al pie de la letra: «el `AgentEvent` pasa a ser el protocolo de eventos por
+cable». `hoard_agent::agent` los re-exporta, así que ni el desktop ni la CLI
+notaron el movimiento, y un test golden fija la forma del JSON.
+
+**Decisiones a no deshacer:**
+
+- **El árbitro entre daemons es el bind; el pidfile sigue arbitrando *sólo*
+  daemon↔motor-embebido.** En unix el mutex del servicio es un `flock` sobre
+  `hoardd.lock` (liveness real: lo suelta el kernel al morir el proceso), y con el
+  lock en la mano el socket rancio se borra **siempre** en vez de intentar
+  adivinar si está vivo — ese orden (lock → unlink → bind) es lo que hace que dos
+  arranques simultáneos no se pisen. En Windows lo hace
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`, atómico por construcción. Mientras 4b/4c no
+  aterricen, el keeper del daemon respeta `instance::live_owner()` y reporta
+  `EngineStatus::blocked_by_pid` en vez de arrancar un segundo motor.
+- **Perder el bind es un final correcto, no un error.** El daemon que llega
+  segundo sale con código 0 y el cliente que lo lanzó se conecta al que ganó.
+  `Client::ensure_running` **no** comprueba "¿hay daemon?" antes de lanzar: eso
+  es un TOCTOU y produciría dos motores. Lanza y reconecta.
+- **El daemon sirve la IPC aunque no tenga motor, y dice por qué no lo tiene**
+  (`IpcError::EngineDown { reason }`, `EngineStatus::last_error`). Sin sesión no
+  se muere: el keeper reintenta con backoff. Un cliente que sólo viera "error"
+  reintentaría para siempre sin poder decirle nada al usuario — misma lección que
+  `Hold{reason}`.
+- **El colapso de reposos es una lista explícita, no "todo lo que se repita".**
+  `journal::collapse_key` devuelve `Some` sólo para eventos de reposo/veto
+  (`RestoreDeferred`, `SaveAutoRestore{Failed,Stuck}`, `BackupThrottled`,
+  `HeavyProcessDetected`) y la clave es el JSON completo del evento, así que sólo
+  colapsan repeticiones **idénticas** y añadir un campo no puede olvidarse de la
+  clave. `BackupScheduled` queda **fuera** aunque se repita: cada emisión
+  significa que el debounce se reinició, y como los colapsos no se empujan en
+  vivo, colapsarlo silenciaría la cuenta atrás de la UI.
+- **Un colapso no se empuja; un hueco sí se confesa.** `Backlog::gap` cuando el
+  anillo ya no tiene lo que el cliente pedía, `ServerFrame::Resync` cuando el
+  cliente se retrasa, y `Welcome::epoch` para que un cursor de otra ejecución del
+  daemon no se interprete como continuidad. Mentir por omisión aquí es el bug de
+  las campanas mudas otra vez.
+- **Todo lo que vive más que una petición va bajo `supervise`** (regla de D.12).
+  Por eso el supervisor subió de `hoard-desktop/src/commands/supervisor.rs` a
+  `hoard_agent::supervisor` (el desktop lo re-exporta desde su ruta de siempre, sin
+  tocar llamantes). Supervisados: bomba de eventos, keeper del motor, bucle de
+  accept, refresher del JWT y un keeper que rearma el par de `cloud_live` si
+  alguna de sus dos tareas muere. Las conexiones **no** se supervisan a propósito:
+  reiniciar el cuerpo de una conexión cuyo socket ya no existe no significa nada,
+  y el cliente reconecta sin perder nada gracias al cursor.
+- **`Running` aborta sus tareas al soltarse.** Soltar un `JoinHandle` no cancela
+  la task: un motor reemplazado dejaría su poller, su latido de presencia y su
+  rotador de token corriendo junto a los del nuevo — dos rotadores del mismo
+  refresh token es la familia 401 que este slice existe para matar. Por lo mismo
+  el keeper **suelta el motor muerto antes** de arrancar otro: dos `AgentLock`
+  vivos en el mismo proceso escriben el mismo pid, y el `Drop` del viejo borraría
+  el pidfile del nuevo.
+- **El canal de eventos es del daemon, no del motor.** Se crea una vez y cada
+  arranque del motor recibe un clon del emisor, así que un motor que rebota no
+  rompe los cursores de los clientes ni obliga a recrear la bomba.
+- **Config del motor: prefs del usuario, con excepción headless.** Se leen las
+  mismas prefs que el desktop; si `prefs.json` **no existe**, la máquina nunca ha
+  visto la GUI y se aplican los defaults de `hoard sync` (auto-restore y sync
+  global ON). Un servidor casero con sólo la CLI no puede acabar en "sólo subo"
+  por heredar defaults pensados para la ventana.
+- **Deuda consciente:** `hoardd/src/session.rs` es un port de
+  `hoard-cli/src/commands/session.rs` (resolución + máquina de fases del
+  refresher) con los `println!` convertidos en `tracing`. Duplicado a propósito
+  para no tocar la CLI en este sub-slice; **la copia de la CLI muere en el 4c**,
+  cuando `hoard sync` pase a ser "asegura el daemon y engánchate". Si el 4c no la
+  borra, esto es drift.
+- **Lo de Windows está verificado a nivel de tipos, no de ejecución.** La ACL del
+  named pipe (`winsec.rs`: SDDL desde el SID del token, `Everyone` fuera) y el
+  `first_pipe_instance` compilan con
+  `cargo check --target x86_64-pc-windows-msvc` sobre esos módulos aislados —el
+  check completo no cabe en Linux porque `zstd-sys`/`libsqlite3-sys` necesitan
+  MSVC—. Falta un humo real en Windows antes de fiarse.
+
+**D.8.3 (`upload_landed` / anti-relanzamiento content-addressed) sigue abierto** y
+la ADR lo declara obligatorio "con el Slice 4": no se ha hecho en 4a. Reiniciar el
+daemon aún no es rutina (nadie depende de él), pero **debe entrar antes de cerrar
+el Slice 4**, porque con el servicio en marcha `in_flight` deja de sobrevivir a
+los reinicios.

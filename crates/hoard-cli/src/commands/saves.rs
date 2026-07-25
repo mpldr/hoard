@@ -5,6 +5,8 @@ use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::library;
 
+use crate::commands::link;
+
 #[derive(Subcommand)]
 pub enum SaveCommand {
     /// Create a new save namespace for a game
@@ -30,8 +32,8 @@ pub enum SaveCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Pause automatic tracking for a save (the daemon stops watching it on its
-    /// next start). Local-only; no server needed.
+    /// Pause automatic tracking for a save (the sync service stops watching it
+    /// right away). Local-only; no server needed.
     Pause {
         /// Save id (UUID) — see `hoard saves`
         id: String,
@@ -63,28 +65,37 @@ pub enum SaveCommand {
 pub async fn run(cmd: SaveCommand) -> Result<()> {
     // Local-only commands mutate `state.json` and need no server session (a
     // Cloud user has no self-host token). Handle them before building a client.
+    //
+    // Los cuatro cambian **qué vigila el motor**, así que desde el Slice 4c se lo
+    // dicen al servicio (`Request::Reload`) en vez de pedirle al usuario que
+    // reinicie `hoard sync` — que además ya no reiniciaría ningún motor, porque
+    // el motor dejó de vivir en este proceso.
     match &cmd {
         SaveCommand::Pause { id } => {
             library::set_paused(id, true)?;
-            println!("paused {id} (restart `hoard sync` to apply)");
+            let applied = link::notify_reload().await;
+            println!("paused {id} ({applied})");
             return Ok(());
         }
         SaveCommand::Resume { id } => {
             library::set_paused(id, false)?;
-            println!("resumed {id} (restart `hoard sync` to apply)");
+            let applied = link::notify_reload().await;
+            println!("resumed {id} ({applied})");
             return Ok(());
         }
         SaveCommand::Preset { id, preset } => {
             library::set_preset(id, preset.clone())?;
+            let applied = link::notify_reload().await;
             match preset {
-                Some(p) => println!("preset for {id} set to '{p}'"),
-                None => println!("preset for {id} cleared (standard)"),
+                Some(p) => println!("preset for {id} set to '{p}' ({applied})"),
+                None => println!("preset for {id} cleared (standard) ({applied})"),
             }
             return Ok(());
         }
         SaveCommand::Path { id, path } => {
             library::set_local_path(id, path)?;
-            println!("path for {id} set to {path}");
+            let applied = link::notify_reload().await;
+            println!("path for {id} set to {path} ({applied})");
             return Ok(());
         }
         _ => {}

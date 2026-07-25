@@ -153,10 +153,12 @@ where
     }
 }
 
-/// Authenticated GET with the same 401-refresh-once dance as `cloud_pull`:
-/// the Supabase JWT rotates hourly and a stale one must never kill a feed.
-/// Returns the response body on 2xx, `None` (logged) otherwise.
-async fn authed_get(path_and_query: &str) -> Option<String> {
+/// Authenticated GET with the same 401-retry-once dance as `cloud_pull`: the
+/// Supabase JWT rotates hourly and a stale one must never kill a feed. Desde el
+/// Slice 4c el token de repuesta se **pide prestado** al servicio en vez de
+/// rotarlo aquí (ADR 0021: un único rotador). Returns the response body on 2xx,
+/// `None` (logged) otherwise.
+async fn authed_get(app: &AppHandle, path_and_query: &str) -> Option<String> {
     let creds = match crate::commands::cloud::load_active_creds() {
         Ok(Some(c)) => c,
         Ok(None) => return None, // signed out between kicks — quiet exit
@@ -196,9 +198,10 @@ async fn authed_get(path_and_query: &str) -> Option<String> {
         }
     };
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let fresh = crate::commands::cloud::refresh_active_session()
-            .await
-            .ok()?;
+        let fresh =
+            crate::commands::cloud::borrow_access_token(app, Some(creds.access_token.clone()))
+                .await
+                .ok()?;
         resp = match send(fresh.access_token).await {
             Ok(r) => r,
             Err(e) => {
@@ -215,7 +218,7 @@ async fn authed_get(path_and_query: &str) -> Option<String> {
 }
 
 async fn fetch_devices_once(app: &AppHandle) {
-    let Some(body) = authed_get("/v1/devices").await else {
+    let Some(body) = authed_get(app, "/v1/devices").await else {
         return;
     };
     // Re-emit the wire payload as-is; the UI owns the shape. Parsing first
@@ -245,7 +248,7 @@ async fn fetch_devices_once(app: &AppHandle) {
 /// armed (the backlog returns the same filtered list and goes through the same
 /// reconcile path).
 async fn fetch_notifications_once(app: &AppHandle) {
-    let Some(rows) = fetch_notification_rows().await else {
+    let Some(rows) = fetch_notification_rows(app).await else {
         return;
     };
     let snapshot = serde_json::json!({ "notifications": rows });
@@ -254,8 +257,8 @@ async fn fetch_notifications_once(app: &AppHandle) {
 
 /// GET the broadcast list, newest-first, as raw JSON rows (the wire shape
 /// already matches the UI's `ServerNotification`, `created_at` included).
-async fn fetch_notification_rows() -> Option<Vec<serde_json::Value>> {
-    let body = authed_get("/v1/notifications").await?;
+async fn fetch_notification_rows(app: &AppHandle) -> Option<Vec<serde_json::Value>> {
+    let body = authed_get(app, "/v1/notifications").await?;
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(mut v) => match v.get_mut("notifications").map(serde_json::Value::take) {
             Some(serde_json::Value::Array(rows)) => Some(rows),
@@ -278,8 +281,8 @@ async fn fetch_notification_rows() -> Option<Vec<serde_json::Value>> {
 /// a broadcast sent while the app was closed used to vanish. Newest-first,
 /// as served.
 #[tauri::command]
-pub async fn notifications_backlog() -> Result<Vec<serde_json::Value>, String> {
-    Ok(fetch_notification_rows().await.unwrap_or_default())
+pub async fn notifications_backlog(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    Ok(fetch_notification_rows(&app).await.unwrap_or_default())
 }
 
 /// Companion for the Eye panel: the UI calls this after arming its
@@ -301,8 +304,8 @@ pub async fn devices_refresh(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn notification_dismiss(app: AppHandle, id: String) -> Result<(), String> {
     use crate::commands::cloud::{
-        cloud_err_to_string, handle_session_expired, is_session_expired, load_active_creds,
-        refresh_active_session,
+        borrow_access_token, cloud_err_to_string, handle_session_expired, is_session_expired,
+        load_active_creds,
     };
     use hoard_agent::cloud_account::{self, CloudError};
     let Some(creds) = load_active_creds().map_err(|e| e.to_string())? else {
@@ -311,12 +314,14 @@ pub async fn notification_dismiss(app: AppHandle, id: String) -> Result<(), Stri
     match cloud_account::dismiss_notification(&creds.server_url, &creds.access_token, &id).await {
         Ok(()) => Ok(()),
         Err(CloudError::Unauthorized) => {
-            let fresh = refresh_active_session().await.map_err(|e| {
-                if is_session_expired(&e) {
-                    handle_session_expired(&app);
-                }
-                e.to_string()
-            })?;
+            let fresh = borrow_access_token(&app, Some(creds.access_token.clone()))
+                .await
+                .map_err(|e| {
+                    if is_session_expired(&e) {
+                        handle_session_expired(&app);
+                    }
+                    e.to_string()
+                })?;
             cloud_account::dismiss_notification(&fresh.server_url, &fresh.access_token, &id)
                 .await
                 .map_err(cloud_err_to_string)

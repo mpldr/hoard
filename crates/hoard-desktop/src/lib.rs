@@ -503,11 +503,12 @@ pub fn run() {
     // close-to-tray, which is the default). Quitting goes through the tray's
     // Quit menu item or `app.exit(0)`.
     app.run(|app_handle, event| {
-        // Don't tear the process down mid token-rotation: a refresh that GoTrue
-        // already rotated server-side but we haven't persisted yet would orphan
-        // the new token and sign the user out on next launch. Bounded wait.
+        // Salir ya no tiene nada que esperar: hasta el Slice 4c había que
+        // bloquear aquí hasta que ninguna rotación de token estuviera a medias
+        // (GoTrue rota server-side antes de que persistamos, y morir en ese hueco
+        // huerfanaba el par nuevo → sesión perdida al siguiente arranque). Quien
+        // rota es el servicio, que sobrevive a que cerremos.
         if let RunEvent::ExitRequested { .. } = event {
-            crate::commands::cloud::wait_for_refresh_quiescent_blocking();
             return;
         }
         if let RunEvent::WindowEvent {

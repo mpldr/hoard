@@ -5,6 +5,13 @@
 //! [`Engine`] vacío y alimentamos el journal a mano. Un test no puede levantar el
 //! motor de verdad — se pondría a sincronizar los saves de quien ejecuta los
 //! tests.
+//!
+//! Por la misma razón no hay aquí un caso de `Request::CloudToken`: prestarlo
+//! lee la sesión Cloud **real** de quien ejecuta los tests (keyring +
+//! `cloud.toml`) y, si le queda poca vida, la **rota** — un `cargo test` no puede
+//! tocar la sesión de nadie. Lo que decide si hay que rotar es puro y está
+//! testeado en `hoard_agent::session` (`needs_rotation`), y la forma de la
+//! petición y de la respuesta, en el golden de `hoard_core::ipc`.
 
 use std::sync::Arc;
 

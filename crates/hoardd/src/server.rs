@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use hoard_agent::session::LendError;
 use hoard_core::ipc::{
     ClientFrame, DaemonStatus, Hello, IpcError, JournalEntry, Payload, Rejected, Reply, Request,
     ServerFrame, Welcome, PROTOCOL_VERSION,
@@ -116,6 +117,30 @@ impl Daemon {
                     dirs.into_iter().map(std::path::PathBuf::from).collect();
                 self.with_engine(|h| async move { h.set_probe_candidates(dirs).await })
                     .await
+            }
+            // Tampoco pasa por `with_engine`, y es load-bearing: el rotador del
+            // token es **del daemon**, no del motor. Un motor caído por falta de
+            // sesión o por un bache de red no puede dejar al desktop sin poder
+            // hablar con la nube — y menos aún empujarle a rotar por su cuenta,
+            // que es justo lo que este slice viene a matar.
+            Request::CloudToken { rejected } => {
+                match hoard_agent::session::lend_token(rejected.as_deref()).await {
+                    Ok(token) => {
+                        if token.rotated {
+                            tracing::info!("hoardd: rotated the Cloud token for a client");
+                        }
+                        Reply::Ok(Payload::CloudToken(token))
+                    }
+                    Err(LendError::Gone(reason)) => {
+                        tracing::warn!(reason = %reason, "hoardd: no Cloud token to lend");
+                        Reply::Error(IpcError::CloudSessionExpired { reason })
+                    }
+                    Err(LendError::Transient(err)) => {
+                        let message = format!("{err:#}");
+                        tracing::warn!(error = %message, "hoardd: couldn't lend a Cloud token");
+                        Reply::Error(IpcError::Internal { message })
+                    }
+                }
             }
             // No pasa por `with_engine`: reiniciar un motor caído es
             // precisamente lo que puede hacer que vuelva (el keeper resuelve la

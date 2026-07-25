@@ -12,7 +12,7 @@ use hoard_agent::library::{self, AddGameArgs};
 use hoard_agent::manifest::Os;
 use hoard_agent::state::CliState;
 
-use crate::commands::session;
+use crate::commands::link;
 
 pub struct Args {
     /// Game name or slug to search for. Optional if `--slug` is given.
@@ -29,8 +29,9 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     // Resolve the session (Cloud or self-host) and pin the sync context before
-    // loading state, so the save is remembered in that account's map.
-    let active = session::resolve().await?;
+    // loading state, so the save is remembered in that account's map. The Cloud
+    // token comes on loan from the service — the CLI doesn't rotate (ADR 0021).
+    let active = link::resolve_session().await?;
     let client = &active.client;
 
     let label = args.label.clone().unwrap_or_else(|| "main".to_string());
@@ -74,8 +75,12 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .await?;
 
+    // El conjunto vigilado cambió: que el servicio lo relea. Antes de este slice
+    // el motor iba embebido en `hoard sync` y el save nuevo entraba en su
+    // siguiente arranque; ahora el dueño es el servicio y se le avisa.
+    let applied = link::notify_reload().await;
     println!(
-        "tracking {} ({})\n  path:    {}\n  save_id: {}",
+        "tracking {} ({})\n  path:    {}\n  save_id: {}\n  {applied}",
         target.display_name,
         target.slug,
         local_path.display(),

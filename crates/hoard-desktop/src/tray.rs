@@ -196,7 +196,6 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
             // we install elsewhere doesn't help us here — that's only for
             // window closes, not explicit quits.
             tracing::info!("user requested quit from tray");
-            crate::commands::cloud::wait_for_refresh_quiescent_blocking();
             app.exit(0);
         }
         other => tracing::debug!(item = other, "unhandled tray menu id"),

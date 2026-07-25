@@ -12,9 +12,15 @@
 //! session's secret store (Secret Service / Keychain / DPAPI), which a root
 //! service can't read. So the service runs as you.
 //!
-//! The service's `ExecStart` is `hoard sync run` — the hidden subcommand that
-//! actually runs the [`daemon`] loop. Everything the user types
-//! (`start`/`stop`/`status`/…) just drives the OS service manager.
+//! The service's `ExecStart` is `hoard sync run`, which since the Slice 4c no
+//! longer *is* the engine: it makes sure `hoardd` is up and follows its journal
+//! (see [`daemon`]). Pointing the unit straight at `hoardd` is the Slice 4d
+//! (packaging), so until then the unit's process and the service's lifetime stay
+//! tied together on purpose — stopping the unit stops the sync, which is what
+//! "stop" has always meant here.
+//!
+//! Everything the user types (`start`/`stop`/`status`/…) drives the OS service
+//! manager; what the *service* is doing comes from the service itself over IPC.
 
 use std::path::PathBuf;
 
@@ -45,17 +51,117 @@ pub enum SyncCommand {
 pub async fn run(action: Option<SyncCommand>) -> Result<()> {
     match action {
         None => {
-            // Paint the overall status panel first, then the OS service detail
+            // Paint the overall status panel first, then the service detail
             // below it — the banner gives cli/server/session/sync at a glance.
             let _ = crate::commands::banner::show(false).await;
+            service_detail().await;
             status().await
         }
         Some(SyncCommand::Start) => start().await,
         Some(SyncCommand::Stop) => stop().await,
         Some(SyncCommand::Restart) => restart().await,
-        Some(SyncCommand::Logs) => logs().await,
-        // The service manager invokes this; it's the real loop.
+        Some(SyncCommand::Logs) => {
+            // Dos mitades, y las dos importan: el diagnóstico del motor está en
+            // el log del servicio (que corre desasido, así que no cae en el
+            // journal de la unidad ni en la consola de nadie), y la crónica de
+            // eventos, en lo que imprime el cliente.
+            service_logs();
+            logs().await
+        }
+        // The service manager invokes this; it attaches to the service.
         Some(SyncCommand::Run { backup_only }) => daemon::run(backup_only).await,
+    }
+}
+
+/// Lo que el **servicio** dice de sí mismo, que es distinto de lo que el gestor
+/// de servicios sabe: el gestor sólo conoce el proceso que él lanzó, y el motor
+/// vive en `hoardd`. No lo arranca — un panel de estado que levanta un servicio
+/// sería el peor efecto secundario posible.
+async fn service_detail() {
+    let Some(status) = crate::commands::link::status().await else {
+        println!("  service: not running");
+        return;
+    };
+    println!(
+        "  service: hoardd {} · pid {} · up {}",
+        status.daemon_version,
+        status.pid,
+        fmt_uptime(status.uptime_secs)
+    );
+    if status.engine.running {
+        println!(
+            "  engine:  up · {} save(s) · {}",
+            status.slots.len().max(status.engine.watched),
+            status.engine.server.as_deref().unwrap_or("unknown server")
+        );
+    } else {
+        // Un motor caído **con motivo** es diagnosticable; sin motivo es el fallo
+        // invisible que costó dos sesiones (D.11/D.12).
+        println!(
+            "  engine:  down · {}",
+            status
+                .engine
+                .last_error
+                .as_deref()
+                .unwrap_or("still starting")
+        );
+    }
+}
+
+/// Las últimas líneas del log de `hoardd`. Es el log que importa desde el Slice
+/// 4c: el servicio se lanza desasido (sesión propia, stdio a `null`), así que su
+/// salida no aparece ni en el journal de la unidad ni en la terminal que lo
+/// arrancó — sólo en su fichero.
+fn service_logs() {
+    let Ok(path) = hoard_agent::config::CliConfig::logs_dir().map(|d| d.join("hoardd.log")) else {
+        return;
+    };
+    if !path.exists() {
+        println!("no service log yet at {}", path.display());
+        return;
+    }
+    println!("── service · {} ──", path.display());
+    match daemon::tail_last_n_lines(&path, 40) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(err) => eprintln!("warning: couldn't read the service log: {err:#}"),
+    }
+    println!();
+}
+
+fn fmt_uptime(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// `hoard sync stop`: quita el autostart **y** para el servicio.
+///
+/// Los dos pasos, y en este orden. Quitar la unidad sin más dejaría a `hoardd`
+/// sincronizando —sobrevive a sus clientes por diseño—, así que "stop" habría
+/// dejado de significar lo que significaba. Y al revés: parar el servicio sin
+/// quitar la unidad lo resucitaría en el siguiente login.
+async fn stop() -> Result<()> {
+    let unit = stop_unit().await;
+    stop_service().await;
+    unit
+}
+
+/// Para el servicio si está arriba. El gestor de servicios sólo mata al proceso
+/// que lanzó, y `hoardd` no es ése. No lo arranca para pararlo, obviamente.
+async fn stop_service() {
+    let Some(mut client) = crate::commands::link::attached("stop").await else {
+        return;
+    };
+    match crate::commands::link::ask(&mut client, hoard_core::ipc::Request::Shutdown).await {
+        Ok(_) => println!("the Hoard service stopped."),
+        Err(err) => eprintln!("warning: the Hoard service didn't acknowledge the stop: {err:#}"),
     }
 }
 
@@ -198,7 +304,7 @@ async fn start() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn stop() -> Result<()> {
+async fn stop_unit() -> Result<()> {
     ensure_systemd()?;
     if !unit_path()?.exists() {
         println!("hoard sync is not installed.");
@@ -325,7 +431,7 @@ async fn start() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn stop() -> Result<()> {
+async fn stop_unit() -> Result<()> {
     let uid = current_uid().await?;
     let domain = format!("gui/{uid}");
     let plist = plist_path()?;
@@ -521,7 +627,7 @@ async fn start() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-async fn stop() -> Result<()> {
+async fn stop_unit() -> Result<()> {
     if !task_exists().await {
         println!("hoard sync is not installed.");
         return Ok(());
@@ -554,43 +660,27 @@ async fn status() -> Result<()> {
         let _ = run_status("schtasks", &["/Query", "/TN", TASK, "/V", "/FO", "LIST"]).await;
         return Ok(());
     }
-    // No installed task: another frontend (the desktop app) may still be
-    // running the shared agent. Report it the same way the banner does so
-    // `hoard` and `hoard sync` agree instead of saying "not installed".
-    if let Some(pid) = hoard_agent::instance::live_owner() {
-        println!("hoard sync running via another frontend (desktop app) · pid {pid}");
-        return Ok(());
-    }
-    println!("hoard sync is not installed. Run `hoard sync start`.");
+    // No installed task, which no longer means "no sync": the service may be up
+    // because the desktop app (or a `hoard track`) asked for it. `service_detail`
+    // above already printed what it's doing, so only say what's missing here.
+    println!("hoard sync isn't installed as a logon task. Run `hoard sync start`.");
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 async fn logs() -> Result<()> {
-    if task_exists().await {
-        // `hoard sync run` writes tracing events to this file (see
-        // `daemon::sync_log_writer`); tail the last ~80 lines.
-        if let Some(path) = daemon::sync_log_path() {
-            if path.exists() {
-                for line in daemon::tail_last_n_lines(&path, 80)? {
-                    println!("{line}");
-                }
-                return Ok(());
+    // `hoard sync run` writes the events it prints to this file (Task Scheduler
+    // drops stdout/stderr), so it's the client half of the story; the service's
+    // own half went above.
+    if let Some(path) = daemon::sync_log_path() {
+        if path.exists() {
+            for line in daemon::tail_last_n_lines(&path, 80)? {
+                println!("{line}");
             }
+            return Ok(());
         }
-        println!("no service logs yet at the expected path.");
-        return Ok(());
     }
-    // No task: if the desktop app runs the agent, it manages its own logs —
-    // don't reference Task Scheduler (which isn't installed here).
-    if hoard_agent::instance::live_owner().is_some() {
-        println!(
-            "sync is run by the desktop app, which manages its own logs. \
-             Use the desktop app or run `hoard sync run` in a terminal."
-        );
-        return Ok(());
-    }
-    println!("sync isn't running. Start it with `hoard sync start`.");
+    println!("no client logs yet at the expected path.");
     Ok(())
 }
 
@@ -603,7 +693,7 @@ async fn start() -> Result<()> {
     bail!("no service backend for this OS — run `hoard sync run` under your own supervisor")
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn stop() -> Result<()> {
+async fn stop_unit() -> Result<()> {
     bail!("no service backend for this OS")
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

@@ -54,7 +54,7 @@ use anyhow::{anyhow, Context, Result};
 use hoard_agent::agent::{AgentConfig, AgentEvent};
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
-use hoard_core::ipc::{AgentSlotStatus, DaemonStatus, IpcError, Payload, Request};
+use hoard_core::ipc::{AgentSlotStatus, CloudToken, DaemonStatus, IpcError, Payload, Request};
 use hoardd::client::{Client, Push};
 use hoardd::endpoint::Endpoint;
 use serde::Serialize;
@@ -239,6 +239,24 @@ impl DaemonLink {
         match self.request(Request::Status).await? {
             Payload::Status(status) => Ok(status),
             other => Err(anyhow!("unexpected answer to status: {other:?}")),
+        }
+    }
+
+    /// Pide prestado un token Cloud válido al servicio.
+    ///
+    /// **El desktop ya no rota.** El servicio es el único que toca el refresh
+    /// token de `cloud.toml` (ADR 0021, Parte A: "un único rotador"), así que
+    /// aquí sólo se pide uno prestado y se usa. Que dos procesos rotaran el mismo
+    /// refresh token es la causa raíz de la familia 401/realtime-mudo: GoTrue
+    /// revoca la familia entera al detectar el reuso, y eso no se recupera ni
+    /// reiniciando.
+    ///
+    /// `rejected` es el token con el que acabamos de comer un 401: sin él, un
+    /// token revocado server-side pero aún "fresco" volvería una y otra vez.
+    pub async fn cloud_token(&self, rejected: Option<String>) -> Result<CloudToken> {
+        match self.request(Request::CloudToken { rejected }).await? {
+            Payload::CloudToken(token) => Ok(token),
+            other => Err(anyhow!("unexpected answer to cloud_token: {other:?}")),
         }
     }
 

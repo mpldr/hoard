@@ -12,6 +12,12 @@ path = "src/main.rs"
 [dependencies]
 hoard-agent = { path = "../hoard-agent" }
 
+# La CLI es un cliente del servicio (ADR 0021, Slice 4c): `hoardd` trae el
+# cliente IPC + "spawn if absent", y `hoard-core` los tipos que viajan por el
+# socket. Igual que el desktop desde el 4b.
+hoard-core = { path = "../hoard-core" }
+hoardd = { path = "../hoardd" }
+
 tokio = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }

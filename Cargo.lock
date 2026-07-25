@@ -3156,6 +3156,8 @@ dependencies = [
  "anyhow",
  "clap",
  "hoard-agent",
+ "hoard-core",
+ "hoardd",
  "indicatif",
  "rpassword",
  "tempfile",

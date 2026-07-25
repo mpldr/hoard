@@ -1,45 +1,63 @@
-//! `hoard daemon` — the desktop app without a window. Starts the shared engine
-//! (`agent::spawn`) over the saves already remembered in `state.json` and keeps
-//! automatic sync going: it backs up changes and, by default, restores and
-//! opens the low-latency pull paths (global-sync), same as the desktop's
-//! Automatic Mode. `hoard sync` is the one-shot sibling: it backs up everything
-//! tracked and exits.
+//! `hoard sync run` — la CLI enganchada al servicio (ADR 0021, Slice 4c).
+//!
+//! Antes de este slice esto **era** el motor: `agent::spawn` sobre los saves de
+//! `state.json`, el pidfile, el rotador del token Cloud, el poller y el latido de
+//! presencia, todo dentro del proceso de la CLI. Ahora nada de eso vive aquí: el
+//! motor es de `hoardd` (uno por usuario, residente, sobrevive a cerrar la app),
+//! y este comando hace lo mismo que el desktop desde el 4b — **asegura el
+//! servicio y se engancha a su journal** — sólo que imprimiendo líneas en vez de
+//! pintar una ventana.
+//!
+//! ## Enganchar es seguir, no releer
+//!
+//! Nos suscribimos desde el cursor que el daemon reporta en el `Welcome`, así que
+//! sólo se imprime lo que pasa **a partir de ahora**. El desktop sí pide el
+//! backlog entero, y con razón: tiene estado en pantalla que reconstruir. Aquí no
+//! hay estado; volcar el anillo al arrancar sólo haría pasar por actual un
+//! historial de ayer. (El hueco entre el `Welcome` y el `Subscribe` sí viaja: el
+//! cursor es del `Welcome`, no del momento de suscribirse.)
+//!
+//! ## Parar esto sí para el sync
+//!
+//! Es la excepción a "cerrar un cliente nunca mata el motor", y es deliberada:
+//! este proceso es el `ExecStart` del servicio de usuario, así que para systemd /
+//! launchd / Task Scheduler **es** el servicio. Si un `systemctl --user stop`
+//! dejara a `hoardd` sincronizando, "parar el sync" habría dejado de significar
+//! nada — y un `hoard sync restart` tras `hoard upgrade` no relevaría el binario
+//! nuevo. Así que al recibir la señal se manda `Shutdown` por IPC, que es
+//! exactamente lo que la ADR llama "una orden explícita del usuario".
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
-
-// Only used by `tail_last_n_lines` (Windows `logs()` + tests), so gated to
-// match it — avoids an unused-import warning on Linux where the tail helper
-// isn't compiled (Linux `logs()` uses journald).
-#[cfg(any(target_os = "windows", test))]
-use anyhow::Context;
-#[cfg(any(target_os = "windows", test))]
+use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom};
 
-use hoard_agent::agent::{self, AgentConfig, AgentEvent, WatchedSave};
-use hoard_agent::cloud_live;
+use hoard_agent::agent::AgentEvent;
 use hoard_agent::config::CliConfig;
-use hoard_agent::library;
-use hoard_agent::state::CliState;
-use tokio::sync::mpsc;
+use hoard_core::ipc::{DaemonStatus, Payload, Request};
+use hoardd::client::Push;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-use crate::commands::session::{self, Active};
+use crate::commands::link;
 
-/// Path to the shared agent lock. The banner (bare `hoard`) reads it to paint the
-/// sync on/off. It's the same file the desktop agent uses (see
-/// `hoard_agent::instance`), so only one live agent per machine either way.
-pub fn pidfile_path() -> Option<std::path::PathBuf> {
-    hoard_agent::instance::lock_path()
-}
+/// Espera entre reintentos del enganche. El caso normal es que el servicio siga
+/// vivo y esto no llegue a usarse; cubre que se reinicie (una actualización) sin
+/// que el stream se quede mudo para siempre.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
-/// Path to the sync service log file (`<state_dir>/logs/sync.log`). Written by
-/// `hoard sync run` (see [`sync_log_writer`]) so the Windows Task Scheduler
-/// service — which drops stdout/stderr — leaves a tail-able log behind. macOS
-/// launchd already redirects via the plist; Linux systemd uses journald, so
-/// the extra file is harmless there. `None` if the state dir can't be resolved.
+/// Cuánto se espera al motor para aplicarle `--backup-only`. El servicio resuelve
+/// la sesión antes de tener motor, así que en el boot la orden llega antes que el
+/// motor: sin esta espera, la bandera se perdería en silencio y el servicio
+/// escribiría en disco justo cuando el usuario pidió que no lo hiciera.
+const BACKUP_ONLY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Ruta del log del servicio de sync escrito por *este* proceso
+/// (`<state_dir>/logs/sync.log`). El Task Scheduler de Windows tira
+/// stdout/stderr, así que sin fichero no quedaría rastro de los eventos que
+/// imprimimos; launchd redirige por el plist y systemd captura en journald, donde
+/// el fichero extra es inofensivo. El log del **servicio** es otro
+/// (`hoardd.log`); ver [`super::service`].
 pub fn sync_log_path() -> Option<std::path::PathBuf> {
     CliConfig::state_dir()
         .ok()
@@ -60,11 +78,9 @@ pub fn sync_log_writer() -> Option<(NonBlocking, WorkerGuard)> {
 
 /// Reads the last `n` lines of `path`. Efficient for large files: only the
 /// trailing 256 KiB is read and the partial line at the chunk boundary is
-/// dropped. Portable (no `tail` subprocess) so it works on Windows where
-/// `tail` isn't available. Only called from the Windows `logs()` (and tests),
-/// so it's gated to those configs to avoid dead-code warnings on Linux (whose
-/// `logs()` uses journald).
-#[cfg(any(target_os = "windows", test))]
+/// dropped. Portable (no `tail` subprocess) so it works on Windows too — and
+/// since the Slice 4c it's what `hoard sync logs` uses on every platform to tail
+/// the service's own log.
 pub(crate) fn tail_last_n_lines(path: &Path, n: usize) -> Result<Vec<String>> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -91,119 +107,163 @@ pub(crate) fn tail_last_n_lines(path: &Path, n: usize) -> Result<Vec<String>> {
     Ok(lines[drop..].iter().map(|s| s.to_string()).collect())
 }
 
-/// `hoard daemon`: resident. `backup_only` disables restore/global-sync (only
-/// backs up, never writes to your disk).
+/// `hoard sync run`: asegura el servicio y sigue su journal hasta que nos manden
+/// parar. `backup_only` le pide al motor que no restaure ni abra los caminos de
+/// pull (sólo sube, nunca escribe en tu disco).
 pub async fn run(backup_only: bool) -> Result<()> {
-    // Refuse to start if another Hoard agent already holds the lock — a second
-    // CLI daemon *or* the desktop app. Two agents fight over each save (a
-    // restore/backup ping-pong) and rotate the shared Cloud refresh token
-    // against each other (reuse-detection → 401).
-    if let Some(pid) = hoard_agent::instance::live_owner() {
-        bail!(
-            "another Hoard agent is already running (pid {pid}) — the desktop app \
-             or another `hoard sync`. Close it first, or use `hoard sync` for a \
-             one-shot backup."
-        );
+    let mut commands = link::ensure("commands").await?;
+    let welcome = commands.welcome().clone();
+    println!(
+        "hoard sync · service {} · pid {}",
+        welcome.daemon_version, welcome.pid
+    );
+    match link::ask(&mut commands, Request::Status).await {
+        Ok(Payload::Status(status)) => print_engine(&status),
+        Ok(other) => println!("  (unexpected answer to status: {other:?})"),
+        Err(err) => println!("  couldn't read the service status: {err:#}"),
     }
 
-    let (active, mut state, state_path, saves) = setup().await?;
-    let mode = if backup_only {
-        "backup only"
-    } else {
-        "full sync (global-sync)"
-    };
-    println!(
-        "hoard sync · {} save(s) · {} · {}",
-        saves.len(),
-        mode,
-        active.server
-    );
+    if backup_only {
+        // Una bandera de este proceso sobre un motor que es de otro: se aplica en
+        // cuanto haya motor y se deshace al parar (paramos el servicio al salir).
+        tokio::spawn(apply_backup_only());
+        println!("  backup only: never restores or writes to your disk");
+    }
     println!("Ctrl-C (or `hoard sync stop`) to stop.\n");
 
-    // Take the shared agent lock (also what the banner reads for on/off). Removed
-    // on exit (Drop), Ctrl-C included.
-    let _pid = hoard_agent::instance::AgentLock::acquire();
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        // No retorna nunca: reconecta sola, porque el servicio puede reiniciarse
+        // (una actualización) sin que este proceso tenga otra forma de enterarse.
+        _ = follow() => {}
+    }
 
-    // At boot the service manager starts us as soon as the network is up, but a
-    // self-hosted server on the same box may still be coming online — the initial
-    // auto-restore then fails with "connection refused" for every save. Wait for
-    // `/v1/health` to answer before spawning the agent. Bounded, so we never hang
-    // if the server simply isn't running (the agent retries per-save anyway).
-    wait_for_server(&active).await;
+    println!("\nstopping the Hoard service…");
+    stop_service().await;
+    Ok(())
+}
 
-    // On Cloud, refresh the JWT in the background so the engine doesn't start
-    // returning 401 an hour after it starts.
-    let _refresh = active
-        .cloud
-        .clone()
-        .map(|s| session::spawn_cloud_refresh(active.client.clone(), s));
-
-    // Clone the client for the Cloud push before `agent::spawn` consumes it
-    // (shares the token via Arc, so the periodic refresh reaches both).
-    let live_client = active.client.clone();
-
-    // Presence heartbeater (Eye panel): the daemon reports this machine as
-    // online + what it's playing, same as the desktop. Gates itself to Cloud
-    // internally; against self-hosted it stays silent.
-    let (presence, _presence_task) = hoard_agent::presence::spawn(live_client.clone());
-
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
-    let (handle, _task) = agent::spawn(active.client, build_config(backup_only), saves, tx);
-
-    // Low-latency Cloud push (Supabase Realtime + fallback poll), same as the
-    // desktop app: pulls from the cloud in ~1s instead of waiting for the sweep.
-    // Cloud only and with full sync (backup_only never writes).
-    let _live = if active.is_cloud && !backup_only {
-        Some(cloud_live::spawn(
-            live_client,
-            handle.clone(),
-            cloud_live::Config {
-                poll_interval: Duration::from_secs(
-                    hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS as u64,
-                ),
-                global_sync: true,
-            },
-        ))
+/// Línea de estado del motor dentro del servicio. Un motor caído **con motivo**
+/// es diagnosticable; sin motivo es el fallo invisible que costó D.11/D.12.
+fn print_engine(status: &DaemonStatus) {
+    if status.engine.running {
+        println!(
+            "  engine up · {} save(s) · {}",
+            status.slots.len().max(status.engine.watched),
+            status.engine.server.as_deref().unwrap_or("unknown server")
+        );
     } else {
-        None
-    };
+        println!(
+            "  engine down · {}",
+            status
+                .engine
+                .last_error
+                .as_deref()
+                .unwrap_or("still starting")
+        );
+    }
+}
 
+/// Le pide al motor el modo "sólo subida" en cuanto exista. Ver
+/// [`BACKUP_ONLY_DEADLINE`]: en el arranque el motor llega después que nosotros,
+/// y una bandera perdida en silencio aquí significa escribir en el disco del
+/// usuario contra lo que pidió.
+async fn apply_backup_only() {
+    let deadline = Instant::now() + BACKUP_ONLY_DEADLINE;
     loop {
-        tokio::select! {
-            _ = shutdown_signal() => {
-                println!("\nstopping…");
-                // Final presence beat first (bounded wait inside): flips this
-                // device offline on the other machines' Eye panels right away.
-                presence.closing().await;
-                let _ = handle.shutdown().await;
-                break;
+        if let Some(mut client) = link::attached("backup-only").await {
+            let sent = link::ask(&mut client, Request::SetAutoRestore { enabled: false })
+                .await
+                .and(link::ask(&mut client, Request::SetGlobalSync { enabled: false }).await);
+            match sent {
+                Ok(_) => return,
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "warning: couldn't put the service in backup-only mode ({err:#}). \
+                             It may restore saves to this machine."
+                        );
+                        return;
+                    }
+                }
             }
-            ev = rx.recv() => {
-                let Some(ev) = ev else { break };
-                // Presence: mirror game transitions to the heartbeater.
-                match &ev {
-                    AgentEvent::GameStarted { game_slug, .. } => {
-                        presence.game_started(game_slug.clone());
-                    }
-                    AgentEvent::GameStopped { game_slug, .. } => {
-                        presence.game_stopped(game_slug.clone());
-                    }
-                    _ => {}
-                }
-                if let Some(line) = render(&ev) {
-                    println!("{line}");
-                }
-                persist(&ev, &mut state, &state_path);
+        } else if Instant::now() >= deadline {
+            eprintln!("warning: couldn't reach the service to set backup-only mode.");
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Sigue el journal del servicio e imprime lo que llega. No retorna: una
+/// conexión caída se reintenta, porque el servicio puede reiniciarse (una
+/// actualización) sin que este proceso tenga otra forma de enterarse.
+async fn follow() {
+    loop {
+        match follow_once().await {
+            Ok(()) => eprintln!("warning: the Hoard service closed the connection; reconnecting…"),
+            Err(err) => eprintln!("warning: lost the Hoard service ({err:#}); reconnecting…"),
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn follow_once() -> Result<()> {
+    let mut events = link::ensure("events").await?;
+    // Desde el cursor del `Welcome`: seguir, no releer. Lo que ocurra entre el
+    // saludo y la suscripción sí viene en el backlog, así que no hay hueco.
+    let since = events.welcome().cursor;
+    let backlog = link::ask(&mut events, Request::Subscribe { since: Some(since) }).await?;
+    if let Payload::Backlog(backlog) = backlog {
+        for entry in backlog.entries {
+            print_event(&entry.event);
+        }
+    }
+    while let Some(push) = events.next_push().await? {
+        match push {
+            Push::Event(entry) => print_event(&entry.event),
+            // Nos retrasamos y el canal descartó filas. El daemon lo confiesa en
+            // vez de dejar el hueco invisible; para un stream de terminal basta
+            // con decirlo y seguir desde el cursor nuevo.
+            Push::Resync { cursor, dropped } => {
+                eprintln!("warning: fell behind the service's events ({dropped} dropped)");
+                let _ = link::ask(
+                    &mut events,
+                    Request::Subscribe {
+                        since: Some(cursor),
+                    },
+                )
+                .await?;
             }
         }
     }
     Ok(())
 }
 
+fn print_event(event: &AgentEvent) {
+    if let Some(line) = render(event) {
+        println!("{line}");
+    }
+}
+
+/// Para el servicio. Conexión nueva a propósito: si el daemon se reinició
+/// mientras seguíamos su journal, la orden tiene que llegarle **al que está
+/// ahora**. No lo arranca: no tendría sentido levantar un servicio para pararlo.
+async fn stop_service() {
+    let Some(mut client) = link::attached("stop").await else {
+        println!("the Hoard service wasn't running.");
+        return;
+    };
+    match link::ask(&mut client, Request::Shutdown).await {
+        Ok(_) => println!("stopped."),
+        Err(err) => eprintln!("warning: the service didn't acknowledge the stop: {err:#}"),
+    }
+}
+
 /// Resolves when the process is asked to stop: Ctrl-C anywhere, plus SIGTERM on
 /// unix — the signal `systemctl --user stop` / `launchctl bootout` send. Without
 /// the SIGTERM arm the service manager would have to SIGKILL us, skipping the
-/// clean agent shutdown.
+/// clean shutdown of the service.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -223,70 +283,6 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-/// Poll `/v1/health` until the server answers, up to a bounded deadline. Skips
-/// the Cloud endpoint (always up — no point adding startup latency there). If the
-/// deadline passes it warns and returns, letting the agent try anyway.
-async fn wait_for_server(active: &Active) {
-    if active.is_cloud {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut announced = false;
-    loop {
-        if active.client.health().await.is_ok() {
-            if announced {
-                println!("server is up.");
-            }
-            return;
-        }
-        if Instant::now() >= deadline {
-            eprintln!(
-                "warning: server at {} still unreachable after 60s; continuing anyway.",
-                active.server
-            );
-            return;
-        }
-        if !announced {
-            println!("waiting for server at {} to come online…", active.server);
-            announced = true;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-type Setup = (Active, CliState, std::path::PathBuf, Vec<WatchedSave>);
-
-/// Active session + saves to watch. Resolves Cloud or self-host (pinning the
-/// context) and fails early if there's no login or nothing tracked on this
-/// machine.
-async fn setup() -> Result<Setup> {
-    let active = session::resolve_resilient().await?;
-
-    let (state, state_path) = CliState::load_default()?;
-    let saves = library::watched_saves_from_state(&state);
-    if saves.is_empty() {
-        bail!(
-            "no saves tracked on this machine. \
-             Add one with `hoard track \"<game>\"` first."
-        );
-    }
-    Ok((active, state, state_path, saves))
-}
-
-/// Agent config. By default global-sync + auto-restore ON (headless self-host
-/// wants two-way sync). `backup_only` turns them off.
-fn build_config(backup_only: bool) -> AgentConfig {
-    // Parks the local copy before letting a newer remote overwrite it (never
-    // destroys data silently).
-    let conflict_root = CliConfig::state_dir().ok().map(|d| d.join("conflicts"));
-    AgentConfig {
-        global_sync: !backup_only,
-        auto_restore: !backup_only,
-        conflict_root,
-        ..AgentConfig::default()
     }
 }
 
@@ -346,24 +342,6 @@ fn render(ev: &AgentEvent) -> Option<String> {
         }
         _ => return None,
     })
-}
-
-/// Persists to `state.json` what the desktop persists after a backup: version
-/// and set-hash, so a daemon restart doesn't re-upload identical snapshots.
-fn persist(ev: &AgentEvent, state: &mut CliState, path: &Path) {
-    if let AgentEvent::BackupSuccess {
-        save_id,
-        version_num,
-        set_hash,
-        ..
-    } = ev
-    {
-        if let Some(s) = state.saves.get_mut(save_id) {
-            s.last_version_num = Some(*version_num);
-            s.set_hash = set_hash.clone();
-        }
-        let _ = state.save(path);
-    }
 }
 
 fn fmt_bytes(b: u64) -> String {

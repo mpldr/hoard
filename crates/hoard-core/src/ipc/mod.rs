@@ -225,6 +225,23 @@ pub enum Request {
     SetProbeCandidates {
         dirs: Vec<String>,
     },
+    /// **Préstame un token Cloud válido.** El daemon es el único que rota
+    /// `cloud.toml` (Parte A: "un único rotador"), así que quien necesite hablar
+    /// con la nube —el desktop para sus llamadas REST, la CLI para un one-shot—
+    /// pide aquí en vez de refrescar por su cuenta. Dos procesos rotando el
+    /// mismo refresh token es la reuse-detection de GoTrue, que revoca la
+    /// familia entera: 401 permanente y sesión muerta sin arreglo.
+    ///
+    /// `rejected` es el token que al cliente le acaban de rechazar con un 401.
+    /// Sin él, un cliente que come un 401 con un token todavía "fresco" (revocado
+    /// server-side, reloj desfasado) recibiría el mismo token una y otra vez y
+    /// reintentaría en bucle. Con él, el daemon rota **sólo** si el que serviría
+    /// es justo ese; si ya lo rotó otro, contesta con el nuevo sin gastar una
+    /// rotación.
+    CloudToken {
+        #[serde(default)]
+        rejected: Option<String>,
+    },
     /// La sesión en disco cambió (el usuario entró con otra cuenta Cloud, o
     /// cerró sesión): tira el motor y deja que el keeper lo levante resolviendo
     /// las credenciales de nuevo.
@@ -262,6 +279,29 @@ pub enum Payload {
     },
     Status(DaemonStatus),
     Backlog(Backlog),
+    CloudToken(CloudToken),
+}
+
+/// Un token Cloud prestado por el daemon (respuesta a [`Request::CloudToken`]).
+///
+/// Es un **préstamo**, no una transferencia: el cliente lo usa para sus
+/// peticiones y no lo persiste. El par completo (access + refresh) vive donde
+/// siempre —keyring + `cloud.toml`— y sólo lo escribe el daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudToken {
+    /// JWT de Supabase con vida suficiente para usarlo ahora mismo.
+    pub access_token: String,
+    /// A qué servidor Cloud pertenece (el cliente no tiene por qué asumir el
+    /// default: un build de dev apunta a otro sitio por entorno).
+    pub server_url: String,
+    /// `exp` del JWT en segundos de época, si se pudo leer. El cliente puede
+    /// adelantarse a la expiración sin decodificar nada.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// El daemon rotó para servir esta respuesta. Sólo informativo (logs): al
+    /// cliente le da igual, y precisamente por eso ya no es asunto suyo.
+    #[serde(default)]
+    pub rotated: bool,
 }
 
 /// Error de aplicación. La conexión sigue viva (a diferencia de
@@ -279,6 +319,17 @@ pub enum IpcError {
     /// al usuario.
     #[error("the Hoard service has no engine: {reason}")]
     EngineDown { reason: String },
+    /// No hay sesión Cloud que prestar y **rotar no lo arregla**: no hay sesión
+    /// en disco, o GoTrue revocó la familia entera de tokens (reuse-detection).
+    /// Sólo un login nuevo la recupera.
+    ///
+    /// Es una variante propia porque el cliente actúa distinto: ante un fallo
+    /// transitorio reintenta, ante esto cierra sesión localmente y le pide al
+    /// usuario que vuelva a entrar. Antes del Slice 4c esa distinción la hacía
+    /// cada frontend downcasteando su propio `RefreshTokenStale`; ahora viaja por
+    /// el cable porque quien lo descubre es el daemon.
+    #[error("the Hoard Cloud session is gone: {reason}")]
+    CloudSessionExpired { reason: String },
     /// Esa petición no existe en esta versión del protocolo.
     #[error("this Hoard service doesn't support `{op}`")]
     Unsupported { op: String },
@@ -438,6 +489,7 @@ mod tests {
                 "set_probe_candidates",
             ),
             (Request::RestartEngine, "restart_engine"),
+            (Request::CloudToken { rejected: None }, "cloud_token"),
             (Request::Shutdown, "shutdown"),
         ];
         for (request, op) in cases {
@@ -454,5 +506,47 @@ mod tests {
         assert!(engine.running);
         assert!(engine.blocked_by_pid.is_none());
         assert!(engine.since.is_none());
+    }
+
+    /// El préstamo del token: el `rejected` es opcional en el cable (un cliente
+    /// que sólo quiere "uno válido" no manda nada) y la respuesta lleva la
+    /// caducidad para que el cliente no tenga que decodificar el JWT.
+    #[test]
+    fn the_cloud_token_loan_round_trips() {
+        let asked: Request = serde_json::from_str(r#"{"op":"cloud_token"}"#).unwrap();
+        assert!(matches!(asked, Request::CloudToken { rejected: None }));
+
+        let lent = Payload::CloudToken(CloudToken {
+            access_token: "jwt".into(),
+            server_url: "https://api.hoard.services".into(),
+            expires_at: Some(1_800_000_000),
+            rotated: true,
+        });
+        let json = serde_json::to_value(&lent).unwrap();
+        assert_eq!(json["payload"], "cloud_token");
+        assert_eq!(json["access_token"], "jwt");
+        assert_eq!(json["expires_at"], 1_800_000_000i64);
+
+        // Un daemon que no sepa la caducidad sigue siendo respuesta válida.
+        let minimal: CloudToken =
+            serde_json::from_str(r#"{"access_token":"jwt","server_url":"u"}"#).unwrap();
+        assert!(minimal.expires_at.is_none());
+        assert!(!minimal.rotated);
+    }
+
+    /// "La sesión Cloud se acabó" tiene variante propia porque el cliente actúa
+    /// distinto que ante un fallo transitorio: cierra sesión en vez de
+    /// reintentar. Su nombre por cable es contrato.
+    #[test]
+    fn a_dead_cloud_session_is_its_own_error() {
+        let err = IpcError::CloudSessionExpired {
+            reason: "the refresh token family was revoked".into(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["error"], "cloud_session_expired");
+        let back: IpcError = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IpcError::CloudSessionExpired { .. }));
+        // Llega legible al usuario (toast / stdout), no como `{:?}`.
+        assert!(back.to_string().contains("revoked"));
     }
 }

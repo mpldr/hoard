@@ -9,12 +9,14 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use hoard_agent::api::ApiClient;
 use hoard_agent::cloud_auth;
 use hoard_agent::config::CliConfig;
 use hoard_agent::state;
+
+use crate::commands::link;
 
 pub async fn login(token: Option<String>, server: Option<String>, force_email: bool) -> Result<()> {
     // Explicit flags skip the menu and stay scriptable.
@@ -200,6 +202,11 @@ async fn login_cloud_email(base: &str) -> Result<()> {
 }
 
 /// Persists the session and sets the Cloud context. Shared by both paths.
+///
+/// El login es una de las dos únicas escrituras del par de tokens que no hace el
+/// servicio (la otra es el logout, que lo borra): acuñar una sesión no es rotarla.
+/// Lo que sí es del servicio es lo que venga después, así que se le avisa: su
+/// motor está hablando con la cuenta que acaba de dejar de valer.
 async fn finish_cloud_login(base: &str, tokens: &cloud_auth::Tokens) -> Result<()> {
     // Wipe any previous session first. `store_tokens` is read-modify-write and
     // would otherwise keep the old `user` snapshot / server_url, so signing in as
@@ -208,6 +215,7 @@ async fn finish_cloud_login(base: &str, tokens: &cloud_auth::Tokens) -> Result<(
     cloud_auth::store_tokens(tokens, base)?;
     let me = cloud_auth::fetch_me(base, &tokens.access).await?;
     state::set_active_context(Some(state::cloud_context(&me.user_id)));
+    link::notify_session_changed().await;
     println!(
         "connected to Hoard Cloud as {} · plan {}",
         me.email, me.plan
@@ -245,6 +253,12 @@ pub async fn logout() -> Result<()> {
         cfg.save(&path)?;
     }
 
+    if had_cloud || had_selfhost {
+        // Las credenciales ya no están: que el servicio tire el motor y resuelva
+        // de nuevo, en vez de seguir con un token que acabamos de borrar.
+        link::notify_session_changed().await;
+    }
+
     match (had_cloud, had_selfhost) {
         (false, false) => println!("no active session"),
         (true, false) => println!("Cloud session closed"),
@@ -255,9 +269,15 @@ pub async fn logout() -> Result<()> {
 }
 
 pub async fn whoami() -> Result<()> {
-    if let Some(sess) = cloud_auth::load_session()? {
-        let tokens = cloud_auth::refresh_freshest().await?;
-        let me = cloud_auth::fetch_me(&sess.server_url, &tokens.access).await?;
+    if cloud_auth::load_session()?.is_some() {
+        // Token prestado por el servicio, no refrescado aquí: dos procesos
+        // rotando el mismo refresh token es la reuse-detection que revoca la
+        // sesión entera (ADR 0021, Parte A).
+        let active = link::resolve_session().await?;
+        let Some(sess) = active.cloud else {
+            bail!("the stored Cloud session is unreadable — run `hoard login`");
+        };
+        let me = cloud_auth::fetch_me(&sess.server_url, &sess.access).await?;
         println!(
             "Hoard Cloud\n  email:   {}\n  user_id: {}\n  plan:    {}\n  usage:   {} / {}",
             me.email,

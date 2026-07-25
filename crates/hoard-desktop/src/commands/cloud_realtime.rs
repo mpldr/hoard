@@ -172,7 +172,10 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
     // near/at expiry. Refresh before joining so Realtime authorizes our changes
     // from the first frame instead of joining "ok" but deaf.
     if token_near_expiry(&creds.access_token) {
-        match cloud::refresh_active_session().await {
+        // Prestado por el servicio, no rotado aquí: el único rotador es `hoardd`
+        // (ADR 0021, Parte A). Sin `rejected`, porque el token no ha fallado —
+        // sólo le queda poco, y el servicio decide si toca rotar.
+        match cloud::borrow_access_token(app, None).await {
             Ok(fresh) => creds = fresh,
             Err(e) => {
                 if cloud::is_session_expired(&e) {
@@ -293,7 +296,7 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
                 // Renew the channel's JWT before it expires. Skipped cheaply when
                 // the current token still has comfortable life left.
                 if token_near_expiry(&current_token) {
-                    match cloud::refresh_active_session().await {
+                    match cloud::borrow_access_token(app, None).await {
                         Ok(fresh) => {
                             if fresh.access_token != current_token {
                                 current_token = fresh.access_token.clone();
@@ -373,8 +376,16 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
                                     // revoked the token family), don't reconnect
                                     // into an endless token-error loop — tear the
                                     // session down so the UI prompts re-login.
-                                    tracing::debug!("cloud-realtime: token rejected, refreshing");
-                                    if let Err(e) = cloud::refresh_active_session().await {
+                                    tracing::debug!("cloud-realtime: token rejected, borrowing another");
+                                    // Con `rejected`: el token puede estar aún
+                                    // lejos de caducar y aun así ser el que
+                                    // Realtime acaba de rechazar. Sin decirlo, el
+                                    // servicio nos devolvería el mismo y el
+                                    // reconecte sería un bucle.
+                                    if let Err(e) =
+                                        cloud::borrow_access_token(app, Some(current_token.clone()))
+                                            .await
+                                    {
                                         if cloud::is_session_expired(&e) {
                                             tracing::info!("cloud-realtime: refresh token revoked — tearing down session");
                                             cloud::handle_session_expired(app);

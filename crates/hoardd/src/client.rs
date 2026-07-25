@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use hoard_core::ipc::{
-    Backlog, ClientFrame, DaemonStatus, Hello, JournalEntry, Payload, Reply, Request, ServerFrame,
-    Welcome, PROTOCOL_VERSION,
+    Backlog, ClientFrame, CloudToken, DaemonStatus, Hello, JournalEntry, Payload, Reply, Request,
+    ServerFrame, Welcome, PROTOCOL_VERSION,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 
@@ -163,6 +163,19 @@ impl Client {
         match self.request(Request::Status).await? {
             Payload::Status(status) => Ok(status),
             other => bail!("unexpected answer to status: {other:?}"),
+        }
+    }
+
+    /// Pide prestado un token Cloud válido. `rejected` es el token que a este
+    /// cliente le acaban de devolver un 401, para que el daemon sepa que
+    /// devolverle el mismo no sirve de nada.
+    ///
+    /// El cliente **no** persiste nada de esto: el par completo lo escribe el
+    /// daemon, que es el único rotador (ADR 0021, Parte A).
+    pub async fn cloud_token(&mut self, rejected: Option<String>) -> Result<CloudToken> {
+        match self.request(Request::CloudToken { rejected }).await? {
+            Payload::CloudToken(token) => Ok(token),
+            other => bail!("unexpected answer to cloud_token: {other:?}"),
         }
     }
 

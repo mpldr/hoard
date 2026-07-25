@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -138,12 +137,16 @@ fn default_storage_status() -> String {
 
 /// Carry the access_token through method calls without persisting it on every
 /// hop. Loaded from the keyring at the top of each command.
+///
+/// **Sin refresh token, y eso es el invariante.** Desde el Slice 4c el desktop no
+/// rota: pide un access token prestado al servicio
+/// ([`borrow_access_token`]). No llevarlo aquí hace que "el desktop no puede
+/// rotar" sea algo que el compilador sostiene, no una convención que la próxima
+/// sesión pueda romper sin enterarse. El par completo sigue en disco, que es de
+/// donde lo lee el único que rota.
 #[derive(Debug, Clone)]
 pub struct CloudCreds {
     pub access_token: String,
-    /// Supabase refresh token. Used by [`refresh_active_session`] to mint a
-    /// fresh access token when the short-lived JWT expires.
-    pub refresh_token: String,
     pub server_url: String,
     /// Cached plan tier from the last `/v1/me`. Used by `cloud_pull` to
     /// label `quota-reached` events. `None` when the session file
@@ -260,7 +263,6 @@ fn load_creds() -> Result<Option<CloudCreds>> {
     }
     Ok(Some(CloudCreds {
         access_token: auth.access_token,
-        refresh_token: auth.refresh_token,
         server_url: if session.server_url.is_empty() {
             cloud_base_url()
         } else {
@@ -278,6 +280,10 @@ pub fn load_active_creds() -> Result<Option<CloudCreds>> {
     load_creds()
 }
 
+/// Persiste una sesión **recién acuñada** (login). Es la única escritura del par
+/// de tokens que le queda al desktop: crear una sesión no es rotarla, y el
+/// servicio no puede hacerlo por nosotros porque el flujo OAuth acaba aquí. Todo
+/// lo demás (renovar) es del servicio.
 fn save_creds(access: &str, refresh: &str, server_url: &str, user: &CloudAccount) -> Result<()> {
     // Try the keyring first; fall back to the file if it isn't available.
     let mut file = CloudSessionFile {
@@ -297,26 +303,28 @@ fn save_creds(access: &str, refresh: &str, server_url: &str, user: &CloudAccount
     }
 }
 
-/// Rewrite just the token pair, keeping the cached `/v1/me` snapshot and
-/// server URL already on disk. Used after a Supabase refresh, which rotates
-/// both tokens but doesn't change the account shape.
-fn update_tokens(access: &str, refresh: &str) -> Result<()> {
+/// Reescribe **sólo** el snapshot de `/v1/me` (y el `server_url`), sin tocar los
+/// tokens ni el keyring.
+///
+/// Existe porque desde el Slice 4c el desktop no escribe el par de tokens: lo
+/// hace el servicio, que es el único rotador. Si al refrescar la cuenta
+/// reescribiéramos también los tokens que acabábamos de leer, bastaría con que el
+/// servicio rotara entremedias para que pisáramos el refresh token nuevo con el
+/// viejo — y el siguiente refresh del servicio dispararía la reuse-detection de
+/// GoTrue, que revoca la familia entera. Ese es exactamente el bug que "un único
+/// rotador" mata, así que aquí no se escriben tokens.
+///
+/// Queda una ventana teórica: con el keyring disponible el fichero no lleva
+/// tokens (`auth = None`) y esto no puede pisar nada, pero en el fallback a
+/// fichero el read-modify-write reescribe el `auth` que acaba de leer. Son
+/// milisegundos y sólo sin keyring; se cierra de verdad cuando el estado sea
+/// privado del daemon (Slice 5).
+fn save_account_snapshot(server_url: &str, user: &CloudAccount) -> Result<()> {
     let mut session = read_session()?.unwrap_or_default();
     if session.server_url.is_empty() {
-        session.server_url = cloud_base_url();
+        session.server_url = server_url.to_string();
     }
-    match keyring_set(access, refresh) {
-        Ok(()) => session.auth = None,
-        Err(_) => {
-            session.auth = Some(AuthSection {
-                access_token: access.to_string(),
-                refresh_token: refresh.to_string(),
-            })
-        }
-    }
-    // El motor ya no vive aquí (ADR 0021, Slice 4b): el `ApiClient` de larga
-    // vida es del servicio, que rota su propio JWT desde `hoardd::session`. Lo
-    // que se escribe en disco es lo que ambos leen.
+    session.user = Some(user.clone());
     write_session(&session)
 }
 
@@ -329,103 +337,50 @@ fn clear_creds() -> Result<()> {
     Ok(())
 }
 
-/// Exchange the stored refresh token for a fresh Supabase session and persist
-/// the rotated tokens. Returns the refreshed creds (cached plan/server URL
-/// carried over). Callers that need a fresh `/v1/me` fetch it themselves with
-/// the new access token.
+/// Consigue un access token Cloud válido **pidiéndoselo al servicio**, y
+/// devuelve las creds con él puesto.
 ///
-/// This is the fix for "the account expires every time I restart": the
-/// access token (a short-lived Supabase JWT) was never renewed, so any call
-/// after it expired — the Refresh button's `/v1/me` or the poller's
-/// `/v1/cloud/sync` — came back 401 and looked like a dead session, even
-/// though the long-lived refresh token was sitting right there unused.
+/// Antes del Slice 4c esto llamaba a GoTrue: cargaba el refresh token, lo
+/// canjeaba, persistía el par rotado y se defendía de sí mismo con un
+/// single-flight y una ventana de reuso de 30 s. Todo ese aparato existía porque
+/// **había dos rotadores** —el desktop y el motor— sobre el mismo `cloud.toml`, y
+/// aun así el mecanismo era por conveniencia, no por diseño: bastaba con que la
+/// otra punta rotara en el hueco equivocado para que GoTrue viera un token
+/// reusado y revocara la familia entera (401 permanente, realtime enmudecido).
 ///
-/// SINGLE-FLIGHT: Supabase rotates the refresh token on every use and revokes
-/// the previous one. If two callers refresh concurrently with the *same*
-/// stored token (the 10 s cloud-pull poller + the user's "Refrescar" button,
-/// say), the second replay trips GoTrue's reuse-detection and revokes the
-/// whole token family → a permanent `refresh_token_not_found` that forces a
-/// re-login. We serialise every refresh behind one async lock and collapse a
-/// burst of concurrent 401s into a single network refresh: a caller that
-/// arrives within `REFRESH_REUSE_WINDOW` of a successful refresh gets the
-/// just-rotated creds instead of hitting Supabase again with a token that is
-/// already on its way to being revoked.
-const REFRESH_REUSE_WINDOW: Duration = Duration::from_secs(30);
-
-fn refresh_gate() -> &'static tokio::sync::Mutex<Option<(Instant, CloudCreds)>> {
-    static GATE: OnceLock<tokio::sync::Mutex<Option<(Instant, CloudCreds)>>> = OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(None))
-}
-
-pub async fn refresh_active_session() -> Result<CloudCreds> {
-    // Holding this across the network call is what serialises refreshes.
-    let mut last = refresh_gate().lock().await;
-
-    // Someone just refreshed while we waited for the lock — reuse their
-    // freshly-rotated creds instead of replaying our now-stale token.
-    if let Some((at, creds)) = last.as_ref() {
-        if at.elapsed() < REFRESH_REUSE_WINDOW {
-            return Ok(creds.clone());
-        }
-    }
-
-    let Some(creds) = load_creds()? else {
-        anyhow::bail!("Not signed in to Hoard Cloud.");
-    };
-    let attempted = creds.refresh_token.clone();
-    let (access, refresh) = match refresh_supabase_session(&creds.refresh_token).await {
-        Ok(pair) => pair,
-        Err(e) if e.downcast_ref::<RefreshTokenStale>().is_some() => {
-            // Reuse-detection: our stored refresh token was already rotated.
-            // The usual cause is a concurrent flight (another process, or a
-            // refresh that landed between our `load_creds` and the lock) that
-            // already minted a fresh pair and persisted it. Re-read disk: if
-            // the stored token changed, adopt it instead of forcing a re-login.
-            let healed = load_creds()
-                .ok()
-                .flatten()
-                .filter(|c| !c.refresh_token.trim().is_empty() && c.refresh_token != attempted);
-            if let Some(c) = healed {
-                tracing::debug!("cloud: refresh token was rotated elsewhere; adopting disk creds");
-                *last = Some((Instant::now(), c.clone()));
-                return Ok(c);
-            }
-            return Err(e.context("session expired — please sign in again"));
-        }
-        Err(e) => return Err(e),
-    };
-    update_tokens(&access, &refresh)?;
-    let fresh = CloudCreds {
-        access_token: access,
-        refresh_token: refresh,
-        ..creds
-    };
-    *last = Some((Instant::now(), fresh.clone()));
-    Ok(fresh)
-}
-
-/// Block until no token refresh is in flight, for graceful shutdown.
+/// Ahora el rotador es uno solo, el servicio, y aquí sólo se pide prestado
+/// (ADR 0021, Parte A). El single-flight vive donde tiene que vivir: en el
+/// proceso que rota. `rejected` es el token con el que acabamos de comer un 401,
+/// para que el servicio sepa que devolvérnoslo no sirve de nada.
 ///
-/// Supabase rotates the refresh token on every use and revokes the previous
-/// one. `refresh_active_session` holds `refresh_gate` across the whole
-/// network call *and* the `update_tokens` persist, so if we acquire the same
-/// lock we know no rotation is mid-flight (the new pair is already on disk).
-/// Tearing the process down between GoTrue rotating server-side and us
-/// persisting would orphan the new token: next launch replays the stale one,
-/// trips reuse-detection, and the user is silently signed out. Callers bound
-/// this with a timeout so a wedged refresh can never block quit.
-pub async fn await_refresh_quiescent() {
-    let _guard = refresh_gate().lock().await;
+/// El par completo sigue en disco (keyring + `cloud.toml`) y lo lee `load_creds`;
+/// lo que cambia es que ya no lo **escribimos**.
+pub async fn borrow_access_token(app: &AppHandle, rejected: Option<String>) -> Result<CloudCreds> {
+    let Some(state) = app.try_state::<AppState>() else {
+        anyhow::bail!("the Hoard service link isn't up yet");
+    };
+    let token = state.daemon.cloud_token(rejected).await?;
+    // Las creds de disco ya llevan el par que el servicio acaba de dejar ahí si
+    // rotó; el access prestado manda por si el keyring va un paso por detrás.
+    let creds = load_creds()?;
+    Ok(match creds {
+        Some(creds) => CloudCreds {
+            access_token: token.access_token,
+            server_url: token.server_url,
+            ..creds
+        },
+        // Sin fichero de sesión pero con token prestado: el servicio tiene una
+        // sesión que este proceso no ha llegado a leer (recién logueado en la
+        // CLI, keyring que tardó). Se usa lo que nos han dado.
+        None => CloudCreds {
+            access_token: token.access_token,
+            server_url: token.server_url,
+            plan: None,
+            user_id: None,
+        },
+    })
 }
 
-/// Synchronous, time-bounded wrapper around [`await_refresh_quiescent`] for the
-/// Tauri event loop (tray Quit / `ExitRequested`), which isn't async. Waits at
-/// most 8 s so a wedged refresh can never prevent the app from quitting.
-pub fn wait_for_refresh_quiescent_blocking() {
-    let _ = tauri::async_runtime::block_on(async {
-        tokio::time::timeout(Duration::from_secs(8), await_refresh_quiescent()).await
-    });
-}
 
 // ---- commands ---------------------------------------------------------
 
@@ -623,7 +578,7 @@ pub async fn cloud_refresh_account(
     let (me, creds) = match fetch_me_raw(&creds.server_url, &creds.access_token).await {
         Ok(me) => (me, creds),
         Err(MeError::Unauthorized) => {
-            let fresh = match refresh_active_session().await {
+            let fresh = match borrow_access_token(&app, Some(creds.access_token.clone())).await {
                 Ok(f) => f,
                 Err(e) => {
                     // Terminal stale → sign out now so the "Refrescar" button
@@ -642,14 +597,9 @@ pub async fn cloud_refresh_account(
         }
         Err(other) => return Err(other.into_message()),
     };
-    // Refresh both the disk and the in-memory cache so the bar updates.
-    save_creds(
-        &creds.access_token,
-        &creds.refresh_token,
-        &creds.server_url,
-        &me,
-    )
-    .map_err(|e| format!("Couldn't update session: {e}"))?;
+    // Sólo el snapshot de la cuenta: los tokens son del servicio.
+    save_account_snapshot(&creds.server_url, &me)
+        .map_err(|e| format!("Couldn't update session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
     Ok(me)
 }
@@ -674,14 +624,22 @@ pub fn cloud_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     Ok(())
 }
 
-/// Terminal session-expiry detector. `true` when `e` carries
-/// [`RefreshTokenStale`]: Supabase revoked the whole refresh-token family
-/// (reuse-detection / not-found) and no fresh token survived on disk, so the
-/// session is irrecoverable — retrying only spins. Loops that drive a token
-/// refresh use this to tear down cleanly instead of looping forever on a
-/// misleading "server unavailable" dot.
+/// Terminal session-expiry detector. `true` when the service answered
+/// [`IpcError::CloudSessionExpired`]: no session on disk, or Supabase revoked the
+/// whole refresh-token family (reuse-detection / not-found) with no fresh token
+/// left to adopt. Irrecoverable — retrying only spins. Loops that drive a token
+/// loan use this to tear down cleanly instead of looping forever on a misleading
+/// "server unavailable" dot.
+///
+/// Desde el Slice 4c el veredicto viaja por el cable en vez de salir de un
+/// downcast local: quien lo descubre es el servicio, que es el único que habla
+/// con GoTrue. Un fallo *transitorio* llega como otro `IpcError` (o como error de
+/// transporte) y no cierra sesión, que es la distinción que importa.
 pub fn is_session_expired(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<RefreshTokenStale>().is_some()
+    matches!(
+        e.downcast_ref::<hoard_core::ipc::IpcError>(),
+        Some(hoard_core::ipc::IpcError::CloudSessionExpired { .. })
+    )
 }
 
 /// Tear down a terminally-expired cloud session: clear the stored creds and the
@@ -827,13 +785,8 @@ pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<Clou
     let me = fetch_me(&creds.server_url, &creds.access_token)
         .await
         .map_err(prettify)?;
-    save_creds(
-        &creds.access_token,
-        &creds.refresh_token,
-        &creds.server_url,
-        &me,
-    )
-    .map_err(|e| format!("Couldn't update session: {e}"))?;
+    save_account_snapshot(&creds.server_url, &me)
+        .map_err(|e| format!("Couldn't update session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
     Ok(me)
 }
@@ -859,13 +812,15 @@ pub async fn cloud_entitlements(app: AppHandle) -> Result<CloudEntitlements, Str
             Ok(ent)
         }
         Err(CloudError::Unauthorized) => {
-            tracing::warn!(target: "entitlements", status = 401, "entitlements: 401, refreshing JWT");
-            let fresh = refresh_active_session().await.map_err(|e| {
-                if is_session_expired(&e) {
-                    handle_session_expired(&app);
-                }
-                prettify(e)
-            })?;
+            tracing::warn!(target: "entitlements", status = 401, "entitlements: 401, borrowing a fresh token");
+            let fresh = borrow_access_token(&app, Some(creds.access_token.clone()))
+                .await
+                .map_err(|e| {
+                    if is_session_expired(&e) {
+                        handle_session_expired(&app);
+                    }
+                    prettify(e)
+                })?;
             match cloud_account::entitlements(&fresh.server_url, &fresh.access_token).await {
                 Ok(ent) => {
                     tracing::info!(
@@ -912,12 +867,14 @@ pub async fn cloud_activate_feature(
     match cloud_account::activate_feature(&creds.server_url, &creds.access_token, &feature).await {
         Ok(st) => Ok(st),
         Err(CloudError::Unauthorized) => {
-            let fresh = refresh_active_session().await.map_err(|e| {
-                if is_session_expired(&e) {
-                    handle_session_expired(&app);
-                }
-                prettify(e)
-            })?;
+            let fresh = borrow_access_token(&app, Some(creds.access_token.clone()))
+                .await
+                .map_err(|e| {
+                    if is_session_expired(&e) {
+                        handle_session_expired(&app);
+                    }
+                    prettify(e)
+                })?;
             cloud_account::activate_feature(&fresh.server_url, &fresh.access_token, &feature)
                 .await
                 .map_err(cloud_err_to_string)
@@ -984,111 +941,6 @@ async fn fetch_me(base: &str, token: &str) -> Result<CloudAccount> {
     fetch_me_raw(base, token)
         .await
         .map_err(|e| anyhow::anyhow!(e.into_message()))
-}
-
-#[derive(Debug, Deserialize)]
-struct RefreshResponse {
-    access_token: String,
-    refresh_token: String,
-}
-
-/// Sentinel error: Supabase rejected the refresh token because it had already
-/// been rotated (GoTrue's reuse-detection, `refresh_token_already_used`) or no
-/// longer exists (`refresh_token_not_found`). Carried as a distinct error type
-/// so [`refresh_active_session`] can downcast and self-heal from a refresh that
-/// another flight already completed, instead of treating it as a dead session.
-#[derive(Debug)]
-struct RefreshTokenStale;
-
-impl std::fmt::Display for RefreshTokenStale {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("refresh token already rotated by another refresh")
-    }
-}
-
-impl std::error::Error for RefreshTokenStale {}
-
-/// Hit Supabase GoTrue's `token?grant_type=refresh_token` endpoint to swap a
-/// refresh token for a new access/refresh pair. The `apikey` header (anon
-/// key) is required by the Supabase API gateway even for token refresh.
-///
-/// On a reuse-detection rejection the error is [`RefreshTokenStale`] so the
-/// caller can recover from a concurrent rotation rather than bailing.
-async fn refresh_supabase_session(refresh_token: &str) -> Result<(String, String)> {
-    let refresh_token = refresh_token.trim();
-    if refresh_token.is_empty() {
-        anyhow::bail!("no refresh token stored — please sign in again");
-    }
-    let url = format!("{}/auth/v1/token?grant_type=refresh_token", supabase_url());
-    // Short per-attempt timeout (vs the 30 s default) so a hung request fails
-    // fast enough to retry *inside* GoTrue's 10 s refresh-token reuse grace.
-    let client = Client::builder()
-        .timeout(Duration::from_secs(7))
-        .user_agent(concat!("hoard-desktop/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building refresh HTTP client")?;
-
-    // Why retry on *transient* failures (network/timeout/5xx/429): Supabase
-    // rotates the refresh token on every use and revokes the old one. If a
-    // refresh reaches GoTrue (token rotated server-side) but its response is
-    // lost — a dropped connection, a timeout mid-flight — we'd keep the now-dead
-    // token on disk and only replay it ~1 h later when the access token next
-    // expires, long past the 10 s reuse grace → GoTrue flags "abuse", revokes
-    // the whole family, and the user is silently signed out (observed in prod).
-    // Retrying the *same* token within the grace re-claims the rotated pair
-    // GoTrue already minted (idempotent within 10 s) instead of orphaning it.
-    // A genuine reuse rejection (already_used/not_found) is returned at once and
-    // never retried — there is nothing left to salvage.
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let sent = client
-            .post(&url)
-            .header("apikey", supabase_anon_key())
-            .json(&serde_json::json!({ "refresh_token": refresh_token }))
-            .send()
-            .await;
-        let resp = match sent {
-            Ok(r) => r,
-            Err(e) => {
-                if attempt < 3 {
-                    tracing::warn!(attempt, error = %e, "cloud: token refresh transport error; retrying within reuse grace");
-                    tokio::time::sleep(Duration::from_millis(600)).await;
-                    continue;
-                }
-                return Err(anyhow::Error::new(e).context(format!("POST {url}")));
-            }
-        };
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            // A successful refresh body carries the new access + refresh tokens;
-            // never interpolate it into an error/log. Surface only status + len.
-            let parsed: RefreshResponse = serde_json::from_str(&body).with_context(|| {
-                format!(
-                    "parsing token refresh response (status {status}, {} bytes)",
-                    body.len()
-                )
-            })?;
-            return Ok((parsed.access_token, parsed.refresh_token));
-        }
-        let low = body.to_lowercase();
-        if low.contains("already_used")
-            || low.contains("already used")
-            || low.contains("not_found")
-            || low.contains("not found")
-        {
-            return Err(anyhow::Error::new(RefreshTokenStale));
-        }
-        // 5xx or 429: server hiccup / rate limit — the rotation may still have
-        // landed, so retry within the grace before giving up.
-        if (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS) && attempt < 3 {
-            tracing::warn!(attempt, %status, "cloud: token refresh server error; retrying within reuse grace");
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            continue;
-        }
-        anyhow::bail!("couldn't renew session ({status}): {body}");
-    }
 }
 
 fn format_http_error(status: StatusCode, body: &str) -> String {
@@ -1181,7 +1033,7 @@ pub async fn cloud_sync_playtime(
     let mut base = creds.server_url.clone();
     match cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body).await {
         Ok(()) => {}
-        Err(CloudError::Unauthorized) => match refresh_active_session().await {
+        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await {
             Ok(fresh) => {
                 token = fresh.access_token.clone();
                 base = fresh.server_url.clone();
@@ -1201,7 +1053,7 @@ pub async fn cloud_sync_playtime(
     // Read the device-merged aggregate (server only; empty on failure).
     match cloud_account::fetch_playtime(&base, "/v1/cloud/playtime", &token).await {
         Ok(sum) => Ok(sum),
-        Err(CloudError::Unauthorized) => match refresh_active_session().await {
+        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await {
             Ok(fresh) => cloud_account::fetch_playtime(
                 &fresh.server_url,
                 "/v1/cloud/playtime",

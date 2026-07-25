@@ -1179,3 +1179,106 @@ servicio rota para el motor y el desktop rota para sus propias llamadas REST;
 `cloud_auth::refresh_freshest` sana la rotación ajena releyendo disco, así que no
 rompe, pero el "un único rotador" de la Parte A no está cerrado hasta que el
 desktop pida el token al servicio (encaja en el Slice 7, cliente cloud único).
+
+---
+
+### D.17 — Slice 4c cerrado: la CLI es un cliente y el rotador es uno (2026-07-25)
+
+`hoard sync` ya no tiene motor. `agent::spawn`, el pidfile, el rotador del token,
+el poller de nube y el latido de presencia salen de `hoard-cli`; en su sitio queda
+`commands/link.rs`, que habla con `hoardd` por la misma IPC del 4a. Con esto
+`agent::spawn`, `presence::spawn` y `cloud_live::spawn` tienen **un único
+llamante en todo el repo**: `hoardd::engine`. Y la promesa titular de la Parte A
+—**un solo rotador de `cloud.toml`**— está cerrada, adelantándola del Slice 7
+porque el desktop no necesita dejar de hablar con la nube para pedir el token
+prestado.
+
+**Decisiones a no deshacer:**
+
+- **Una sesión, dos puertas, y la diferencia está en los tipos.**
+  `hoard_agent::session` (la implementación compartida; el port duplicado de
+  `hoardd/src/session.rs` y la copia de la CLI han muerto) expone
+  `resolve_owned` —la que refresca al arrancar, sólo el servicio— y
+  `resolve_borrowed`, que **no llama a GoTrue jamás**. El refresh token sólo
+  viaja en `CloudEndpoint::refresh` cuando resolvió el dueño: un cliente no lo
+  recibe, así que no puede rotar aunque la próxima sesión se despiste. Lo mismo
+  en el desktop: `CloudCreds` perdió el campo `refresh_token`. "El cliente no
+  rota" lo sostiene el compilador, no un comentario.
+- **`Request::CloudToken { rejected }` y por qué el `rejected` no es opcional de
+  verdad.** Un cliente puede comer un 401 con un token que **no ha caducado**
+  (revocado server-side, reloj desfasado); sin decir cuál le falló, el daemon le
+  devolvería el mismo y el reintento sería un bucle — que es exactamente lo que
+  le pasaría al Realtime en su rama `TokenError`. Con él, el daemon rota sólo si
+  el que serviría es ése; si ya lo había rotado, contesta con el nuevo sin gastar
+  una rotación.
+- **El margen de préstamo (5 min) tiene que ser mayor que el margen de los
+  clientes** (`TOKEN_REFRESH_MARGIN` = 120 s en el realtime). Si fuera menor, el
+  cliente pediría a los 120 s, recibiría el mismo token y volvería a pedir cada
+  30 s hasta cruzar nuestro umbral.
+- **`CloudToken` no pasa por `with_engine`.** El rotador es del **daemon**, no
+  del motor: un motor caído por falta de sesión o por un bache de red no puede
+  dejar al desktop sin poder hablar con la nube — y menos empujarle a rotar por su
+  cuenta, que es lo que este slice mata.
+- **Quién escribe el par de tokens, tras el slice:** el daemon (rotación, vía
+  `cloud_auth::refresh_freshest`) y los flujos de **login/logout** de cada
+  frontend, que acuñan o borran la sesión —acuñar no es rotar, y el OAuth acaba
+  en el cliente—. Nada más: el desktop pasó a `save_account_snapshot`, que sólo
+  reescribe el snapshot de `/v1/me`. Reescribir el par leído minutos antes era
+  la forma de pisar una rotación ajena con un token viejo y disparar la
+  reuse-detection.
+- **Muere el chequeo `instance::live_owner()` del keeper, y es obligatorio, no
+  cosmético.** Arbitraba contra el motor embebido, que ya no existe; dejarlo era
+  una bomba: `is_alive` da por bueno cualquier proceso cuyo nombre contenga
+  "hoard", y ahora todos los clientes lo contienen (`hoard sync run`,
+  `hoard-desktop`). Un `agent.pid` rancio cuyo pid reciclara un cliente habría
+  dejado al servicio **sin motor para siempre y en silencio** — la clase de fallo
+  de D.11/D.12. El lock se sigue *tomando* (gratis, y hace que un frontend
+  anterior a 4b/4c se aparte); el fichero entero muere en el 4d, donde también hay
+  que actualizar el doc de `instance.rs`, que ya miente.
+- **Sólo `hoard sync run` arranca el servicio.** Es el comando cuyo trabajo *es*
+  que el sync corra. Los demás (`hoard track`, `hoard save pause`, `login`,
+  `logout`, el banner, `hoard sync` a secas) **avisan si hay servicio y callan si
+  no**: un `hoard whoami` no puede convertir la máquina en una máquina que
+  sincroniza como efecto secundario. La contrapartida se asume y se dice: sin
+  servicio nadie renueva el token Cloud, así que un one-shot usa el de disco tal
+  cual y, si ya caducó, el error lleva la pista de que quien renueva es
+  `hoard sync start` (`session::stale_token_hint`).
+- **Enganchar es seguir, no releer.** `hoard sync run` se suscribe desde el
+  cursor del `Welcome`, así que imprime lo que pasa a partir de ahí (el desktop sí
+  pide el anillo entero, porque tiene estado en pantalla que reconstruir; una
+  terminal no). El hueco entre el saludo y la suscripción viaja igual, así que no
+  hay agujero.
+- **Parar `hoard sync run` sí para el servicio**, y es la excepción consciente a
+  "cerrar un cliente nunca mata el motor": ese proceso es el `ExecStart` de la
+  unidad, así que para systemd/launchd/Task Scheduler **es** el servicio. Si un
+  `systemctl --user stop` dejara a `hoardd` sincronizando, "parar el sync" habría
+  dejado de significar nada, y `hoard sync restart` tras un `hoard upgrade` no
+  relevaría el binario nuevo. `hoard sync stop` hace las dos cosas (quita el
+  autostart y manda `Shutdown`), por si el servicio lo levantó otro.
+- **Hueco conocido y aceptado:** un cliente **enganchado** resucita el servicio
+  ~3 s después de un `Shutdown` ajeno, porque su reconexión es `ensure_running`.
+  Pasa con un `hoard sync run` en primer plano o con el desktop abierto (desde el
+  4b). Es defendible —quien está enganchado pidió que el sync corriera— y en el
+  camino desplegado no ocurre: parar la unidad mata primero al cliente. Si algún
+  día molesta, la salida limpia es que el daemon se despida
+  (`ServerFrame::Goodbye`) para que el cliente distinga "lo pararon a propósito"
+  de "se cayó", que es la única forma de decidirlo bien; no un fichero-marcador,
+  que es el error del pidfile otra vez.
+- **`--backup-only` espera al motor.** En el arranque el cliente llega antes que
+  el motor (el servicio resuelve la sesión primero), así que la orden se reintenta
+  hasta 2 min. Una bandera perdida en silencio aquí significa escribir en el disco
+  del usuario justo cuando pidió que no.
+- **`hoard sync logs` enseña dos mitades:** el log de `hoardd` (el diagnóstico
+  del motor; el servicio corre desasido, así que su salida no cae ni en el journal
+  de la unidad ni en ninguna terminal) y el del cliente (la crónica de eventos).
+- **No hay test de extremo a extremo del préstamo, a propósito.** Prestar lee la
+  sesión Cloud **real** de quien ejecuta los tests y, si le queda poca vida, la
+  rota: un `cargo test` no puede tocar la sesión de nadie. Lo que se testea es la
+  política pura (`needs_rotation`: token sano se presta sin rotar, uno a punto de
+  morir se rota, uno rechazado nunca se devuelve, caducidad ilegible rota) y la
+  forma del cable (golden de `hoard_core::ipc`).
+
+**Lo que queda del Slice 4:** el 4d (borrar `instance.rs` y el empaquetado — el
+bundle tiene que llevar `hoardd` y las units deberían apuntar a él en vez de a
+`hoard sync run`) y las notificaciones nativas. Sigue abierto D.8.3
+(`upload_landed`).

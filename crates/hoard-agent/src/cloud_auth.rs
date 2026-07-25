@@ -572,13 +572,29 @@ pub fn session_user_id() -> Result<Option<String>> {
 /// padding). No verifica la firma — solo lee el `user_id`, que el server
 /// revalida en cada request.
 fn jwt_sub(jwt: &str) -> Option<String> {
+    jwt_claims(jwt)?.get("sub")?.as_str().map(String::from)
+}
+
+/// `exp` de un JWT en segundos de época. `None` si el token no es decodificable
+/// o no lo trae — quien decide sobre esto debe tratarlo como "no sé cuánto le
+/// queda", nunca como "le queda mucho".
+pub fn jwt_expiry(jwt: &str) -> Option<i64> {
+    jwt_claims(jwt)?.get("exp")?.as_i64()
+}
+
+fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     use base64::Engine;
     let payload = jwt.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
+        .decode(payload.trim_end_matches('='))
         .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("sub")?.as_str().map(String::from)
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// ¿Es este fallo de refresh de los que sólo arregla un `hoard login` nuevo
+/// (GoTrue revocó la familia), frente a un bache de red que merece reintento?
+pub fn is_session_expired(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RefreshTokenStale>().is_some()
 }
 
 // ---- refresh centralizado ---------------------------------------------
@@ -688,5 +704,22 @@ mod tests {
     fn ignores_an_empty_or_absent_session() {
         assert!(adoptable("ours", Some(&disk("   "))).is_none());
         assert!(adoptable("ours", None).is_none());
+    }
+
+    /// El `exp` se lee sin verificar firma, y un token que no se puede decodificar
+    /// devuelve `None` (no un número optimista): quien presta el token trata
+    /// `None` como "rota por si acaso".
+    #[test]
+    fn reads_the_expiry_of_a_jwt_and_admits_ignorance() {
+        use base64::Engine;
+        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"u-1","exp":1800000000}"#);
+        let jwt = format!("header.{body}.signature");
+        assert_eq!(jwt_expiry(&jwt), Some(1_800_000_000));
+        assert_eq!(jwt_sub(&jwt).as_deref(), Some("u-1"));
+
+        assert_eq!(jwt_expiry("not-a-jwt"), None);
+        let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"u"}"#);
+        assert_eq!(jwt_expiry(&format!("h.{no_exp}.s")), None);
     }
 }

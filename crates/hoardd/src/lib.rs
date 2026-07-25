@@ -8,18 +8,20 @@
 //! **proceso propio de vida larga**: exactamente uno por usuario, que sobrevive
 //! al cierre de la app y con el que desktop y CLI hablan por un socket local.
 //!
-//! ## Qué hay y qué no en el Slice 4a
+//! ## Qué hay y qué no (tras el Slice 4c)
 //!
 //! **Hay:** el binario, la IPC (socket con permisos solo-usuario + handshake
 //! versionado + journal con cursor y push en vivo), el arranque y la supervisión
-//! del motor, y "spawn if absent" idempotente.
+//! del motor, "spawn if absent" idempotente, y **el único rotador del refresh
+//! token** — que además lo presta por IPC a quien lo necesite
+//! (`Request::CloudToken`). Desde el 4b el desktop no tiene motor; desde el 4c
+//! tampoco la CLI: `hoard sync` asegura este servicio y se engancha a su journal.
 //!
-//! **No hay todavía:** el desktop y la CLI siguen embebiendo su motor y **nadie
-//! depende de este servicio** — se puede levantar y hablar con él, pero
-//! arrancarlo no cambia lo que hacen los frontends (salvo que, como siempre, se
-//! aparten cuando otro agente tiene el pidfile). Convertirlos en clientes es 4b y
-//! 4c; borrar `instance.rs` es 4d; el empaquetado (systemd user unit / launchd /
-//! Task Scheduler) y las notificaciones nativas cierran el Slice 4.
+//! **No hay todavía:** borrar `instance.rs` es 4d (aquí sólo se sigue *tomando*
+//! el pidfile, para que un frontend de una versión anterior no arranque un motor
+//! contra nosotros); el empaquetado (systemd user unit / launchd / Task Scheduler
+//! apuntando a este binario, y el sidecar del bundle) y las notificaciones
+//! nativas cierran el Slice 4.
 //!
 //! ## Mapa
 //!
@@ -31,8 +33,11 @@
 //!   reposos repetidos.
 //! - [`engine`] — arranque, supervisión y bomba de eventos del motor.
 //! - [`server`] — handshake y despacho.
-//! - [`client`] — cliente + "spawn if absent" (lo que usarán 4b y 4c).
-//! - [`session`] — sesión y **único** rotador del refresh token.
+//! - [`client`] — cliente + "spawn if absent" (lo que usan el desktop y la CLI).
+//!
+//! La sesión (resolución, refresher y préstamo del token) vive en
+//! `hoard_agent::session`: el Slice 4a la tenía duplicada aquí para no tocar la
+//! CLI, y el 4c dejó una sola implementación compartida.
 
 pub mod client;
 pub mod codec;
@@ -40,7 +45,6 @@ pub mod endpoint;
 pub mod engine;
 pub mod journal;
 pub mod server;
-pub mod session;
 pub mod transport;
 
 #[cfg(windows)]

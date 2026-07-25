@@ -34,6 +34,7 @@ pub mod restore;
 pub mod roots;
 pub mod scoring;
 pub mod serverclass;
+pub mod session;
 pub mod state;
 pub mod steam;
 pub mod supervisor;

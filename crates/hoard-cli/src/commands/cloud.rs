@@ -9,7 +9,7 @@ use clap::Subcommand;
 
 use hoard_agent::cloud_account::{self, CloudError};
 
-use super::session;
+use super::link;
 
 #[derive(Subcommand)]
 pub enum CloudCommand {
@@ -41,7 +41,10 @@ fn err(e: CloudError) -> anyhow::Error {
 }
 
 pub async fn run(cmd: CloudCommand) -> Result<()> {
-    let active = session::resolve().await?;
+    // El token viene prestado por el servicio (ADR 0021, Slice 4c): la CLI no
+    // rota. Sin servicio se usa el de disco tal cual, y si ya caducó el error lo
+    // dice con la pista de que quien renueva es `hoard sync`.
+    let active = link::resolve_session().await?;
     let Some(sess) = active.cloud else {
         bail!("este comando requiere sesión Hoard Cloud — inicia sesión con `hoard login`");
     };

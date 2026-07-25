@@ -397,10 +397,11 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
 
     // The access token is a short-lived Supabase JWT. When it expires the
     // sync endpoint answers 401 — which previously surfaced as a permanent
-    // "server down" dot. Renew it with the refresh token and retry once so the
-    // poller keeps working across the token's lifetime (and across restarts).
+    // "server down" dot. Ask the service for a fresh one (it's the only rotator
+    // since the Slice 4c) and retry once, so the poller keeps working across the
+    // token's lifetime (and across restarts).
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        match crate::commands::cloud::refresh_active_session().await {
+        match crate::commands::cloud::borrow_access_token(app, Some(access_token.clone())).await {
             Ok(fresh) => {
                 access_token = fresh.access_token;
                 match client.get(&url).bearer_auth(&access_token).send().await {

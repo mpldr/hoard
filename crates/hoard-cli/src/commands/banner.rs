@@ -15,8 +15,6 @@ use anyhow::Result;
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 
-use crate::commands::daemon;
-
 /// Block "H" logo (8 rows, 10 columns). Fixed width so the right-hand info
 /// column lines up.
 const LOGO: [&str; 8] = [
@@ -184,14 +182,32 @@ async fn probe_server(url: &str) -> (bool, String, Option<String>) {
     }
 }
 
-/// The daemon's PID if one is alive (reads the pidfile and checks liveness via
-/// the shared `hoard_agent::instance::is_alive`, so this and `hoard sync`
-/// agree — and a stale pidfile no longer reports "running").
-fn daemon_pid() -> Option<u32> {
-    let path = daemon::pidfile_path()?;
-    let txt = std::fs::read_to_string(path).ok()?;
-    let pid: u32 = txt.trim().parse().ok()?;
-    hoard_agent::instance::is_alive(pid).then_some(pid)
+/// La fila `sync`: se la preguntamos **al servicio**, que es quien sincroniza.
+///
+/// Hasta el Slice 4c esto leía el pidfile y comprobaba que el proceso siguiera
+/// vivo. Ya no: el motor vive en `hoardd` y la verdad es su respuesta, que además
+/// distingue "el servicio está arriba" de "el servicio tiene motor" — un pidfile
+/// nunca supo la diferencia. Conectar no arranca nada: un panel de estado que
+/// levantara el servicio sería el peor efecto secundario posible.
+async fn sync_row() -> (bool, String) {
+    let Some(status) = crate::commands::link::status().await else {
+        return (false, "stopped".to_string());
+    };
+    if status.engine.running {
+        let watched = status.slots.len().max(status.engine.watched);
+        return (true, format!("running · {watched} save(s) · pid {}", status.pid));
+    }
+    (
+        false,
+        format!(
+            "service up, engine down · {}",
+            status
+                .engine
+                .last_error
+                .as_deref()
+                .unwrap_or("still starting")
+        ),
+    )
 }
 
 /// `full` prints the whole cheat-sheet. `false` (used above `hoard sync`)
@@ -246,11 +262,7 @@ pub async fn show(full: bool) -> Result<()> {
     // Start Menu shortcut (the Tauri app isn't on PATH).
     let has_desktop = desktop_installed();
 
-    let daemon_pid = daemon_pid();
-    let (daemon_on, daemon_label) = match daemon_pid {
-        Some(pid) => (true, format!("running · pid {pid}")),
-        None => (false, "stopped".to_string()),
-    };
+    let (daemon_on, daemon_label) = sync_row().await;
 
     // Right-hand column, in order. It may have more rows than the logo; the
     // extra ones are painted under the logo with indentation (fastfetch style).

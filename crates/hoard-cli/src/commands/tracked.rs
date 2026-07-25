@@ -6,9 +6,8 @@
 use anyhow::Result;
 use time::format_description::well_known::Rfc3339;
 
+use hoard_agent::session;
 use hoard_agent::state::CliState;
-
-use crate::commands::session;
 
 pub async fn run() -> Result<()> {
     // No network: pin the active account's context via the stored JWT/URL.

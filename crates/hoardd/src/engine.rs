@@ -13,17 +13,22 @@
 //! - [`pump`]: bucle supervisado que consume `AgentEvent`s, los persiste en
 //!   `state.json` y los mete en el journal (que es quien empuja a los clientes).
 //!
-//! ## Convivencia con el motor embebido (transitorio, Slices 4a–4c)
+//! ## El pidfile, ya sin arbitrar (Slice 4c)
 //!
-//! Mientras el desktop y `hoard sync` sigan embebiendo `agent::spawn`, dos
-//! motores a la vez causarían el ping-pong de backup/restore y la
-//! reuse-detection del refresh token que la ADR describe. El árbitro entre
-//! daemon y motor embebido sigue siendo el pidfile de `hoard_agent::instance`:
-//! si el desktop lo tiene tomado, el keeper **no** arranca el motor y lo reporta
-//! (`EngineStatus::blocked_by_pid`) en vez de pelearse por los saves. Cuando el
-//! daemon sí lo toma, el desktop y la CLI se apartan solos, que es su
-//! comportamiento de siempre. El pidfile se borra en el Slice 4d, cuando ya no
-//! quede motor embebido; el árbitro definitivo es la propiedad del socket.
+//! Mientras el desktop (4b) y `hoard sync` (4c) embebían `agent::spawn`, el
+//! árbitro entre daemon y motor embebido era el pidfile de
+//! `hoard_agent::instance`: si otro lo tenía tomado, el keeper no arrancaba motor
+//! y lo reportaba (`EngineStatus::blocked_by_pid`). Ya no queda ningún motor
+//! embebido, así que **ese chequeo se ha ido**, y no por limpieza: `is_alive`
+//! acepta cualquier proceso cuyo nombre contenga "hoard", y ahora todos los
+//! clientes lo contienen (`hoard sync run`, `hoard-desktop`). Un `agent.pid`
+//! rancio cuyo pid reciclara un cliente habría dejado al servicio **sin motor
+//! para siempre y en silencio** — la clase de fallo invisible de D.11/D.12.
+//!
+//! Se sigue *tomando* el lock mientras haya motor: es gratis y hace que un
+//! frontend de una versión anterior a los slices 4b/4c se aparte en vez de
+//! arrancar un segundo motor. El fichero entero muere en el 4d; el árbitro
+//! definitivo es la propiedad del socket.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,11 +51,6 @@ use crate::journal::EventLog;
 
 /// Cada cuánto comprueba el keeper que el motor sigue vivo.
 const KEEPER_TICK: Duration = Duration::from_secs(5);
-
-/// Espera del keeper cuando el motor embebido de otro proceso tiene el pidfile.
-/// Largo a propósito: es una situación estable (el usuario tiene la app abierta),
-/// no un fallo que reintentar a toda prisa.
-const BLOCKED_RECHECK: Duration = Duration::from_secs(30);
 
 /// Backoff tras un arranque fallido del motor (sin sesión, red caída).
 const START_BACKOFF_MIN: Duration = Duration::from_secs(5);
@@ -151,9 +151,6 @@ impl Engine {
     /// sin poder decirle nada al usuario.
     pub fn down_reason(&self) -> String {
         let guard = self.lock();
-        if let Some(pid) = guard.status.blocked_by_pid {
-            return format!("another Hoard agent (pid {pid}) owns the engine");
-        }
         if guard.stopping {
             return "the daemon is shutting down".to_string();
         }
@@ -210,16 +207,7 @@ impl Engine {
     fn note_error(&self, error: String) {
         let mut guard = self.lock();
         guard.status.running = false;
-        guard.status.blocked_by_pid = None;
         guard.status.last_error = Some(error);
-        guard.running = None;
-    }
-
-    fn note_blocked(&self, pid: u32) {
-        let mut guard = self.lock();
-        guard.status.running = false;
-        guard.status.blocked_by_pid = Some(pid);
-        guard.status.last_error = None;
         guard.running = None;
     }
 
@@ -368,20 +356,6 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             // Suelta el cadáver (y su pidfile) antes de intentar otro arranque.
             engine.forget();
         }
-        // Convivencia 4a–4c: si otro agente (desktop / `hoard sync`) tiene el
-        // pidfile, no arrancamos un segundo motor.
-        if let Some(pid) = hoard_agent::instance::live_owner() {
-            if engine.status().blocked_by_pid != Some(pid) {
-                tracing::warn!(
-                    pid,
-                    "hoardd: another Hoard agent owns the engine; serving IPC without one"
-                );
-            }
-            engine.note_blocked(pid);
-            engine.nap(BLOCKED_RECHECK).await;
-            continue;
-        }
-
         match start(events_tx.clone()).await {
             Ok(started) => {
                 tracing::info!(
@@ -418,7 +392,9 @@ struct Started {
 /// Arranca el motor: sesión → saves → `agent::spawn` → presencia, empuje Cloud y
 /// refresher del JWT.
 async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
-    let active = crate::session::resolve().await?;
+    // `resolve_owned`: el camino que rota. Es del servicio y de nadie más — los
+    // clientes usan `resolve_borrowed` con el token que les prestamos.
+    let active = hoard_agent::session::resolve_owned().await?;
     let (state, _path) = CliState::load_default()?;
     // Sin saves rastreados el motor arranca igual (a diferencia de `hoard sync`,
     // que es un comando y puede abortar): un servicio residente tiene que estar
@@ -442,12 +418,15 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
     if active.is_cloud && global_sync {
         aux.push(spawn_cloud_live(live_client, handle.clone()));
     }
-    // Un solo rotador del refresh token: éste.
-    if let Some(session) = active.cloud {
+    // Un solo rotador del refresh token: éste. `owned()` es `Some` sólo porque
+    // resolvimos como dueños; un cliente ni siquiera recibe el refresh token.
+    if let Some(session) = active.cloud.as_ref().and_then(|c| c.owned()) {
         let shared = Arc::new(tokio::sync::Mutex::new(session));
         aux.push(tokio::spawn(hoard_agent::supervisor::supervise(
             "hoardd cloud refresh",
-            move || crate::session::refresh_loop(refresh_client.clone(), shared.clone()),
+            move || {
+                hoard_agent::session::refresh_loop(refresh_client.clone(), shared.clone())
+            },
         )));
     }
 
@@ -494,10 +473,14 @@ fn engine_config() -> AgentConfig {
 }
 
 /// Empuje Cloud bajo supervisión. `cloud_live::spawn` monta dos `tokio::spawn`
-/// sueltos (poll + Realtime) que sobreviven a errores pero no a un pánico; hasta
-/// que el Slice 4c mate el daemon CLI y esa función se pueda cambiar sin tocar su
-/// otro llamante, el keeper lo cubre desde fuera: si alguna de las dos tareas
-/// termina, se tira el par y se rearma.
+/// sueltos (poll + Realtime) que sobreviven a errores pero no a un pánico, así
+/// que el keeper lo cubre desde fuera: si alguna de las dos tareas termina, se
+/// tira el par y se rearma.
+///
+/// Desde el Slice 4c éste es su **único** llamante (el daemon CLI ya no existe),
+/// así que la supervisión se puede meter dentro de `cloud_live` sin romper a
+/// nadie. Se deja para el Slice 7 (cliente cloud único), que va a tocar esa
+/// función entera; envolverla desde fuera ya cumple la regla de D.12.
 fn spawn_cloud_live(client: ApiClient, handle: AgentHandle) -> JoinHandle<()> {
     tokio::spawn(hoard_agent::supervisor::supervise(
         "hoardd cloud-live",

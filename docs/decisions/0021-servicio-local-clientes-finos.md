@@ -870,3 +870,31 @@ equivocada), así que puede ser contenido divergente y no el 409 en sí.
 `supervisor::supervise`. Las tres piezas de este incidente —poller, Realtime y
 los feeds de `cloud_feed`— eran `tokio::spawn` sueltos, y las tres fallaron en
 silencio por el mismo pánico.
+
+---
+
+### D.13 — Restore no deduplica contra el disco local (rendimiento, post-release)
+
+Con el sync ya correcto (dogfooding 2026-07-25: Windows sube al instante, Linux
+baja solo y en el momento), queda una **asimetría de rendimiento**: la subida
+deduplica contra los blobs del servidor, pero la bajada **no** deduplica contra
+lo que ya hay en disco. El mismo almacenamiento content-addressed, aprovechado
+sólo por un lado.
+
+`restore::restore_cloud_cas` construye un job por **cada** fichero del manifiesto
+y los baja todos (cero menciones de reutilización local en `restore.rs`). Caso
+real: Factorio, doce zips de ~8 MB, cambia uno → se bajan ~400 MB en ~1 min
+(prácticamente line-rate: no es descarga lenta, es descarga de más) cuando
+bastarían ~8 MB.
+
+**Fix:** indexar por SHA-256 los ficheros ya presentes en el destino y, cuando el
+SHA coincide con el del manifiesto, **copiar desde el fichero local** en vez de
+hacer el GET. Hashear el directorio cuesta un segundo o dos frente a un minuto de
+red. **Propiedad de seguridad que lo hace barato:** la verificación de hash
+posterior ya existe y se mantiene — una reutilización equivocada no cuadra el
+SHA y salta, así que el atajo no puede corromper un restore.
+
+**Secuencia: va DESPUÉS de publicar.** El panic de `CloudFeed` llevaba vivo desde
+que se introdujeron los feeds, así que los usuarios ya desplegados probablemente
+tienen el auto-restore roto igual que lo estaba aquí. Publicar la corrección pesa
+más que hacerla rápida; esto es optimización, no correctness.

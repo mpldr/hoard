@@ -1561,6 +1561,64 @@ anotadas aquí porque son de la familia D.11/D.12:
 El arreglo natural para ambos —tope y `spawn_blocking` alrededor del llavero, y
 un `last_error` que lo diga— es de `hoard-agent`, no de este slice.
 
+#### El llavero, siempre acotado (arreglado; `hoard-agent`)
+
+Las dos consecuencias de arriba están arregladas. Toda llamada al llavero pasa
+por `keychain::keyring_op`: la ejecuta un hilo propio, se deja de esperar a los
+5 s y devuelve `KeyringTimeout` como motivo. Primero la sesión Cloud
+(`cloud_auth`), después el token self-hosted (`credentials`), que se quedó igual
+en la primera pasada y podía colgarse exactamente igual.
+
+**Decisiones a no deshacer:**
+
+- **El hilo es propio y suelto, no `spawn_blocking`.** Es la mitad que no se ve:
+  al soltarse el runtime, tokio **espera a que terminen sus hilos de bloqueo**, así
+  que una llamada colgada en ese pool seguiría impidiendo que el proceso muera —
+  el atasco del `systemctl --user stop`. A un hilo propio y sin `join` no lo
+  espera nadie al salir.
+- **Uno solo, con cola.** Un hilo por llamada bastaría para no esperar de más,
+  pero la llamada colgada no se puede cancelar: con el llavero bloqueado y el
+  keeper reintentando cada pocos minutos, cada intento filtraría un hilo más para
+  siempre. Serializando, lo que se acumula es la cola (un `Box` por intento).
+- **Un solo llavero, un solo hilo.** Cloud y self-hosted comparten `keychain` a
+  propósito. No hay dos llaveros: si `org.freedesktop.secrets` está bloqueado lo
+  está para las dos, así que un hilo por módulo sólo daría dos hilos colgados en
+  vez de uno. Con un llavero sano las operaciones tardan milisegundos y la cola no
+  se nota.
+- **El motivo va tipado, no sólo en el texto.** `KeyringTimeout` existe para que
+  "está bloqueado" no se pueda confundir con "no hay sesión" — confundirlos es lo
+  que hacía invisible el fallo. Con eso, `pick_auth` (Cloud) y `pick_token`
+  (self-hosted) pueden decidir bien: el fichero 0600 salva la sesión cuando lo
+  hay, y **cuando no lo hay el error del llavero sale entero** hasta `last_error`
+  y el log, en vez del `Ok(None)` que pintaba a un usuario deslogueado con sus
+  tokens intactos en el llavero.
+- **Pero la ausencia del fichero de sesión sigue siendo "primera ejecución", no
+  un error.** `save` escribe `session.toml` siempre, incluso cuando el llavero no
+  está; si no hay fichero, nadie ha entrado nunca en esta máquina y el sitio del
+  usuario es el asistente. Devolver el error del llavero también ahí rompería el
+  primer login precisamente en las máquinas con el llavero bloqueado, que es donde
+  el fallback a fichero es la única forma de entrar.
+- **`credentials` no necesita su propio `load_session_async`, y es a propósito.**
+  El arranque del motor self-hosted resuelve el token desde `config.toml`
+  (`session::selfhosted`), no del llavero; quienes sí lo leen son la telemetría
+  (hilo propio suyo) y los comandos del desktop, donde con la espera acotada el
+  peor caso es un tirón de 5 s. El `spawn_blocking` está donde importaba: en
+  `resolve_owned`, la task del keeper que aborta el apagado.
+
+**Verificado en ejecución**, no sólo en tipos: con un bus de sesión falso que
+acepta la conexión y no contesta nunca, el motor publica el motivo en el log y en
+`engine.last_error` (antes `None`), un cliente ajeno lo lee por IPC, y un SIGTERM
+mata el proceso en ~2 s con el llavero todavía mudo. En la suite hay un test de
+que la task que espera al llavero se cancela al instante, y otro de que un
+llavero bloqueado no se lee como "no hay sesión" — uno por sesión, Cloud y
+self-hosted.
+
+**Lo que queda igual y anotado:** `hoard-desktop/src/commands/cloud.rs` tiene
+todavía su propio par `keyring_set`/`keyring_get` sin tope, hermano del que había
+en `cloud_auth`. Vive en los `#[tauri::command]`, así que lo que puede colgar es
+una ventana, no el servicio; el sitio al que tiene que caer es `keychain`, no una
+tercera copia.
+
 **Lo que sigue sin verificarse en máquina real:** el mismo humo en Windows y
 macOS (el 4b sí ejecutó la IPC y la ACL del pipe en Windows por SSH; lo que falta
 allí es el bundle + la tarea del Task Scheduler), y sus backends de

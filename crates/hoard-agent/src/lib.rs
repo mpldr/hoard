@@ -17,6 +17,7 @@ pub mod config;
 pub mod correlation;
 pub mod credentials;
 pub mod detection;
+pub mod keychain;
 pub mod launchers;
 pub mod library;
 pub mod logship;

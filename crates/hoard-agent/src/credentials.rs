@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use crate::api::Whoami;
 use crate::config::CliConfig;
+use crate::keychain::{keyring_op, KeyringTimeout, KEYRING_TIMEOUT};
 
 const KEYRING_SERVICE: &str = "hoard-desktop";
 const KEYRING_USER: &str = "default";
@@ -138,17 +139,15 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
 }
 
 /// Load credentials if any are stored. Returns `Ok(None)` when no session is
-/// present yet (e.g. fresh install) — that is not an error.
+/// present yet (e.g. fresh install) — that is not an error. Un llavero
+/// bloqueado, en cambio, **sí** lo es: ver [`pick_token`].
 pub fn load() -> Result<Option<Credentials>> {
     match read_session() {
         // Normal path: the on-disk cache is readable and has a server URL. The
         // token comes from the keychain, falling back to the file copy.
         Ok(Some(session)) if !session.server.url.is_empty() => {
-            let token = match try_keyring_get() {
-                Ok(Some(blob)) if !blob.token.is_empty() => Some(blob.token),
-                _ => session.auth.as_ref().map(|a| a.token.clone()),
-            };
-            match token.filter(|t| !t.is_empty()) {
+            let from_file = session.auth.as_ref().map(|a| a.token.clone());
+            match pick_token(try_keyring_get(), from_file)? {
                 Some(token) => Ok(Some(Credentials {
                     url: session.server.url,
                     token,
@@ -161,6 +160,13 @@ pub fn load() -> Result<Option<Credentials>> {
         // build clamped down and `read_session` couldn't repair). Don't drop
         // the session over a disk hiccup: the keychain now carries the URL too,
         // so it can restore everything on its own.
+        //
+        // Aquí un fallo del llavero **sí** se traga, al revés que arriba: sin
+        // fichero de sesión nadie ha entrado nunca en esta máquina (`save` lo
+        // escribe siempre, incluso cuando el llavero no está), así que su
+        // ausencia es la respuesta y `Ok(None)` manda al usuario al asistente —
+        // que es lo que quiere en una primera ejecución, con llavero bloqueado o
+        // sin él. Un fichero ilegible sigue devolviendo su error de lectura.
         read => {
             if let Ok(Some(blob)) = try_keyring_get() {
                 if !blob.token.is_empty() && !blob.url.is_empty() {
@@ -188,6 +194,38 @@ pub fn load() -> Result<Option<Credentials>> {
                 _ => Ok(None),
             }
         }
+    }
+}
+
+/// Qué token vale: el del llavero cuando contesta, el del fichero 0600 cuando el
+/// llavero falla por algo **reparable** (bloqueado, sin D-Bus en una sesión
+/// headless) — eso no es "no hay sesión".
+///
+/// Es el gemelo de `cloud_auth::pick_auth`, y por el mismo motivo: tragarse el
+/// `Err` como si fuese `NoEntry` devolvía `Ok(None)` con el token intacto en el
+/// llavero, o sea un usuario que aparece deslogueado sin una línea que lo
+/// explique. Con el fichero de sesión delante (hay URL: aquí **sí** se entró
+/// alguna vez) un llavero mudo y sin fallback en disco tiene que salir entero:
+/// es la única pista de que está bloqueado.
+fn pick_token(
+    from_keyring: Result<Option<KeyringBlob>>,
+    from_file: Option<String>,
+) -> Result<Option<String>> {
+    let from_file = from_file.filter(|t| !t.is_empty());
+    match from_keyring {
+        Ok(Some(blob)) if !blob.token.is_empty() => Ok(Some(blob.token)),
+        // Sin entrada (o con una vacía): no hay fallo que contar, cae al fichero.
+        Ok(_) => Ok(from_file),
+        Err(e) => match from_file {
+            Some(token) => {
+                tracing::debug!(error = %e, "keyring ilegible; usando el token del fichero");
+                Ok(Some(token))
+            }
+            // Un tope agotado ya se explica solo; a cualquier otro fallo se le
+            // añade dónde ocurrió.
+            None if e.is::<KeyringTimeout>() => Err(e),
+            None => Err(e.context("leyendo la sesión self-hosted del keyring")),
+        },
     }
 }
 
@@ -321,27 +359,43 @@ fn scrub_file_token() -> Result<()> {
     Ok(())
 }
 
+// Las tres operaciones van por `keychain::keyring_op`: hilo propio, tope de
+// [`KEYRING_TIMEOUT`] y [`KeyringTimeout`] como motivo cuando se agota. Un
+// llavero bloqueado no falla, se queda esperando un desbloqueo que en una sesión
+// sin escritorio nadie va a contestar, y una llamada síncrona sin tope cuelga a
+// quien la hizo (ADR 0021 D.19 — lo mismo que ya pasaba con la sesión Cloud).
+
 fn try_keyring_set(creds: &Credentials) -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     // Store the whole session (token + URL + cached user) as TOML so the
     // keychain can restore it without the on-disk cache. See `KeyringBlob`.
+    // Se serializa aquí, fuera del hilo del llavero: la operación tiene que ser
+    // `'static` y `creds` es prestado.
     let blob = toml::to_string(&KeyringBlob {
         token: creds.token.clone(),
         url: creds.url.clone(),
         user: creds.user.clone(),
     })
     .context("serializing keychain blob")?;
-    entry.set_password(&blob)?;
-    Ok(())
+    keyring_op(
+        "saving the self-hosted session",
+        KEYRING_TIMEOUT,
+        move || {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+            entry.set_password(&blob)?;
+            Ok(())
+        },
+    )
 }
 
 fn try_keyring_get() -> Result<Option<KeyringBlob>> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.get_password() {
-        Ok(raw) => Ok(Some(parse_keyring_blob(&raw))),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    keyring_op("reading the self-hosted session", KEYRING_TIMEOUT, || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+        match entry.get_password() {
+            Ok(raw) => Ok(Some(parse_keyring_blob(&raw))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 /// Parse a keychain payload, tolerating the legacy format where the entry was
@@ -358,12 +412,13 @@ fn parse_keyring_blob(raw: &str) -> KeyringBlob {
 }
 
 fn try_keyring_delete() -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    keyring_op("deleting the self-hosted session", KEYRING_TIMEOUT, || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -397,5 +452,92 @@ mod tests {
     fn token_validation_rejects_non_hex() {
         let bad = format!("hoard_v1_{}", "z".repeat(64));
         assert!(!is_valid_token(&bad));
+    }
+
+    // ---- el llavero bloqueado, ruta self-hosted (D.19) ----------------
+    //
+    // Que la espera esté acotada se prueba en `crate::keychain`, que es el hilo
+    // que comparten las dos sesiones. Aquí, lo que es de ésta: qué token gana y
+    // que "bloqueado" no se lea como "no hay sesión".
+
+    fn stuck() -> anyhow::Error {
+        anyhow::Error::new(KeyringTimeout {
+            doing: "reading the self-hosted session",
+            after: KEYRING_TIMEOUT,
+        })
+    }
+
+    fn in_the_keyring(token: &str) -> Result<Option<KeyringBlob>> {
+        Ok(Some(KeyringBlob {
+            token: token.to_string(),
+            url: "https://saves.example".to_string(),
+            user: None,
+        }))
+    }
+
+    /// El fallo de D.19 en la ruta self-hosted: con el token sólo en el llavero,
+    /// uno bloqueado devolvía `Ok(None)` y el usuario aparecía deslogueado —
+    /// indistinguible de una instalación nueva, y sin nada que mirar. Ahora el
+    /// motivo sale entero y tipado.
+    #[test]
+    fn a_locked_keyring_is_not_a_logged_out_user() {
+        let err = pick_token(Err(stuck()), None).expect_err("no puede ser Ok(None)");
+        assert!(err.is::<KeyringTimeout>(), "{err:#}");
+        assert!(format!("{err:#}").contains("locked"), "{err:#}");
+    }
+
+    /// Pero con token en el fichero (el fallback 0600 de cuando no hay llavero)
+    /// un llavero bloqueado no desloguea a nadie: se sigue con lo que hay.
+    #[test]
+    fn a_locked_keyring_still_falls_back_to_the_file_token() {
+        let got = pick_token(Err(stuck()), Some("hoard_v1_del-fichero".to_string()))
+            .expect("el fichero salva la sesión")
+            .expect("token");
+        assert_eq!(got, "hoard_v1_del-fichero");
+    }
+
+    /// Un fallo del llavero que no es el tope (sin D-Bus, entrada corrupta) llega
+    /// igual de entero, con el contexto de dónde ocurrió.
+    #[test]
+    fn another_keyring_failure_also_surfaces() {
+        let err = pick_token(Err(anyhow::anyhow!("no D-Bus session bus")), None)
+            .expect_err("el fallo del llavero se propaga");
+        assert!(err.downcast_ref::<KeyringTimeout>().is_none());
+        assert!(
+            format!("{err:#}").contains("no D-Bus session bus"),
+            "{err:#}"
+        );
+    }
+
+    /// Y un llavero sano gana al fichero; sin entrada (o con una vacía, que es
+    /// como quedan las de una sesión a medio borrar) se cae al fichero.
+    #[test]
+    fn a_healthy_keyring_wins_and_an_empty_one_falls_back() {
+        let got = pick_token(
+            in_the_keyring("hoard_v1_del-llavero"),
+            Some("hoard_v1_del-fichero".to_string()),
+        )
+        .expect("ok")
+        .expect("token");
+        assert_eq!(got, "hoard_v1_del-llavero");
+
+        let from_file = Some("hoard_v1_del-fichero".to_string());
+        assert_eq!(
+            pick_token(Ok(None), from_file.clone())
+                .expect("ok")
+                .as_deref(),
+            Some("hoard_v1_del-fichero")
+        );
+        assert_eq!(
+            pick_token(in_the_keyring(""), from_file)
+                .expect("ok")
+                .as_deref(),
+            Some("hoard_v1_del-fichero")
+        );
+        assert!(pick_token(Ok(None), None).expect("ok").is_none());
+        // Un fichero con el token vacío es lo mismo que no tenerlo.
+        assert!(pick_token(Ok(None), Some(String::new()))
+            .expect("ok")
+            .is_none());
     }
 }

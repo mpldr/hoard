@@ -37,10 +37,22 @@ esac
 # A plain `cargo build --release` (no bundle) needs no copy at all: both binaries
 # already land in `target/release`, next to `hoard-desktop`, which is the first
 # place the sidecar lookup and `hoardd::client::daemon_binary` look.
+# `install -m 0755`, no `cp`, y el bit de ejecución se comprueba después.
+#
+# El bundler mete el sidecar en el paquete **con el modo que tenga aquí**, así que
+# un fichero sin permiso de ejecución se instala sin él y la app no puede lanzar
+# el servicio: `.deb` que instala bien, app que no sincroniza y un ENOENT/EACCES
+# que no lleva a ninguna parte. Pasó de verdad (2026-07-26): el `cp` conserva el
+# modo del **destino** cuando ya existe, así que un sidecar que perdiera el bit
+# una vez se quedaba sin él en todas las builds siguientes de esa copia de
+# trabajo. `install` fija el modo siempre, y el chequeo convierte un fallo
+# silencioso de empaquetado en un build roto.
 place() {
   local name="$1"
-  cp "$HOARD/target/release/$name$ext" "$DESK/$name-$triple$ext"
-  echo "Placed sidecar: $DESK/$name-$triple$ext"
+  local dest="$DESK/$name-$triple$ext"
+  install -m 0755 "$HOARD/target/release/$name$ext" "$dest"
+  [ -x "$dest" ] || { echo "ERROR: $dest isn't executable" >&2; exit 1; }
+  echo "Placed sidecar: $dest"
 }
 
 echo "Building hoard-screen sidecar ($triple, features: $features)"

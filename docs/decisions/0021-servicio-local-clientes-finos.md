@@ -1432,4 +1432,139 @@ empezando por Linux. Después, el Slice 5 (estado en SQLite).
 tipos y de tests (unidad, plist y XML de la tarea son funciones puras con tests;
 el traspaso y la despedida, con procesos de verdad en Linux). Falta un humo real
 de `hoard sync start` en las tres plataformas y un bundle de verdad que confirme
-que `hoardd` aterriza junto al ejecutable.
+que `hoardd` aterriza junto al ejecutable. *(Hecho en Linux en el 4e — ver
+D.19.)*
+
+---
+
+### D.19 — Slice 4e cerrado: avisa el servicio, y el `.deb` probado de verdad (2026-07-26)
+
+Las notificaciones nativas las manda el daemon (decisión **b** de D.14.1), que
+era lo único que le quedaba al Slice 4. **Con esto el Slice 4 está cerrado.**
+Linux primero —donde se dogfoodea—, y Windows y macOS detrás de la misma
+interfaz.
+
+**Decisiones a no deshacer:**
+
+- **El aviso sale de la bomba de eventos, no de cada ejecutor.** `engine::pump`
+  es el único sitio por el que pasan todos los `AgentEvent`, así que ahí va el
+  aviso. Colgarlo de la rama de backup y de la de restore por separado es
+  exactamente cómo el 429 acabó manejado en un camino y no en el otro (D.7): dos
+  sitios que hay que acordarse de tocar a la vez.
+- **Las prefs son las que ya había, y se leen frescas.** `notify_on_success` para
+  la copia guardada, `notify_on_failure` para los tres avisos de problema
+  (fallo, no cabe en el plan, restore encallado). Ni una preferencia nueva: este
+  slice cambia **quién** avisa, no de qué. Se releen en cada aviso porque el
+  usuario toca el interruptor en Ajustes y el servicio no se reinicia por eso —
+  y sólo cuando el evento es de los que pueden avisar (`notifiable`), para no
+  leer `prefs.json` en cada tick. Hay test de que ese filtro barato y la puerta
+  de verdad no se separan.
+- **`already_landed` no suena.** No viajó un byte: el contenido ya estaba arriba
+  (D.18). Avisar de una copia que no ha ocurrido es la misma mentira que sonar al
+  reproducir el journal.
+- **Quién avisa lo dice el cable, no una lista de plataformas en el frontend.**
+  `DaemonStatus::notifications` es `notify::SUPPORTED`, una constante del build
+  del daemon; el desktop lee esa bandera y se calla. Cuando aterrice el backend
+  de Windows, la app se calla sola **sin tocar la UI**. Codificar "en Linux calla"
+  en el frontend habría sido una regla que hay que acordarse de cambiar en otro
+  sitio, que es la clase de drift del racimo 3.
+- **El default de esa bandera es `false`, y es deliberado.** Un daemon anterior no
+  la manda; asumir `false` significa que el frontend sigue avisando él. El peor
+  caso es un aviso duplicado durante una convivencia de versiones; con el default
+  al revés sería **silencio**, que es el fallo que no se ve. Hay test.
+- **El texto vive en el daemon, en los ocho idiomas de la app.** No puede leer el
+  i18n del frontend (es JSON del webview), y un servicio que avisa en otro idioma
+  que la ventana se lee como si fuera otro programa. Son cuatro frases y no
+  crecen; el idioma sale de `prefs.language` y, si el usuario no lo ha tocado,
+  del entorno. Un hueco mal escrito (`{nombre}`) no da error de compilación —
+  sale literalmente en la notificación—, así que hay un test que lo caza por
+  idioma. Si algún día son muchas frases, la salida es compartir los `.json` en
+  compilación, no dos catálogos que driftan.
+- **Un fallo de entrega se queja una vez.** En una máquina sin servidor de
+  notificaciones (NAS, sesión sin escritorio) fallan **todas**: la primera va a
+  `warn` con el motivo, las siguientes a `debug`. Y la entrega lleva tope de 5 s,
+  porque quien llama es la bomba de eventos y detrás vienen la persistencia del
+  estado y el push a los clientes: un servidor de notificaciones colgado no puede
+  atascar el journal.
+- **Linux va por `notify-rust`, que es lo que ya usaba el desktop por debajo** (es
+  la dependencia del plugin de Tauri, y ya estaba en el árbol). Así el aviso del
+  servicio se ve exactamente igual que el que mandaba la app, con el mismo icono
+  del tema (`hoard-desktop`).
+- **El humo real del bus es un test `#[ignore]`.** Ni CI ni una sesión sin
+  escritorio tienen servidor de notificaciones, así que correrlo siempre sería
+  rojo por el entorno y no por el código:
+  `cargo test -p hoardd -- --ignored --nocapture the_session_bus`. Verificado
+  contra un servidor de notificaciones de mentira en el bus de sesión: llega
+  `app="Hoard"`, `icon="hoard-desktop"` y el texto en el idioma del usuario.
+
+**Lo que no se toca, a propósito:** un auto-restore que aterriza sigue sin
+notificación nativa (era un toast de la app y sigue siéndolo). Es el candidato
+más claro a añadir —con la app cerrada, unos ficheros que aparecen bajo `~` es lo
+más digno de contar— pero no hay preferencia que lo gobierne y este slice no
+inventa ninguna.
+
+#### Empaquetado, verificado en máquina real (cierra el punto abierto de D.18)
+
+`.deb` construido y **instalado** de verdad en el Linux de dogfooding. Encontró
+un fallo que ningún test de tipos podía ver:
+
+- **El sidecar viajaba sin permiso de ejecución.** `usr/bin/hoardd` iba en el
+  paquete con modo `0644`, así que se instalaba sin `+x` y la app no podía
+  lanzarlo: bundle correcto, instalación correcta, **app que no sincroniza**, y
+  un error de `spawn` que no lleva a ninguna parte. La causa es de manual:
+  `scripts/build-sidecar.sh` colocaba el binario con `cp`, y **`cp` conserva el
+  modo del destino cuando el fichero ya existe**; en cuanto esa copia perdía el
+  bit una vez —por ejemplo con el `touch` de placeholder que los jobs de lint
+  usan para que el `build.rs` de Tauri encuentre el `externalBin`— se quedaba sin
+  él en todas las builds siguientes de esa copia de trabajo. **Arreglo:**
+  `install -m 0755` en vez de `cp`, más un `[ -x ]` que aborta el build. El fallo
+  tiene que ser ruidoso donde se produce; un binario no ejecutable dentro de un
+  `.deb` no se nota hasta que alguien lo instala.
+  *Las releases de CI no estaban afectadas* (runner limpio, el destino no existe
+  y `cp` hereda el modo del origen), pero nada lo garantizaba. Ahora sí.
+
+Con eso arreglado, lo comprobado sobre el paquete instalado:
+
+- `hoardd` **aterriza junto al ejecutable** y ejecutable: `/usr/bin/hoardd`
+  (0755) al lado de `/usr/bin/hoard-desktop`, que es donde
+  `client::daemon_binary()` mira primero.
+- **La app levanta el servicio sola:** sin daemon y sin socket, arrancar el
+  desktop instalado deja corriendo `/usr/bin/hoardd` —el hermano del ejecutable,
+  no otro del `PATH`—, con el socket a `0600`, y el desktop engancha sus dos
+  conexiones (`(commands)` y `(events)`). **Al cerrar la app el servicio sigue
+  vivo**, que es la promesa entera del Slice 4.
+- **El arranque en boot funciona:** la app reescribió la unidad
+  `hoard-sync.service` —la que había apuntaba todavía a `"~/.local/bin/hoard"
+  sync run`, de antes del 4d— a `ExecStart="/usr/bin/hoardd"`, `enabled`
+  (`WantedBy=default.target`). `systemctl --user start` la deja `active
+  (running)` sirviendo el socket, y un **cliente ajeno** (un script de Python,
+  ni una línea de nuestro Rust) completa el handshake y recibe un `Status` con
+  `"notifications": true` — el paquete anuncia por el cable que avisa él.
+
+**Lo que este humo no pudo verificar, y por qué.** La sesión de dogfooding es
+remota y el llavero de login está **bloqueado** (`Locked = true` en
+`org.freedesktop.secrets`), así que la resolución de la sesión Cloud
+(`cloud_auth`, lectura de `keyring`) se queda esperando un desbloqueo que nadie
+puede contestar. Consecuencias observadas, **ninguna de este slice** pero las dos
+anotadas aquí porque son de la familia D.11/D.12:
+
+1. El motor se queda en `starting` **para siempre y sin una línea de log**:
+   `EngineStatus::last_error` sigue en `None`, así que "bloqueado en el llavero"
+   es indistinguible de "arrancando". Un fallo invisible más.
+2. Con el motor así, `hoardd` **no se puede parar**: la llamada al llavero es
+   síncrona, `task.abort()` no puede desalojarla y el proceso no termina
+   (`systemctl --user stop` deja la unidad en `deactivating` hasta el SIGKILL del
+   timeout). Aislado: el mismo binario instalado, con `--no-engine`, se para
+   limpio en menos de dos segundos, así que el atasco es de la resolución de
+   sesión, no del apagado.
+
+El arreglo natural para ambos —tope y `spawn_blocking` alrededor del llavero, y
+un `last_error` que lo diga— es de `hoard-agent`, no de este slice.
+
+**Lo que sigue sin verificarse en máquina real:** el mismo humo en Windows y
+macOS (el 4b sí ejecutó la IPC y la ACL del pipe en Windows por SSH; lo que falta
+allí es el bundle + la tarea del Task Scheduler), y sus backends de
+notificaciones, que ni existen todavía.
+
+**Siguiente:** Slice 5 — estado en SQLite (C.4), con el plan de migración de
+D.1.2 como prerrequisito.

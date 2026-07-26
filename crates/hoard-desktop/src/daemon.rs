@@ -100,14 +100,25 @@ const STATUS_EVERY: Duration = Duration::from_secs(20);
 pub struct AgentStatus {
     pub running: bool,
     pub watched_count: usize,
+    /// El servicio manda él mismo las notificaciones nativas del SO (ADR 0021
+    /// D.14.1), así que la UI **no** debe mandar las suyas o el usuario vería el
+    /// aviso dos veces con la app abierta. En una plataforma donde el servicio
+    /// todavía no sabe notificar (Windows, macOS) llega `false` y el aviso sigue
+    /// siendo del frontend, igual que antes de este slice.
+    pub service_notifies: bool,
 }
 
 impl AgentStatus {
     /// Lo que la UI debe pintar cuando no sabemos nada del motor.
+    ///
+    /// `service_notifies: false` es el default seguro: sin servicio tampoco
+    /// llegan eventos, así que no hay nada que duplicar, y el peor caso posible
+    /// es un aviso repetido — nunca uno perdido.
     pub fn down() -> Self {
         Self {
             running: false,
             watched_count: 0,
+            service_notifies: false,
         }
     }
 }
@@ -453,6 +464,7 @@ async fn status_loop(app: AppHandle) -> Finished {
                 let now = AgentStatus {
                     running: status.engine.running,
                     watched_count: status.slots.len().max(status.engine.watched),
+                    service_notifies: status.notifications,
                 };
                 if !now.running {
                     tracing::debug!(

@@ -37,6 +37,14 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Notificaciones nativas por el bus de sesión (ADR 0021 D.14.1). Es la misma
+# librería que usa por debajo el plugin de notificaciones de Tauri, así que el
+# aviso del servicio se ve igual que el que mandaba el desktop. Sólo Linux: los
+# backends de Windows y macOS se añaden detrás de la misma interfaz
+# (`notify::Sink`), y hasta entonces el frontend sigue notificando allí.
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { workspace = true }
+
 # ACL del named pipe: sin descriptor de seguridad explícito Windows le da a
 # `Everyone` acceso de lectura al pipe, y por ahí viajan nombres de juego, rutas
 # y comandos del sync. La ADR pide permisos solo-usuario (0600 / ACL), así que

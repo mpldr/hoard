@@ -371,6 +371,17 @@ pub struct DaemonStatus {
     pub uptime_secs: u64,
     /// Cursor del journal, para arrancar una suscripción sin backlog.
     pub cursor: u64,
+    /// **El servicio manda él mismo las notificaciones nativas del SO** (ADR
+    /// 0021 D.14.1). Un cliente que lea `true` no debe mandar las suyas o el
+    /// usuario vería el aviso dos veces con la app abierta.
+    ///
+    /// `false` significa "este build del daemon todavía no sabe notificar en
+    /// esta plataforma" (hoy: Windows y macOS), y entonces el aviso sigue
+    /// siendo del frontend — que es exactamente como funcionaba antes. Campo
+    /// nuevo con `default`, así que un cliente anterior lo lee como `false` y
+    /// sigue notificando como hasta ahora (C.6: append-only).
+    #[serde(default)]
+    pub notifications: bool,
     pub engine: EngineStatus,
     pub slots: Vec<AgentSlotStatus>,
 }
@@ -567,6 +578,21 @@ mod tests {
         let legacy: EngineStatus =
             serde_json::from_str(r#"{"running":false,"blocked_by_pid":4242}"#).unwrap();
         assert!(!legacy.running);
+    }
+
+    /// Un daemon anterior a las notificaciones nativas no manda el campo, y el
+    /// `false` que se asume es justo el lado seguro: el frontend sigue avisando
+    /// él. Al revés (bandera nueva, cliente viejo) el campo sobra y se ignora.
+    /// Un default invertido dejaría al usuario sin ningún aviso mientras
+    /// conviven versiones.
+    #[test]
+    fn a_daemon_that_doesnt_notify_reads_as_not_notifying() {
+        let old: DaemonStatus = serde_json::from_str(
+            r#"{"daemon_version":"7.7.17","protocol":1,"pid":1,"epoch":"e",
+                "uptime_secs":0,"cursor":0,"engine":{"running":false},"slots":[]}"#,
+        )
+        .unwrap();
+        assert!(!old.notifications);
     }
 
     /// El préstamo del token: el `rejected` es opcional en el cable (un cliente

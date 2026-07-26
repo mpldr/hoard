@@ -129,6 +129,10 @@ impl Daemon {
             epoch: self.epoch.clone(),
             uptime_secs: self.started.elapsed().as_secs(),
             cursor: self.log.cursor(),
+            // Que el frontend sepa si avisamos nosotros. Es una constante de
+            // este build (hay backend de notificaciones para esta plataforma o
+            // no), no algo que cambie mientras corremos.
+            notifications: crate::notify::SUPPORTED,
             engine: engine_status,
             slots,
         }

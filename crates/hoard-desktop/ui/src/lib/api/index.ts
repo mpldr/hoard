@@ -397,6 +397,13 @@ export function renameSaveLabel(
 export type AgentStatus = {
   running: boolean;
   watched_count: number;
+  /** The sync service sends the native OS notifications itself (ADR 0021
+   *  D.14.1), so this app must not send its own or the user sees each one
+   *  twice while the window is open. `false` — including on an older service
+   *  that doesn't report the field, and on the platforms whose service-side
+   *  backend isn't wired yet (Windows, macOS) — means the notification is
+   *  still ours to send, exactly as before. */
+  service_notifies?: boolean;
 };
 
 /** Per-slot diagnostic snapshot. Mirrors

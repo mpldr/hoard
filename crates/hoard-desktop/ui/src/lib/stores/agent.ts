@@ -26,8 +26,12 @@
  *
  *  1. **Tray colouring** — we collapse all per-save states into a single
  *     "global state" and push it down to Rust so the tray icon recolours.
- *  2. **Desktop notifications** — backup successes/failures fire a system
- *     notification, gated by the user's prefs.
+ *  2. **Desktop notifications** — a fallback now, not the source. Since ADR
+ *     0021 D.14.1 the *service* fires them, which is the only way they arrive
+ *     with the app closed; it says so in `AgentStatus.service_notifies` and
+ *     then `notify()` here stays quiet. On a platform where the service can't
+ *     yet (Windows, macOS) the flag is `false` and this store notifies exactly
+ *     as it always did.
  *
  * Doing this in the same place avoids a separate listener subscription per
  * concern, and keeps the priority logic (failures beat successes beat
@@ -153,6 +157,12 @@ let replaying = false;
 
 function notify(title: string, body: string) {
   if (replaying) return;
+  // The service notifies by itself where it can (Linux today; ADR 0021 D.14.1).
+  // Sending ours on top would show the same backup twice whenever the window
+  // happens to be open — and the whole point of moving them to the service is
+  // that they also arrive when it isn't. Where the service can't yet (Windows,
+  // macOS) the flag is `false` and this stays exactly as it was.
+  if (get(status).service_notifies) return;
   if (!notificationsAllowed) return;
   try {
     sendNotification({ title, body });

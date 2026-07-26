@@ -178,6 +178,16 @@ async fn service_detail() {
                 .unwrap_or("still starting")
         );
     }
+    // Quién manda los avisos nativos. Sin esta línea, "no me llega nada con la
+    // app cerrada" no se puede distinguir de "las tengo apagadas en Ajustes".
+    println!(
+        "  notify:  {}",
+        if status.notifications {
+            "the service sends them (even with the app closed)"
+        } else {
+            "the app sends them while it's open (no service backend on this OS yet)"
+        }
+    );
 }
 
 /// Las últimas líneas del log de `hoardd`. Es el log que importa desde el Slice

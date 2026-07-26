@@ -8,20 +8,19 @@
 //! **proceso propio de vida larga**: exactamente uno por usuario, que sobrevive
 //! al cierre de la app y con el que desktop y CLI hablan por un socket local.
 //!
-//! ## Qué hay y qué no (tras el Slice 4d)
+//! ## Qué hay (Slice 4 cerrado)
 //!
-//! **Hay:** el binario, la IPC (socket con permisos solo-usuario + handshake
-//! versionado + journal con cursor y push en vivo), el arranque y la supervisión
-//! del motor, "spawn if absent" idempotente, **el único rotador del refresh
-//! token** —que además lo presta por IPC a quien lo necesite
-//! (`Request::CloudToken`)—, el arranque en boot como servicio de usuario
-//! ([`autostart`]) y la despedida explícita ([`hoard_core::ipc::ServerFrame::Goodbye`])
-//! que distingue "lo pararon" de "se cayó". Desde el 4b el desktop no tiene
-//! motor; desde el 4c tampoco la CLI: `hoard sync` asegura este servicio y se
-//! engancha a su journal. Desde el 4d no queda pidfile: el árbitro es el socket.
-//!
-//! **No hay todavía:** las notificaciones nativas del SO (empezando por Linux)
-//! cierran el Slice 4.
+//! El binario, la IPC (socket con permisos solo-usuario + handshake versionado +
+//! journal con cursor y push en vivo), el arranque y la supervisión del motor,
+//! "spawn if absent" idempotente, **el único rotador del refresh token** —que
+//! además lo presta por IPC a quien lo necesite (`Request::CloudToken`)—, el
+//! arranque en boot como servicio de usuario ([`autostart`]), la despedida
+//! explícita ([`hoard_core::ipc::ServerFrame::Goodbye`]) que distingue "lo
+//! pararon" de "se cayó", y las **notificaciones nativas** ([`notify`]), que
+//! manda el servicio para que lleguen con la app cerrada. Desde el 4b el desktop
+//! no tiene motor; desde el 4c tampoco la CLI: `hoard sync` asegura este
+//! servicio y se engancha a su journal. Desde el 4d no queda pidfile: el árbitro
+//! es el socket.
 //!
 //! ## Mapa
 //!
@@ -33,6 +32,8 @@
 //! - [`codec`] — tramas sobre el socket (el formato vive en `hoard_core::ipc`).
 //! - [`journal`] — journal con cursor + push; guarda transiciones y acciones, no
 //!   reposos repetidos.
+//! - [`notify`] — notificaciones nativas del SO (Linux hoy; Windows y macOS
+//!   detrás de la misma interfaz).
 //! - [`engine`] — arranque, supervisión y bomba de eventos del motor.
 //! - [`server`] — handshake y despacho.
 //! - [`client`] — cliente + "spawn if absent" (lo que usan el desktop y la CLI).
@@ -47,6 +48,7 @@ pub mod codec;
 pub mod endpoint;
 pub mod engine;
 pub mod journal;
+pub mod notify;
 pub mod server;
 pub mod transport;
 
@@ -132,6 +134,9 @@ pub async fn run(options: Options) -> Result<Outcome> {
     let log = Arc::new(EventLog::new());
     let engine = Engine::new();
     let daemon = Arc::new(Daemon::new(log.clone(), engine.clone()));
+    // Quien avisa al usuario es el servicio, no la ventana (D.14.1): con la app
+    // cerrada no hay nadie más que pueda.
+    let notifier = Arc::new(notify::Notifier::for_this_platform());
 
     // El canal de eventos es del daemon, no del motor: se crea una vez y cada
     // arranque del motor recibe un clon del emisor. Así un motor reiniciado sigue
@@ -146,9 +151,15 @@ pub async fn run(options: Options) -> Result<Outcome> {
     tasks.push(tokio::spawn({
         let engine = engine.clone();
         let log = log.clone();
+        let notifier = notifier.clone();
         let events_rx = events_rx.clone();
         supervisor::supervise("hoardd event pump", move || {
-            engine::pump(engine.clone(), log.clone(), events_rx.clone())
+            engine::pump(
+                engine.clone(),
+                log.clone(),
+                notifier.clone(),
+                events_rx.clone(),
+            )
         })
     }));
     if options.with_engine {

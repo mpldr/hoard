@@ -93,6 +93,7 @@ pub async fn start_agent(
     let reported = AgentStatus {
         running,
         watched_count,
+        service_notifies: status.notifications,
     };
     daemon::emit_status(&app, &reported);
     Ok(reported)

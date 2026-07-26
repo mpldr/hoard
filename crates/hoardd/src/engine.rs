@@ -517,16 +517,23 @@ pub async fn slot_status(engine: &Engine) -> Vec<hoard_core::ipc::AgentSlotStatu
     }
 }
 
-/// Bombea los eventos del motor: presencia, `state.json` y journal.
+/// Bombea los eventos del motor: presencia, `state.json`, journal y aviso
+/// nativo.
 ///
 /// El canal es **del daemon**, no del motor: se crea una vez y cada arranque del
 /// motor recibe un clon del emisor. Así este bucle puede reiniciarse bajo
 /// `supervise` sin perder el receptor, y un motor reiniciado sigue escribiendo en
 /// el mismo journal (los cursores de los clientes no se rompen porque el motor
 /// haya rebotado).
+///
+/// Las notificaciones nativas salen de aquí y no del ejecutor de cada acción
+/// porque éste es el **único** sitio por el que pasan todos los eventos del
+/// motor: un aviso colgado de la rama de backup y otro de la de restore es
+/// exactamente cómo el 429 acabó manejado en un camino y no en el otro (D.7).
 pub async fn pump(
     engine: Engine,
     log: Arc<EventLog>,
+    notifier: Arc<crate::notify::Notifier>,
     events_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<AgentEvent>>>,
 ) -> Finished {
     let mut rx = events_rx.lock().await;
@@ -546,6 +553,9 @@ pub async fn pump(
             _ => {}
         }
         persist(&event);
+        // Antes de meterlo en el journal: el aviso es del evento **vivo**, y un
+        // colapso (una racha del mismo reposo) no debe cambiar si suena o no.
+        notifier.consider(&event).await;
         log.record(OffsetDateTime::now_utc(), event);
     }
     // El canal sólo se cierra cuando ya no queda ningún emisor, y el daemon

@@ -1,40 +1,53 @@
 <script lang="ts">
   /**
-   * Dashboard — live view of every tracked save.
+   * Dashboard — live view of every tracked save (1.1.0 redesign).
    *
-   * Hydrates from `list_tracked_saves` and then reactively renders status
-   * pills driven by the agent activity store (which subscribes to
-   * `agent://*` events at boot time).
+   * A cover grid (one SaveGameCard per save) instead of the old list rows,
+   * plus a summary bar with library-wide totals. Hydrates from
+   * `list_tracked_saves`; live status pills are driven by the agent activity
+   * store (subscribed at boot). Stored-version counts are fetched lazily per
+   * card (`list_save_snapshots`) and refetched when the live session confirms
+   * a new version for that save.
+   *
+   * The panel distinguishes the version THIS device holds from the cloud
+   * head (local_version_num vs cloud_version_num, ADR 0021 D.10): the pill
+   * is local, the cover chip is cloud. That split lives in SaveGameCard.
    */
   import { onMount } from "svelte";
   import { push } from "svelte-spa-router";
-  import { tilt } from "../lib/actions/tilt";
   import {
-    LogOut,
-    PlayCircle,
-    Clock,
-    UploadCloud,
-    Check,
     AlertTriangle,
-    CircleDot,
-    RefreshCw,
-    History,
-    PauseCircle,
-    Cloud,
+    Clock,
+    Gamepad2,
+    HardDrive,
     Layers,
+    LogOut,
+    Plus,
+    RefreshCw,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
   import Card from "../lib/components/Card.svelte";
-  import Cover from "../lib/components/Cover.svelte";
+  import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
-  import QuotaBar from "../lib/components/QuotaBar.svelte";
+  import SaveGameCard from "../lib/components/SaveGameCard.svelte";
   import * as api from "../lib/api";
   import type { TrackedSave } from "../lib/api";
-  import { auth, refreshQuota, signOut } from "../lib/stores/auth";
+  import { refreshQuota, signOut } from "../lib/stores/auth";
   import { activity, status } from "../lib/stores/agent";
+  import {
+    customNames,
+    hydrateGameNames,
+    setGameName,
+  } from "../lib/stores/gameNames";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
+  import {
+    formatBytes,
+    formatDateTime,
+    formatRelativeTime,
+    prettifySlug,
+  } from "../lib/utils/format";
 
   let saves = $state<TrackedSave[]>([]);
   let loading = $state(true);
@@ -57,6 +70,76 @@
       arr.sort((a, b) => t(b) - t(a));
     }
     return arr;
+  });
+
+  // Slugs tracked more than once (two folders of the same game): the card
+  // shows the label chip only for these, so single-save games stay clean.
+  const dupSlugs = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const s of saves) {
+      counts.set(s.game_slug, (counts.get(s.game_slug) ?? 0) + 1);
+    }
+    return new Set(
+      [...counts].filter(([, n]) => n > 1).map(([slug]) => slug),
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Stored-version counts (per-card "Total versions" + summary bar).
+  // Fetched lazily after the list lands — one read-only call per save, never
+  // blocking the grid. Refetched when the live session confirms a new
+  // version for that save (upload committed / auto-restore landed).
+  // ---------------------------------------------------------------------
+  let versionCounts = $state<Record<string, number | null>>({});
+  const countsRequested = new Set<string>();
+  const seenLiveVersion = new Map<string, number>();
+
+  async function fetchVersions(saveId: string) {
+    try {
+      const snaps = await api.listSaveSnapshots(saveId, false);
+      versionCounts = { ...versionCounts, [saveId]: snaps.length };
+    } catch {
+      // Unavailable (offline server, pruned save…): the card shows "—".
+      versionCounts = { ...versionCounts, [saveId]: null };
+    }
+  }
+
+  $effect(() => {
+    for (const s of saves) {
+      const live = $activity[s.save_id]?.last_version;
+      const changed = live != null && seenLiveVersion.get(s.save_id) !== live;
+      if (changed) seenLiveVersion.set(s.save_id, live);
+      if (!countsRequested.has(s.save_id) || changed) {
+        countsRequested.add(s.save_id);
+        void fetchVersions(s.save_id);
+      }
+    }
+  });
+
+  // Summary-bar aggregates.
+  const totalSize = $derived(
+    saves.reduce((sum, s) => sum + (s.total_size_bytes ?? 0), 0),
+  );
+  const totalVersions = $derived.by(() => {
+    let sum = 0;
+    let seen = false;
+    for (const s of saves) {
+      const c = versionCounts[s.save_id];
+      if (typeof c === "number") {
+        sum += c;
+        seen = true;
+      }
+    }
+    return seen ? String(sum) : "…";
+  });
+  const lastBackupAt = $derived.by(() => {
+    let best: string | null = null;
+    for (const s of saves) {
+      if (s.last_backup_at && (!best || s.last_backup_at > best)) {
+        best = s.last_backup_at;
+      }
+    }
+    return best;
   });
 
   // Per-user "max versions per save" cap. `null` = unlimited. Edited right
@@ -118,18 +201,44 @@
     toastSuccess($_("dashboard.max_versions_saved"));
     // Pruning frees server space right away — reflect it on the bar.
     refreshQuota().catch(() => {});
+    // …and the stored-version counts this panel shows.
+    for (const s of saves) void fetchVersions(s.save_id);
   }
 
-  function fmtBytes(n: number): string {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  // ---------------------------------------------------------------------
+  // Rename (display name). Purely presentational, per-device: it writes the
+  // `gameNames` override store. The slug — the sync key — never changes.
+  // ---------------------------------------------------------------------
+  let renameTarget = $state<TrackedSave | null>(null);
+  let renameDraft = $state("");
+  let renaming = $state(false);
+
+  function askRename(save: TrackedSave) {
+    renameTarget = save;
+    // Seed only with an existing override: an empty field means "revert to
+    // the automatic name" (the placeholder shows what that is).
+    renameDraft = $customNames[save.game_slug] ?? "";
   }
 
-  // Tick once a second so "next backup in 28s" countdowns animate. Skip the
-  // state write while the window is hidden (minimised / in the tray): nobody
-  // can see the countdown, and the write would force a pointless re-render.
+  async function confirmRename() {
+    if (!renameTarget) return;
+    const slug = renameTarget.game_slug;
+    renaming = true;
+    try {
+      await setGameName(slug, renameDraft);
+      toastSuccess($_("dashboard.rename_success"));
+      renameTarget = null;
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      renaming = false;
+    }
+  }
+
+  // Tick once a second so "next backup in 28s" countdowns and relative times
+  // animate. Skip the state write while the window is hidden (minimised / in
+  // the tray): nobody can see them, and the write would force a pointless
+  // re-render.
   $effect(() => {
     const id = setInterval(() => {
       if (!document.hidden) now = Date.now();
@@ -137,10 +246,10 @@
     return () => clearInterval(id);
   });
 
-  // Poll the storage quota every 30s while the dashboard is open so the
-  // QuotaBar tracks reality after backups land. The first poll runs
-  // immediately on mount via `hydrateAuth`, so this just keeps it warm.
-  // Hidden window → skip the round-trip; the next visible tick refreshes it.
+  // Poll the storage quota every 30s while the dashboard is open. The panel
+  // no longer renders its own QuotaBar (the sidebar's QuotaMini shows it),
+  // but this poll is what keeps that sidebar figure fresh. Hidden window →
+  // skip the round-trip; the next visible tick refreshes it.
   $effect(() => {
     const id = setInterval(() => {
       if (!document.hidden) refreshQuota().catch(() => {});
@@ -156,6 +265,7 @@
         maxVersionsInput = n;
       })
       .catch(() => {});
+    void hydrateGameNames();
     try {
       saves = await api.listTrackedSaves();
     } catch (e) {
@@ -177,169 +287,38 @@
     }
   }
 
-  async function backupNow(saveId: string) {
+  async function backupNow(save: TrackedSave) {
     try {
-      await api.backupNow(saveId);
+      await api.backupNow(save.save_id);
       toastSuccess($_("dashboard.backup_queued"));
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     }
   }
 
-  /**
-   * The version **this device** holds: the backend's local cursor, moved
-   * forward by anything the live session has since confirmed (an upload that
-   * committed, or an auto-restore that landed). Never the cloud head.
-   *
-   * Keeping the two apart is the whole point: the panel used to label the
-   * *cloud* head "Guardado (v138)" while this machine sat at v120 with a dead
-   * poller, so the user believed they had versions they'd never downloaded
-   * (ADR 0021 D.10).
-   */
-  function localVersion(save: TrackedSave): number | null {
-    const live = $activity[save.save_id]?.last_version;
-    const stored = save.local_version_num;
-    if (live == null) return stored;
-    if (stored == null) return live;
-    return Math.max(live, stored);
-  }
-
-  /** `true` when the cloud holds a version this device doesn't have yet. */
-  function cloudAhead(save: TrackedSave): boolean {
-    if (save.cloud_version_num == null) return false;
-    const local = localVersion(save);
-    return local == null || save.cloud_version_num > local;
-  }
-
-  /** Tooltip for the cloud-version chip: always spells out both numbers, so
-   *  "the cloud has vN" can never be read as "this device has vN". */
-  function cloudTitle(save: TrackedSave): string {
-    const cloud = save.cloud_version_num;
-    const local = localVersion(save);
-    if (!cloudAhead(save)) return $_("dashboard.cloud_version_title");
-    if (local == null) {
-      return $_("dashboard.cloud_ahead_no_local_title", { values: { cloud } });
+  async function togglePause(save: TrackedSave) {
+    const next = !save.paused;
+    try {
+      await api.setSavePaused(save.save_id, next);
+      saves = saves.map((s) =>
+        s.save_id === save.save_id ? { ...s, paused: next } : s,
+      );
+      toastSuccess(
+        next ? $_("dashboard.paused_toast") : $_("dashboard.resumed_toast"),
+      );
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
     }
-    return $_("dashboard.cloud_ahead_title", { values: { cloud, local } });
-  }
-
-  /** The status pill. Reflects **local** state only — what this machine has
-   *  on disk and what the agent is doing about it. The cloud head gets its
-   *  own chip so the two are never conflated. */
-  function pillFor(save: TrackedSave) {
-    const a = $activity[save.save_id];
-    const local = localVersion(save);
-    // Live activity always wins — if the agent reports anything, the pill
-    // reflects *that* (it's the freshest signal on screen). Falls through
-    // to the server-side history check only when we have no in-memory state
-    // for this save, which is the case on a cold app launch.
-    if (!a) {
-      return idlePill(save, local);
-    }
-    switch (a.state) {
-      case "running":
-        return {
-          label: $_("dashboard.pill_running"),
-          icon: PlayCircle,
-          klass: "text-sky-400",
-          rail: "bg-sky-500",
-          tint: "bg-sky-500/[0.05]",
-        };
-      case "scheduled": {
-        const secs = Math.max(
-          0,
-          Math.round(((a.next_backup_at ?? now) - now) / 1000),
-        );
-        return {
-          label: $_("dashboard.pill_scheduled", { values: { seconds: secs } }),
-          icon: Clock,
-          klass: "text-amber-400",
-          rail: "bg-amber-500",
-          tint: "bg-amber-500/[0.04]",
-        };
-      }
-      case "uploading":
-        return {
-          label: $_("dashboard.pill_uploading"),
-          icon: UploadCloud,
-          klass: "text-amber-400",
-          rail: "bg-amber-500",
-          tint: "bg-amber-500/[0.05]",
-        };
-      case "ok":
-        return {
-          label: local
-            ? $_("dashboard.pill_saved_local_v", { values: { version: local } })
-            : $_("dashboard.pill_saved"),
-          icon: Check,
-          klass: "text-emerald-400",
-          rail: "bg-emerald-500",
-          tint: "bg-emerald-500/[0.04]",
-        };
-      case "partial":
-        return {
-          label: $_("dashboard.pill_partial"),
-          icon: AlertTriangle,
-          klass: "text-amber-400",
-          rail: "bg-amber-500",
-          tint: "bg-amber-500/[0.04]",
-        };
-      case "failed":
-        return {
-          label: a.will_retry ? $_("dashboard.pill_failed_retry") : $_("dashboard.pill_failed"),
-          icon: AlertTriangle,
-          klass: "text-red-400",
-          rail: "bg-red-500",
-          tint: "bg-red-500/[0.05]",
-        };
-      default:
-        return idlePill(save, local);
-    }
-  }
-
-  /** Resting pill (no live activity): what this device holds, or — when it
-   *  holds nothing — an explicit "only in the cloud" instead of a version
-   *  number the user would read as their own. */
-  function idlePill(save: TrackedSave, local: number | null) {
-    if (local != null) {
-      return {
-        label: $_("dashboard.pill_saved_local_v", { values: { version: local } }),
-        icon: Check,
-        klass: "text-emerald-400",
-        rail: "bg-emerald-500",
-        tint: "bg-emerald-500/[0.04]",
-      };
-    }
-    if (save.cloud_version_num != null) {
-      return {
-        label: $_("dashboard.pill_cloud_only_v", {
-          values: { version: save.cloud_version_num },
-        }),
-        icon: Cloud,
-        klass: "text-zinc-400",
-        rail: "bg-zinc-600",
-        tint: "",
-      };
-    }
-    return {
-      label: $_("dashboard.pill_no_backup"),
-      icon: CircleDot,
-      klass: "text-zinc-400",
-      rail: "bg-zinc-600",
-      tint: "",
-    };
   }
 </script>
 
-<div class="mx-auto max-w-5xl px-8 py-8">
-  <header class="mb-7 flex items-start justify-between gap-4">
+<div class="mx-auto max-w-[1600px] px-8 py-8">
+  <header class="mb-6 flex items-start justify-between gap-4">
     <div class="min-w-0">
-      <h1 class="font-display text-[28px] leading-tight font-semibold tracking-[-0.02em] text-zinc-50">
-        {#if $auth.user}
-          {$_("dashboard.welcome_back", { values: { username: $auth.user.username } })}
-        {:else}
-          {$_("dashboard.title")}
-        {/if}
+      <h1
+        class="font-display text-[28px] leading-tight font-semibold tracking-[-0.02em] text-zinc-50"
+      >
+        {$_("dashboard.title")}
       </h1>
       <p class="mt-2 flex items-center gap-2.5 text-sm text-zinc-400">
         <span class="relative inline-flex h-3 w-3 shrink-0">
@@ -355,7 +334,9 @@
           ></span>
         </span>
         <span>
-          {$status.running ? $_("dashboard.agent_watching") : $_("dashboard.agent_offline")}
+          {$status.running
+            ? $_("dashboard.agent_watching")
+            : $_("dashboard.agent_offline")}
           {#if $status.running}
             <span class="text-zinc-600">·</span>
             {$_("dashboard.tracked_count", { values: { count: saves.length } })}
@@ -363,26 +344,34 @@
         </span>
       </p>
     </div>
-    <Button
-      variant="ghost"
-      onclick={handleLogout}
-      loading={signingOut}
-      aria-label={$_("dashboard.sign_out")}
-    >
-      <LogOut size={16} />
-      {$_("dashboard.sign_out")}
-    </Button>
+    <!-- mr-20 clears the shell's fixed bell/eye overlay (top-right corner). -->
+    <div class="mr-20 flex shrink-0 items-center gap-2">
+      <Button
+        variant="ghost"
+        onclick={handleLogout}
+        loading={signingOut}
+        aria-label={$_("dashboard.sign_out")}
+      >
+        <LogOut size={16} />
+        {$_("dashboard.sign_out")}
+      </Button>
+    </div>
   </header>
 
-  {#if $auth.user}
-    <div class="mb-4">
-      <QuotaBar user={$auth.user} />
+  <!-- Sync service down: the stores report it (`status.running`); we only
+       give the state the visual weight it deserves — no invented logic. -->
+  {#if !loading && !$status.running}
+    <div
+      class="mb-5 flex items-center gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-200"
+    >
+      <AlertTriangle size={15} class="shrink-0 text-amber-400" />
+      {$_("dashboard.service_offline_banner")}
     </div>
   {/if}
 
   {#if !loading && saves.length > 0}
     <div
-      class="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2"
+      class="mb-5 flex flex-wrap items-center justify-end gap-x-5 gap-y-3"
     >
       <label class="flex items-center gap-2 text-xs text-zinc-400">
         <span class="text-zinc-500">{$_("dashboard.sort_label")}</span>
@@ -423,12 +412,19 @@
           </Button>
         {/if}
       </label>
+
+      <Button onclick={() => push("/library")}>
+        <Plus size={15} />
+        {$_("dashboard.add_game")}
+      </Button>
     </div>
   {/if}
 
   {#if loading}
     <Card>
-      <div class="shimmer py-12 text-center text-sm text-zinc-400">{$_("common.loading")}</div>
+      <div class="shimmer py-12 text-center text-sm text-zinc-400">
+        {$_("common.loading")}
+      </div>
     </Card>
   {:else if saves.length === 0}
     <Card>
@@ -444,123 +440,85 @@
         <p class="mx-auto mt-2 max-w-md text-sm text-zinc-400">
           {$_("dashboard.no_saves_body")}
         </p>
+        <div class="mt-6">
+          <Button onclick={() => push("/library")}>
+            <Plus size={15} />
+            {$_("dashboard.add_game")}
+          </Button>
+        </div>
       </div>
     </Card>
   {:else}
-    <div class="space-y-2.5">
+    <div
+      class="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4"
+    >
       {#each sortedSaves as save (save.save_id)}
-        {@const pill = pillFor(save)}
-        <div
-          class="tilt group relative flex items-center gap-4 overflow-hidden rounded-xl border border-white/[0.08] {pill.tint} p-4 pl-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
-          use:tilt
-        >
-          <!-- Status rail: a 3px vertical bar on the left edge, coloured by
-               the save's live state. Makes the list scanable at a glance —
-               green=ok, amber=scheduled, sky=running, red=failed. -->
-          <span
-            class="absolute inset-y-0 left-0 w-[3px] {pill.rail}"
-            aria-hidden="true"
-          ></span>
-          <Cover
-            slug={save.game_slug}
-            name={save.game_slug}
-            class="h-14 w-14 shrink-0 rounded-2xl"
-            initialClass="text-xl"
-          />
-          <div class="min-w-0 flex-1">
-            <div class="flex items-center gap-2">
-              <span class="truncate text-[15px] font-medium text-zinc-100">
-                {save.game_slug}
-              </span>
-              <span
-                class="shrink-0 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[11px] text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
-              >
-                {save.label}
-              </span>
-              {#if save.paused}
-                <span
-                  class="inline-flex shrink-0 items-center gap-1 rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-400 ring-1 ring-inset ring-amber-500/30"
-                >
-                  <PauseCircle size={11} /> {$_("dashboard.paused")}
-                </span>
-              {/if}
-            </div>
-            <p
-              class="mt-1 flex items-center gap-1.5 truncate text-xs text-zinc-600"
-              title={save.local_path}
-            >
-              <span class="inline-block h-1 w-1 shrink-0 rounded-full bg-zinc-700"></span>
-              <span class="truncate font-mono">{save.local_path}</span>
-            </p>
-          </div>
-          {#if save.cloud_version_num != null}
-            <!-- The CLOUD's head version, always labelled as such and never
-                 merged into the status pill (which is this device's). Amber
-                 when the cloud is ahead: same "there's something newer waiting"
-                 semantics as the update-available badge. -->
-            <span
-              class="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] tabular-nums ring-1 ring-inset {cloudAhead(
-                save,
-              )
-                ? 'bg-amber-500/10 text-amber-400 ring-amber-500/30'
-                : 'bg-white/[0.04] text-zinc-300 ring-white/[0.06]'}"
-              title={cloudTitle(save)}
-            >
-              <Cloud size={11} class={cloudAhead(save) ? "" : "text-zinc-500"} />
-              {$_("dashboard.cloud_version_badge", {
-                values: { version: save.cloud_version_num },
-              })}
-            </span>
-          {/if}
-          {#if save.total_size_bytes > 0}
-            <!-- Cloud footprint only — the panel never shows local sizes. -->
-            <span
-              class="inline-flex shrink-0 items-center gap-1 rounded-md bg-white/[0.04] px-2 py-1 text-[11px] tabular-nums text-zinc-300 ring-1 ring-inset ring-white/[0.06]"
-              title={$_("dashboard.cloud_size_title")}
-            >
-              <Cloud size={11} class="text-zinc-500" />
-              {fmtBytes(save.total_size_bytes)}
-            </span>
-          {/if}
-          <div class="flex shrink-0 items-center gap-1.5 text-xs font-medium {pill.klass}">
-            {#if pill.klass.includes("sky") || pill.klass.includes("amber")}
-              <span class="relative flex h-2 w-2">
-                <span class="absolute inline-flex h-full w-full animate-ping rounded-full {pill.rail} opacity-60"></span>
-                <span class="relative inline-flex h-2 w-2 rounded-full {pill.rail}"></span>
-              </span>
-            {:else}
-              <pill.icon size={14} />
-            {/if}
-            <span class="whitespace-nowrap">{pill.label}</span>
-          </div>
-          <div class="flex shrink-0 items-center gap-1">
-            <Button
-              variant="ghost"
-              size="md"
-              onclick={() => push(`/history/${save.save_id}`)}
-              title={$_("dashboard.history_title")}
-              aria-label={$_("dashboard.history")}
-            >
-              <History size={14} />
-              <span class="hidden lg:inline">{$_("dashboard.history")}</span>
-            </Button>
-            <Button
-              variant="secondary"
-              size="md"
-              onclick={() => backupNow(save.save_id)}
-              disabled={!$status.running}
-              title={!$status.running
-                ? $_("dashboard.tooltip_offline")
-                : save.paused
-                  ? $_("dashboard.tooltip_force_paused")
-                  : $_("dashboard.tooltip_force")}
-            >
-              <UploadCloud size={14} />
-              <span class="hidden lg:inline">{$_("dashboard.back_up")}</span>
-            </Button>
-          </div>
-        </div>
+        <SaveGameCard
+          {save}
+          {now}
+          versions={versionCounts[save.save_id]}
+          agentRunning={$status.running}
+          showLabel={dupSlugs.has(save.game_slug)}
+          onRename={askRename}
+          onBackup={backupNow}
+          onTogglePause={togglePause}
+          onHistory={(s) => push(`/history/${s.save_id}`)}
+        />
       {/each}
+    </div>
+
+    <!-- Library-wide summary: same four numbers the mockup's footer shows. -->
+    <div
+      class="mt-6 grid grid-cols-2 gap-x-4 gap-y-5 rounded-xl border border-white/[0.08] bg-zinc-900/40 px-6 py-5 md:grid-cols-4"
+    >
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_games")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <Gamepad2 size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{saves.length}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_versions")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <Layers size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{totalVersions}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_size")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <HardDrive size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{formatBytes(totalSize)}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.last_backup")}</p>
+        {#if lastBackupAt}
+          <p
+            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+          >
+            <Clock size={18} class="text-zinc-500" />
+            {formatRelativeTime(lastBackupAt, now)}
+          </p>
+          <p class="mt-0.5 pl-[26px] text-[11px] tabular-nums text-zinc-500">
+            {formatDateTime(lastBackupAt)}
+          </p>
+        {:else}
+          <p
+            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+          >
+            <Clock size={18} class="text-zinc-500" />
+            <span>{$_("dashboard.never_saved")}</span>
+          </p>
+        {/if}
+      </div>
     </div>
   {/if}
 </div>
@@ -605,6 +563,42 @@
       loading={savingMaxVersions}
     >
       {$_("dashboard.max_versions_confirm_apply")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<!-- Rename (display name). Per-device override via the gameNames store; the
+     slug that ties detection, covers and the server row together never
+     changes. Empty field = revert to the automatic name. -->
+<Modal
+  open={renameTarget !== null}
+  title={$_("dashboard.rename_modal_title")}
+  dismissible={!renaming}
+  onClose={() => {
+    if (!renaming) renameTarget = null;
+  }}
+>
+  <p class="mb-3 text-sm text-zinc-300">
+    {$_("dashboard.rename_modal_body")}
+  </p>
+  <Input
+    bind:value={renameDraft}
+    placeholder={renameTarget ? prettifySlug(renameTarget.game_slug) : ""}
+    disabled={renaming}
+    onkeydown={(e) => {
+      if (e.key === "Enter" && !renaming) void confirmRename();
+    }}
+  />
+  {#snippet footer()}
+    <Button
+      variant="ghost"
+      onclick={() => (renameTarget = null)}
+      disabled={renaming}
+    >
+      {$_("common.cancel")}
+    </Button>
+    <Button onclick={confirmRename} loading={renaming}>
+      {$_("common.save")}
     </Button>
   {/snippet}
 </Modal>

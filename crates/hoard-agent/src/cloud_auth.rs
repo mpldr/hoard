@@ -15,7 +15,8 @@
 //! para no pisar el cache de cuenta del desktop.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -458,31 +459,148 @@ fn write_session_file(s: &SessionFile) -> Result<()> {
     Ok(())
 }
 
+// ---- el llavero, siempre acotado --------------------------------------
+
+/// Tope de espera de **cualquier** operación del llavero.
+///
+/// Un llavero bloqueado no falla: `org.freedesktop.secrets` se queda esperando a
+/// que alguien conteste el prompt de desbloqueo, y en una sesión sin escritorio
+/// (SSH, NAS, el dogfooding de D.19) nadie lo va a contestar nunca. Esa espera sin
+/// tope dejaba el motor en `starting` para siempre y **sin una línea de log**
+/// (`last_error` en `None`, indistinguible de "arrancando") y, peor, hacía que el
+/// daemon no se pudiera parar: `abort()` no desaloja una llamada síncrona, así que
+/// `systemctl --user stop` se quedaba en `deactivating` hasta el SIGKILL.
+///
+/// Un llavero sano contesta en milisegundos, así que cinco segundos no dan falsos
+/// positivos; y si el usuario tarda en teclear su contraseña, el reintento del
+/// keeper lo recoge en cuanto quede desbloqueado.
+const KEYRING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// El llavero no contestó dentro del tope. Es un tipo propio para que "está
+/// bloqueado" no se confunda con "no hay sesión": confundirlos es exactamente lo
+/// que hacía invisible el fallo.
+#[derive(Debug)]
+pub struct KeyringTimeout {
+    /// Qué se estaba haciendo, en una frase, para el log y el `last_error`.
+    pub doing: &'static str,
+    pub after: Duration,
+}
+
+impl std::fmt::Display for KeyringTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the system keyring didn't answer in {}s while {} — it is most likely \
+             locked, waiting for an unlock nobody can answer; unlock the login \
+             keyring (or sign in again with `hoard login`)",
+            self.after.as_secs(),
+            self.doing
+        )
+    }
+}
+
+impl std::error::Error for KeyringTimeout {}
+
+type KeyringJob = Box<dyn FnOnce() + Send>;
+
+/// Cola del **único** hilo que habla con el llavero.
+///
+/// Un hilo por llamada bastaría para no esperar de más, pero la llamada colgada no
+/// se puede cancelar: con el llavero bloqueado y el keeper reintentando cada pocos
+/// minutos, cada intento dejaría un hilo más colgado para siempre. Serializando,
+/// lo que se acumula es la cola (un `Box` por intento) y no los hilos.
+///
+/// Y es un hilo **suelto**, no del pool de `spawn_blocking`: al soltarse el
+/// runtime, tokio espera a que terminen sus hilos de bloqueo, así que uno colgado
+/// ahí volvería a impedir que el proceso muera — que es justo la mitad del bug.
+/// A un hilo propio y sin `join` no lo espera nadie al salir.
+fn keyring_queue() -> Option<&'static Mutex<mpsc::Sender<KeyringJob>>> {
+    static QUEUE: OnceLock<Option<Mutex<mpsc::Sender<KeyringJob>>>> = OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<KeyringJob>();
+            std::thread::Builder::new()
+                .name("hoard-keyring".to_string())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .map_err(|err| {
+                    tracing::error!(error = %err, "keyring: couldn't start the keyring thread")
+                })
+                .ok()?;
+            Some(Mutex::new(tx))
+        })
+        .as_ref()
+}
+
+/// Corre `op` en el hilo del llavero y **deja de esperarla** pasado `wait`.
+/// Devuelve lo que devuelva `op`, o [`KeyringTimeout`] si no contestó a tiempo.
+fn keyring_op<T: Send + 'static>(
+    doing: &'static str,
+    wait: Duration,
+    op: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let Some(queue) = keyring_queue() else {
+        bail!("no keyring thread available");
+    };
+    let (tx, rx) = mpsc::channel();
+    let job: KeyringJob = Box::new(move || {
+        // Si quien preguntó ya se rindió, el envío falla y el resultado se
+        // descarta: nadie se queda esperando a nadie.
+        let _ = tx.send(op());
+    });
+    // Igual que en el journal y en la ranura del motor: un pánico ajeno no puede
+    // dejar el llavero inaccesible para siempre.
+    let sender = queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sender.send(job).is_err() {
+        bail!("the keyring thread is gone");
+    }
+    drop(sender);
+    match rx.recv_timeout(wait) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            Err(anyhow::Error::new(KeyringTimeout { doing, after: wait }))
+        }
+        // El hilo se fue con la operación a medias (un pánico dentro de `keyring`).
+        Err(RecvTimeoutError::Disconnected) => bail!("the keyring call died while {doing}"),
+    }
+}
+
 fn keyring_set(access: &str, refresh: &str) -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     let blob = toml::to_string(&AuthSection {
         access_token: access.to_string(),
         refresh_token: refresh.to_string(),
     })?;
-    entry.set_password(&blob)?;
-    Ok(())
+    keyring_op("saving the Cloud session", KEYRING_TIMEOUT, move || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+        entry.set_password(&blob)?;
+        Ok(())
+    })
 }
 
 fn keyring_get() -> Result<Option<AuthSection>> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.get_password() {
-        Ok(blob) => Ok(Some(toml::from_str(&blob)?)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    keyring_op("reading the Cloud session", KEYRING_TIMEOUT, || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+        match entry.get_password() {
+            Ok(blob) => Ok(Some(toml::from_str(&blob)?)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 fn keyring_delete() -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    keyring_op("deleting the Cloud session", KEYRING_TIMEOUT, || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 /// Carga la sesión Cloud activa (keyring primero, fichero como fallback), o
@@ -491,27 +609,7 @@ pub fn load_session() -> Result<Option<Session>> {
     let Some(file) = read_session_file()? else {
         return Ok(None);
     };
-    // El keyring puede fallar por algo REPARABLE (bloqueado, sin D-Bus en una
-    // sesión headless): eso no es "no hay sesión". Tragarse el `Err` como si
-    // fuese `NoEntry` caía al fichero, que con keyring sano lleva `auth = None`
-    // (ver `store_tokens`) → `load_session` devolvía `Ok(None)` y el usuario
-    // aparecía deslogueado con sus tokens intactos en el llavero. Sólo `NoEntry`
-    // cae al fichero en silencio; un error real se propaga si el fichero
-    // tampoco tiene tokens que ofrecer.
-    let auth = match keyring_get() {
-        Ok(Some(a)) => Some(a),
-        Ok(None) => file.auth.clone(),
-        Err(e) => match file.auth.clone() {
-            Some(a) => {
-                tracing::debug!(error = %e, "keyring ilegible; usando los tokens del fichero");
-                Some(a)
-            }
-            None => {
-                return Err(e.context("leyendo la sesión Cloud del keyring"));
-            }
-        },
-    };
-    let Some(auth) = auth else {
+    let Some(auth) = pick_auth(keyring_get(), file.auth.clone())? else {
         return Ok(None);
     };
     if auth.access_token.is_empty() {
@@ -526,6 +624,59 @@ pub fn load_session() -> Result<Option<Session>> {
         access: auth.access_token,
         refresh: auth.refresh_token,
     }))
+}
+
+/// [`load_session`] **fuera del hilo del runtime**.
+///
+/// La lectura del llavero es síncrona y, aunque ya está acotada
+/// ([`KEYRING_TIMEOUT`]), bloquea el hilo que la hace mientras espera: en un
+/// runtime de un solo hilo eso para todo lo demás, y en cualquiera un `abort()`
+/// sobre la task que la hizo no se nota hasta que vuelve. Con `spawn_blocking` la
+/// espera vive en el pool de bloqueo y la task que la aguarda se puede cancelar en
+/// el momento — que es lo que hace que el arranque del motor no cuelgue el apagado
+/// del daemon (D.19).
+///
+/// Quien resuelva la sesión desde una task —el arranque del motor— usa esto; los
+/// caminos síncronos (comandos locales de la CLI) siguen con [`load_session`], que
+/// tampoco puede esperar para siempre.
+pub async fn load_session_async() -> Result<Option<Session>> {
+    match tokio::task::spawn_blocking(load_session).await {
+        Ok(result) => result,
+        // Sólo pasa si `keyring` entró en pánico. Decirlo es infinitamente mejor
+        // que un arranque colgado sin motivo.
+        Err(join) => Err(anyhow::Error::new(join).context("leyendo la sesión Cloud")),
+    }
+}
+
+/// Qué tokens valen: los del llavero cuando contesta, los del fichero cuando el
+/// llavero falla por algo **reparable** (bloqueado, sin D-Bus en una sesión
+/// headless) — eso no es "no hay sesión".
+///
+/// Tragarse el `Err` como si fuese `NoEntry` caía al fichero, que con keyring sano
+/// lleva `auth = None` (ver `store_tokens`) → `load_session` devolvía `Ok(None)` y
+/// el usuario aparecía deslogueado con sus tokens intactos en el llavero. Sólo
+/// `NoEntry` cae al fichero en silencio; un error real se propaga si el fichero
+/// tampoco tiene tokens que ofrecer.
+fn pick_auth(
+    from_keyring: Result<Option<AuthSection>>,
+    from_file: Option<AuthSection>,
+) -> Result<Option<AuthSection>> {
+    match from_keyring {
+        Ok(Some(a)) => Ok(Some(a)),
+        Ok(None) => Ok(from_file),
+        Err(e) => match from_file {
+            Some(a) => {
+                tracing::debug!(error = %e, "keyring ilegible; usando los tokens del fichero");
+                Ok(Some(a))
+            }
+            // Sin nada en el fichero, el error del llavero **es** la respuesta y
+            // tiene que llegar entero a `last_error` y al log: es la única pista
+            // de que el llavero está bloqueado. Un tope agotado ya se explica
+            // solo; a cualquier otro fallo se le añade dónde ocurrió.
+            None if e.is::<KeyringTimeout>() => Err(e),
+            None => Err(e.context("leyendo la sesión Cloud del keyring")),
+        },
+    }
 }
 
 /// Persiste el par de tokens conservando el `user` y el `server_url` ya en
@@ -721,5 +872,157 @@ mod tests {
         assert_eq!(jwt_expiry("not-a-jwt"), None);
         let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"u"}"#);
         assert_eq!(jwt_expiry(&format!("h.{no_exp}.s")), None);
+    }
+
+    // ---- el llavero bloqueado (D.19) ----------------------------------
+
+    /// Lo que hace un llavero bloqueado: esperar un desbloqueo que nadie va a
+    /// contestar. Se simula con una operación que tarda mucho más que el tope (no
+    /// con una infinita, para no dejar el hilo del llavero ocupado el resto de la
+    /// suite).
+    fn a_locked_keyring() -> impl FnOnce() -> Result<Option<AuthSection>> + Send + 'static {
+        || {
+            std::thread::sleep(Duration::from_millis(300));
+            // A estas alturas ya nadie escucha: el resultado se descarta y el hilo
+            // del llavero queda libre para el siguiente test.
+            Ok(None)
+        }
+    }
+
+    fn stuck() -> anyhow::Error {
+        anyhow::Error::new(KeyringTimeout {
+            doing: "reading the Cloud session",
+            after: KEYRING_TIMEOUT,
+        })
+    }
+
+    fn tokens_in_the_file() -> AuthSection {
+        AuthSection {
+            access_token: "jwt-del-fichero".to_string(),
+            refresh_token: "refresh-del-fichero".to_string(),
+        }
+    }
+
+    /// El fallo de D.19: la llamada al llavero no volvía nunca. Ahora se deja de
+    /// esperar, y con un motivo tipado — el que aterriza en `last_error` y en el
+    /// log del servicio.
+    #[test]
+    fn a_keyring_that_never_answers_gives_up_with_a_reason() {
+        let started = Instant::now();
+        let err = keyring_op(
+            "reading the Cloud session",
+            Duration::from_millis(20),
+            a_locked_keyring(),
+        )
+        .expect_err("tiene que rendirse, no esperar");
+        // Lo que importa no es el número sino que la espera esté acotada: quien
+        // llamó recupera el control muchísimo antes de que la operación termine.
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "esperó de más: {:?}",
+            started.elapsed()
+        );
+
+        let timeout = err
+            .downcast_ref::<KeyringTimeout>()
+            .expect("el motivo va tipado, no sólo en el texto");
+        assert_eq!(timeout.doing, "reading the Cloud session");
+        let text = err.to_string();
+        assert!(
+            text.contains("keyring") && text.contains("locked"),
+            "{text}"
+        );
+    }
+
+    /// Un llavero que sí contesta pasa tal cual, y su fallo propio (sin D-Bus,
+    /// entrada corrupta) no se disfraza de tope: el motivo tiene que ser el de
+    /// verdad.
+    #[test]
+    fn a_keyring_that_answers_is_passed_through_verbatim() {
+        let got = keyring_op("reading the Cloud session", KEYRING_TIMEOUT, || {
+            Ok(Some(tokens_in_the_file()))
+        })
+        .expect("contesta");
+        assert_eq!(got.expect("tokens").access_token, "jwt-del-fichero");
+
+        let err = keyring_op::<()>("reading the Cloud session", KEYRING_TIMEOUT, || {
+            bail!("no D-Bus session bus")
+        })
+        .expect_err("el fallo del llavero se propaga");
+        assert!(err.downcast_ref::<KeyringTimeout>().is_none());
+        assert_eq!(err.to_string(), "no D-Bus session bus");
+    }
+
+    /// Sin tokens en el fichero, un llavero bloqueado **no** puede parecer "no hay
+    /// sesión": el motivo sale entero para que el motor lo publique en vez de
+    /// quedarse en `starting` sin una línea de log.
+    #[test]
+    fn a_locked_keyring_surfaces_the_reason_instead_of_looking_logged_out() {
+        let err = pick_auth(Err(stuck()), None).expect_err("no puede ser Ok(None)");
+        assert!(err.is::<KeyringTimeout>(), "{err:#}");
+        assert!(format!("{err:#}").contains("locked"), "{err:#}");
+    }
+
+    /// Pero con tokens en el fichero (el fallback 0600) un llavero bloqueado no
+    /// desloguea a nadie: se sigue con lo que hay, que es lo que ya hacía.
+    #[test]
+    fn a_locked_keyring_still_falls_back_to_the_file_tokens() {
+        let got = pick_auth(Err(stuck()), Some(tokens_in_the_file()))
+            .expect("el fichero salva la sesión")
+            .expect("tokens");
+        assert_eq!(got.access_token, "jwt-del-fichero");
+    }
+
+    /// Y un llavero sano gana al fichero, con o sin fichero.
+    #[test]
+    fn a_healthy_keyring_wins_and_an_empty_one_falls_back() {
+        let from_keyring = AuthSection {
+            access_token: "jwt-del-llavero".to_string(),
+            refresh_token: "refresh-del-llavero".to_string(),
+        };
+        let got = pick_auth(Ok(Some(from_keyring)), Some(tokens_in_the_file()))
+            .expect("ok")
+            .expect("tokens");
+        assert_eq!(got.access_token, "jwt-del-llavero");
+
+        // `NoEntry`: no hay entrada, no hay fallo. Cae al fichero en silencio.
+        let got = pick_auth(Ok(None), Some(tokens_in_the_file()))
+            .expect("ok")
+            .expect("tokens");
+        assert_eq!(got.access_token, "jwt-del-fichero");
+        assert!(pick_auth(Ok(None), None).expect("ok").is_none());
+    }
+
+    /// La otra mitad de D.19: la espera no puede vivir en el hilo de la task que
+    /// el apagado aborta. Con la lectura en el pool de bloqueo, la task que la
+    /// aguarda se cancela en el momento — el runtime queda libre y el daemon
+    /// parable, aunque el llavero siga sin contestar.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_task_waiting_on_the_keyring_can_be_aborted_at_once() {
+        let task = tokio::spawn(async {
+            match tokio::task::spawn_blocking(|| {
+                keyring_op(
+                    "reading the Cloud session",
+                    Duration::from_secs(30),
+                    a_locked_keyring(),
+                )
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(join) => Err(anyhow::Error::new(join)),
+            }
+        });
+        // Un runtime de un solo hilo: si la espera estuviera en él, este `yield`
+        // no volvería y el `abort` no llegaría a ejecutarse.
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "el apagado esperó al llavero: {:?}",
+            started.elapsed()
+        );
     }
 }

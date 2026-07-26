@@ -112,7 +112,11 @@ impl CloudEndpoint {
 ///
 /// **Sólo el servicio llama a esto.** Es el camino que rota.
 pub async fn resolve_owned() -> Result<Active> {
-    if let Some(sess) = cloud_auth::load_session()? {
+    // `load_session_async` y no `load_session`: la lectura del llavero es síncrona
+    // y este camino corre en la task del keeper, la que el apagado aborta. Con la
+    // lectura en el hilo de la task, un llavero bloqueado dejaba el motor en
+    // `starting` y el daemon sin poder pararse (D.19).
+    if let Some(sess) = cloud_auth::load_session_async().await? {
         return resolve_cloud_owned(sess).await;
     }
     let active = selfhosted()?;

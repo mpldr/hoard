@@ -33,7 +33,10 @@ fn parse(v: &str) -> Option<(u64, u64, u64)> {
     let major = it.next()?.trim().parse().ok()?;
     let minor = it.next()?.trim().parse().ok()?;
     let patch_raw = it.next().unwrap_or("0");
-    let digits: String = patch_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     let patch = digits.parse().ok()?;
     Some((major, minor, patch))
 }
@@ -77,7 +80,11 @@ struct Cache {
 }
 
 fn cache_path() -> Option<std::path::PathBuf> {
-    Some(crate::config::CliConfig::cache_dir().ok()?.join("update-check.json"))
+    Some(
+        crate::config::CliConfig::cache_dir()
+            .ok()?
+            .join("update-check.json"),
+    )
 }
 
 fn now_secs() -> u64 {

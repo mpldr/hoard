@@ -78,11 +78,9 @@ pub async fn set_max_versions(
         // Clearing the cap never prunes, so the preview is only meaningful
         // for a concrete number.
         let pruned = match body.max_versions {
-            Some(n) => {
-                crate::routes::snapshots::count_over_version_cap(&state.pool, &user_id, n)
-                    .await
-                    .map_err(|e| internal(e, "version-cap count"))?
-            }
+            Some(n) => crate::routes::snapshots::count_over_version_cap(&state.pool, &user_id, n)
+                .await
+                .map_err(|e| internal(e, "version-cap count"))?,
             None => 0,
         };
         return Ok(Json(MaxVersionsResponse {

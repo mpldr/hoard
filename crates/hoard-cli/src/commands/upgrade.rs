@@ -99,7 +99,10 @@ fn installer_command(version: Option<&str>) -> std::process::Command {
     // `irm …/install.ps1 | iex`, with the pin set as an env var beforehand.
     let mut ps = String::new();
     if let Some(v) = version {
-        ps.push_str(&format!("$env:HOARD_VERSION = '{}'; ", v.replace('\'', "''")));
+        ps.push_str(&format!(
+            "$env:HOARD_VERSION = '{}'; ",
+            v.replace('\'', "''")
+        ));
     }
     ps.push_str(&format!("irm {BASE}/install.ps1 | iex"));
     let mut cmd = std::process::Command::new("powershell");

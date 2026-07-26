@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::presigning::PresigningConfig;
 use std::time::Duration;
 
-use crate::s3::{S3, S3Params};
+use crate::s3::{S3Params, S3};
 
 pub struct R2Store {
     inner: S3,

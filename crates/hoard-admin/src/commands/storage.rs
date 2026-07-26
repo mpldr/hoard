@@ -199,7 +199,10 @@ async fn reachability(store: &Arc<dyn BlobStore>, data_dir: &Path) -> Result<()>
         .await
         .context("stage probe file")?;
     let key = format!("_hoard_probe/{}", Uuid::new_v4());
-    store.put_from_file(&key, &stage).await.context("probe put")?;
+    store
+        .put_from_file(&key, &stage)
+        .await
+        .context("probe put")?;
     let present = store.exists(&key).await.context("probe head")?;
     let _ = store.delete(&key).await;
     if !present {
@@ -397,10 +400,16 @@ async fn migrate(
                         verified.lock().unwrap().push(obj);
                     }
                     Err(e) => {
-                        failures.lock().unwrap().push((obj.key.clone(), e.to_string()));
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push((obj.key.clone(), e.to_string()));
                     }
                 }
-                pb.set_message(format!("{} copied", human_bytes(copied_bytes.load(Ordering::Relaxed) as i64)));
+                pb.set_message(format!(
+                    "{} copied",
+                    human_bytes(copied_bytes.load(Ordering::Relaxed) as i64)
+                ));
                 pb.inc(1);
             }
         })
@@ -441,15 +450,22 @@ async fn migrate(
     // Only now, after a fully-verified pass, is it safe to delete the source.
     if delete_source {
         let verified = Arc::try_unwrap(verified).unwrap().into_inner().unwrap();
-        println!("Deleting {} object(s) from the source backend…", verified.len());
+        println!(
+            "Deleting {} object(s) from the source backend…",
+            verified.len()
+        );
         let del_pb = ProgressBar::new(verified.len() as u64);
         let del_failures: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         futures::stream::iter(verified)
             .map(|obj| {
-                let (src, del_pb, del_failures) = (src.clone(), del_pb.clone(), del_failures.clone());
+                let (src, del_pb, del_failures) =
+                    (src.clone(), del_pb.clone(), del_failures.clone());
                 async move {
                     if let Err(e) = src.delete(&obj.key).await {
-                        del_failures.lock().unwrap().push((obj.key.clone(), e.to_string()));
+                        del_failures
+                            .lock()
+                            .unwrap()
+                            .push((obj.key.clone(), e.to_string()));
                     }
                     del_pb.inc(1);
                 }
@@ -605,7 +621,12 @@ async fn status(cfg: &Config) -> Result<()> {
             println!("{:<24} {:>10} {:>12}", username, objs, human_bytes(bytes));
         }
     }
-    println!("{:<24} {:>10} {:>12}", "TOTAL", total_objs, human_bytes(total_bytes));
+    println!(
+        "{:<24} {:>10} {:>12}",
+        "TOTAL",
+        total_objs,
+        human_bytes(total_bytes)
+    );
 
     // Reachability of the active backend.
     print!("\nReachability   : ");
@@ -691,9 +712,11 @@ mod tests {
         let dst = local(&dst_dir);
 
         let obj = seed(&src, &tmp, b"AAAAAAAAAAAAAAAA").await; // 16 bytes
-        // Destination holds a same-length but different-content object.
+                                                               // Destination holds a same-length but different-content object.
         let staged = tmp.join("corrupt");
-        tokio::fs::write(&staged, b"BBBBBBBBBBBBBBBB").await.unwrap();
+        tokio::fs::write(&staged, b"BBBBBBBBBBBBBBBB")
+            .await
+            .unwrap();
         dst.put_from_file(&obj.key, &staged).await.unwrap();
 
         // verify_skips = true (as --delete-source sets) → hash mismatch → Err.

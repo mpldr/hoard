@@ -321,7 +321,10 @@ async fn guarded_pull(
         if !guard.take_rerun() {
             return;
         }
-        tracing::debug!(trigger, "cloud-pull: re-running for kicks that arrived mid-pull");
+        tracing::debug!(
+            trigger,
+            "cloud-pull: re-running for kicks that arrived mid-pull"
+        );
     }
 }
 

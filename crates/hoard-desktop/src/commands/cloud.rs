@@ -381,7 +381,6 @@ pub async fn borrow_access_token(app: &AppHandle, rejected: Option<String>) -> R
     })
 }
 
-
 // ---- commands ---------------------------------------------------------
 
 /// Resolve the public URL the OAuth login flow starts from. The desktop UI
@@ -1033,7 +1032,8 @@ pub async fn cloud_sync_playtime(
     let mut base = creds.server_url.clone();
     match cloud_account::push_playtime(&base, "/v1/cloud/playtime", &token, &body).await {
         Ok(()) => {}
-        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await {
+        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await
+        {
             Ok(fresh) => {
                 token = fresh.access_token.clone();
                 base = fresh.server_url.clone();
@@ -1053,7 +1053,8 @@ pub async fn cloud_sync_playtime(
     // Read the device-merged aggregate (server only; empty on failure).
     match cloud_account::fetch_playtime(&base, "/v1/cloud/playtime", &token).await {
         Ok(sum) => Ok(sum),
-        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await {
+        Err(CloudError::Unauthorized) => match borrow_access_token(&app, Some(token.clone())).await
+        {
             Ok(fresh) => cloud_account::fetch_playtime(
                 &fresh.server_url,
                 "/v1/cloud/playtime",

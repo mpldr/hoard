@@ -410,9 +410,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
         let shared = Arc::new(tokio::sync::Mutex::new(session));
         aux.push(tokio::spawn(hoard_agent::supervisor::supervise(
             "hoardd cloud refresh",
-            move || {
-                hoard_agent::session::refresh_loop(refresh_client.clone(), shared.clone())
-            },
+            move || hoard_agent::session::refresh_loop(refresh_client.clone(), shared.clone()),
         )));
     }
 

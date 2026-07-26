@@ -664,7 +664,9 @@ mod tests {
             RestoreFailures::default(),
             "un throttle NO cuenta como fallo"
         );
-        let until = next.next_restore_at.expect("restore frenado hasta un deadline");
+        let until = next
+            .next_restore_at
+            .expect("restore frenado hasta un deadline");
         assert!(until > at(0), "el backoff mira al futuro");
 
         // Antes del deadline: cooldown, sin restore.
@@ -680,7 +682,11 @@ mod tests {
         // Cruzado el deadline (delta legítimo): el restore procede.
         let past = (until - at(0)).whole_seconds() + 1;
         let (_n2, ds_past) = reconcile(&next, &obs_after, world(past));
-        assert_eq!(acts(&ds_past), vec![&Action::Restore], "tras el backoff, restaura");
+        assert_eq!(
+            acts(&ds_past),
+            vec![&Action::Restore],
+            "tras el backoff, restaura"
+        );
 
         // Simetría: el MISMO throttle en un backup frena `next_backup_at`, no el
         // restore.
@@ -696,7 +702,10 @@ mod tests {
             ..quiet_obs()
         };
         let (bn, bds) = reconcile(&bstate, &bobs, world(0));
-        assert!(bn.next_backup_at.is_some(), "el throttle de backup frena el backup");
+        assert!(
+            bn.next_backup_at.is_some(),
+            "el throttle de backup frena el backup"
+        );
         assert!(bn.next_restore_at.is_none(), "sin tocar el lado restore");
         assert!(
             matches!(
@@ -725,7 +734,11 @@ mod tests {
             ..quiet_obs()
         };
         let (s1, d1) = reconcile(&state, &obs_playing, world(0));
-        assert_eq!(acts(&d1), vec![&Action::DeferPull], "1ª vez: difiere y notifica");
+        assert_eq!(
+            acts(&d1),
+            vec![&Action::DeferPull],
+            "1ª vez: difiere y notifica"
+        );
         assert!(s1.pull_pending && s1.deferred_notified);
 
         // Sigue jugando: ya no re-notifica, retiene con el motivo del veto.
@@ -741,7 +754,11 @@ mod tests {
             ..quiet_obs()
         };
         let (s3, d3) = reconcile(&s2, &obs_closed, world(10));
-        assert_eq!(acts(&d3), vec![&Action::Restore], "al cerrar, el pull aterriza");
+        assert_eq!(
+            acts(&d3),
+            vec![&Action::Restore],
+            "al cerrar, el pull aterriza"
+        );
         assert!(!s3.pull_pending && !s3.deferred_notified, "consumido");
     }
 
@@ -864,7 +881,10 @@ mod tests {
         let (s2, _d2) = reconcile(&s1, &obs_done, world(1));
         assert!(!s2.has_pending, "la subida destrabó los cambios locales");
         assert_eq!(s2.known_version, Some(7));
-        assert!(s2.pull_pending, "el pull sigue pendiente: el juego no ha cerrado");
+        assert!(
+            s2.pull_pending,
+            "el pull sigue pendiente: el juego no ha cerrado"
+        );
 
         // El usuario sigue jugando y guarda otra vez; la nube se adelanta OTRA
         // vez (v8) sin cierre de juego de por medio. El slot NO debe encallarse.
@@ -1103,7 +1123,11 @@ mod tests {
         let (next, ds) = reconcile(&state, &obs, world(0));
         assert_eq!(next.in_flight, None, "la op terminó");
         assert!(!next.has_pending, "el contenido está en una versión");
-        assert_eq!(next.known_version, Some(9), "adopta la versión que ya lo tenía");
+        assert_eq!(
+            next.known_version,
+            Some(9),
+            "adopta la versión que ya lo tenía"
+        );
         assert_eq!(next.synced_fingerprint, Some(2));
         assert!(
             next.last_backup_at.is_none(),
@@ -1212,7 +1236,10 @@ mod tests {
             ..quiet_obs()
         };
         let (same, ds_same) = reconcile(&state, &obs_same, world(0));
-        assert!(same.restore_failures.stuck_notified, "sin novedad, sigue stuck");
+        assert!(
+            same.restore_failures.stuck_notified,
+            "sin novedad, sigue stuck"
+        );
         assert_eq!(ds_same, vec![hold("restore cooldown")]);
 
         // El server publica v6: la escalada muere y el pull sale ya.
@@ -1289,7 +1316,11 @@ mod tests {
         // (la comparación es estrictamente mayor, así que el tick que cae
         // exacto sobre el deadline aún no acusa).
         let (_n, edge) = reconcile(&state, &fed_at(0), world(CLOUD_STALE_AFTER_SECS));
-        assert_eq!(edge, vec![hold("converged")], "el umbral no muerde antes de tiempo");
+        assert_eq!(
+            edge,
+            vec![hold("converged")],
+            "el umbral no muerde antes de tiempo"
+        );
 
         // Un segundo más: ciego, con motivo propio.
         let (_n, stale) = reconcile(&state, &fed_at(0), world(CLOUD_STALE_AFTER_SECS + 1));
@@ -1298,7 +1329,10 @@ mod tests {
             vec![hold(CLOUD_STALE_REASON)],
             "una caché de nube envejecida no es convergencia"
         );
-        assert!(acts(&stale).is_empty(), "pero sigue sin inventarse acciones");
+        assert!(
+            acts(&stale).is_empty(),
+            "pero sigue sin inventarse acciones"
+        );
 
         // Sin nube que observar (self-hosted / daemon CLI): no hay nada que
         // declarar obsoleto, por muy lejos que esté `now` del epoch.
@@ -1345,7 +1379,10 @@ mod tests {
         // un feed rancio (para la UI y el replay es la misma avería).
         let (_n, blind_ds) = reconcile(&state, &blind, world(CLOUD_STALE_AFTER_SECS + 1));
         assert_eq!(blind_ds, vec![hold(CLOUD_STALE_REASON)]);
-        assert!(acts(&blind_ds).is_empty(), "y sigue sin inventarse acciones");
+        assert!(
+            acts(&blind_ds).is_empty(),
+            "y sigue sin inventarse acciones"
+        );
 
         // Un feed real manda sobre el ancla de arranque: la marca fresca
         // rejuvenece la observación aunque el motor lleve horas arriba.
@@ -1560,7 +1597,10 @@ mod tests {
     }
 
     fn arb_world() -> impl Strategy<Value = World> {
-        (-100i64..300, any::<u64>()).prop_map(|(now_off, seed)| World { now: at(now_off), seed })
+        (-100i64..300, any::<u64>()).prop_map(|(now_off, seed)| World {
+            now: at(now_off),
+            seed,
+        })
     }
 
     proptest! {

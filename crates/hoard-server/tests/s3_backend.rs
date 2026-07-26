@@ -72,7 +72,11 @@ async fn s3_backend_roundtrip() {
     let r = store.local_ref(&key, &spool).await.unwrap();
     assert!(r.cleanup, "remote backend spools");
     let got = tokio::fs::read(&r.path).await.unwrap();
-    assert_eq!(hex::encode(Sha256::digest(&got)), sha, "bytes survive round-trip");
+    assert_eq!(
+        hex::encode(Sha256::digest(&got)),
+        sha,
+        "bytes survive round-trip"
+    );
 
     // Trash-purge GC primitive.
     store.delete(&key).await.unwrap();

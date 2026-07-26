@@ -629,115 +629,117 @@ where
         let landed = &landed;
         let progress = &progress;
         let options = &options;
-        fetch_futs.push(async move {
-            if let Some(parent) = dest_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("creating parent {}", parent.display()))?;
-            }
-
-            // Local shortcut first. On failure — including a sha that doesn't
-            // match, which is the whole point of keeping the check — we fall
-            // through to the network, so a bad reuse costs a wasted read, never
-            // a corrupt file or a failed restore. (That fallback is also what
-            // makes a direct restore safe when a source we indexed is itself
-            // some other entry's destination, as with rotating autosave names:
-            // whoever loses the race fails verification and downloads.)
-            if let ByteSource::Reuse(src) = planned {
-                match copy_local_blob(src, dest_path, file, options).await {
-                    Ok(()) => {
-                        // One bump on success rather than per chunk: a partial
-                        // copy that later falls back to the network must not
-                        // have its bytes counted twice.
-                        let n = file.size_bytes.max(0) as u64;
-                        let done = landed.fetch_add(n, Ordering::Relaxed) + n;
-                        progress(done, total);
-                        apply_manifest_mtime(file, dest_path);
-                        return Ok::<(u64, Origin), anyhow::Error>((n, Origin::Reused));
-                    }
-                    Err(e) => tracing::warn!(
-                        path = %file.relative_path,
-                        source = %src.display(),
-                        error = %format!("{e:#}"),
-                        "cloud restore: local reuse failed verification — downloading the blob"
-                    ),
-                }
-            }
-
-            let presigned = file.download.as_ref().ok_or_else(|| {
-                anyhow!("manifest missing download URL for {}", file.relative_path)
-            })?;
-            // R2/Cloudflare occasionally truncates a blob mid-stream ("end of
-            // file before message length reached"). Failing the whole restore
-            // over one dropped connection is a brutal retry — the next
-            // reconciliation sweep re-downloads *every* blob. Blobs are
-            // content-addressed and sha-verified, so just re-fetch the one blob a
-            // few times with a short backoff (a truncated body fails the sha
-            // check, which is retried too).
-            const BLOB_FETCH_ATTEMPTS: u32 = 4;
-            let mut attempt = 0u32;
-            loop {
-                attempt += 1;
-                let fetch = async {
-                    let resp = client.get_presigned(presigned).await?;
-                    let mut out = tokio::fs::File::create(&dest_path)
+        fetch_futs.push(
+            async move {
+                if let Some(parent) = dest_path.parent() {
+                    tokio::fs::create_dir_all(parent)
                         .await
-                        .with_context(|| format!("writing {}", dest_path.display()))?;
-                    let mut hasher = Sha256::new();
-                    let mut stream = resp.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        let chunk = chunk.context("downloading blob")?;
-                        if !options.skip_verify {
-                            hasher.update(&chunk);
+                        .with_context(|| format!("creating parent {}", parent.display()))?;
+                }
+
+                // Local shortcut first. On failure — including a sha that doesn't
+                // match, which is the whole point of keeping the check — we fall
+                // through to the network, so a bad reuse costs a wasted read, never
+                // a corrupt file or a failed restore. (That fallback is also what
+                // makes a direct restore safe when a source we indexed is itself
+                // some other entry's destination, as with rotating autosave names:
+                // whoever loses the race fails verification and downloads.)
+                if let ByteSource::Reuse(src) = planned {
+                    match copy_local_blob(src, dest_path, file, options).await {
+                        Ok(()) => {
+                            // One bump on success rather than per chunk: a partial
+                            // copy that later falls back to the network must not
+                            // have its bytes counted twice.
+                            let n = file.size_bytes.max(0) as u64;
+                            let done = landed.fetch_add(n, Ordering::Relaxed) + n;
+                            progress(done, total);
+                            apply_manifest_mtime(file, dest_path);
+                            return Ok::<(u64, Origin), anyhow::Error>((n, Origin::Reused));
                         }
-                        out.write_all(&chunk)
+                        Err(e) => tracing::warn!(
+                            path = %file.relative_path,
+                            source = %src.display(),
+                            error = %format!("{e:#}"),
+                            "cloud restore: local reuse failed verification — downloading the blob"
+                        ),
+                    }
+                }
+
+                let presigned = file.download.as_ref().ok_or_else(|| {
+                    anyhow!("manifest missing download URL for {}", file.relative_path)
+                })?;
+                // R2/Cloudflare occasionally truncates a blob mid-stream ("end of
+                // file before message length reached"). Failing the whole restore
+                // over one dropped connection is a brutal retry — the next
+                // reconciliation sweep re-downloads *every* blob. Blobs are
+                // content-addressed and sha-verified, so just re-fetch the one blob a
+                // few times with a short backoff (a truncated body fails the sha
+                // check, which is retried too).
+                const BLOB_FETCH_ATTEMPTS: u32 = 4;
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    let fetch = async {
+                        let resp = client.get_presigned(presigned).await?;
+                        let mut out = tokio::fs::File::create(&dest_path)
                             .await
                             .with_context(|| format!("writing {}", dest_path.display()))?;
-                        let done = landed.fetch_add(chunk.len() as u64, Ordering::Relaxed)
-                            + chunk.len() as u64;
-                        progress(done, total);
-                    }
-                    out.flush().await.context("flushing file")?;
-                    if !options.skip_verify {
-                        let got = hex::encode(hasher.finalize());
-                        if got != file.sha256 {
-                            bail!(
-                                "sha256 mismatch for {}: expected {}, got {}",
-                                file.relative_path,
-                                file.sha256,
-                                got
-                            );
+                        let mut hasher = Sha256::new();
+                        let mut stream = resp.bytes_stream();
+                        while let Some(chunk) = stream.next().await {
+                            let chunk = chunk.context("downloading blob")?;
+                            if !options.skip_verify {
+                                hasher.update(&chunk);
+                            }
+                            out.write_all(&chunk)
+                                .await
+                                .with_context(|| format!("writing {}", dest_path.display()))?;
+                            let done = landed.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                                + chunk.len() as u64;
+                            progress(done, total);
                         }
+                        out.flush().await.context("flushing file")?;
+                        if !options.skip_verify {
+                            let got = hex::encode(hasher.finalize());
+                            if got != file.sha256 {
+                                bail!(
+                                    "sha256 mismatch for {}: expected {}, got {}",
+                                    file.relative_path,
+                                    file.sha256,
+                                    got
+                                );
+                            }
+                        }
+                        Ok::<(), anyhow::Error>(())
                     }
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
-                match fetch {
-                    Ok(()) => break,
-                    Err(e) if attempt < BLOB_FETCH_ATTEMPTS && is_retryable_blob_error(&e) => {
-                        tracing::warn!(
-                            attempt,
-                            path = %file.relative_path,
-                            error = %format!("{e:#}"),
-                            "cloud restore: blob download failed — retrying"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            300u64 * u64::from(attempt),
-                        ))
-                        .await;
+                    .await;
+                    match fetch {
+                        Ok(()) => break,
+                        Err(e) if attempt < BLOB_FETCH_ATTEMPTS && is_retryable_blob_error(&e) => {
+                            tracing::warn!(
+                                attempt,
+                                path = %file.relative_path,
+                                error = %format!("{e:#}"),
+                                "cloud restore: blob download failed — retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                300u64 * u64::from(attempt),
+                            ))
+                            .await;
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
                 }
+
+                apply_manifest_mtime(file, dest_path);
+
+                Ok::<(u64, Origin), anyhow::Error>((
+                    file.size_bytes.max(0) as u64,
+                    Origin::Downloaded,
+                ))
             }
-
-            apply_manifest_mtime(file, dest_path);
-
-            Ok::<(u64, Origin), anyhow::Error>((
-                file.size_bytes.max(0) as u64,
-                Origin::Downloaded,
-            ))
-        }
-        .boxed());
+            .boxed(),
+        );
     }
     let restored: Vec<(u64, Origin)> = futures::stream::iter(fetch_futs)
         .buffer_unordered(RESTORE_CONCURRENCY)
@@ -1048,7 +1050,9 @@ mod tests {
         assert!(is_retryable_blob_error(&anyhow!(
             "sha256 mismatch for save.zip: expected abc, got def"
         )));
-        assert!(is_retryable_blob_error(&anyhow!("connection reset by peer")));
+        assert!(is_retryable_blob_error(&anyhow!(
+            "connection reset by peer"
+        )));
         // Permanent errors must NOT retry.
         assert!(!is_retryable_blob_error(&anyhow!(
             "writing /x: No space left on device (os error 28)"
@@ -1127,10 +1131,7 @@ mod tests {
         let plan = plan_byte_sources(&manifest_shas, &index);
 
         assert_eq!(plan.len(), N);
-        let downloads = plan
-            .iter()
-            .filter(|s| **s == ByteSource::Download)
-            .count();
+        let downloads = plan.iter().filter(|s| **s == ByteSource::Download).count();
         assert_eq!(downloads, 1, "only the rotated file should be fetched");
         // And each reuse points at the local file that actually holds those bytes.
         for (i, source) in plan.iter().take(N - 1).enumerate() {

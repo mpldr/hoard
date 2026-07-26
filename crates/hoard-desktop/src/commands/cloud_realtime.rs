@@ -252,9 +252,9 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
 
     let mut hb = interval(Duration::from_secs(HEARTBEAT_SECS));
     hb.tick().await; // consume the immediate first tick
-    // Token-expiry watchdog. First tick is intentionally NOT consumed: it fires
-    // immediately so a socket that joined with an already-aged on-disk token
-    // renews at once instead of waiting a full interval.
+                     // Token-expiry watchdog. First tick is intentionally NOT consumed: it fires
+                     // immediately so a socket that joined with an already-aged on-disk token
+                     // renews at once instead of waiting a full interval.
     let mut token_check = interval(Duration::from_secs(TOKEN_CHECK_SECS));
     // Shared monotonic `ref` for every client-initiated frame after the join
     // (heartbeats + access_token pushes) so no two collide.
@@ -617,7 +617,9 @@ mod tests {
         let err = r#"["1","1","realtime:hoard","phx_reply",{"status":"error","response":{"reason":"token has expired"}}]"#;
         assert!(matches!(classify(err), Some(Action::TokenError)));
         // Heartbeat ack (ref != "1") → ignored.
-        assert!(classify(r#"[null,"2","phoenix","phx_reply",{"status":"ok","response":{}}]"#).is_none());
+        assert!(
+            classify(r#"[null,"2","phoenix","phx_reply",{"status":"ok","response":{}}]"#).is_none()
+        );
         // Old object format / garbage → None, never a panic.
         assert!(classify(r#"{"event":"postgres_changes"}"#).is_none());
         assert!(classify("nonsense").is_none());
@@ -630,7 +632,7 @@ mod tests {
         assert!(is_heartbeat_ack(ack, Some("7")));
         assert!(!is_heartbeat_ack(ack, Some("8"))); // different ref
         assert!(!is_heartbeat_ack(ack, None)); // nothing pending
-        // A channel join reply (topic realtime:hoard) is not a heartbeat ack.
+                                               // A channel join reply (topic realtime:hoard) is not a heartbeat ack.
         let join = r#"["1","1","realtime:hoard","phx_reply",{"status":"ok","response":{}}]"#;
         assert!(!is_heartbeat_ack(join, Some("1")));
     }

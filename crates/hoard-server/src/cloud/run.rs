@@ -7,8 +7,8 @@ use crate::cloud::{
     bandwidth, compress, db, export, polar, pollguard, r2,
     routes::{
         blob_proxy, checkout, device as device_routes, entitlements as ent_routes,
-        logs as log_routes, me, notifications as notification_routes,
-        playtime as playtime_routes, saves, sync as sync_routes,
+        logs as log_routes, me, notifications as notification_routes, playtime as playtime_routes,
+        saves, sync as sync_routes,
     },
     state::CloudState,
 };

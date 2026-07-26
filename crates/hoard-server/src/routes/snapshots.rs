@@ -53,7 +53,11 @@ fn internal() -> (StatusCode, Json<serde_json::Value>) {
 /// the source of truth (a row exists iff the object is stored and refcounted),
 /// so dedup/quota consult it instead of a per-key HEAD against the store —
 /// which on the S3 backend would be one network round-trip per file.
-async fn blob_in_db(pool: &sqlx::SqlitePool, user_id: &str, sha: &str) -> Result<bool, sqlx::Error> {
+async fn blob_in_db(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    sha: &str,
+) -> Result<bool, sqlx::Error> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT 1 FROM blobs WHERE user_id=? AND sha256=? LIMIT 1")
             .bind(user_id)

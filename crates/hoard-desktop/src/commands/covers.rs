@@ -102,9 +102,11 @@ pub async fn has_custom_cover(app: tauri::AppHandle, app_id: u32) -> Result<bool
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("covers");
-    Ok(tokio::task::spawn_blocking(move || find_custom_cover(&dir, app_id).is_some())
-        .await
-        .map_err(|e| e.to_string())?)
+    Ok(
+        tokio::task::spawn_blocking(move || find_custom_cover(&dir, app_id).is_some())
+            .await
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 /// Copy a user-selected image into the cover cache as a custom cover for the

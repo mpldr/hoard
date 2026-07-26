@@ -195,7 +195,10 @@ async fn sync_row() -> (bool, String) {
     };
     if status.engine.running {
         let watched = status.slots.len().max(status.engine.watched);
-        return (true, format!("running · {watched} save(s) · pid {}", status.pid));
+        return (
+            true,
+            format!("running · {watched} save(s) · pid {}", status.pid),
+        );
     }
     (
         false,

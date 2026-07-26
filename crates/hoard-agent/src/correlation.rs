@@ -760,7 +760,10 @@ mod tests {
             "unins000.exe",
             "MyGame-Uninstall.exe",
         ] {
-            assert!(!is_game_like(n, None), "{n} should be filtered as installer");
+            assert!(
+                !is_game_like(n, None),
+                "{n} should be filtered as installer"
+            );
         }
         // Falsos positivos que NO debe tumbar: un juego que menciona la palabra
         // en medio (no como último token) sigue pasando.

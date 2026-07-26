@@ -496,7 +496,8 @@ mod tests {
             write_blob(data_dir, "u1", sha, b"data").await;
         }
 
-        let store: Arc<dyn BlobStore> = Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
+        let store: Arc<dyn BlobStore> =
+            Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
         purge_trash(&pool, data_dir, &store, 0).await.unwrap();
 
         // s1 gone (cascade removed its files); s2 intact.
@@ -610,7 +611,8 @@ mod tests {
             write_chunk(data_dir, "u1", sha, b"data").await;
         }
 
-        let store: Arc<dyn BlobStore> = Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
+        let store: Arc<dyn BlobStore> =
+            Arc::new(crate::store::LocalFs::new(data_dir.to_path_buf()));
         purge_trash(&pool, data_dir, &store, 0).await.unwrap();
 
         // s1 gone (cascade removed its files + chunk refs); s2 intact.

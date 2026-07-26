@@ -87,6 +87,9 @@ mod tests {
             ConflictResolution::BackupThenTakeRemote
         );
         // Remoto gana pero SIN backup-dir → fallback duro: conservar local.
-        assert_eq!(resolve_conflict(false, false), ConflictResolution::KeepLocal);
+        assert_eq!(
+            resolve_conflict(false, false),
+            ConflictResolution::KeepLocal
+        );
     }
 }

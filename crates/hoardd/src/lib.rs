@@ -231,7 +231,9 @@ fn sweep_legacy_pidfile() {
         return;
     }
     match std::fs::remove_file(&path) {
-        Ok(()) => tracing::info!(path = %path.display(), "hoardd: removed the legacy agent pidfile"),
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "hoardd: removed the legacy agent pidfile")
+        }
         Err(err) => {
             tracing::debug!(error = %err, path = %path.display(), "hoardd: couldn't remove the legacy agent pidfile")
         }

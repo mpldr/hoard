@@ -112,10 +112,7 @@ pub fn spawn(state: CloudState) {
 /// `(picked, ok)` — how many were picked up and how many of those finished
 /// (compressed, kept raw, or marked missing). Failures retry on a later
 /// tick; the caller uses `ok` to stop draining when nothing progresses.
-async fn sweep_once(
-    state: &CloudState,
-    cfg: &CompressionConfig,
-) -> anyhow::Result<(usize, usize)> {
+async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Result<(usize, usize)> {
     // Eligible: raw (or claimed-but-unfinished) blobs old enough, with no
     // recent direct-download URL out in the wild, still referenced and not
     // frozen in the archive grace window.

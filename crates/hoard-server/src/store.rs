@@ -22,14 +22,22 @@ use async_trait::async_trait;
 /// Object key for a whole-file blob. First two hex chars of the sha shard the
 /// keyspace so one user's blobs spread across 256 folders/prefixes.
 pub fn blob_key(user_id: &str, sha256: &str) -> String {
-    let shard = if sha256.len() >= 2 { &sha256[..2] } else { "00" };
+    let shard = if sha256.len() >= 2 {
+        &sha256[..2]
+    } else {
+        "00"
+    };
     format!("blobs/{user_id}/{shard}/{sha256}")
 }
 
 /// Object key for a content-defined chunk (ADR 0019). Same sharding as blobs
 /// under a distinct `chunks/` prefix.
 pub fn chunk_key(user_id: &str, sha256: &str) -> String {
-    let shard = if sha256.len() >= 2 { &sha256[..2] } else { "00" };
+    let shard = if sha256.len() >= 2 {
+        &sha256[..2]
+    } else {
+        "00"
+    };
     format!("chunks/{user_id}/{shard}/{sha256}")
 }
 
@@ -245,24 +253,19 @@ pub async fn build_backend(
             #[cfg(feature = "s3-backend")]
             {
                 let s3cfg = cfg.storage.s3.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "the s3 backend requires an [storage.s3] section in config"
-                    )
+                    anyhow::anyhow!("the s3 backend requires an [storage.s3] section in config")
                 })?;
                 let store = S3Store::connect(s3cfg)
                     .await
                     .context("connecting to S3-compatible endpoint")?;
-                store
-                    .probe()
-                    .await
-                    .context("S3 bucket is not reachable/writable (check endpoint, bucket, credentials)")?;
+                store.probe().await.context(
+                    "S3 bucket is not reachable/writable (check endpoint, bucket, credentials)",
+                )?;
                 Ok(Arc::new(store))
             }
             #[cfg(not(feature = "s3-backend"))]
             {
-                anyhow::bail!(
-                    "the s3 backend requires building with --features s3-backend"
-                )
+                anyhow::bail!("the s3 backend requires building with --features s3-backend")
             }
         }
     }
@@ -290,7 +293,12 @@ pub async fn sanity_check(pool: &sqlx::SqlitePool, store: &Arc<dyn BlobStore>) -
     .fetch_all(pool)
     .await?
     .iter()
-    .map(|r| blob_key(&r.get::<String, _>("user_id"), &r.get::<String, _>("sha256")))
+    .map(|r| {
+        blob_key(
+            &r.get::<String, _>("user_id"),
+            &r.get::<String, _>("sha256"),
+        )
+    })
     .collect();
 
     if keys.is_empty() {
@@ -300,7 +308,12 @@ pub async fn sanity_check(pool: &sqlx::SqlitePool, store: &Arc<dyn BlobStore>) -
         .fetch_all(pool)
         .await?
         .iter()
-        .map(|r| chunk_key(&r.get::<String, _>("user_id"), &r.get::<String, _>("sha256")))
+        .map(|r| {
+            chunk_key(
+                &r.get::<String, _>("user_id"),
+                &r.get::<String, _>("sha256"),
+            )
+        })
         .collect();
     }
 

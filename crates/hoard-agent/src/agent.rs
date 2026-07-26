@@ -794,7 +794,9 @@ fn fingerprint_from_set_hash(composite: &str) -> u64 {
 /// reductor).
 fn observe_local_fingerprint(path: &Path) -> Option<u64> {
     let files = crate::backup::walk_source(path).ok()?;
-    Some(fingerprint_of(&crate::backup::compute_set_signature(&files)))
+    Some(fingerprint_of(&crate::backup::compute_set_signature(
+        &files,
+    )))
 }
 
 /// Construye la [`kernel::State`] durable del slot para pasarla al reductor
@@ -2279,9 +2281,10 @@ fn spawn_auto_restore(
                 // fired "keeps failing to restore (3×)" for saves that were never
                 // broken. Honour the server's retry_after and don't count it.
                 let throttled = match api_err {
-                    Some(ApiError::RateLimited { retry_after_seconds, .. }) => {
-                        Some(*retry_after_seconds)
-                    }
+                    Some(ApiError::RateLimited {
+                        retry_after_seconds,
+                        ..
+                    }) => Some(*retry_after_seconds),
                     _ => None,
                 };
                 if not_on_server {
@@ -2997,8 +3000,14 @@ async fn local_mtime_wins(local: &Path, remote: &Path) -> bool {
     // Sans-IO boundary: this shell samples both mtimes; the kernel decides.
     // An unreadable file → `None` → the kernel hands the tie to the remote,
     // exactly as the old early-return `false` did.
-    let local_mtime = tokio::fs::metadata(local).await.and_then(|m| m.modified()).ok();
-    let remote_mtime = tokio::fs::metadata(remote).await.and_then(|m| m.modified()).ok();
+    let local_mtime = tokio::fs::metadata(local)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
+    let remote_mtime = tokio::fs::metadata(remote)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
     kernel::restore_merge::local_wins_on_mtime(local_mtime, remote_mtime)
 }
 
@@ -3788,10 +3797,7 @@ fn game_identity_tokens(slug: &str, display: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::with_capacity(2);
     for raw in [slug, display] {
         let t = canon_token(raw);
-        if t.len() >= MIN_IDENTITY_TOKEN_LEN
-            && !is_generic_identity_token(&t)
-            && !v.contains(&t)
-        {
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !is_generic_identity_token(&t) && !v.contains(&t) {
             v.push(t);
         }
     }
@@ -3810,10 +3816,7 @@ fn process_identity_candidates(name: &str, exe: Option<&Path>) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     let push = |s: &str, v: &mut Vec<String>| {
         let t = canon_token(s);
-        if t.len() >= MIN_IDENTITY_TOKEN_LEN
-            && !is_generic_identity_token(&t)
-            && !v.contains(&t)
-        {
+        if t.len() >= MIN_IDENTITY_TOKEN_LEN && !is_generic_identity_token(&t) && !v.contains(&t) {
             v.push(t);
         }
     };
@@ -4340,10 +4343,7 @@ fn process_poll(
             // algo de latencia en la ventana estrecha "bump < 1 tick antes de
             // lanzar" (aterriza al cerrar); ver el resumen del slice.
         } else {
-            let was_weak_session = slots
-                .get(&id)
-                .map(|s| s.weak_session)
-                .unwrap_or(false);
+            let was_weak_session = slots.get(&id).map(|s| s.weak_session).unwrap_or(false);
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = false;
                 slot.weak_session = false;
@@ -4500,7 +4500,14 @@ mod tests {
         // Windows ("jacka"). El username es componente de ruta de TODO exe del
         // perfil, así que cualquier app disparaba "estás jugando". Los tokens
         // de fontanería no pueden ser identidad ni de juego ni de proceso.
-        for t in ["users", "appdata", "roaming", "locallow", "savedgames", "games"] {
+        for t in [
+            "users",
+            "appdata",
+            "roaming",
+            "locallow",
+            "savedgames",
+            "games",
+        ] {
             assert!(is_generic_identity_token(t), "{t} debería vetarse");
         }
         assert!(!is_generic_identity_token("eldenring"));
@@ -4514,7 +4521,9 @@ mod tests {
             "game.exe",
             Some(Path::new("/Users/bob/AppData/Roaming/GSE Saves/game.exe")),
         );
-        assert!(!cands.iter().any(|c| c == "users" || c == "appdata" || c == "roaming"));
+        assert!(!cands
+            .iter()
+            .any(|c| c == "users" || c == "appdata" || c == "roaming"));
         assert!(cands.contains(&"gsesaves".to_string()));
         // Un juego normal conserva su identidad por carpeta de instalación.
         let cands = process_identity_candidates(

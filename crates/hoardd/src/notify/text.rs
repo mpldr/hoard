@@ -40,7 +40,7 @@ impl Lang {
     /// en inglés, que es el idioma fuente.
     pub fn for_user(pref: Option<&str>) -> Self {
         pref.and_then(Self::parse)
-            .or_else(|| Self::from_env())
+            .or_else(Self::from_env)
             .unwrap_or(Lang::En)
     }
 

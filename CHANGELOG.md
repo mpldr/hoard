@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-28
+
 ### Added
+- **Hoard keeps syncing with the app closed.** The sync engine moved out of
+  the window and into a local service (`hoardd`) that starts with your session
+  and stays resident: the desktop app and the `hoard` CLI are now thin clients
+  that talk to it over a local socket. Close the app mid-game and your saves
+  still get backed up; open it again and it just attaches to the service
+  that was already running. On Linux the service also sends the native
+  notifications, so a finished backup tells you even with no window open
+  (Windows and macOS still notify from the app).
+- **Real game covers, in the shape covers are.** The panel now asks Steam for
+  each game's vertical 2:3 art instead of the 460×215 store banner, so a card
+  shows the actual cover instead of a center-cropped strip of one. Games with
+  no vertical art keep their banner, letterboxed over a blurred blow-up of
+  itself rather than cropped to a third of the image. You can frame the whole
+  grid as 2:3 posters or as squares (toolbar, top right — the square is there
+  for custom art that isn't a poster), and your own image still beats both:
+  hover a cover and click the pencil in its corner.
+- **Redesigned dashboard.** The list of rows is now a grid of cover cards, each
+  one carrying what the row had no room for: last save, total size across
+  versions, stored-version count, a per-game menu (rename, pause, history) and
+  a status pill that always speaks for *this* device — the cloud's version
+  rides in a separate chip over the cover. A summary bar at the bottom totals
+  games, versions, size and last backup.
 - **Sniper scope (magnifier) in Hoard Screen.** A lens — circle or square —
   that shows whatever is under it magnified (×1–×4), sniper-style. Drag and
   resize it anywhere; clicks pass through to the game, and a crosshair draws
@@ -24,7 +48,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   through the same compositing path on every OS, is always click-through,
   and stays pixel-crisp at any size.
 
+### Changed
+- **Restores skip what your disk already has.** Before downloading a version,
+  the client indexes the live folder by content: any file whose contents
+  already sit there is copied locally instead of fetched. Restoring a 400 MB
+  Factorio save after a small change now moves single-digit megabytes over the
+  network.
+
 ### Fixed
+- **Saves no longer get tracked under an app's name.** A background app that
+  happened to be busy while a save folder changed could be credited with it,
+  so the panel grew entries called "ChatGPT", "opencode" or "Codex … Setup"
+  pointing at another game's folder — and since each wrong name made a new
+  entry, they piled up. AI/desktop apps, capture tools (OBS, Streamlabs) and
+  file-sync clients (Dropbox, Nextcloud, Syncthing, …) are no longer taken for
+  games, the same folder can't be tracked twice under different names, and
+  entries already poisoned are dropped when a real game covers that folder.
+- **The cloud panel no longer goes stale in silence.** A background task that
+  died could leave the app showing versions that no longer matched the cloud,
+  with nothing on screen saying so; the engine now watches the cloud itself,
+  restarts the task that died, and says out loud when its view is stale.
+- **A locked keyring can't freeze the app any more.** If the system keyring
+  never answered (locked wallet, no unlock prompt), the engine hung and the
+  service refused to stop. Keyring reads now give up after 5 seconds with a
+  reason you can read.
 - **Hoard Screen editor can no longer lose track of the overlay.** The editor
   now re-syncs with the overlay process every few seconds (and on open), so a
   panel that is really on screen — e.g. a TikTok capture while gaming — can

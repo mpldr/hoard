@@ -224,6 +224,7 @@ pub async fn run_scan(app: &AppHandle) {
     // skips it (the cross-device bug: detected=1, tracked=0). They're collected
     // separately so a High detection can ADOPT them instead.
     let mut tracked_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tracked_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut orphans_by_slug: std::collections::HashMap<
         String,
         crate::commands::library::TrackedSave,
@@ -239,6 +240,9 @@ pub async fn run_scan(app: &AppHandle) {
                 }
             }
         } else {
+            if !t.local_path.is_empty() {
+                tracked_paths.push(std::path::PathBuf::from(&t.local_path));
+            }
             tracked_slugs.insert(t.game_slug);
         }
     }
@@ -257,12 +261,34 @@ pub async fn run_scan(app: &AppHandle) {
         if tracked_slugs.contains(&g.slug) || g.found_paths.is_empty() {
             continue;
         }
+        // La MISMA carpeta ya rastreada bajo OTRO slug no vuelve a rastrearse.
+        // El nombre de un descubrimiento de fase 4 sale de la atribución de la
+        // correlación, y esa atribución cambia entre escaneos (ChatGPT →
+        // opencode → code sobre la carpeta de Planet S, informe jul-2026): sin
+        // esta puerta, cada nombre nuevo era un slug nuevo y la carpeta acababa
+        // rastreada N veces. El guard por slug no lo ve porque el slug cambia.
+        if tracked_paths
+            .iter()
+            .any(|t| hoard_agent::detection::paths_overlap(&g.found_paths[0], t))
+        {
+            tracing::debug!(
+                slug = %g.slug,
+                path = %g.found_paths[0].display(),
+                "automatic scan: folder already tracked under another slug; skipping"
+            );
+            continue;
+        }
         if g.confidence == Confidence::High {
+            let path = g.found_paths[0].clone();
             if let Some(orphan) = orphans_by_slug.remove(&g.slug) {
-                adopt.push((orphan, g.found_paths[0].clone()));
+                adopt.push((orphan, path.clone()));
             } else {
                 candidates.push(g);
             }
+            // Reserva la carpeta dentro de ESTE mismo escaneo: dos hallazgos
+            // distintos sobre la misma ruta (el mismo churn de atribución, sólo
+            // que en un único informe) no deben rastrearla dos veces.
+            tracked_paths.push(path);
         } else {
             probe_dirs.extend(g.found_paths.iter().cloned());
         }

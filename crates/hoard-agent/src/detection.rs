@@ -2194,9 +2194,30 @@ fn discover_in_roots(
 /// True if `candidate` is already covered by a catalog/Steam hit: either it
 /// equals a known path, sits inside one, or contains one.
 fn path_already_known(candidate: &Path, known: &HashSet<PathBuf>) -> bool {
-    known
-        .iter()
-        .any(|k| candidate.starts_with(k) || k.starts_with(candidate))
+    known.iter().any(|k| paths_overlap(candidate, k))
+}
+
+/// `true` si dos rutas se solapan: son la misma carpeta, o una cuelga de la
+/// otra. Es el predicado de "esta carpeta ya está cubierta" que usan tanto el
+/// descubrimiento de fase 4 como el auto-track (que sin él rastreaba la misma
+/// carpeta una vez por cada nombre que la correlación le atribuía).
+///
+/// En Windows compara sin distinguir mayúsculas: `C:\Users\…\Saved Games` y
+/// `c:\users\…\saved games` son la MISMA carpeta, y la ruta guardada en el
+/// state y la que sale del walk no siempre coinciden en caja.
+pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        // `starts_with` compara por COMPONENTES, así que bajar la cadena
+        // entera a minúsculas no altera la semántica (los separadores siguen
+        // donde estaban).
+        let (a, b) = (
+            PathBuf::from(a.to_string_lossy().to_lowercase()),
+            PathBuf::from(b.to_string_lossy().to_lowercase()),
+        );
+        a.starts_with(&b) || b.starts_with(&a)
+    } else {
+        a.starts_with(b) || b.starts_with(a)
+    }
 }
 
 /// Best-effort game name for a phase-4 save folder.

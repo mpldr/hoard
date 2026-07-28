@@ -49,6 +49,28 @@ pub struct RestoreOutcome {
     pub files_reused: usize,
     /// Subset of `bytes_extracted` that never crossed the network.
     pub bytes_reused: u64,
+    /// Cuánto costó cada mitad del restore. Ver [`RestoreTimings`].
+    pub timings: RestoreTimings,
+}
+
+/// Reparto del tiempo de un restore entre sus fases.
+///
+/// El mismo save puede tardar 25 s, 15 s o nada según qué fase domine —el
+/// manifiesto, el hasheo del disco local, o la transferencia— y sin este
+/// desglose las tres son indistinguibles desde fuera: un usuario solo ve
+/// "a veces va lento". Se rellena en la ruta content-addressed (la de Cloud);
+/// en las otras solo se conoce el total.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreTimings {
+    /// Pedir el manifiesto de la versión (con sus URLs prefirmadas).
+    pub manifest_ms: u64,
+    /// Indexar por contenido lo que ya hay en disco (dedup D.13). Es tiempo de
+    /// CPU/IO local: crece con el tamaño de la carpeta, no con la red.
+    pub index_ms: u64,
+    /// Mover bytes: GETs a R2 más las copias locales que el índice ahorró.
+    pub transfer_ms: u64,
+    /// De la primera llamada al último byte escrito.
+    pub total_ms: u64,
 }
 
 /// Hard ceiling on the total bytes a single restore may write to disk —
@@ -62,6 +84,21 @@ const MAX_RESTORE_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
 /// bandwidth, dominates the many-small-files shape of most saves; a small
 /// window hides it without hammering the disk with concurrent writes.
 const RESTORE_CONCURRENCY: usize = 4;
+
+/// Override del fan-out, para medirlo. El valor bueno depende de la forma del
+/// save (un monolito no se parte, 4000 chunks sí) y de la línea del usuario, y
+/// hasta que el banco (`hoard-pruebas bench`) no barra el rango no hay motivo
+/// para creer que 4 es el número correcto para todos. Fuera de `[1, 64]` se
+/// ignora: un fan-out absurdo no es una preferencia, es un dedo torcido.
+const CONCURRENCY_ENV: &str = "HOARD_RESTORE_CONCURRENCY";
+
+fn restore_concurrency() -> usize {
+    std::env::var(CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(RESTORE_CONCURRENCY)
+}
 
 /// Slack factor over the manifest-declared expanded size: enough room for
 /// unlisted sidecar files while still bounding a bomb to ~2× the real payload.
@@ -131,6 +168,7 @@ where
     if client.is_cloud().await {
         return download_snapshot_cloud(client, save_id, version, dest, options, progress).await;
     }
+    let started = std::time::Instant::now();
     let detail: SnapshotDetail = client.snapshot_detail(save_id, version).await?;
     let expected: HashMap<String, &SnapshotFile> = detail
         .files
@@ -279,6 +317,12 @@ where
         files_extracted,
         bytes_extracted,
         destination: dest.to_path_buf(),
+        // El tar entero no tiene fases separables: descarga, descompresión y
+        // escritura van en el mismo bucle. Solo hay total.
+        timings: RestoreTimings {
+            total_ms: started.elapsed().as_millis() as u64,
+            ..Default::default()
+        },
         // Whole-archive path: nothing to skip per file.
         files_reused: 0,
         bytes_reused: 0,
@@ -324,11 +368,16 @@ where
     // New uploads are content-addressed: pull the per-file manifest (with
     // presigned GETs) and download each blob. Legacy archive versions report
     // `content_addressed = false` and fall through to the whole-archive path.
+    let started = std::time::Instant::now();
     let manifest = client
         .cloud_version_manifest(save_id, version, true)
         .await?;
+    let manifest_ms = started.elapsed().as_millis() as u64;
     if manifest.content_addressed {
-        return restore_cloud_cas(client, dest, options, manifest, progress).await;
+        let mut outcome = restore_cloud_cas(client, dest, options, manifest, progress).await?;
+        outcome.timings.manifest_ms = manifest_ms;
+        outcome.timings.total_ms = started.elapsed().as_millis() as u64;
+        return Ok(outcome);
     }
 
     let meta = client.cloud_download(save_id, version).await?;
@@ -358,7 +407,11 @@ where
 
     let result = download_and_extract_cloud(client, &meta, dest, &tmp, &options, progress).await;
     let _ = tokio::fs::remove_file(&tmp).await;
-    result
+    result.map(|mut outcome| {
+        outcome.timings.manifest_ms = manifest_ms;
+        outcome.timings.total_ms = started.elapsed().as_millis() as u64;
+        outcome
+    })
 }
 
 /// Files already on disk, keyed by the SHA-256 of their contents. Built by
@@ -432,7 +485,7 @@ async fn build_reuse_index(dir: &Path, wanted_sizes: &HashSet<u64>) -> ReuseInde
         );
     }
     let hashed: Vec<Option<(String, PathBuf)>> = futures::stream::iter(hash_futs)
-        .buffered(RESTORE_CONCURRENCY)
+        .buffered(restore_concurrency())
         .collect()
         .await;
 
@@ -594,6 +647,7 @@ where
     // Dedup against the disk before touching the network. Hashing the folder
     // costs a couple of seconds; the blobs it lets us skip cost a minute of
     // egress each time a save rotates one file out of a dozen.
+    let index_started = std::time::Instant::now();
     let plan = match options.reuse_from.as_deref() {
         Some(reuse_dir) => {
             let wanted: HashSet<u64> = manifest
@@ -607,6 +661,7 @@ where
         }
         None => vec![ByteSource::Download; jobs.len()],
     };
+    let index_ms = index_started.elapsed().as_millis() as u64;
 
     // A few blobs download in flight at once — presigned-GET round-trip
     // latency dominates the many-small-files shape. Each blob writes to its
@@ -624,6 +679,7 @@ where
     let landed = AtomicU64::new(0);
     progress(0, total);
 
+    let transfer_started = std::time::Instant::now();
     let mut fetch_futs = Vec::with_capacity(jobs.len());
     for ((file, dest_path), planned) in jobs.iter().zip(plan.iter()) {
         let landed = &landed;
@@ -742,9 +798,10 @@ where
         );
     }
     let restored: Vec<(u64, Origin)> = futures::stream::iter(fetch_futs)
-        .buffer_unordered(RESTORE_CONCURRENCY)
+        .buffer_unordered(restore_concurrency())
         .try_collect()
         .await?;
+    let transfer_ms = transfer_started.elapsed().as_millis() as u64;
 
     let mut files_reused = 0usize;
     let mut bytes_reused = 0u64;
@@ -764,11 +821,17 @@ where
     }
     // The dogfooding check for D.13: on a save that rotated one file out of a
     // dozen this should read ~390 MB reused / ~8 MB downloaded, not 400/0.
+    // Las fases van en la misma línea porque la pregunta que sigue a "tardó
+    // 25 s" siempre es "¿en qué?", y responderla con dos líneas separadas
+    // obliga a casarlas por timestamp cuando hay varios saves en vuelo.
     tracing::info!(
         files_reused,
         mib_reused = as_mib(bytes_reused),
         files_downloaded,
         mib_downloaded = as_mib(bytes_downloaded),
+        index_ms,
+        transfer_ms,
+        concurrency = restore_concurrency(),
         dedup_source = options
             .reuse_from
             .as_deref()
@@ -783,6 +846,12 @@ where
         destination: dest.to_path_buf(),
         files_reused,
         bytes_reused,
+        timings: RestoreTimings {
+            manifest_ms: 0, // lo rellena `download_snapshot_cloud`, que lo pidió
+            index_ms,
+            transfer_ms,
+            total_ms: 0,
+        },
     })
 }
 
@@ -921,6 +990,9 @@ where
         // Legacy whole-archive cloud version: no per-file blobs to skip.
         files_reused: 0,
         bytes_reused: 0,
+        // El total lo sella `download_snapshot_cloud`, que es quien arrancó el
+        // cronómetro (incluye pedir el manifiesto).
+        timings: RestoreTimings::default(),
     })
 }
 
@@ -1153,7 +1225,7 @@ mod tests {
 
         seed(dir.path(), "save.dat", &local);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(&[remote.clone()])).await;
+        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote))).await;
         let plan = plan_byte_sources(&[sha_of(&remote)], &index);
 
         assert_eq!(plan, vec![ByteSource::Download]);
@@ -1192,7 +1264,7 @@ mod tests {
         let blob = vec![7u8; 8192];
         seed(dir.path(), "nested/old-name.zip", &blob);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(&[blob.clone()])).await;
+        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob))).await;
         let plan = plan_byte_sources(&[sha_of(&blob)], &index);
 
         assert_eq!(

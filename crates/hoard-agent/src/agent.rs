@@ -3745,10 +3745,10 @@ async fn run_backup_with_retry(
     }
 }
 
-/// `accept_correlation_signals` (el filtro anti horas-fantasma) se movió al
-/// kernel leaf en el Slice 1 (ADR 0021): vive en
-/// [`hoard_core::kernel::correlation`] y se importa arriba. Era ya una función
-/// pura, así que su sitio natural es el kernel.
+// `accept_correlation_signals` (el filtro anti horas-fantasma) se movió al
+// kernel leaf en el Slice 1 (ADR 0021): vive en
+// `hoard_core::kernel::correlation` y se importa arriba. Era ya una función
+// pura, así que su sitio natural es el kernel.
 
 /// Longitud mínima de un token de identidad para que cuente en el match
 /// genérico. Por debajo (`gta`, `ori`, `ff`) es demasiado corto y colisiona

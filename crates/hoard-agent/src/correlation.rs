@@ -165,6 +165,34 @@ const NON_GAME_PROCESS: &[&str] = &[
     "crossdeviceservice",
     "logipluginservice",
     "generate_emu_config",
+    // Apps de IA/escritorio con instalador propio en el perfil del usuario
+    // (`%LOCALAPPDATA%\Programs\...`, `/opt/...`): ni la regla de ruta de
+    // sistema ni "electron" (el nombre del proceso es el de la app, no el del
+    // runtime) las alcanzaban. Informe jul-2026: ChatGPT heredó la carpeta de
+    // Planet S y el auto-track la rastreó con su nombre.
+    "chatgpt",
+    "copilot",
+    "windsurf",
+    "ollama",
+    "lmstudio",
+    "notion",
+    "obsidian",
+    // Captura/streaming: corren JUNTO al juego y queman CPU, así que el orden
+    // por CPU de `sample_game_processes` no los relega — pueden ganarle la
+    // atribución al juego real.
+    "obs64",
+    "obs32",
+    "obs-studio",
+    "streamlabs",
+    // Clientes de sync de ficheros: no son juegos y, peor, REESCRIBEN la
+    // carpeta que vigilamos (que es justo la señal con la que se atribuye la
+    // correlación). OneDrive ya estaba arriba; estos son los otros.
+    "dropbox",
+    "nextcloud",
+    "megasync",
+    "syncthing",
+    "pcloud",
+    "googledrive",
     // El propio Hoard.
     "hoard",
 ];
@@ -178,7 +206,9 @@ const NON_GAME_PROCESS: &[&str] = &[
 /// por substring); como substring pescaría exes legítimos tipo `upcoming.exe`.
 /// `"setup"` son instaladores (como substring pescaría juegos con "setup" en la
 /// carpeta); `"achievements"` es el watcher de logros de GSE/Goldberg, que corre
-/// JUNTO al juego emulado pero no es el juego.
+/// JUNTO al juego emulado pero no es el juego. `"cursor"`/`"zed"` son editores:
+/// como substring se comerían `Precursor.exe` o cualquier juego con "zed"
+/// dentro (`Fuzed.exe`).
 const NON_GAME_PROCESS_EXACT: &[&str] = &[
     "code",
     "code.exe",
@@ -188,6 +218,10 @@ const NON_GAME_PROCESS_EXACT: &[&str] = &[
     "setup.exe",
     "achievements",
     "achievements.exe",
+    "cursor",
+    "cursor.exe",
+    "zed",
+    "zed.exe",
 ];
 
 /// Un proceso nacido dentro de esta ventana tras el arranque del SISTEMA es
@@ -746,6 +780,31 @@ mod tests {
         // Real games still pass.
         assert!(is_game_like("eldenring.exe", None));
         assert!(is_game_like("Hades.exe", None));
+    }
+
+    #[test]
+    fn is_game_like_rejects_desktop_ai_and_sync_apps() {
+        // El caso real (informe jul-2026): ChatGPT vive en
+        // `%LOCALAPPDATA%\Programs\ChatGPT`, así que ninguna regla de RUTA lo
+        // alcanzaba y su nombre de proceso no es "electron" — pasaba el filtro
+        // y heredaba la carpeta de Planet S.
+        for n in [
+            "ChatGPT.exe",
+            "chatgpt",
+            "Cursor.exe",
+            "zed",
+            "ollama.exe",
+            "obs64.exe",
+            "Streamlabs OBS.exe",
+            "Dropbox.exe",
+            "syncthing",
+            "nextcloud.exe",
+        ] {
+            assert!(!is_game_like(n, None), "{n} should be filtered");
+        }
+        // Los match EXACTOS no pueden comerse un juego que los lleve dentro.
+        assert!(is_game_like("Precursor.exe", None));
+        assert!(is_game_like("Fuzed.exe", None));
     }
 
     #[test]

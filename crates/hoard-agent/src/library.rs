@@ -664,10 +664,62 @@ fn fill_local_sizes(out: &mut [TrackedSave]) {
     }
 }
 
+/// Poda las filas ENVENENADAS por la correlación y las elimina del estado.
+/// Devuelve sus `save_id` (el caller persiste y las despega del agente vivo).
+///
+/// El nombre de un descubrimiento de fase 4 sale del proceso que la correlación
+/// atribuyó a la carpeta, así que una atribución mala rastrea el save con el
+/// nombre de una app: el informe de jul-2026 traía `ChatGPT`, `opencode` y
+/// `code` apuntando los tres a la carpeta de Planet S. Como cada nombre da un
+/// slug distinto, la poda por (slug,label) no las ve.
+///
+/// Sólo cae lo DEMOSTRABLEMENTE basura: una fila cuyo slug no pasa
+/// [`crate::correlation::is_game_like`] **y** cuya carpeta ya está cubierta por
+/// otra fila que sí parece un juego. Podar sólo por nombre se comería juegos
+/// reales — la lista negra casa por substring, así que "Hoard" o
+/// "Reaper: Tale of a Pale Swordsman" darían falso positivo. Una fila
+/// envenenada que sea la ÚNICA de su carpeta se queda: ahí no hay a quién
+/// devolverle el save, y renombrarla o soltarla es decisión del usuario.
+fn prune_poisoned_rows(state: &mut CliState) -> Vec<String> {
+    let looks_like_game = |slug: &str| crate::correlation::is_game_like(slug, None);
+    let rows: Vec<(String, String, PathBuf)> = state
+        .saves
+        .iter()
+        .map(|(id, st)| (id.clone(), st.game_slug.clone(), st.local_path.clone()))
+        .collect();
+
+    let mut poisoned: Vec<String> = Vec::new();
+    for (id, slug, local) in &rows {
+        if looks_like_game(slug) || local.as_os_str().is_empty() {
+            continue;
+        }
+        let covered = rows.iter().any(|(other_id, other_slug, other_local)| {
+            other_id != id
+                && looks_like_game(other_slug)
+                && !other_local.as_os_str().is_empty()
+                && crate::detection::paths_overlap(local, other_local)
+        });
+        if covered {
+            tracing::info!(
+                save_id = %id,
+                slug = %slug,
+                path = %local.display(),
+                "library: fila con nombre de app sobre una carpeta ya rastreada por un juego; se despega"
+            );
+            poisoned.push(id.clone());
+        }
+    }
+    for id in &poisoned {
+        state.saves.remove(id);
+    }
+    poisoned.sort();
+    poisoned
+}
+
 /// Lista los saves que Hoard rastrea para el usuario logueado. El server manda
 /// en `latest_version_num`; el path local sale de `CliState`. Devuelve también
-/// los `save_id` "perdedores" que se podaron (duplicados) para que el frontend
-/// los despegue del agente vivo.
+/// los `save_id` "perdedores" que se podaron (duplicados o envenenados) para que
+/// el frontend los despegue del agente vivo.
 pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<String>)> {
     let mut detached: Vec<String> = Vec::new();
 
@@ -682,12 +734,29 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             let exists = local.exists() as u8;
             in_manifest * 2 + exists
         };
+        // Recorrido ORDENADO por id: el de un HashMap no lo es, así que en un
+        // empate cada listado podaba una fila distinta y el churn no acababa
+        // nunca. Con el orden fijo gana siempre el id menor.
+        let mut rows: Vec<(String, String, String, PathBuf)> = cli_state
+            .saves
+            .iter()
+            .map(|(id, st)| {
+                (
+                    id.clone(),
+                    st.game_slug.clone(),
+                    st.label.clone(),
+                    st.local_path.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut winners: std::collections::HashMap<(String, String), (String, u8)> =
             std::collections::HashMap::new();
         let mut losers: Vec<String> = Vec::new();
-        for (id, st) in &cli_state.saves {
-            let key = (st.game_slug.clone(), st.label.clone());
-            let s = score(id, &st.local_path);
+        for (id, slug, label, local) in &rows {
+            let key = (slug.clone(), label.clone());
+            let s = score(id, local);
             match winners.get(&key) {
                 None => {
                     winners.insert(key, (id.clone(), s));
@@ -702,10 +771,11 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 }
             }
         }
+        for id in &losers {
+            cli_state.saves.remove(id);
+        }
+        losers.extend(prune_poisoned_rows(&mut cli_state));
         if !losers.is_empty() {
-            for id in &losers {
-                cli_state.saves.remove(id);
-            }
             cli_state.save(&path)?;
             detached = losers;
         }
@@ -759,7 +829,15 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
 
     // Self-hosted: el server lista todas las filas; enriquecemos con CliState.
     let saves = client.list_saves(None).await?;
-    let (cli_state, _) = CliState::load_default()?;
+    let (mut cli_state, state_path) = CliState::load_default()?;
+    // La poda por (slug,label) es cloud-only (el manifest es su árbitro), pero
+    // la de filas envenenadas no necesita nube: su árbitro es el nombre y la
+    // carpeta. Un self-hoster sufre el mismo churn de atribución.
+    let poisoned = prune_poisoned_rows(&mut cli_state);
+    if !poisoned.is_empty() {
+        cli_state.save(&state_path)?;
+        detached = poisoned;
+    }
     let mut out = Vec::with_capacity(saves.len());
     for s in saves {
         match cli_state.saves.get(s.id.as_str()) {
@@ -1000,12 +1078,87 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detected_paths_in, local_detection, CachedDetection};
+    use super::{detected_paths_in, local_detection, prune_poisoned_rows, CachedDetection};
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
     };
+    use crate::state::{CliState, SaveState};
     use std::path::PathBuf;
     use time::OffsetDateTime;
+
+    fn save_state(slug: &str, path: &str) -> SaveState {
+        SaveState {
+            local_path: PathBuf::from(path),
+            game_slug: slug.to_string(),
+            label: "main".to_string(),
+            last_backup_at: None,
+            last_version_num: None,
+            paused: false,
+            preset: None,
+            set_hash: None,
+            processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prune_poisoned_rows_drops_app_named_rows_sharing_a_tracked_folder() {
+        // El informe de jul-2026: ChatGPT/opencode/code rastreados los tres
+        // sobre la carpeta de Planet S porque la atribución de la correlación
+        // cambió entre escaneos y cada nombre dio un slug nuevo.
+        let folder = "/home/u/Documentos/Saved Games/PlanetS";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("a-planet".into(), save_state("planet-s", folder));
+        state
+            .saves
+            .insert("b-chatgpt".into(), save_state("chatgpt", folder));
+        state
+            .saves
+            .insert("c-opencode".into(), save_state("opencode", folder));
+        state
+            .saves
+            .insert("d-code".into(), save_state("code", folder));
+
+        let pruned = prune_poisoned_rows(&mut state);
+
+        assert_eq!(pruned, vec!["b-chatgpt", "c-opencode", "d-code"]);
+        assert_eq!(state.saves.len(), 1);
+        assert!(state.saves.contains_key("a-planet"));
+    }
+
+    #[test]
+    fn prune_poisoned_rows_keeps_rows_no_real_game_covers() {
+        // Sin un juego que cubra la carpeta no se poda: la lista negra casa por
+        // substring, así que podar sólo por nombre se comería el juego "Hoard".
+        let mut state = CliState::default();
+        state.saves.insert(
+            "a".into(),
+            save_state("chatgpt", "/home/u/Saved Games/PlanetS"),
+        );
+        state
+            .saves
+            .insert("b".into(), save_state("hoard", "/home/u/Saved Games/Hoard"));
+
+        assert!(prune_poisoned_rows(&mut state).is_empty());
+        assert_eq!(state.saves.len(), 2);
+    }
+
+    #[test]
+    fn prune_poisoned_rows_covers_nested_folders_too() {
+        // La fila envenenada puede colgar de la del juego (el walk de fase 4
+        // emite subcarpetas), no sólo coincidir exactamente.
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("a".into(), save_state("planet-s", "/home/u/Saves/PlanetS"));
+        state.saves.insert(
+            "b".into(),
+            save_state("chatgpt", "/home/u/Saves/PlanetS/profile1"),
+        );
+
+        assert_eq!(prune_poisoned_rows(&mut state), vec!["b"]);
+    }
 
     fn game(
         slug: &str,

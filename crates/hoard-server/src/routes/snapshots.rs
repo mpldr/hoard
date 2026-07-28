@@ -864,7 +864,6 @@ pub async fn detail(
     .await
     .map_err(|_| internal())?
     .into_iter()
-    .into_iter()
     .map(|r| {
         // El sha lo calcula el propio server al subir, así que uno inválido
         // significa DB tocada a mano. Aquí NO se repara ni se omite: la lista de

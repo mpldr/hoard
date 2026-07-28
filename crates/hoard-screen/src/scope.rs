@@ -265,7 +265,6 @@ mod tests {
             zoom: 2.0,
             shape: ScopeShape::Square,
             border: true,
-            ..Default::default()
         })
         .acquire()
         .unwrap();

@@ -70,7 +70,7 @@ Works in all -- except phone, you can install in:
 | Linux (Fedora / openSUSE) | the `.rpm` asset on the release page | ✅ |
 | Linux (any distro) | `Hoard_<version>_amd64.AppImage` | ✅ |
 | macOS (Apple Silicon only) | `Hoard_<version>_aarch64.dmg` -- I dont have a macOS to try it | ⚠️ |
-| Steam Deck (gamemode only) | With [Hoard-CLI](https://hoard.services/cli) | ✅ |
+| SteamOS/Brazzite/CachyOS gamemode | With [Hoard-CLI](https://hoard.services/cli) | ✅ |
 
 
 >**Please note:** I'm currently unable to build and test on Mac and steamOS.

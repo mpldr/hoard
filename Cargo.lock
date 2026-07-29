@@ -3240,6 +3240,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hoard-pruebas"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "hex",
+ "hoard-agent",
+ "hoard-core",
+ "hoardd",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hoard-screen"
 version = "1.1.0"
 dependencies = [
@@ -3328,7 +3351,6 @@ dependencies = [
  "libc",
  "notify-rust",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "time",

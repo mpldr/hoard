@@ -335,8 +335,16 @@ mod windows_tests {
             !sddl.contains(";;;AU)"),
             "authenticated users must not be in the pipe DACL: {sddl}"
         );
-        // Y lo que sí: nosotros (SID numérico) y LocalSystem.
-        assert!(sddl.contains(";;;S-1-5-21"), "the user's own SID: {sddl}");
+        // Y lo que sí: nosotros y LocalSystem. El SID propio sale numérico
+        // (`S-1-5-21-…`) salvo cuando es una cuenta con alias conocido, que
+        // SDDL abrevia: en los runners de CI la sesión es el Administrador
+        // integrado y el descriptor se lee `(A;;FA;;;LA)`. `LA` es esa CUENTA,
+        // no el grupo Administradores (`BA`), así que sigue siendo "un usuario
+        // concreto" y la propiedad que este test cuida se mantiene.
+        assert!(
+            sddl.contains(";;;S-1-5-21") || sddl.contains(";;;LA)"),
+            "the pipe must be granted to a specific user account: {sddl}"
+        );
         assert!(sddl.contains(";;;SY)"), "SYSTEM keeps access: {sddl}");
         // DACL protegido: sin herencia que reabra lo que acabamos de cerrar.
         assert!(

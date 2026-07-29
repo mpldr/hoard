@@ -56,6 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   network.
 
 ### Fixed
+- **Dismissing a message from the bell now sticks.** Dismissing only removed
+  it from that window: the next time the app checked in — a restart, or a
+  minute later — the server sent it back and it reappeared, forever. The
+  dismissal is now recorded on the server, so a message you close stays closed
+  on every machine you sign in from and after a reinstall. (Operator
+  broadcasts also reach the bell again at all, which they hadn't since 1.0.4.)
+- **Updating on Windows no longer trips over the sync service.** With the
+  service now outliving the window, the installer had to overwrite a file the
+  daemon was holding open, and the update failed — leaving the app running
+  without its service. The installer stops the service (and the overlay)
+  before replacing anything, and the in-app updater downloads the installer
+  that does so.
 - **Saves no longer get tracked under an app's name.** A background app that
   happened to be busy while a save folder changed could be credited with it,
   so the panel grew entries called "ChatGPT", "opencode" or "Codex … Setup"

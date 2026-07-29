@@ -33,6 +33,7 @@
   import Button from "./Button.svelte";
   import Cover from "./Cover.svelte";
   import type { TrackedSave } from "../api";
+  import { coverAspectClass, type CoverShape } from "../stores/coverShape.svelte";
   import { activity } from "../stores/agent";
   import { customNames } from "../stores/gameNames";
   import {
@@ -49,6 +50,7 @@
     versions,
     agentRunning,
     showLabel,
+    shape,
     onRename,
     onBackup,
     onTogglePause,
@@ -66,6 +68,9 @@
     /** True when another tracked save shares this slug: the label chip is
      *  what tells the two folders apart. */
     showLabel: boolean;
+    /** Frame the cover as a 2:3 poster or a square — the user's choice, held
+     *  by the parent so the whole grid agrees. */
+    shape: CoverShape;
     onRename: (save: TrackedSave) => void;
     onBackup: (save: TrackedSave) => void;
     onTogglePause: (save: TrackedSave) => void;
@@ -238,15 +243,20 @@
   class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-900/40 shadow-[0_1px_0_0_rgba(255,255,255,0.03)_inset] transition-all duration-200 hover:-translate-y-1 hover:border-white/[0.14] hover:shadow-[0_16px_40px_-12px_rgba(0,0,0,0.8)]"
   use:tilt
 >
-  <!-- Big cover. Aspect ~3/4 like the mockup posters; the Steam capsule is
-       landscape, so `object-cover` center-crops it — a custom portrait cover
-       (hover the image → pencil) fills the frame perfectly. -->
-  <div class="relative aspect-[3/4] w-full overflow-hidden">
+  <!-- Big cover, framed 2:3 (the store-standard cover ratio) or square, per
+       the user's choice. Rust prefers Steam's vertical `library_600x900`, so
+       most games fill the poster exactly; the ones that only ship the
+       landscape header get letterboxed by `fit="smart"` rather than
+       center-cropped to a third of themselves. Own art beats both: hover the
+       cover → pencil in the corner. -->
+  <div class="relative {coverAspectClass(shape)} w-full overflow-hidden">
     <Cover
       slug={save.game_slug}
       name={displayName}
       class="h-full w-full"
       initialClass="text-4xl"
+      fit="smart"
+      editor="corner"
     />
     <div
       class="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-zinc-950/70 to-transparent"

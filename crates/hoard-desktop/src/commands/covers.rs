@@ -85,22 +85,23 @@ pub async fn cover_bytes(app: tauri::AppHandle, app_id: u32) -> Result<Response,
     // No portrait on disk. Unless we already learned this game has none, ask
     // the CDN for it. The marker matters: without it, every game that only
     // ships a header would re-ask Steam on each launch, forever.
-    if !dir.join(format!("{app_id}{PORTRAIT_SUFFIX}.none")).exists() {
+    let marker = dir.join(format!("{app_id}{PORTRAIT_SUFFIX}.none"));
+    if !marker_still_stands(&marker).await {
         match fetch_portrait(app_id).await {
             Fetch::Bytes(bytes) => {
                 let _ = tokio::fs::create_dir_all(&dir).await;
                 let _ = tokio::fs::write(&portrait, &bytes).await;
+                let _ = tokio::fs::remove_file(&marker).await;
                 // A landscape capsule cached by an older build is now dead
                 // weight; the portrait supersedes it.
                 let _ = tokio::fs::remove_file(&landscape).await;
                 return Ok(Response::new(bytes));
             }
-            // Steam answered "no such asset". Remember it so we never ask
-            // again, and fall through to the landscape capsule.
+            // Steam answered "no such asset". Remember it — stamped with the
+            // strategy that concluded it — and fall through to the header.
             Fetch::Missing => {
                 let _ = tokio::fs::create_dir_all(&dir).await;
-                let _ = tokio::fs::write(dir.join(format!("{app_id}{PORTRAIT_SUFFIX}.none")), b"")
-                    .await;
+                let _ = tokio::fs::write(&marker, LOOKUP_STRATEGY.to_string()).await;
             }
             // Offline or a transient error — don't write the marker, or one
             // flaky launch would pin this game to landscape art for good.
@@ -143,6 +144,39 @@ pub async fn cover_bytes(app: tauri::AppHandle, app_id: u32) -> Result<Response,
 /// Cache-name suffix for the vertical art, kept apart from the landscape
 /// capsule cached as `{app_id}.jpg` by every build up to 1.0.4.
 const PORTRAIT_SUFFIX: &str = "_600x900";
+
+/// How we currently look a portrait up. **Bump this whenever `fetch_portrait`
+/// learns a new place to look.**
+///
+/// A "this game has no vertical art" marker is only as true as the search that
+/// produced it, and that bit me the first day: a build that only tried the
+/// guessable URLs marked Europa Universalis V and Surviving Mars: Relaunched
+/// as artless, and the very next build — the one that reads the store manifest
+/// and *can* find their art — never asked again, because the marker was
+/// already there. Stamping the marker with the strategy makes the old verdicts
+/// expire on their own instead of outliving the code that reached them.
+const LOOKUP_STRATEGY: u32 = 2;
+
+/// Steam publishes vertical art for older games later on, so a negative
+/// verdict also expires with time — not just with a better search.
+const MARKER_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// `true` if a "no vertical art" marker is still worth believing: written by
+/// the search we run today, and recent enough. Anything else — missing, older
+/// strategy, stale, unreadable — means ask Steam again.
+async fn marker_still_stands(marker: &std::path::Path) -> bool {
+    let Ok(body) = tokio::fs::read_to_string(marker).await else {
+        return false;
+    };
+    if body.trim().parse::<u32>() != Ok(LOOKUP_STRATEGY) {
+        return false;
+    }
+    tokio::fs::metadata(marker)
+        .await
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|age| age < MARKER_TTL).unwrap_or(true))
+        .unwrap_or(false)
+}
 
 /// Fetch a game's vertical cover from Steam, in two tiers.
 ///
@@ -442,7 +476,7 @@ async fn steam_store_search_app_id(term: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assets_of, capsule_path};
+    use super::{assets_of, capsule_path, marker_still_stands, LOOKUP_STRATEGY};
 
     /// Payload de `GetItems` para Elden Ring (1245620): layout plano, los
     /// ficheros cuelgan directos de `apps/<id>/`.
@@ -490,6 +524,38 @@ mod tests {
         assert!(path_of(&payload)
             .unwrap()
             .ends_with("library_600x900.jpg?t=1781089207"));
+    }
+
+    #[tokio::test]
+    async fn a_marker_from_an_older_search_is_not_believed() {
+        // El caso real del 28-jul: un build que solo probaba las URLs
+        // adivinables marco Europa Universalis V como "sin vertical", y el
+        // build siguiente —que SI sabe encontrarla— no volvio a preguntar.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("3450310_600x900.none");
+
+        // Marcador vacio: el que escribian los builds de ese dia.
+        tokio::fs::write(&marker, b"").await.unwrap();
+        assert!(!marker_still_stands(&marker).await);
+
+        // Marcador de una estrategia anterior.
+        tokio::fs::write(&marker, (LOOKUP_STRATEGY - 1).to_string())
+            .await
+            .unwrap();
+        assert!(!marker_still_stands(&marker).await);
+
+        // El de hoy si vale: sin esto volveriamos a preguntar en cada arranque
+        // por cada juego que de verdad no tiene caratula vertical.
+        tokio::fs::write(&marker, LOOKUP_STRATEGY.to_string())
+            .await
+            .unwrap();
+        assert!(marker_still_stands(&marker).await);
+    }
+
+    #[tokio::test]
+    async fn no_marker_means_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!marker_still_stands(&dir.path().join("nada.none")).await);
     }
 
     #[test]

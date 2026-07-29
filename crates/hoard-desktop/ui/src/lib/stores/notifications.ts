@@ -109,9 +109,7 @@ function readStored(): AppNotification[] {
     const all = JSON.parse(raw) as AppNotification[];
     // Drop expired normal/low; keep all high.
     const cutoff = Date.now() - EXPIRY_MS;
-    const kept = all.filter(
-      (n) => n.priority === "high" || n.at >= cutoff,
-    );
+    const kept = all.filter((n) => n.priority === "high" || n.at >= cutoff);
     if (kept.length !== all.length) persist(kept);
     return kept;
   } catch {
@@ -121,9 +119,67 @@ function readStored(): AppNotification[] {
 
 function persist(list: AppNotification[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, MAX_ENTRIES)));
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(list.slice(0, MAX_ENTRIES)),
+    );
   } catch {
     /* storage disabled / quota — the in-memory list still works */
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Dismissing a broadcast
+// ---------------------------------------------------------------------------
+//  A broadcast is dismissed on the SERVER (per user, across devices) — the
+//  local list is only a cache, and `reconcileServer` replaces it wholesale
+//  with whatever the server still serves. So dropping the entry locally is
+//  not enough: without telling the server, the next snapshot puts it right
+//  back. That's exactly what happened with the "Hello World" test broadcast —
+//  dismissed, back on restart, forever — while the other one seemed to
+//  dismiss fine only because it had expired server-side.
+//
+//  Two halves, and both are needed:
+//    - POST the dismissal so the server stops serving it everywhere.
+//    - Keep a local tombstone so the in-flight snapshot (or a failed POST)
+//      can't resurrect it in the meantime.
+
+const DISMISSED_KEY = "hoard-notifications-dismissed";
+
+function readDismissed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DISMISSED_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+let dismissedIds = readDismissed();
+/** Ids with a dismissal POST in flight, so retries don't pile up. */
+const dismissing = new Set<string>();
+
+function persistDismissed(): void {
+  try {
+    localStorage.setItem(DISMISSED_KEY, JSON.stringify([...dismissedIds]));
+  } catch {
+    /* storage disabled — the server-side dismissal still carries it */
+  }
+}
+
+/** Record the dismissal server-side. Best-effort: if it fails (offline, token
+ *  mid-rotation) the tombstone keeps the entry hidden here, and the next
+ *  snapshot that still carries the id retries it. */
+async function tellServer(id: string): Promise<void> {
+  if (dismissing.has(id)) return;
+  dismissing.add(id);
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("notification_dismiss", { id });
+  } catch {
+    /* retried from reconcileServer while the server keeps serving it */
+  } finally {
+    dismissing.delete(id);
   }
 }
 
@@ -152,19 +208,36 @@ export function pushNotification(
   });
 }
 
-/** Dismiss a single notification by id. */
+/** Dismiss a single notification by id. Server broadcasts are dismissed on
+ *  the server too, so they stay gone here, on your other machines, and after
+ *  a reinstall. */
 export function dismissNotification(id: string): void {
+  let fromServer = false;
   notifications.update((list) => {
+    fromServer = list.some((n) => n.id === id && n.source === "server");
     const next = list.filter((n) => n.id !== id);
     persist(next);
     return next;
   });
+  if (fromServer) forgetServerSide(id);
 }
 
-/** Clear all. */
+/** Clear all. Every server broadcast in the list is dismissed server-side,
+ *  same as clearing them one by one. */
 export function clearNotifications(): void {
-  notifications.set([]);
+  let serverIds: string[] = [];
+  notifications.update((list) => {
+    serverIds = list.filter((n) => n.source === "server").map((n) => n.id);
+    return [];
+  });
   persist([]);
+  for (const id of serverIds) forgetServerSide(id);
+}
+
+function forgetServerSide(id: string): void {
+  dismissedIds.add(id);
+  persistDismissed();
+  void tellServer(id);
 }
 
 /** Unread count — for a badge on the bell. Simplified: all non-dismissed are
@@ -183,19 +256,37 @@ let serverListener: (() => void) | null = null;
  *  sourced notifications (`source: "app"`) are untouched. Existing `at`
  *  timestamps are preserved so the ordering doesn't churn on every snapshot. */
 function reconcileServer(rows: ServerNotification[]): void {
+  // A tombstoned id still in the list means the server never got (or hasn't
+  // yet applied) the dismissal — offline when the user clicked, say. Retry it
+  // now and keep the row hidden meanwhile.
+  const served = new Set(rows.map((r) => r.id));
+  for (const id of dismissedIds) {
+    if (served.has(id)) void tellServer(id);
+  }
+  // Tombstones for rows the server no longer serves have done their job (the
+  // dismissal landed, or it expired); drop them so the list can't grow
+  // without bound.
+  const stale = [...dismissedIds].filter((id) => !served.has(id));
+  if (stale.length > 0) {
+    for (const id of stale) dismissedIds.delete(id);
+    persistDismissed();
+  }
+
   notifications.update((list) => {
     const prevAt = new Map(list.map((n) => [n.id, n.at]));
     const app = list.filter((n) => n.source === "app");
-    const server: AppNotification[] = rows.map((p) => ({
-      id: p.id,
-      title: p.title,
-      body: p.body,
-      priority: p.priority ?? "normal",
-      at: prevAt.get(p.id) ?? Date.now(),
-      source: "server",
-      action_url: p.action_url,
-      action_label: p.action_label,
-    }));
+    const server: AppNotification[] = rows
+      .filter((p) => !dismissedIds.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        title: p.title,
+        body: p.body,
+        priority: p.priority ?? "normal",
+        at: prevAt.get(p.id) ?? Date.now(),
+        source: "server",
+        action_url: p.action_url,
+        action_label: p.action_label,
+      }));
     // Newest first across both sources.
     const next = [...server, ...app]
       .sort((a, b) => b.at - a.at)
@@ -237,10 +328,7 @@ export async function initServerNotifications(): Promise<void> {
  *  to render with {@html}. No raw HTML in the input survives the escape. */
 export function renderMarkdown(md: string): string {
   // 1. Escape everything.
-  let s = md
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  let s = md.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   // 2. Inline code first (so its contents aren't mangled by bold/italic).
   s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
   // 3. Bold.

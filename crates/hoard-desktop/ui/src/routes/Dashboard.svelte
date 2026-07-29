@@ -23,7 +23,9 @@
     Layers,
     LogOut,
     Plus,
+    RectangleVertical,
     RefreshCw,
+    Square,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
@@ -41,6 +43,12 @@
     hydrateGameNames,
     setGameName,
   } from "../lib/stores/gameNames";
+  import {
+    coverShape,
+    hydrateCoverShape,
+    setCoverShape,
+    type CoverShape,
+  } from "../lib/stores/coverShape.svelte";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
   import {
     formatBytes,
@@ -59,6 +67,17 @@
   // SERVER-side one (`total_size_bytes`) — the panel never shows local sizes,
   // that's the Library's job.
   let sortBy = $state<"recent" | "size">("recent");
+
+  // Cover framing, per device. 2:3 is the store-standard poster; square is
+  // there for curated/custom art that isn't one.
+  const SHAPES: { value: CoverShape; icon: typeof Square; key: string }[] = [
+    {
+      value: "portrait",
+      icon: RectangleVertical,
+      key: "dashboard.cover_shape_portrait",
+    },
+    { value: "square", icon: Square, key: "dashboard.cover_shape_square" },
+  ];
 
   const sortedSaves = $derived.by(() => {
     const arr = [...saves];
@@ -266,6 +285,7 @@
       })
       .catch(() => {});
     void hydrateGameNames();
+    void hydrateCoverShape();
     try {
       saves = await api.listTrackedSaves();
     } catch (e) {
@@ -373,6 +393,33 @@
     <div
       class="mb-5 flex flex-wrap items-center justify-end gap-x-5 gap-y-3"
     >
+      <!-- Cover shape. 2:3 is what stores use; square is for curated/custom
+           art that isn't a poster. Per device, applies to the whole grid. -->
+      <div class="flex items-center gap-2 text-xs text-zinc-400">
+        <span class="text-zinc-500">{$_("dashboard.cover_shape_label")}</span>
+        <div
+          class="flex items-center gap-0.5 rounded-md border border-white/[0.08] bg-zinc-900 p-0.5"
+          role="group"
+          aria-label={$_("dashboard.cover_shape_label")}
+        >
+          {#each SHAPES as opt (opt.value)}
+            <button
+              type="button"
+              onclick={() => setCoverShape(opt.value)}
+              aria-pressed={coverShape() === opt.value}
+              title={$_(opt.key)}
+              aria-label={$_(opt.key)}
+              class="flex h-6 w-7 items-center justify-center rounded transition-colors {coverShape() ===
+              opt.value
+                ? 'bg-emerald-600/20 text-emerald-300'
+                : 'text-zinc-500 hover:bg-white/[0.06] hover:text-zinc-200'}"
+            >
+              <opt.icon size={13} />
+            </button>
+          {/each}
+        </div>
+      </div>
+
       <label class="flex items-center gap-2 text-xs text-zinc-400">
         <span class="text-zinc-500">{$_("dashboard.sort_label")}</span>
         <select
@@ -459,6 +506,7 @@
           versions={versionCounts[save.save_id]}
           agentRunning={$status.running}
           showLabel={dupSlugs.has(save.game_slug)}
+          shape={coverShape()}
           onRename={askRename}
           onBackup={backupNow}
           onTogglePause={togglePause}

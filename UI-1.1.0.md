@@ -144,12 +144,25 @@ por si se reutiliza).
    (`notify_on_success`/`notify_on_failure`); no hay flag por save. Botón
    dejado **deshabilitado** con TODO visible en `SaveGameCard.svelte` y
    tooltip localizado. Necesita pref por save en el motor + wiring.
-2. **Carátulas verticales reales de Steam**: `covers.rs` (Rust, congelado)
-   descarga `header.jpg` (460×215, apaisado). Para el look exacto del
-   mockup el backend debería preferir `library_600x900.jpg` (vertical).
-   La UI ya está lista: marco 3/4 + `object-cover`; hoy el header apaisado
-   se ve con recorte central y los covers custom verticales se ven
-   perfectos.
+2. ~~**Carátulas verticales reales de Steam**~~ — **HECHO (28-jul)**. El
+   informe de un usuario en Discord ("make sure the covers are square or 2:3
+   ratio, an option for both would be perfect") lo adelantó al lote de la
+   1.1.0:
+   - `covers.rs` pide primero el arte vertical de Steam
+     (`library_600x900_2x.jpg`, el 600×900 real; el `library_600x900.jpg` a
+     secas sirve un 300×450) por las dos rutas de CDN, cachea en
+     `{app_id}_600x900.jpg` y sólo cae al `header.jpg` cuando el juego no
+     tiene vertical. Un 404 deja marcador `.none` para no repreguntar; un
+     error de red NO, para no fijar un juego al apaisado por un arranque sin
+     conexión.
+   - El marco pasa de `3/4` a **2:3 o cuadrado a elección del usuario**
+     (selector en la toolbar, `stores/coverShape.svelte.ts`, por dispositivo).
+   - `Cover.svelte` gana `fit="smart"`: mide la imagen y el marco y hace
+     letterbox sobre una copia desenfocada de sí misma cuando no encajan
+     (umbral 40%, calibrado para que 2:3-en-cuadrado rellene y
+     cuadrado-en-2:3 o el header apaisado se acolchen), en vez de recortar.
+   - `editor="corner"`: el lápiz deja de tapar la carátula entera y se va a
+     una esquina, como pedía el hilo.
 3. **`Total versions` sin N llamadas**: se calcula con
    `list_save_snapshots(save_id, false)` por tarjeta (lectura en segundo
    plano). Si se quiere evitar, un campo `version_count` en `TrackedSave`

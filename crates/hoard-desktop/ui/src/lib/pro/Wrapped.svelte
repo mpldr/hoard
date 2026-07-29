@@ -537,6 +537,7 @@
               name={mostPlayed ?? ""}
               class="h-5 w-8 rounded"
               initialClass="text-[10px]"
+              fit="smart"
             />
           {/if}
           <span class="truncate text-sm font-semibold text-zinc-100">{mostPlayed ?? "—"}</span>
@@ -755,6 +756,7 @@
                 name={g.label}
                 class="h-11 w-[74px] rounded-lg"
                 initialClass="text-lg"
+                fit="smart"
               />
               <div class="min-w-0 flex-1">
                 <div class="flex items-center justify-between gap-2">

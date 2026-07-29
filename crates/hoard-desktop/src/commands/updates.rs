@@ -478,6 +478,21 @@ fn sanitize_exe_path(exe: std::path::PathBuf) -> std::path::PathBuf {
     exe
 }
 
+/// Installer preference on Windows, best first. The order is load-bearing —
+/// see the note in [`pick_asset`] — and lives out here so a test can check it
+/// on any host (the `pick_asset` branches are `cfg`-gated, and CI doesn't
+/// build this crate on Windows at all).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_PREFERENCE: &[&str] = &["-setup.exe", ".exe", ".msi"];
+
+/// First asset whose filename ends with one of `suffixes`, in the order given
+/// — not the order the release happens to list them in.
+fn first_by_suffix<'a>(assets: &'a [GhAsset], suffixes: &[&str]) -> Option<&'a GhAsset> {
+    suffixes
+        .iter()
+        .find_map(|suffix| assets.iter().find(|a| a.name.ends_with(suffix)))
+}
+
 /// Pick the right asset for the current OS/arch. We match on filename suffix
 /// because Tauri's bundle namer doesn't expose a stable scheme we can predict.
 fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
@@ -492,24 +507,26 @@ fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
         } else {
             (".deb", ".rpm")
         };
-        if let Some(a) = assets.iter().find(|a| a.name.ends_with(primary)) {
-            return Some(a);
-        }
-        if let Some(a) = assets.iter().find(|a| a.name.ends_with(secondary)) {
-            return Some(a);
-        }
-        assets.iter().find(|a| a.name.ends_with(".AppImage"))
+        first_by_suffix(assets, &[primary, secondary, ".AppImage"])
     }
     #[cfg(target_os = "windows")]
     {
-        assets
-            .iter()
-            .find(|a| a.name.ends_with(".msi"))
-            .or_else(|| assets.iter().find(|a| a.name.ends_with(".exe")))
+        // NSIS (`-setup.exe`) first, MSI only as a fallback — the reverse of
+        // what this did until 1.1.0, and the order matters now that `hoardd`
+        // outlives the window (ADR 0021). An installer has to overwrite
+        // `hoardd.exe` while the daemon is holding it open, and only the NSIS
+        // bundle carries the hook that stops it first (`installer-hooks.nsh`,
+        // `NSIS_HOOK_PREINSTALL`). Through the MSI that hook never runs:
+        // Windows Installer just hits the locked file and falls back to its
+        // "files in use" prompt, which can't close a windowless background
+        // process — so the update fails and the app comes back up without its
+        // daemon. NSIS also installs per-user (`installMode: currentUser`),
+        // so the in-app update doesn't stop for a UAC prompt.
+        first_by_suffix(assets, WINDOWS_PREFERENCE)
     }
     #[cfg(target_os = "macos")]
     {
-        assets.iter().find(|a| a.name.ends_with(".dmg"))
+        first_by_suffix(assets, &[".dmg"])
     }
 }
 
@@ -657,10 +674,20 @@ async fn launch_installer(path: &std::path::Path) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 async fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     let p = path.to_string_lossy().to_string();
-    tokio::process::Command::new("msiexec")
-        .args(["/i", &p])
-        .spawn()
-        .map_err(|e| format!("spawning msiexec: {e}"))?;
+    // Two bundle formats, two ways to start them. `pick_asset` prefers the
+    // NSIS `-setup.exe` (it's the one that stops `hoardd` before overwriting
+    // it), which runs directly; an `.msi` still has to go through `msiexec`,
+    // and handing one to the other just fails.
+    if p.to_ascii_lowercase().ends_with(".msi") {
+        tokio::process::Command::new("msiexec")
+            .args(["/i", &p])
+            .spawn()
+            .map_err(|e| format!("spawning msiexec: {e}"))?;
+    } else {
+        tokio::process::Command::new(&p)
+            .spawn()
+            .map_err(|e| format!("spawning installer: {e}"))?;
+    }
     Ok(())
 }
 
@@ -939,6 +966,56 @@ pub async fn trigger_server_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assets(names: &[&str]) -> Vec<GhAsset> {
+        names
+            .iter()
+            .map(|n| GhAsset {
+                name: (*n).to_string(),
+                browser_download_url: format!("https://example.invalid/{n}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn windows_update_takes_the_nsis_installer_not_the_msi() {
+        // El release publica los dos, y el .msi va PRIMERO en la lista de
+        // assets, así que el orden no puede salir del release: sólo el bundle
+        // NSIS trae el hook que para `hoardd` antes de pisar su .exe.
+        let rel = assets(&[
+            "Hoard_1.1.0_x64_en-US.msi",
+            "Hoard_1.1.0_x64_en-US.msi.sha256",
+            "Hoard_1.1.0_x64-setup.exe",
+            "Hoard_1.1.0_x64-setup.exe.sha256",
+        ]);
+        assert_eq!(
+            first_by_suffix(&rel, WINDOWS_PREFERENCE).map(|a| a.name.as_str()),
+            Some("Hoard_1.1.0_x64-setup.exe")
+        );
+    }
+
+    #[test]
+    fn windows_falls_back_to_the_msi_when_theres_no_nsis() {
+        let rel = assets(&["Hoard_1.1.0_x64_en-US.msi"]);
+        assert_eq!(
+            first_by_suffix(&rel, WINDOWS_PREFERENCE).map(|a| a.name.as_str()),
+            Some("Hoard_1.1.0_x64_en-US.msi")
+        );
+    }
+
+    #[test]
+    fn suffix_order_beats_release_order() {
+        let rel = assets(&["b.rpm", "a.deb"]);
+        assert_eq!(
+            first_by_suffix(&rel, &[".deb", ".rpm"]).map(|a| a.name.as_str()),
+            Some("a.deb")
+        );
+        assert_eq!(
+            first_by_suffix(&rel, &[".rpm", ".deb"]).map(|a| a.name.as_str()),
+            Some("b.rpm")
+        );
+        assert!(first_by_suffix(&rel, &[".dmg"]).is_none());
+    }
 
     #[test]
     fn newer_minor_beats_older() {

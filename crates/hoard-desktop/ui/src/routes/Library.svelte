@@ -16,7 +16,6 @@
     Search as SearchIcon,
     RefreshCw,
     Plus,
-    Check,
     Filter,
     HardDrive,
     Gamepad2,
@@ -36,13 +35,13 @@
     Cloud,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
   import Button from "../lib/components/Button.svelte";
   import Card from "../lib/components/Card.svelte";
   import Cover from "../lib/components/Cover.svelte";
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
+  import LinkOrphanModal from "../lib/components/LinkOrphanModal.svelte";
   import ManualTrackModal from "../lib/components/ManualTrackModal.svelte";
   import ScanFolderModal from "../lib/components/ScanFolderModal.svelte";
   import * as api from "../lib/api";
@@ -63,6 +62,7 @@
     reactivateAndRefresh,
   } from "../lib/stores/cloud";
   import { cardWidth } from "../lib/stores/cardSizes.svelte";
+  import { wrongPathSuspected } from "../lib/stores/agent";
   import CardResizeHandle from "../lib/components/CardResizeHandle.svelte";
 
   let report = $state<DetectionReport | null>(null);
@@ -71,6 +71,8 @@
   // both independent of the auto-detection flow.
   let emulatorModalOpen = $state(false);
   let scanFolderOpen = $state(false);
+  /** Cloud orphan whose "Vincular a este equipo…" dialog is open. */
+  let linkingOrphan = $state<TrackedSave | null>(null);
 
   // Manually-added emulator saves carry a synthesized slug: `emu-<id>` for a
   // catalog pick or `emu-<slugified name>` for a custom one. The Library shows
@@ -125,10 +127,11 @@
   let sourceFilter = $state<"all" | DetectionSource>("all");
   let unlisten: UnlistenFn | null = null;
 
-  /** Currently-open "no save folder" alert. We render a single shared Modal
-   *  driven by this state instead of one Modal per card — keeps the DOM lean
-   *  for catalogs with hundreds of detected games. */
-  let alertGame = $state<DetectedGame | null>(null);
+  /** Game whose folder is being chosen by scanning ("track with another
+   *  folder", "no save folder yet"). Drives ScanFolderModal in target mode; a
+   *  single shared modal, not one per card, keeps the DOM lean for catalogs
+   *  with hundreds of detected games. */
+  let folderTargetGame = $state<DetectedGame | null>(null);
   /** Currently-open untrack confirmation. Same single-modal pattern. */
   let untrackTarget = $state<TrackedSave | null>(null);
   let untracking = $state(false);
@@ -365,35 +368,13 @@
     return game.path_confidences?.[i] ?? game.confidence;
   }
 
-  function sizeForSlug(slug: string): number {
-    // Local footprint on THIS machine (what the user actually pays for here),
-    // not the server-side total across every snapshot.
-    return localSaves
-      .filter((t) => t.game_slug === slug)
-      .reduce((acc, s) => acc + (s.local_size_bytes ?? 0), 0);
-  }
-
-  /** "Choose save folder…" button inside the alert modal. Pops the picker
-   *  *after* the user has read the explanation — no surprise dialogs. */
-  async function chooseFromAlert() {
-    if (!alertGame) return;
-    const game = alertGame;
-    alertGame = null; // Close the modal so the OS picker isn't on top.
-    const chosen = await pickFolder(game.display_name);
-    if (!chosen) return;
-    await persistManualPath(game, chosen);
-    await trackWithPath(game, chosen);
-  }
-
-  /** "Pick a different folder" icon button next to the auto-Track action.
-   *  Used when the user wants to override the detected save path — e.g.
-   *  Stellaris on Windows expands to the Documents folder, but the user
-   *  keeps their saves on another drive, or wants to pick a sibling folder
-   *  with custom data. Bypasses the alert modal entirely (that one is for
-   *  the no-found-paths case). */
-  async function trackWithCustomPath(game: DetectedGame) {
-    const chosen = await pickFolder(game.display_name, saveDirFor(game));
-    if (!chosen) return;
+  /** Folder chosen for a game through the scan dialog — both the "another
+   *  folder" button and the "no save folder yet" one land here. The override is
+   *  persisted so a re-scan doesn't revert to the heuristic guess. */
+  async function useFolderForTarget(chosen: string) {
+    const game = folderTargetGame;
+    folderTargetGame = null;
+    if (!game) return;
     await persistManualPath(game, chosen);
     await trackWithPath(game, chosen);
   }
@@ -605,48 +586,12 @@
     }
   }
 
-  /** Open the OS folder picker. Returns the selected absolute path or null
-   *  on cancel. We pass the game's display name as the dialog title so the
-   *  user knows which game they're picking the save folder for. */
-  async function pickFolder(
-    displayName: string,
-    defaultPath?: string,
-  ): Promise<string | null> {
-    try {
-      const result = await openDialog({
-        directory: true,
-        multiple: false,
-        // Open the picker *at* the game's detected/tracked save folder when we
-        // know it, so the user lands on their saves instead of Documents.
-        defaultPath: defaultPath || undefined,
-        title: $_("library.pick_folder_title", {
-          values: { name: displayName },
-        }),
-      });
-      // Tauri's dialog plugin returns string | null; normalise just in case.
-      if (typeof result === "string" && result.length > 0) return result;
-      return null;
-    } catch (e) {
-      toastError(typeof e === "string" ? e : (e as Error).message);
-      return null;
-    }
-  }
-
   // ---- derived views -------------------------------------------------
 
-  // Slugs THIS machine actually monitors (has a local folder for). Orphan rows
-  // are cloud saves from another machine — they must NOT count as tracked here,
-  // or a detected game shows a lying "Monitorizado" badge and the "+" never
-  // adopts it (BUG 3/4).
-  const trackedSlugs = $derived(
-    new Set(
-      tracked.filter((t) => !t.orphan && t.local_path).map((t) => t.game_slug),
-    ),
-  );
-
   // Saves with a local folder on this machine vs cloud-only saves from other
-  // machines. Drives the split between "Juegos monitorizados" (this machine,
-  // local size) and "En la nube — otras máquinas" (adoptable) — BUG 4.
+  // machines. Los primeros son los que salen marcados dentro de la rejilla
+  // única; los segundos van a "En la nube — otras máquinas" (adoptables), que
+  // sigue siendo una sección aparte porque la acción es otra — BUG 4.
   const localSaves = $derived(tracked.filter((t) => !t.orphan));
   const cloudOrphans = $derived(tracked.filter((t) => t.orphan));
 
@@ -677,13 +622,21 @@
     }
   }
 
-  /** "Vincular a esta máquina…" on a cloud-orphan card: pick a folder, then
-   *  adopt the existing save into it. */
-  async function linkOrphan(orphan: TrackedSave) {
-    const chosen = await pickFolder(orphan.game_slug);
-    if (!chosen) return;
-    await adoptOrphan(orphan, chosen);
+  /** "Vincular a esta máquina…" on a cloud-orphan card. Opens the modal that
+   *  offers what detection already found here — the folders for this slug, or
+   *  any other detected game picked by name — and keeps the folder picker as
+   *  the escape hatch. Going straight to the OS dialog (as 1.0.4 did after the
+   *  UI rewrite dropped this wiring) makes the user hand-find a folder Hoard
+   *  already knows. */
+  function linkOrphan(orphan: TrackedSave) {
+    linkingOrphan = orphan;
   }
+
+  /** Folders this machine already tracks: the modal drops them from its
+   *  candidate list so two saves can't land on one folder. */
+  const trackedPaths = $derived(
+    localSaves.map((t) => t.local_path).filter((p) => p.length > 0),
+  );
 
   const filtered = $derived.by(() => {
     if (!report) return [];
@@ -772,8 +725,8 @@
   });
 
   // Slugs whose detection row has source=manual_override. Drives the
-  // "Volver a sugerencia automática" button on the tracked-games strip — we
-  // only show it when the user actually has an override to clear.
+  // "Volver a sugerencia automática" de las partidas monitorizadas — sólo se
+  // enseña cuando el usuario tiene de verdad un override que limpiar.
   const slugsWithManualOverride = $derived.by(() => {
     const s = new Set<string>();
     if (!report) return s;
@@ -785,6 +738,107 @@
 
   function hasManualOverride(slug: string): boolean {
     return slugsWithManualOverride.has(slug);
+  }
+
+  // ── Rejilla única ──────────────────────────────────────────────────────────
+  //
+  // Antes esta página tenía los juegos monitorizados arriba y, al final del
+  // todo, la lista de detectados desde la que se dan de alta. Un juego ya
+  // monitorizado salía en las dos, y lo que había que buscar para añadir algo
+  // nuevo era justo lo que quedaba más lejos. Ahora hay una sola rejilla: una
+  // tarjeta por juego, los monitorizados primero, y dentro de cada tarjeta
+  // conviven lo que ya vigilamos y las rutas que la detección propone.
+
+  /** Un juego de la biblioteca, con las dos mitades de lo que sabemos de él. */
+  type LibraryEntry = {
+    slug: string;
+    name: string;
+    appId: number | null;
+    /** Fila de detección, si el escaneo lo encontró. */
+    game: DetectedGame | null;
+    /** Partidas monitorizadas en ESTA máquina para ese juego (pueden ser
+     *  varias: un mismo juego con dos carpetas dadas de alta). */
+    saves: TrackedSave[];
+  };
+
+  /** Chip de la barra: sólo los monitorizados, o todo lo que hay. */
+  let onlyTracked = $state(false);
+
+  const savesBySlug = $derived.by(() => {
+    const m = new Map<string, TrackedSave[]>();
+    for (const s of localSaves) {
+      const arr = m.get(s.game_slug);
+      if (arr) arr.push(s);
+      else m.set(s.game_slug, [s]);
+    }
+    return m;
+  });
+
+  /** Todo lo que el escaneo conoce, filtros aparte: sirve para saber si un
+   *  monitorizado tiene fila de detección o hay que sacarlo por su cuenta. */
+  const detectedSlugs = $derived(
+    new Set((report?.games ?? []).map((g) => g.slug)),
+  );
+
+  const allEntries = $derived.by(() => {
+    const out: LibraryEntry[] = [];
+
+    for (const g of filtered) {
+      out.push({
+        slug: g.slug,
+        name: g.display_name,
+        appId: g.steam_app_id,
+        game: g,
+        saves: savesBySlug.get(g.slug) ?? [],
+      });
+    }
+
+    // Monitorizados que la detección no encuentra: añadidos a mano, emuladores,
+    // o un juego que el escaneo ya no ve. Sin ellos, juntar las dos listas
+    // perdería justo las partidas que el usuario dio de alta él mismo.
+    const q = search.trim().toLowerCase();
+    const filtersOff = confidenceFilter === "all" && sourceFilter === "all";
+    for (const [slug, saves] of savesBySlug) {
+      if (detectedSlugs.has(slug)) continue;
+      const name = displayName(slug);
+      if (q && !name.toLowerCase().includes(q)) continue;
+      // No tienen grado ni origen que comparar, así que con un filtro de
+      // detección puesto no pintan nada en el resultado.
+      if (!filtersOff) continue;
+      out.push({
+        slug,
+        name,
+        appId: appIdBySlug.get(slug) ?? null,
+        game: null,
+        saves,
+      });
+    }
+
+    // Lo que ya vigilas, primero; el resto por nombre.
+    out.sort((a, b) => {
+      const at = a.saves.length > 0;
+      const bt = b.saves.length > 0;
+      if (at !== bt) return at ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return out;
+  });
+
+  const trackedEntryCount = $derived(
+    allEntries.filter((e) => e.saves.length > 0).length,
+  );
+
+  const entries = $derived(
+    onlyTracked ? allEntries.filter((e) => e.saves.length > 0) : allEntries,
+  );
+
+  /** Rutas detectadas que todavía no monitorizamos, con su índice original
+   *  para que `pathConf` siga leyendo el grado correcto. Las que ya están
+   *  dadas de alta viven en el bloque verde de la tarjeta, no aquí. */
+  function untrackedPaths(game: DetectedGame): { path: string; i: number }[] {
+    return game.found_paths
+      .map((path, i) => ({ path, i }))
+      .filter(({ path }) => !trackedByPath.has(path));
   }
 </script>
 
@@ -823,145 +877,480 @@
     </div>
   </header>
 
-  {#if localSaves.length > 0}
-    <!-- Per-game disk-usage strip for THIS machine. Shows what Hoard monitors
-         here and how much space each save occupies *on this device* (local
-         folder size, not the server total). Saves that live only on other
-         machines go in the "En la nube" section below. -->
-    <section class="mb-6">
+  {#if scanning && progress}
+    <div class="mb-6 rounded-xl border border-white/[0.08] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)]">
+      <div class="mb-2 flex items-center justify-between text-xs text-zinc-400">
+        <span>{$_("library.scanning_catalog")}</span>
+        <span class="tabular-nums">
+          {progress.done.toLocaleString()} / {progress.total.toLocaleString()}
+        </span>
+      </div>
+      <div class="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+        <div
+          class="h-full rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)] transition-all"
+          style="width: {pct}%"
+        ></div>
+      </div>
+    </div>
+  {/if}
+
+  {#snippet deepScanTile()}
+    <button
+      type="button"
+      onclick={runDeepScan}
+      disabled={scanning}
+      use:tilt
+      title={$_("library.deep_scan_hint")}
+      class="tilt group flex flex-col rounded-xl border border-red-500/30 bg-red-950/20 p-4 text-left shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-red-500/55 hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      <div class="mb-2 flex items-start gap-2.5">
+        <div
+          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-red-500/15 text-red-400"
+        >
+          <AlertTriangle class="h-5 w-5" />
+        </div>
+        <div class="min-w-0">
+          <h3 class="truncate text-sm font-medium text-red-300">
+            {$_("library.deep_scan_title")}
+          </h3>
+          <p class="truncate text-xs text-red-400/70">
+            {$_("library.deep_scan_subtitle")}
+          </p>
+        </div>
+      </div>
+      <p class="mt-auto pt-2 text-xs leading-snug text-red-300/60">
+        {$_("library.deep_scan_hint")}
+      </p>
+    </button>
+  {/snippet}
+
+  <!-- Una sola rejilla: monitorizados y detectados en la misma lista, con los
+       primeros arriba. Ver el bloque "Rejilla única" del <script>. -->
+  {#if report || localSaves.length > 0}
+    <div class="mb-4 flex flex-wrap items-center gap-3">
       <div
-        class="mb-2 flex items-center justify-between gap-3 text-xs uppercase tracking-wide text-zinc-500"
+        class="flex items-center gap-0.5 rounded-lg border border-white/[0.08] bg-zinc-900 p-0.5"
+        role="group"
+        aria-label={$_("library.filter_scope")}
       >
-        <span>{$_("library.tracked_games")}</span>
-        <!-- Header total = LOCAL footprint (this machine); the per-card pill
-             is the server-side size. Both are labelled so they can't be
-             confused — see summary_local / size_server_title. -->
+        <button
+          type="button"
+          onclick={() => (onlyTracked = true)}
+          aria-pressed={onlyTracked}
+          class="rounded-md px-2.5 py-1 text-xs font-medium transition-colors {onlyTracked
+            ? 'bg-emerald-500/15 text-emerald-300'
+            : 'text-zinc-400 hover:text-zinc-200'}"
+        >
+          {$_("library.chip_tracked", { values: { count: trackedEntryCount } })}
+        </button>
+        <button
+          type="button"
+          onclick={() => (onlyTracked = false)}
+          aria-pressed={!onlyTracked}
+          class="rounded-md px-2.5 py-1 text-xs font-medium transition-colors {onlyTracked
+            ? 'text-zinc-400 hover:text-zinc-200'
+            : 'bg-zinc-700/50 text-zinc-100'}"
+        >
+          {$_("library.chip_all", { values: { count: allEntries.length } })}
+        </button>
+      </div>
+
+      <div class="min-w-[12rem] flex-1">
+        <Input bind:value={search} placeholder={$_("library.search")} icon={SearchIcon} />
+      </div>
+
+      {#if report}
+        <label class="flex items-center gap-2 text-xs text-zinc-400">
+          <Filter size={14} />
+          {$_("library.confidence")}
+          <select
+            bind:value={confidenceFilter}
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100"
+          >
+            <option value="all">{$_("library.any")}</option>
+            <option value="high">{$_("library.high")}</option>
+            <option value="medium">{$_("library.medium")}</option>
+            <option value="low">{$_("library.low")}</option>
+          </select>
+        </label>
+        <label class="flex items-center gap-2 text-xs text-zinc-400">
+          {$_("library.source")}
+          <select
+            bind:value={sourceFilter}
+            class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100"
+          >
+            <option value="all">{$_("library.any")}</option>
+            <option value="both">{$_("library.both_sources")}</option>
+            <option value="steam_library">{$_("library.steam_only")}</option>
+            <option value="filesystem_heuristic">{$_("library.filesystem_only")}</option>
+          </select>
+        </label>
+      {/if}
+
+      {#if localSaves.length > 0}
+        <!-- Total = huella LOCAL en esta máquina; las tarjetas etiquetan por
+             separado el tamaño en la nube. Ver summary_local / size_server_title. -->
         <span
-          class="inline-flex items-center gap-1.5 tabular-nums normal-case tracking-normal text-zinc-400"
+          class="inline-flex items-center gap-1.5 text-xs tabular-nums text-zinc-400"
           title={$_("library.size_local_title")}
         >
           <HardDrive size={11} class="shrink-0 text-zinc-500" />
           {$_("library.summary_local", { values: { count: localSaves.length, size: fmtBytes(trackedTotalBytes) } })}
         </span>
-      </div>
+      {/if}
+    </div>
+
+    {#if entries.length === 0}
+      <Card class={report ? "" : "mb-6"}>
+        <div class="py-12 text-center text-sm text-zinc-400">
+          {#if onlyTracked}
+            {$_("library.no_tracked_yet")}
+          {:else if report && report.games.length === 0}
+            {$_("library.no_results_empty")}
+          {:else}
+            {$_("library.no_results_filtered")}
+          {/if}
+        </div>
+      </Card>
+      {#if report}
+        <div class="mb-6 mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {@render deepScanTile()}
+        </div>
+      {/if}
+    {:else}
+      <!-- mb-6: la rejilla ya no es lo último de la página (debajo van la nube
+           y las horas jugadas), así que necesita el mismo aire que el resto de
+           secciones o el cubo del escaneo profundo queda pegado al siguiente
+           encabezado. -->
       <div
-        class="grid gap-2"
-        style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("tracked")}px, 1fr))"
+        class="mb-6 grid gap-3"
+        style="grid-template-columns: repeat(auto-fill, minmax({cardWidth('detected')}px, 1fr))"
       >
-{#each localSaves as save (save.save_id)}
+        {#each entries as entry (entry.slug)}
+          {@const isTracked = entry.saves.length > 0}
+          {@const pending = entry.game ? untrackedPaths(entry.game) : []}
+          {@const expanded = expandedPaths.has(entry.slug)}
           <div
-            class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
+            class="tilt group relative flex flex-col overflow-hidden rounded-xl border bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:bg-zinc-900/50 {isTracked
+              ? 'border-emerald-500/25 hover:border-emerald-500/40'
+              : 'border-white/[0.08] hover:border-white/[0.12]'}"
             use:tilt
           >
-            <CardResizeHandle section="tracked" />
-            <div class="flex items-start gap-2.5">
-              <Cover
-                appId={appIdBySlug.get(save.game_slug) ?? null}
-                slug={save.game_slug}
-                name={displayName(save.game_slug)}
-                class="h-9 w-9 shrink-0 rounded-lg"
-                initialClass="text-xs"
-              />
+            <CardResizeHandle section="detected" />
 
-              <div class="min-w-0 flex-1 flex flex-col gap-0.5">
-                <div class="flex items-center justify-between gap-1">
-                  <p
-                    class="truncate text-sm font-medium text-zinc-100"
-                    title={save.game_slug}
-                  >
-                    {displayName(save.game_slug)}
+            <div class="flex items-start justify-between gap-2 p-4 pb-3">
+              <div class="flex min-w-0 items-center gap-3">
+                <Cover
+                  appId={entry.appId}
+                  slug={entry.slug}
+                  name={entry.name}
+                  class="h-12 w-12 shrink-0 rounded-xl"
+                  initialClass="text-lg"
+                />
+                <div class="min-w-0">
+                  <h3 class="truncate text-sm font-medium text-zinc-100" title={entry.name}>
+                    {entry.name}
+                  </h3>
+                  <p class="truncate text-xs text-zinc-500" title={entry.slug}>
+                    {entry.slug}
                   </p>
-                  <div class="flex shrink-0 items-center gap-0.5">
-                    {#if purgeDate(save.save_id)}
-                      <button
-                        type="button"
-                        onclick={() => reactivate(save)}
-                        disabled={reactivating.has(save.save_id)}
-                        title={$_("archived.reactivate")}
-                        class="inline-flex shrink-0 items-center rounded-md bg-sky-500/15 p-1 text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
-                      >
-                        <RotateCw
-                          size={11}
-                          class={reactivating.has(save.save_id) ? "animate-spin" : ""}
-                        />
-                      </button>
-                    {/if}
-                    <button
-                      type="button"
-                      onclick={() => askRename(save)}
-                      aria-label={$_("library.rename_button")}
-                      title={$_("library.rename_title")}
-                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-                    >
-                      <Pencil size={11} />
-                    </button>
-                    {#if hasManualOverride(save.game_slug)}
-                      <button
-                        type="button"
-                        onclick={() => revertToAutoDetection(save)}
-                        class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-                        title={$_("library.revert_to_auto")}
-                      >
-                        <RotateCcw size={11} />
-                      </button>
-                    {/if}
-                    <button
-                      type="button"
-                      onclick={() => askUntrack(save)}
-                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-                      title={$_("library.untrack_title")}
-                    >
-                      <Trash size={11} />
-                    </button>
-                    <button
-                      type="button"
-                      onclick={() => askDelete(save)}
-                      class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-rose-400"
-                      title={$_("library.delete_title")}
-                    >
-                      <Trash size={11} class="text-rose-500" />
-                    </button>
-                  </div>
                 </div>
-
-                <p
-                  class="flex items-center gap-1 text-[10px] text-zinc-500"
-                  title={save.local_path}
-                >
-                  <FolderOpen size={10} class="shrink-0" />
-                  <span class="truncate">{save.local_path}</span>
-                </p>
               </div>
+              {#if entry.game}
+                {@const game = entry.game}
+                <div class="flex shrink-0 flex-col items-end gap-1">
+                  <span
+                    class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset {confidenceBadgeClass(
+                      game.confidence,
+                    )}"
+                  >
+                    {confidenceLabel(game.confidence)}
+                  </span>
+                  <span
+                    class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset {sourceBadgeClass(
+                      game.source,
+                    )}"
+                  >
+                    {#if game.source === "steam_library"}
+                      <Gamepad2 size={10} />
+                    {:else}
+                      <HardDrive size={10} />
+                    {/if}
+                    {sourceLabel(game.source)}
+                  </span>
+                  <!-- Sólo una nota: Steam Cloud cubre la copia de Steam, se
+                       puede desactivar por juego y no guarda histórico, así que
+                       querer copia propia encima es de lo más normal. No cambia
+                       el orden, ni el grado, ni el auto-track. -->
+                  {#if game.steam_cloud}
+                    <span
+                      class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-400 ring-1 ring-inset ring-zinc-600/50"
+                      title={$_("library.steam_cloud_note_title")}
+                    >
+                      <Cloud size={10} />
+                      {$_("library.steam_cloud_note")}
+                    </span>
+                  {/if}
+                </div>
+              {/if}
             </div>
 
-            <div class="mt-1.5 flex items-center justify-between text-[10px]">
-              {#if purgeDate(save.save_id)}
-                <span class="flex items-center gap-1 text-sky-300">
-                  <Snowflake size={10} class="shrink-0" />
-                  <span class="truncate">{$_("archived.frozen_note", { values: { date: purgeDate(save.save_id) } })}</span>
-                </span>
-              {:else}
-                <span class="flex items-center gap-1.5">
-                  <span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused ? 'bg-amber-400' : 'bg-emerald-400'}"></span>
-                  <span class={save.paused ? "text-amber-400" : "text-emerald-400/90"}>
-                    {save.paused ? $_("library.paused_badge") : $_("library.monitored_badge")}
+            {#if isTracked}
+              <!-- Lo que esta máquina ya vigila del juego. Un slug puede tener
+                   más de una partida dada de alta (dos carpetas distintas), así
+                   que cada una trae su estado y sus botones. -->
+              <div
+                class="mx-3 mb-2 flex flex-col gap-2.5 rounded-lg bg-emerald-500/[0.06] p-2.5 ring-1 ring-inset ring-emerald-500/20"
+              >
+                {#each entry.saves as save (save.save_id)}
+                  <div class="flex flex-col gap-1">
+                    <div class="flex items-center justify-between gap-2">
+                      {#if purgeDate(save.save_id)}
+                        <span class="flex min-w-0 items-center gap-1 text-[11px] text-sky-300">
+                          <Snowflake size={11} class="shrink-0" />
+                          <span class="truncate">{$_("archived.frozen_note", { values: { date: purgeDate(save.save_id) } })}</span>
+                        </span>
+                      {:else}
+                        <span class="flex items-center gap-1.5 text-[11px]">
+                          <span
+                            class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
+                              ? 'bg-amber-400'
+                              : 'bg-emerald-400'}"
+                          ></span>
+                          <span class={save.paused ? "text-amber-400" : "text-emerald-300"}>
+                            {save.paused ? $_("library.paused_badge") : $_("library.monitored_badge")}
+                          </span>
+                        </span>
+                      {/if}
+                      <div class="flex shrink-0 items-center gap-0.5">
+                        {#if purgeDate(save.save_id)}
+                          <button
+                            type="button"
+                            onclick={() => reactivate(save)}
+                            disabled={reactivating.has(save.save_id)}
+                            title={$_("archived.reactivate")}
+                            class="inline-flex shrink-0 items-center rounded-md bg-sky-500/15 p-1 text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
+                          >
+                            <RotateCw
+                              size={11}
+                              class={reactivating.has(save.save_id) ? "animate-spin" : ""}
+                            />
+                          </button>
+                        {/if}
+                        <button
+                          type="button"
+                          onclick={() => askRename(save)}
+                          aria-label={$_("library.rename_button")}
+                          title={$_("library.rename_title")}
+                          class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                        >
+                          <Pencil size={11} />
+                        </button>
+                        {#if hasManualOverride(entry.slug)}
+                          <button
+                            type="button"
+                            onclick={() => revertToAutoDetection(save)}
+                            class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                            title={$_("library.revert_to_auto")}
+                          >
+                            <RotateCcw size={11} />
+                          </button>
+                        {/if}
+                        <button
+                          type="button"
+                          onclick={() => askUntrack(save)}
+                          class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                          title={$_("library.untrack_title")}
+                        >
+                          <Trash size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          onclick={() => askDelete(save)}
+                          class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-rose-400"
+                          title={$_("library.delete_title")}
+                        >
+                          <Trash size={11} class="text-rose-500" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <p
+                      class="flex items-center gap-1 text-[10px] text-zinc-500"
+                      title={save.local_path}
+                    >
+                      <FolderOpen size={10} class="shrink-0" />
+                      <span class="truncate">{save.local_path}</span>
+                    </p>
+
+                    <!-- Carpeta vacía y ni una copia jamás: casi siempre la
+                         ruta rastreada no es donde guarda el juego (la nativa
+                         mientras corre por Proton, el contenedor en vez de su
+                         `remote/`…). Pegajoso, no un toast: el barrido lo
+                         reevalúa cada ciclo y un aviso efímero sonaría sin
+                         parar. Se va solo en cuanto una copia aterriza. -->
+                    {#if $wrongPathSuspected[save.save_id]}
+                      <p
+                        class="flex items-start gap-1 text-[10px] text-amber-400/90"
+                        title={$_("library.wrong_path_hint")}
+                      >
+                        <AlertTriangle size={10} class="mt-px shrink-0" />
+                        <span>{$_("library.wrong_path_hint")}</span>
+                      </p>
+                    {/if}
+
+                    {#if (save.local_size_bytes ?? 0) > 0 || save.total_size_bytes > 0}
+                      <div class="flex items-center gap-3 text-[10px] tabular-nums text-zinc-400">
+                        {#if (save.local_size_bytes ?? 0) > 0}
+                          <span
+                            class="inline-flex items-center gap-1"
+                            title={$_("library.size_local_title")}
+                          >
+                            <HardDrive size={10} class="shrink-0 text-zinc-500" />
+                            {fmtBytes(save.local_size_bytes ?? 0)}
+                          </span>
+                        {/if}
+                        {#if save.total_size_bytes > 0}
+                          <span
+                            class="inline-flex items-center gap-1"
+                            title={$_("library.size_server_title")}
+                          >
+                            <Cloud size={10} class="shrink-0 text-zinc-500" />
+                            {fmtBytes(save.total_size_bytes)}
+                          </span>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            {#if entry.game}
+              {@const game = entry.game}
+              {#if pending.length}
+                <!-- Rutas que la detección propone y todavía no seguimos. Las
+                     ya dadas de alta salen arriba, en el bloque verde, para no
+                     repetir la misma carpeta dos veces en la tarjeta. Cada una
+                     lleva su propio grado: una carpeta ALTA no debe arrastrar a
+                     una hermana BAJA. -->
+                <div class="mx-3 mb-2 flex flex-col gap-1.5">
+                  <span class="text-[10px] uppercase tracking-wide text-zinc-600">
+                    {$_("library.suggested_paths")}
                   </span>
-                </span>
+                  {#each expanded ? pending : pending.slice(0, 1) as entryPath (entryPath.path)}
+                    <div class="flex items-center gap-2">
+                      <span
+                        class="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide ring-1 ring-inset {confidenceBadgeClass(
+                          pathConf(game, entryPath.i),
+                        )}"
+                      >
+                        {confidenceLabel(pathConf(game, entryPath.i))}
+                      </span>
+                      <span
+                        class="min-w-0 flex-1 truncate font-mono text-[11px] text-zinc-500"
+                        title={entryPath.path}
+                      >
+                        {entryPath.path}
+                      </span>
+                      <button
+                        type="button"
+                        onclick={() => trackPath(game, entryPath.path)}
+                        aria-label={$_("library.track_this_path")}
+                        title={$_("library.track_this_path")}
+                        class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-emerald-500/10 hover:text-emerald-300"
+                      >
+                        <Plus size={13} />
+                      </button>
+                    </div>
+                  {/each}
+                  {#if pending.length > 1}
+                    <button
+                      type="button"
+                      onclick={() => toggleExpand(entry.slug)}
+                      class="self-start text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
+                    >
+                      {expanded
+                        ? $_("library.show_less")
+                        : $_("library.found_more", { values: { count: pending.length - 1 } })}
+                    </button>
+                  {/if}
+                </div>
+              {:else if !isTracked}
+                <p class="mx-4 mb-2 text-[11px] italic text-zinc-600">
+                  {$_("library.no_save_folder_yet")}
+                </p>
               {/if}
-              {#if save.total_size_bytes > 0}
-                <span
-                  class="inline-flex items-center gap-1 font-medium tabular-nums text-zinc-300"
-                  title={$_("library.size_server_title")}
+
+              <div class="mt-auto flex items-center gap-2 p-3 pt-1">
+                {#if !isTracked && !game.found_paths.length}
+                  <!-- Coincidencia de Steam sin carpeta de guardado. Abre el
+                       mismo escaneo de carpeta que el resto, con la explicación
+                       y la ruta de instalación dentro (y escaneándola ya). -->
+                  <button
+                    type="button"
+                    onclick={() => (folderTargetGame = game)}
+                    aria-label={$_("library.no_save_alert_aria")}
+                    title={$_("library.no_save_alert_aria")}
+                    class="inline-flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-500/30 transition-colors hover:bg-amber-500/20"
+                  >
+                    <AlertTriangle size={14} />
+                    {$_("library.no_save_folder_yet")}
+                  </button>
+                {/if}
+                <!-- Otra carpeta para este juego: escaneo, no explorador. Deja
+                     un override que sobrevive al re-escaneo. -->
+                <button
+                  type="button"
+                  onclick={() => (folderTargetGame = game)}
+                  aria-label={$_("library.track_pick_folder_aria")}
+                  title={$_("library.track_pick_folder_aria")}
+                  class="shrink-0 rounded p-1.5 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
                 >
-                  <Cloud size={10} class="shrink-0 text-zinc-500" />
-                  {fmtBytes(save.total_size_bytes)}
-                </span>
-              {/if}
-            </div>
+                  <FolderOpen size={14} />
+                </button>
+                {#if !isTracked}
+                  <button
+                    type="button"
+                    onclick={() => askDismiss(game)}
+                    aria-label={$_("library.ignore_confirm")}
+                    title={$_("library.ignore_confirm")}
+                    class="ml-auto shrink-0 rounded p-1.5 text-rose-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
+                  >
+                    <Trash size={14} />
+                  </button>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
+        {#if report}
+          {@render deepScanTile()}
+        {/if}
       </div>
-    </section>
+    {/if}
+  {:else if !scanning}
+    <Card class="mb-6">
+      <div class="py-16 text-center">
+        <div
+          class="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/10 text-amber-400 ring-1 ring-amber-500/30"
+        >
+          <RefreshCw size={20} />
+        </div>
+        <h2 class="text-base font-medium text-zinc-100">
+          {$_("library.no_scan_title")}
+        </h2>
+        <p class="mx-auto mt-2 max-w-md text-sm text-zinc-400">
+          {$_("library.no_scan_body")}
+        </p>
+        <div class="mt-6">
+          <Button onclick={runScan}>
+            <RefreshCw size={16} />
+            {$_("library.scan_now")}
+          </Button>
+        </div>
+      </div>
+    </Card>
   {/if}
 
   {#if cloudOrphans.length > 0}
@@ -1130,349 +1519,7 @@
     </section>
   {/if}
 
-  {#if scanning && progress}
-    <div class="mb-6 rounded-xl border border-white/[0.08] bg-zinc-950/40 p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)]">
-      <div class="mb-2 flex items-center justify-between text-xs text-zinc-400">
-        <span>{$_("library.scanning_catalog")}</span>
-        <span class="tabular-nums">
-          {progress.done.toLocaleString()} / {progress.total.toLocaleString()}
-        </span>
-      </div>
-      <div class="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
-        <div
-          class="h-full rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)] transition-all"
-          style="width: {pct}%"
-        ></div>
-      </div>
-    </div>
-  {/if}
 
-  {#if report}
-    <div class="mb-5 flex flex-wrap items-center gap-3">
-      <div class="flex-1 min-w-[14rem]">
-        <Input bind:value={search} placeholder={$_("library.search")} icon={SearchIcon} />
-      </div>
-      <label class="flex items-center gap-2 text-xs text-zinc-400">
-        <Filter size={14} />
-        {$_("library.confidence")}
-        <select
-          bind:value={confidenceFilter}
-          class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100"
-        >
-          <option value="all">{$_("library.any")}</option>
-          <option value="high">{$_("library.high")}</option>
-          <option value="medium">{$_("library.medium")}</option>
-          <option value="low">{$_("library.low")}</option>
-        </select>
-      </label>
-      <label class="flex items-center gap-2 text-xs text-zinc-400">
-        {$_("library.source")}
-        <select
-          bind:value={sourceFilter}
-          class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100"
-        >
-          <option value="all">{$_("library.any")}</option>
-          <option value="both">{$_("library.both_sources")}</option>
-          <option value="steam_library">{$_("library.steam_only")}</option>
-          <option value="filesystem_heuristic">{$_("library.filesystem_only")}</option>
-        </select>
-      </label>
-    </div>
-
-    {#snippet deepScanTile()}
-      <button
-        type="button"
-        onclick={runDeepScan}
-        disabled={scanning}
-        use:tilt
-        title={$_("library.deep_scan_hint")}
-        class="tilt group flex flex-col rounded-xl border border-red-500/30 bg-red-950/20 p-4 text-left shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-red-500/55 hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-60"
-      >
-        <div class="mb-2 flex items-start gap-2.5">
-          <div
-            class="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-red-500/15 text-red-400"
-          >
-            <AlertTriangle class="h-5 w-5" />
-          </div>
-          <div class="min-w-0">
-            <h3 class="truncate text-sm font-medium text-red-300">
-              {$_("library.deep_scan_title")}
-            </h3>
-            <p class="truncate text-xs text-red-400/70">
-              {$_("library.deep_scan_subtitle")}
-            </p>
-          </div>
-        </div>
-        <p class="mt-auto pt-2 text-xs leading-snug text-red-300/60">
-          {$_("library.deep_scan_hint")}
-        </p>
-      </button>
-    {/snippet}
-
-    {#if filtered.length === 0}
-      <Card>
-        <div class="py-12 text-center text-sm text-zinc-400">
-          {report.games.length === 0
-            ? $_("library.no_results_empty")
-            : $_("library.no_results_filtered")}
-        </div>
-      </Card>
-      <div class="mt-3 grid grid-cols-1 gap-3 px-3 md:grid-cols-2 xl:grid-cols-3">
-        {@render deepScanTile()}
-      </div>
-    {:else}
-      <div class="grid gap-3 px-3" style="grid-template-columns: repeat(auto-fill, minmax({cardWidth("detected")}px, 1fr))">
-        {#each filtered as game (game.slug)}
-          {@const isTracked = trackedSlugs.has(game.slug)}
-          <div
-            class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-950/40 p-1 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12] hover:bg-zinc-900/50"
-            use:tilt
-          >
-            <CardResizeHandle section="detected" />
-            <div class="flex items-start justify-between gap-2 p-4 pb-3">
-              <div class="flex min-w-0 items-center gap-3">
-                <Cover
-                  appId={game.steam_app_id}
-                  slug={game.slug}
-                  name={game.display_name}
-                  class="h-12 w-12 shrink-0 rounded-xl"
-                  initialClass="text-lg"
-                />
-                <div class="min-w-0">
-                  <h3
-                    class="truncate text-sm font-medium text-zinc-100"
-                    title={game.display_name}
-                  >
-                    {game.display_name}
-                  </h3>
-                  <p class="truncate text-xs text-zinc-500" title={game.slug}>
-                    {game.slug}
-                  </p>
-                </div>
-              </div>
-              <div class="flex shrink-0 flex-col items-end gap-1">
-                <span
-                  class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset {confidenceBadgeClass(
-                    game.confidence,
-                  )}"
-                >
-                  {confidenceLabel(game.confidence)}
-                </span>
-                <span
-                  class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset {sourceBadgeClass(
-                    game.source,
-                  )}"
-                >
-                  {#if game.source === "steam_library"}
-                    <Gamepad2 size={10} />
-                  {:else}
-                    <HardDrive size={10} />
-                  {/if}
-                  {sourceLabel(game.source)}
-                </span>
-              </div>
-            </div>
-
-            {#if game.found_paths.length}
-              <!-- Grouped per-path list. A game can write to several save
-                   folders with very different confidence (e.g. the real
-                   rotating-save dir vs. a Steam-cloud marker stub). We show
-                   ONE card per game and let each folder carry its own grade +
-                   monitor toggle, so a HIGH path doesn't drag a LOW sibling
-                   into tracking. Collapsed to the strongest path until the
-                   user expands. -->
-              {@const expanded = expandedPaths.has(game.slug)}
-              {@const visible = expanded ? game.found_paths.length : 1}
-              <div class="mt-2 flex flex-col gap-1.5">
-                {#each game.found_paths.slice(0, visible) as path, i (path)}
-                  {@const ts = trackedByPath.get(path)}
-                  <div class="flex items-center gap-2">
-                    <span
-                      class="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide ring-1 ring-inset {confidenceBadgeClass(
-                        pathConf(game, i),
-                      )}"
-                    >
-                      {confidenceLabel(pathConf(game, i))}
-                    </span>
-                    <span
-                      class="min-w-0 flex-1 truncate font-mono text-[11px] text-zinc-500"
-                      title={path}
-                    >
-                      {path}
-                    </span>
-                    {#if ts}
-                      <span
-                        class="shrink-0 text-emerald-300"
-                        title={$_("library.tracked_badge")}
-                      >
-                        <Check size={13} />
-                      </span>
-                      <button
-                        type="button"
-                        onclick={() => askUntrack(ts)}
-                        aria-label={$_("library.untrack_button")}
-                        title={$_("library.untrack_title")}
-                        class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-                      >
-                        <Trash2 size={13} />
-                      </button>
-                    {:else}
-                      <button
-                        type="button"
-                        onclick={() => trackPath(game, path)}
-                        aria-label={$_("library.track_this_path")}
-                        title={$_("library.track_this_path")}
-                        class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-emerald-500/10 hover:text-emerald-300"
-                      >
-                        <Plus size={13} />
-                      </button>
-                    {/if}
-                  </div>
-                {/each}
-                {#if game.found_paths.length > 1}
-                  <button
-                    type="button"
-                    onclick={() => toggleExpand(game.slug)}
-                    class="self-start text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
-                  >
-                    {expanded
-                      ? $_("library.show_less")
-                      : $_("library.found_more", { values: { count: game.found_paths.length - 1 } })}
-                  </button>
-                {/if}
-              </div>
-
-              <div class="mt-4 flex items-center gap-2">
-                {#if isTracked}
-                  {@const sz = sizeForSlug(game.slug)}
-                  <span
-                    class="inline-flex flex-1 items-center gap-1.5 rounded-md bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300 ring-1 ring-inset ring-emerald-500/30"
-                  >
-                    <Check size={12} />
-                    {$_("library.tracked_badge")}
-                    {#if sz > 0}
-                      <span
-                        class="inline-flex items-center gap-1 text-emerald-400/70 tabular-nums"
-                        title={$_("library.size_local_title")}
-                      >
-                        · <HardDrive size={10} class="shrink-0" />
-                        {fmtBytes(sz)}
-                      </span>
-                    {/if}
-                  </span>
-                {/if}
-                <!-- Folder picker: hand-pick a save folder we didn't detect.
-                     Sets a manual override so a re-scan keeps it. -->
-                <button
-                  type="button"
-                  onclick={() => trackWithCustomPath(game)}
-                  aria-label={$_("library.track_pick_folder_aria")}
-                  title={$_("library.track_pick_folder_aria")}
-                  class="shrink-0 rounded p-1.5 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
-                >
-                  <FolderOpen size={14} />
-                </button>
-                {#if !isTracked}
-                  <button
-                    type="button"
-                    onclick={() => askDismiss(game)}
-                    aria-label={$_("library.ignore_confirm")}
-                    title={$_("library.ignore_confirm")}
-                    class="ml-auto shrink-0 rounded p-1.5 text-rose-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-                  >
-                    <Trash size={14} />
-                  </button>
-                {/if}
-              </div>
-            {:else}
-              <p class="mt-1 text-[11px] italic text-zinc-600">
-                {$_("library.no_save_folder_yet")}
-              </p>
-
-              <div class="mt-4 flex items-center gap-2">
-                {#if isTracked}
-                  {@const t = trackedBySlug.get(game.slug)}
-                  <span
-                    class="inline-flex flex-1 items-center gap-1.5 rounded-md bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300 ring-1 ring-inset ring-emerald-500/30"
-                  >
-                    <Check size={12} />
-                    {$_("library.tracked_badge")}
-                    {#if t && t.total_size_bytes > 0}
-                      <span class="text-emerald-400/70 tabular-nums">
-                        · {fmtBytes(t.total_size_bytes)}
-                      </span>
-                    {/if}
-                  </span>
-                  {#if t}
-                    <button
-                      type="button"
-                      onclick={() => askUntrack(t)}
-                      aria-label={$_("library.untrack_button")}
-                      title={$_("library.untrack_title")}
-                      class="shrink-0 rounded p-1.5 text-zinc-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  {/if}
-                {:else}
-                  <!-- Steam-only match with no save folder yet. Amber alert
-                       instead of auto-popping the OS picker or doing nothing:
-                       a modal explains why and offers an explicit folder pick. -->
-                  <button
-                    type="button"
-                    onclick={() => (alertGame = game)}
-                    aria-label={$_("library.no_save_alert_aria")}
-                    title={$_("library.no_save_alert_aria")}
-                    class="inline-flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-500/30 transition-colors hover:bg-amber-500/20"
-                  >
-                    <AlertTriangle size={14} />
-                    {$_("library.no_save_folder_yet")}
-                  </button>
-                  <button
-                    type="button"
-                    onclick={() => askDismiss(game)}
-                    aria-label={$_("library.ignore_confirm")}
-                    title={$_("library.ignore_confirm")}
-                    class="ml-auto shrink-0 rounded p-1.5 text-rose-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-                  >
-                    <Trash size={14} />
-                  </button>
-                {/if}
-              </div>
-            {/if}
-          </div>
-        {/each}
-        {@render deepScanTile()}
-      </div>
-    {/if}
-  {:else if !scanning}
-    <Card>
-      <div class="py-16 text-center">
-        <div
-          class="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/10 text-amber-400 ring-1 ring-amber-500/30"
-        >
-          <RefreshCw size={20} />
-        </div>
-        <h2 class="text-base font-medium text-zinc-100">
-          {$_("library.no_scan_title")}
-        </h2>
-        <p class="mx-auto mt-2 max-w-md text-sm text-zinc-400">
-          {$_("library.no_scan_body")}
-        </p>
-        <div class="mt-6">
-          <Button onclick={runScan}>
-            <RefreshCw size={16} />
-            {$_("library.scan_now")}
-          </Button>
-        </div>
-      </div>
-    </Card>
-  {/if}
-
-  <!-- "No save folder yet" alert. Triggered by clicking the amber warning
-       button on a Steam-only detection card. Explains why we don't have a
-       path and offers an explicit "pick folder" action — no surprise OS
-       dialog. -->
   <ManualTrackModal
     open={emulatorModalOpen}
     onClose={() => (emulatorModalOpen = false)}
@@ -1489,35 +1536,44 @@
     }}
   />
 
-  <Modal
-    open={alertGame !== null}
-    title={$_("library.no_save_alert_title", {
-      values: { name: alertGame?.display_name ?? "" },
-    })}
-    onClose={() => (alertGame = null)}
-  >
-    <p class="text-sm text-zinc-300">
-      {$_("library.no_save_alert_body", {
-        values: { name: alertGame?.display_name ?? "" },
-      })}
-    </p>
-    {#if alertGame?.install_dir}
-      <p class="mt-3 break-all rounded-md bg-zinc-950/60 px-3 py-2 font-mono text-[11px] text-zinc-400 ring-1 ring-inset ring-zinc-800">
-        {$_("library.no_save_alert_install_hint", {
-          values: { path: alertGame.install_dir },
-        })}
-      </p>
-    {/if}
-    {#snippet footer()}
-      <Button variant="ghost" onclick={() => (alertGame = null)}>
-        {$_("common.cancel")}
-      </Button>
-      <Button onclick={chooseFromAlert}>
-        <FolderOpen size={14} />
-        {$_("library.no_save_alert_choose")}
-      </Button>
-    {/snippet}
-  </Modal>
+  <LinkOrphanModal
+    open={linkingOrphan !== null}
+    orphan={linkingOrphan}
+    {trackedPaths}
+    onClose={() => (linkingOrphan = null)}
+    onPick={async (path) => {
+      const target = linkingOrphan;
+      linkingOrphan = null;
+      if (target) await adoptOrphan(target, path);
+    }}
+    onScanned={(r) => {
+      report = r;
+    }}
+  />
+
+  <!-- Carpeta para UN juego concreto: el botón de "otra carpeta" y el aviso de
+       "sin carpeta todavía" abren esto. Es el mismo escaneo que el general —
+       antes uno abría el explorador a pelo y el otro un aviso con un botón que
+       abría el explorador — con la explicación y la ruta de instalación de
+       Steam dentro, que es la que se quiere mirar. -->
+  <ScanFolderModal
+    open={folderTargetGame !== null}
+    target={folderTargetGame
+      ? {
+          slug: folderTargetGame.slug,
+          display_name: folderTargetGame.display_name,
+          install_dir: folderTargetGame.install_dir,
+          seed_path: saveDirFor(folderTargetGame),
+          steam_app_id: folderTargetGame.steam_app_id,
+          no_paths: !folderTargetGame.found_paths.length,
+        }
+      : null}
+    onClose={() => (folderTargetGame = null)}
+    onPick={useFolderForTarget}
+    onAdded={(saved) => {
+      tracked = [...tracked, saved];
+    }}
+  />
 
   <!-- Destructive: stop tracking a game. Snapshots already on the server
        are NOT deleted by this — only the local watch/auto-backup link.

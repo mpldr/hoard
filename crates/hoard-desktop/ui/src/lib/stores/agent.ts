@@ -104,6 +104,15 @@ export type StuckRestore = {
 export const restoreStuck: Writable<Record<string, StuckRestore>> = writable(
   {},
 );
+
+/** Saves whose tracked folder looks wrong: empty, and never once backed up.
+ *
+ * Same shape and reasoning as `restoreStuck` — a sticky condition, not an
+ * activity blip. It deliberately does NOT toast: the reconciliation sweep
+ * re-checks the folder every cycle, so a toast would fire forever. Instead the
+ * Library card carries an amber hint until a backup actually lands, which is
+ * also the only thing that can clear it. */
+export const wrongPathSuspected: Writable<Record<string, true>> = writable({});
 export const status: Writable<AgentStatus> = writable({
   running: false,
   watched_count: 0,
@@ -201,6 +210,12 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
       patch(ev.save_id, { state: "uploading", next_backup_at: undefined });
       break;
     case "backup_success": {
+      // Una copia real es la única prueba de que la carpeta era la buena.
+      wrongPathSuspected.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const { [ev.save_id]: _gone, ...rest } = m;
+        return rest;
+      });
       patch(ev.save_id, {
         state: "ok",
         last_version: ev.version_num,
@@ -353,6 +368,13 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
       // reflect the save as idle. Users who want the cloud copy pulled into an
       // empty folder enable "Restore from cloud when a save folder is empty"
       // in Settings.
+      //
+      // The one case worth surfacing is a save that has *never* backed up and
+      // is empty: that's a mis-tracked folder, not a game between saves. It
+      // goes to a sticky flag on the card (not a toast — see the store).
+      if (ev.likely_wrong_path) {
+        wrongPathSuspected.update((m) => ({ ...m, [ev.save_id]: true }));
+      }
       patch(ev.save_id, {
         state: "idle",
         error: undefined,

@@ -18,7 +18,6 @@ use std::sync::Mutex;
 
 use hoard_agent::api::{ApiClient, ApiError};
 use hoard_agent::correlation::CorrelationStore;
-use hoard_agent::credentials;
 use hoard_agent::detection::{
     self, DetectedGame, DetectionReport, DetectionSource, DetectionTrace,
 };
@@ -106,6 +105,12 @@ pub async fn scan_library(
     // games on the same volume. The filter is purely a UI-edge concern.
     report.games.retain(|g| !cli_state.is_ignored(&g.slug));
 
+    // Y las carpetas descartadas. Se filtran por RUTA, no por slug, porque un
+    // hallazgo de fase 4 se llama como el proceso que la correlación le
+    // atribuyó y ese nombre cambia entre escaneos: descartarlo por slug no
+    // aguanta, vuelve con nombre nuevo.
+    hoard_agent::library::apply_excluded_paths(&mut report, &cli_state);
+
     persist_scan(&state, report.clone());
     Ok(report)
 }
@@ -154,15 +159,22 @@ pub async fn deep_scan_library(
     Ok(report)
 }
 
-/// Ludusavi-style "add from folder": scan ONE user-chosen folder and return
-/// the games detected inside it, for the folder-picker button next to "Manual
-/// track". Unlike `scan_library` this never touches the catalog or Steam and
-/// never persists into the library cache — it's a one-off lookup whose results
-/// the UI shows as "found <Game> here — track it?".
+/// "Add from folder": scan ONE user-chosen folder and return the games found
+/// inside it. Backs all three explicit-folder flows in the Library — the "scan
+/// folder" button, "track this game with another folder", and "no save folder
+/// yet" — so pointing Hoard at a place always answers the same way instead of
+/// dropping the user in the OS file picker.
+///
+/// Never touches the catalog or Steam and never persists into the library
+/// cache: it's a one-off lookup whose results the UI shows as "found <Game>
+/// here — track it?". The walk itself ([`detection::discover_in_folder`]) does
+/// NOT apply the periodic scan's precision gate — the user pointing at the
+/// folder is the evidence — so a save folder with a proprietary extension comes
+/// back like any other.
 ///
 /// Runs on the blocking pool: the walk is synchronous filesystem I/O bounded by
-/// the deep per-root timeout, so keeping it off the async runtime avoids
-/// stalling the UI event loop on a slow/large folder.
+/// its own timeout, so keeping it off the async runtime avoids stalling the UI
+/// event loop on a slow/large folder.
 #[tauri::command]
 pub async fn scan_folder(path: String) -> Result<Vec<DetectedGame>, String> {
     let root = PathBuf::from(&path);
@@ -195,8 +207,13 @@ pub async fn scan_folder(path: String) -> Result<Vec<DetectedGame>, String> {
                 path_confidences: vec![a.confidence],
                 confidence: a.confidence,
                 source: DetectionSource::FilesystemHeuristic,
-                steam_app_id: None,
+                // Puesto sólo cuando la atribución cayó en una entrada del
+                // catálogo: es lo que le da carátula a la fila del modal.
+                steam_app_id: a.steam_app_id,
                 install_dir: None,
+                // Escaneo de una carpeta suelta: no hay entrada de catálogo
+                // resuelta aquí, así que no hay nota que dar.
+                steam_cloud: false,
             })
             .collect()
     })
@@ -224,13 +241,22 @@ pub fn cached_detection(state: State<'_, AppState>) -> Option<DetectionReport> {
 /// Reads the in-memory cache (fresher than disk: `scan_library` writes it
 /// first). A `scanned_at: None` result means nobody ever scanned here — the UI
 /// offers a scan rather than claiming there's nothing.
+///
+/// `tracked_paths` (las carpetas que esta máquina ya rastrea) las pone quien
+/// llama: la Biblioteca ya tiene esa lista en pantalla, así que abrir el
+/// diálogo no cuesta ni una petición al server.
 #[tauri::command]
 pub fn detected_paths_for_game(
     game_slug: String,
+    tracked_paths: Vec<String>,
     state: State<'_, AppState>,
 ) -> library::LocalDetection {
+    let tracked: Vec<std::path::PathBuf> = tracked_paths
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
     let guard = state.detection_cache.last.lock().unwrap();
-    library::local_detection(guard.as_ref(), &game_slug)
+    library::local_detection(guard.as_ref(), &game_slug, &tracked)
 }
 
 /// Update both the in-memory cache and the on-disk copy. Disk failures are
@@ -255,10 +281,11 @@ fn persist_scan(state: &State<'_, AppState>, report: DetectionReport) {
 /// prettifies errors.
 #[tauri::command]
 pub async fn add_game_to_tracking(
+    app: AppHandle,
     args: AddGameArgs,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     let outcome = library::add_to_tracking(&client, args)
         .await
         .map_err(pretty_error)?;
@@ -274,10 +301,11 @@ pub async fn add_game_to_tracking(
 /// folder. Core of cross-device sync. Logic in `hoard_agent::library::adopt`.
 #[tauri::command]
 pub async fn adopt_save(
+    app: AppHandle,
     args: AdoptArgs,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     let outcome = library::adopt(&client, args).await.map_err(pretty_error)?;
     attach_save_if_running(&state, outcome.watched).await;
     Ok(outcome.tracked)
@@ -289,8 +317,11 @@ pub async fn adopt_save(
 /// `hoard_agent::library::list_tracked`; this wrapper detaches any duplicate
 /// rows the self-heal pruned from the watched set.
 #[tauri::command]
-pub async fn list_tracked_saves(state: State<'_, AppState>) -> Result<Vec<TrackedSave>, String> {
-    let client = current_client(&state)?;
+pub async fn list_tracked_saves(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<TrackedSave>, String> {
+    let client = current_client(&app, &state).await?;
     let (out, detached) = library::list_tracked(&client).await.map_err(pretty_error)?;
     for id in detached {
         detach_save_if_running(&state, id).await;
@@ -304,11 +335,12 @@ pub async fn list_tracked_saves(state: State<'_, AppState>) -> Result<Vec<Tracke
 /// already exists" message instead of a generic toast.
 #[tauri::command]
 pub async fn rename_save_label(
+    app: AppHandle,
     save_id: String,
     new_label: String,
     state: State<'_, AppState>,
 ) -> Result<TrackedSave, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     let (tracked, watched) = library::rename_label(&client, &save_id, &new_label)
         .await
         .map_err(|e| {
@@ -438,6 +470,29 @@ pub async fn ignore_detected_game(slug: String) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Descarta una carpeta del escaneo. Wrapper fino sobre el agente: la lógica
+/// (y el estado) viven ahí, como manda la regla de paridad CLI↔desktop.
+#[tauri::command]
+pub async fn exclude_scan_path(path: String) -> Result<(), AppError> {
+    hoard_agent::library::exclude_path(std::path::Path::new(path.trim()))
+        .map_err(|e| AppError::plain(e.to_string()))
+}
+
+/// Deshace [`exclude_scan_path`].
+#[tauri::command]
+pub async fn unexclude_scan_path(path: String) -> Result<(), AppError> {
+    hoard_agent::library::unexclude_path(std::path::Path::new(path.trim()))
+        .map_err(|e| AppError::plain(e.to_string()))
+}
+
+/// Las carpetas descartadas, para la lista de Ajustes.
+#[tauri::command]
+pub async fn list_excluded_scan_paths() -> Result<Vec<String>, AppError> {
+    hoard_agent::library::list_excluded_paths()
+        .map(|v| v.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+        .map_err(|e| AppError::plain(e.to_string()))
+}
+
 /// Drop the blacklist entry for `slug` so the next scan re-surfaces it in
 /// the Library. Mirror of [`ignore_detected_game`]. Idempotent.
 #[tauri::command]
@@ -496,10 +551,11 @@ pub async fn untrack_save(save_id: String, state: State<'_, AppState>) -> Result
 /// re-add doesn't immediately bounce back to the same wrong folder.
 #[tauri::command]
 pub async fn delete_save_completely(
+    app: AppHandle,
     save_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     library::delete_completely(&client, &save_id)
         .await
         .map_err(pretty_error)?;
@@ -513,13 +569,18 @@ pub async fn delete_save_completely(
 /// long-lived client on `AppState` because the user can log out at any time
 /// and we want fresh creds per command — the cost is negligible (`reqwest`
 /// connections are pooled internally).
-pub(crate) fn current_client(state: &State<'_, AppState>) -> Result<ApiClient, String> {
-    // Prefer the self-hosted session: the cached UserInfo gives us the URL and
-    // the keychain holds the bearer token.
+pub(crate) async fn current_client(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<ApiClient, String> {
+    // Prefer the self-hosted session: the cached UserInfo gives us the URL and el
+    // token lo presta el servicio (D.20 — el ítem del llavero es suyo, y leerlo
+    // desde aquí es lo que pedía la contraseña en macOS).
     let self_hosted = state.user.lock().unwrap().clone();
     if let Some(user) = self_hosted {
-        let creds = credentials::load()
-            .map_err(|e| format!("Couldn't load credentials: {e}"))?
+        let creds = crate::commands::auth::server_session(app)
+            .await
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| "Saved credentials are missing. Sign in again.".to_string())?;
         return ApiClient::new(user.server_url, creds.token).map_err(|e| e.to_string());
     }
@@ -530,12 +591,12 @@ pub(crate) fn current_client(state: &State<'_, AppState>) -> Result<ApiClient, S
     // hit "Not logged in" on every monitor/backup action even though the
     // sidebar showed "Nube conectada".
     //
-    // Note: the JWT is short-lived (~1h). The cloud-pull poller refreshes the
-    // on-disk token on a 401, so per-command clients built here stay fresh;
-    // the long-lived agent client created at `start_agent` is the one case that
-    // can outlive a token and is handled separately.
-    if let Some(cloud) = crate::commands::cloud::load_active_creds()
-        .map_err(|e| format!("Couldn't load cloud credentials: {e}"))?
+    // El JWT lo presta el servicio (D.20): este proceso no lee el llavero, así que
+    // no puede quedarse con un token viejo ni provocar un diálogo de autorización
+    // en macOS. Y viene siempre fresco, que es lo que la nota de abajo pedía.
+    if let Some(cloud) = crate::commands::cloud::active_creds_via(&state.daemon)
+        .await
+        .map_err(|e| format!("Couldn't get cloud credentials: {e}"))?
     {
         return ApiClient::new(cloud.server_url, cloud.access_token).map_err(|e| e.to_string());
     }
@@ -550,11 +611,8 @@ pub(crate) fn current_client(state: &State<'_, AppState>) -> Result<ApiClient, S
 pub(crate) fn sync_active_context(state: &AppState) -> Option<String> {
     let ctx = if let Some(user) = state.user.lock().unwrap().clone() {
         Some(hoard_agent::state::selfhosted_context(&user.server_url))
-    } else if let Ok(Some(cloud)) = crate::commands::cloud::load_active_creds() {
-        cloud
-            .user_id
-            .as_deref()
-            .map(hoard_agent::state::cloud_context)
+    } else if let Ok(Some(user_id)) = crate::commands::cloud::active_user_id() {
+        Some(hoard_agent::state::cloud_context(&user_id))
     } else {
         None
     };

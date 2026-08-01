@@ -4,8 +4,16 @@
    * cloud from ANOTHER machine, with no local folder here.
    *
    * The folder picker used to be the only way through, even when detection
-   * already knew where the game saves on this machine. So detected folders
-   * come first as one-click options and the picker stays as the fallback.
+   * already knew where the game saves on this machine. So the offer is now, in
+   * order:
+   *
+   * 1. Folders detected for THIS slug — one click, no thinking.
+   * 2. Any other game detected here, pickable by NAME. The slug match is exact,
+   *    and two machines routinely slug one game differently (a Steam copy on
+   *    one side, a loose install on the other): before this, that difference
+   *    dumped the user into the file manager to hand-find a folder Hoard had
+   *    already found. Best name match comes first and is badged.
+   * 3. The folder picker, still there for what detection genuinely missed.
    *
    * Cold cache (never scanned — the case for anyone who never turned on Modo
    * Automático) is deliberately NOT rendered as "nothing found": we don't
@@ -15,7 +23,7 @@
    * the tracked-list refresh, and this modal shouldn't fork that.
    */
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, Radar, Link } from "lucide-svelte";
+  import { FolderOpen, Radar, Link, Search, Gamepad2 } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
   import Modal from "./Modal.svelte";
@@ -25,6 +33,7 @@
     scanLibrary,
     type Confidence,
     type DetectionReport,
+    type LinkCandidate,
     type LocalDetection,
     type TrackedSave,
   } from "../api";
@@ -33,22 +42,45 @@
   type Props = {
     open: boolean;
     orphan: TrackedSave | null;
+    /** Folders this machine already tracks — dropped from the candidate list so
+     *  two saves can't end up backing up one folder. */
+    trackedPaths?: string[];
     onClose: () => void;
     onPick: (path: string) => void;
     /** Lets Library.svelte adopt the report from an in-modal scan instead of
      *  leaving its own cards stale. */
     onScanned?: (report: DetectionReport) => void;
   };
-  let { open, orphan, onClose, onPick, onScanned }: Props = $props();
+  let {
+    open,
+    orphan,
+    trackedPaths = [],
+    onClose,
+    onPick,
+    onScanned,
+  }: Props = $props();
 
   let detection = $state<LocalDetection | null>(null);
   let loading = $state(false);
   let scanning = $state(false);
+  let search = $state("");
 
   // `null` scanned_at = no cache at all. Distinct from "scanned and found
   // nothing", which is a real answer and only earns the picker.
   const neverScanned = $derived(detection !== null && detection.scanned_at === null);
   const paths = $derived(detection?.paths ?? []);
+  const candidates = $derived(detection?.candidates ?? []);
+
+  // Already sorted by the agent (affinity, then name); search only filters.
+  const shown = $derived.by(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return candidates;
+    return candidates.filter(
+      (c) =>
+        c.display_name.toLowerCase().includes(q) ||
+        c.game_slug.toLowerCase().includes(q),
+    );
+  });
 
   // Re-query whenever a different orphan opens the modal. Cheap: the command
   // is an in-memory cache lookup, no scan.
@@ -57,13 +89,14 @@
       void load(orphan.game_slug);
     } else if (!open) {
       detection = null;
+      search = "";
     }
   });
 
   async function load(slug: string) {
     loading = true;
     try {
-      detection = await detectedPathsForGame(slug);
+      detection = await detectedPathsForGame(slug, trackedPaths);
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
       detection = null;
@@ -79,12 +112,18 @@
     try {
       const report = await scanLibrary();
       onScanned?.(report);
-      detection = await detectedPathsForGame(orphan.game_slug);
+      detection = await detectedPathsForGame(orphan.game_slug, trackedPaths);
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
       scanning = false;
     }
+  }
+
+  /** Picking a game links its strongest save folder — the same one automatic
+   *  tracking would have chosen. */
+  function pickGame(c: LinkCandidate) {
+    if (c.paths.length > 0) onPick(c.paths[0].path);
   }
 
   async function pickOther() {
@@ -188,6 +227,82 @@
       {:else}
         <p class="text-sm text-zinc-500">{$_("library.link_no_detection")}</p>
       {/if}
+
+      <!-- Pick the GAME, not the folder. Shown whenever this machine has
+           anything else detected — including alongside an exact-slug hit,
+           because the exact hit can still be the wrong game. -->
+      {#if candidates.length > 0}
+        <div>
+          <span class="mb-1.5 block text-xs font-medium text-zinc-400">
+            {paths.length > 0
+              ? $_("library.link_pick_other_game")
+              : $_("library.link_pick_game_heading")}
+          </span>
+
+          <!-- The search box only earns its space once scanning the list by eye
+               stops being realistic. -->
+          {#if candidates.length > 6}
+            <div class="relative mb-1.5">
+              <Search
+                size={13}
+                class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500"
+              />
+              <input
+                type="text"
+                bind:value={search}
+                placeholder={$_("library.link_search_games")}
+                class="w-full rounded-lg border border-white/[0.08] bg-zinc-950/60 py-1.5 pl-7 pr-2.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:border-emerald-600/40 focus:outline-none"
+              />
+            </div>
+          {/if}
+
+          {#if shown.length === 0}
+            <p class="text-sm text-zinc-500">
+              {$_("library.link_no_game_matches")}
+            </p>
+          {:else}
+            <ul class="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+              {#each shown as c (c.game_slug)}
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => pickGame(c)}
+                    class="group flex w-full items-center gap-2.5 rounded-lg border border-white/[0.08] bg-zinc-950/60 px-3 py-2 text-left transition-colors hover:border-emerald-600/40 hover:bg-emerald-600/10"
+                  >
+                    <Gamepad2
+                      size={14}
+                      class="shrink-0 text-zinc-500 group-hover:text-emerald-300"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span
+                        class="block truncate text-xs text-zinc-200 group-hover:text-zinc-100"
+                      >
+                        {c.display_name}
+                      </span>
+                      <span
+                        class="block truncate font-mono text-[10px] text-zinc-500"
+                        title={c.paths[0]?.path}
+                      >
+                        {c.paths[0]?.path}
+                      </span>
+                    </span>
+                    {#if c.affinity >= 2}
+                      <span
+                        class="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300 ring-1 ring-inset ring-emerald-500/30"
+                      >
+                        {$_("library.link_same_name")}
+                      </span>
+                    {/if}
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          <p class="mt-1.5 text-xs text-zinc-500">
+            {$_("library.link_pick_game_hint")}
+          </p>
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -195,11 +310,13 @@
     <Button variant="ghost" onclick={onClose}>
       {$_("common.cancel")}
     </Button>
-    <!-- With detected folders on offer THEY are the primary action (emerald on
-         hover) and the picker is the escape hatch; with none, the picker is the
-         only way forward and takes the emerald. -->
+    <!-- With something detected on offer THAT is the primary action (emerald on
+         hover) and the picker is the escape hatch; with nothing, the picker is
+         the only way forward and takes the emerald. -->
     <Button
-      variant={paths.length > 0 ? "secondary" : "primary"}
+      variant={paths.length > 0 || candidates.length > 0
+        ? "secondary"
+        : "primary"}
       onclick={pickOther}
     >
       <FolderOpen size={14} />

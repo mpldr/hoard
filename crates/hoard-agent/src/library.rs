@@ -9,13 +9,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use hoard_manifest::ludusavi;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::agent::{dir_size_bytes, WatchedSave};
 use crate::api::ApiClient;
 use crate::config::CliConfig;
-use crate::detection::{Confidence, DetectionReport};
+use crate::detection::{Confidence, DetectedGame, DetectionReport};
+use crate::junkdirs;
 use crate::manifest::Os;
 use crate::presets::{self, SavePolicy};
 use crate::state::{CliState, SaveState};
@@ -177,8 +179,34 @@ pub struct LocalDetection {
     pub game_slug: String,
     /// Candidatas ordenadas strongest-first (mismo orden que `found_paths`).
     pub paths: Vec<DetectedPath>,
+    /// Los **demás** juegos detectados aquí, para vincular por juego cuando el
+    /// slug de la nube no casa con ninguno local. Ver [`link_candidates`].
+    #[serde(default)]
+    pub candidates: Vec<LinkCandidate>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub scanned_at: Option<OffsetDateTime>,
+}
+
+/// Un juego detectado en ESTA máquina ofrecido como destino de vínculo.
+///
+/// El emparejamiento por slug exacto ([`detected_paths_in`]) se rompe en cuanto
+/// las dos máquinas nombran el juego distinto —la misma copia instalada por
+/// caminos distintos, un Steam contra un suelto—, y entonces el usuario se
+/// quedaba con el selector de carpetas como única salida: cazar a mano una ruta
+/// que Hoard ya conoce. Estas son las candidatas para decir "es este juego" en
+/// vez de "es esta carpeta".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkCandidate {
+    pub game_slug: String,
+    pub display_name: String,
+    /// Rutas de save del juego, strongest-first. Nunca vacío: un juego sin
+    /// carpeta que ofrecer no es candidato.
+    pub paths: Vec<DetectedPath>,
+    /// Parecido entre el nombre del juego local y el slug que viene de la nube:
+    /// `2` mismo nombre normalizado, `1` uno contiene al otro, `0` nada. Ordena
+    /// la lista y deja al frontend destacar lo que casi seguro es el mismo
+    /// juego.
+    pub affinity: u8,
 }
 
 impl LocalDetection {
@@ -218,17 +246,117 @@ pub fn detected_paths_in(report: &DetectionReport, game_slug: &str) -> Vec<Detec
         .collect()
 }
 
+/// Normaliza un nombre o un slug a solo alfanuméricos en minúscula, que es lo
+/// único comparable entre "R.E.P.O.", "repo" y "R E P O".
+fn normalized_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Parecido entre el slug de la nube y un juego local. Ver [`LinkCandidate::affinity`].
+///
+/// Se mira contra el nombre visible **y** contra el slug: el mismo juego puede
+/// llegar como `raccoin` desde una máquina y `Raccoin` / `rac-coin` desde otra,
+/// y los tres normalizan igual. La contención pide 4 caracteres para que un
+/// nombre corto no se declare pariente de media biblioteca ("Ori" dentro de
+/// "Origin", "GTA" dentro de cualquier cosa con esas letras seguidas).
+fn name_affinity(cloud_slug: &str, game: &DetectedGame) -> u8 {
+    let cloud = normalized_name(cloud_slug);
+    if cloud.is_empty() {
+        return 0;
+    }
+    let mut best = 0;
+    for local in [
+        normalized_name(&game.display_name),
+        normalized_name(&game.slug),
+    ] {
+        if local.is_empty() {
+            continue;
+        }
+        let score = if local == cloud {
+            2
+        } else if cloud.len() >= 4
+            && local.len() >= 4
+            && (local.contains(&cloud) || cloud.contains(&local))
+        {
+            1
+        } else {
+            0
+        };
+        best = best.max(score);
+    }
+    best
+}
+
+/// Los juegos detectados aquí a los que se puede enganchar el save `game_slug`
+/// que vive en la nube, mejor parecido primero.
+///
+/// Fuera quedan tres grupos, y por motivos distintos:
+///
+/// * El propio `game_slug`, que ya va en [`LocalDetection::paths`] y saldría
+///   duplicado.
+/// * Los juegos sin ninguna ruta de save encontrada: no hay carpeta que
+///   vincular, solo un nombre.
+/// * Los que apuntan a una carpeta **ya rastreada** por otro save. Vincular ahí
+///   pondría dos saves distintos a hacer backup de la misma carpeta, que es
+///   justo lo que el escaneo automático evita con `paths_overlap`; ofrecerlo en
+///   un desplegable no lo haría menos roto.
+pub fn link_candidates(
+    report: &DetectionReport,
+    game_slug: &str,
+    tracked_paths: &[PathBuf],
+) -> Vec<LinkCandidate> {
+    let mut out: Vec<LinkCandidate> = report
+        .games
+        .iter()
+        .filter(|g| g.slug != game_slug && !g.found_paths.is_empty())
+        .filter(|g| {
+            !tracked_paths
+                .iter()
+                .any(|t| crate::detection::paths_overlap(&g.found_paths[0], t))
+        })
+        .map(|g| LinkCandidate {
+            game_slug: g.slug.clone(),
+            display_name: g.display_name.clone(),
+            paths: detected_paths_in(report, &g.slug),
+            affinity: name_affinity(game_slug, g),
+        })
+        .collect();
+    // Parecido primero (lo que el usuario venía buscando), y el resto por
+    // nombre: la lista larga se recorre con el ojo, no con la barra de scroll.
+    out.sort_by(|a, b| {
+        b.affinity.cmp(&a.affinity).then_with(|| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        })
+    });
+    out
+}
+
 /// Lo que la detección local sabe de `game_slug` según una caché ya cargada.
 /// `cached` es `None` cuando nadie ha escaneado todavía en esta máquina.
 ///
 /// El desktop pasa su caché en memoria (`AppState`) y la CLI la de disco
 /// ([`load_detection_from_disk`]); la regla de qué es una candidata vive aquí,
 /// una sola vez.
-pub fn local_detection(cached: Option<&CachedDetection>, game_slug: &str) -> LocalDetection {
+///
+/// `tracked_paths` son las carpetas que esta máquina ya rastrea, para no
+/// ofrecer como destino una carpeta que ya tiene dueño ([`link_candidates`]).
+pub fn local_detection(
+    cached: Option<&CachedDetection>,
+    game_slug: &str,
+    tracked_paths: &[PathBuf],
+) -> LocalDetection {
     LocalDetection {
         game_slug: game_slug.to_string(),
         paths: cached
             .map(|c| detected_paths_in(&c.report, game_slug))
+            .unwrap_or_default(),
+        candidates: cached
+            .map(|c| link_candidates(&c.report, game_slug, tracked_paths))
             .unwrap_or_default(),
         scanned_at: cached.map(|c| c.scanned_at),
     }
@@ -255,13 +383,92 @@ pub fn resolve_policy(game_slug: &str, stored_preset: Option<&str>) -> SavePolic
     SavePolicy::from_preset(name)
 }
 
-/// Nombres de proceso que marcan "jugando" para slugs que el storefront no da
-/// (TLauncher Minecraft, Factorio nativo). Del catálogo built-in.
+/// Nombres de proceso que marcan "jugando" para este slug.
+///
+/// Fuente principal: el bloque `launch:` del manifiesto Ludusavi, que trae el
+/// ejecutable de ~18k juegos. Antes esto sólo devolvía el catálogo built-in —
+/// dos entradas— y todo lo demás dependía del match por tokens del slug o de
+/// una correlación que en frío vale cero; ahora la primera sesión de un juego
+/// del catálogo ya dispara "arrancó" sin haberlo visto nunca.
+///
+/// **Sólo se aceptan ejecutables inequívocos**: `hoard_manifest` deja fuera del
+/// índice los nombres que reclaman varios juegos (`game.exe`, `launcher.exe`,
+/// `nw.exe`, `dosbox.exe`…), y aquí se exige además que el nombre resuelva de
+/// vuelta a ESTE slug. Sin ese filtro, un `game.exe` cualquiera pondría a
+/// jugar —y a acumular horas— a un juego al azar.
+///
+/// El catálogo built-in sigue teniendo la última palabra (Minecraft por
+/// TLauncher no sale del manifiesto): se añade siempre, sin duplicar.
 pub fn resolve_processes(game_slug: &str) -> Vec<String> {
-    presets::builtin_processes_for(game_slug)
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    if let Some(entry) = ludusavi::find_by_slug(game_slug) {
+        for exe in &entry.launch_exes {
+            let unambiguous = ludusavi::find_by_exe(exe).is_some_and(|e| e.slug == game_slug);
+            if unambiguous && !out.iter().any(|p| p.eq_ignore_ascii_case(exe)) {
+                out.push(exe.clone());
+            }
+        }
+    }
+    for p in presets::builtin_processes_for(game_slug) {
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(p)) {
+            out.push((*p).to_string());
+        }
+    }
+    out
+}
+
+// ---- carpetas descartadas por el usuario -----------------------------------
+
+/// Descarta una carpeta: la detección deja de ofrecerla, y todo lo que cuelgue
+/// de ella. Idempotente.
+///
+/// Es la respuesta al problema que ignorar-por-slug no resuelve: el nombre de
+/// un hallazgo de fase 4 lo pone la correlación, y cambia entre escaneos, así
+/// que la misma carpeta vuelve con slug nuevo una y otra vez. La ruta no
+/// cambia.
+pub fn exclude_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("Path can't be empty.");
+    }
+    let (mut state, file) = CliState::load_default()?;
+    state.add_excluded_path(path.to_path_buf());
+    state.save(&file)?;
+    tracing::info!(path = %path.display(), "detection: folder excluded by the user");
+    Ok(())
+}
+
+/// Deja de descartar exactamente esta carpeta. Mirror de [`exclude_path`].
+pub fn unexclude_path(path: &Path) -> Result<()> {
+    let (mut state, file) = CliState::load_default()?;
+    state.remove_excluded_path(path);
+    state.save(&file)?;
+    Ok(())
+}
+
+/// Las carpetas descartadas en este equipo, para pintarlas en Ajustes.
+pub fn list_excluded_paths() -> Result<Vec<PathBuf>> {
+    Ok(CliState::load_default()?.0.excluded_paths)
+}
+
+/// Quita del informe las rutas que el usuario descartó, y con ellas los juegos
+/// que se quedan sin ninguna.
+///
+/// La sutileza que importa: un juego **sin rutas desde el principio** NO se
+/// toca. Esa fila es deliberada — significa "vi el juego en disco pero no sé
+/// dónde guarda" y es la que pinta la alerta ámbar para que el usuario elija
+/// carpeta. Borrarla le quitaría al usuario la única forma de arreglarlo.
+/// Sólo desaparece el juego al que la exclusión le quitó TODAS las que tenía.
+pub fn apply_excluded_paths(report: &mut DetectionReport, state: &CliState) {
+    if state.excluded_paths.is_empty() {
+        return;
+    }
+    report.games.retain_mut(|g| {
+        let had = g.found_paths.len();
+        g.found_paths.retain(|p| !state.is_path_excluded(p));
+        g.path_confidences.truncate(g.found_paths.len());
+        // Tenía rutas y ninguna sobrevivió ⇒ fuera. Nunca tuvo ⇒ se queda.
+        had == 0 || !g.found_paths.is_empty()
+    });
 }
 
 /// `save_id` sintético de un slot playtime-only. Prefijo anticolisión.
@@ -424,15 +631,64 @@ pub fn watched_save_from(
 
 // ---- add / adopt / list / rename / untrack / delete ------------------------
 
-fn validate_folder(local_path: &Path) -> Result<()> {
+/// Comprobaciones de FORMA de una ruta de save, sin exigir que exista.
+///
+/// Se aplican también al destino de un restore, donde la carpeta legítimamente
+/// puede no existir todavía (máquina nueva). Rechazan lo que no puede ser
+/// nunca la carpeta de un juego: un perfil entero, una raíz de sistema, o el
+/// propio directorio de estado de Hoard —cuyo backup se copiaría a sí mismo
+/// en bucle—.
+pub fn validate_path_shape(local_path: &Path) -> Result<()> {
     if local_path.as_os_str().is_empty() {
         anyhow::bail!("Save folder path can't be empty.");
     }
+    if let Some(reason) = junkdirs::dangerous_sync_root(local_path) {
+        anyhow::bail!(
+            "Refusing to use {}: {reason}. Pick the game's own save folder inside it.",
+            local_path.display()
+        );
+    }
+    if let Ok(state_dir) = CliConfig::state_dir() {
+        if local_path.starts_with(&state_dir) || state_dir.starts_with(local_path) {
+            anyhow::bail!(
+                "Refusing to use {}: that's Hoard's own data folder.",
+                local_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Igual que [`validate_path_shape`] y además: la carpeta tiene que existir
+/// (se crea si falta) y no puede estar ya rastreada por otro save.
+///
+/// Lo segundo evita dos watchers y dos historiales sobre los mismos bytes. El
+/// escaneo automático ya lo comprobaba por su cuenta, pero un alta manual —o
+/// la CLI— podían duplicar igual.
+fn validate_folder(local_path: &Path, except_save_id: Option<&str>) -> Result<()> {
+    validate_path_shape(local_path)?;
     if !local_path.exists() {
+        // No existe todavía: se asume carpeta. Un save de fichero suelto
+        // siempre se da de alta sobre un fichero que YA está (lo propone la
+        // detección al encontrarlo), así que aquí no hay ambigüedad.
         std::fs::create_dir_all(local_path)
             .with_context(|| format!("Couldn't create {}", local_path.display()))?;
-    } else if !local_path.is_dir() {
-        anyhow::bail!("{} isn't a folder.", local_path.display());
+    } else if !local_path.is_dir() && !local_path.is_file() {
+        anyhow::bail!("{} isn't a folder or a file.", local_path.display());
+    }
+    if let Ok((state, _)) = CliState::load_default() {
+        // `except_save_id` es el save que se está reapuntando: solaparse
+        // consigo mismo no es un conflicto.
+        if let Some((_, other)) = state.saves.iter().find(|(id, st)| {
+            Some(id.as_str()) != except_save_id
+                && crate::detection::paths_overlap(&st.local_path, local_path)
+        }) {
+            anyhow::bail!(
+                "'{}' already tracks {} — one folder, one game.",
+                other.game_slug,
+                other.local_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -450,7 +706,17 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         .or_else(|| presets::builtin_preset_for(&args.game_slug).map(str::to_string));
 
     let local_path = PathBuf::from(&args.local_path);
-    validate_folder(&local_path)?;
+    // Re-añadir el MISMO (juego, etiqueta) es un flujo legítimo (re-track,
+    // re-onboarding, re-alta por detección) y reusa la fila existente más
+    // abajo; sólo tiene que fallar si la carpeta es de OTRO save.
+    let reusing = CliState::load_default().ok().and_then(|(state, _)| {
+        state
+            .saves
+            .iter()
+            .find(|(_, st)| st.game_slug == args.game_slug && st.label == label)
+            .map(|(id, _)| id.clone())
+    });
+    validate_folder(&local_path, reusing.as_deref())?;
 
     // Cloud no tiene `create_save` server-side: la fila se materializa en el
     // primer upload (UPSERT en (user_id, game_slug, label)). El cliente minta un
@@ -596,7 +862,9 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
     // server aquí, la fila cloud ya existe.
     let _ = client;
     let local_path = PathBuf::from(&args.local_path);
-    validate_folder(&local_path)?;
+    // Adoptar es reapuntar un save que ya existe en la nube: solaparse consigo
+    // mismo no es un conflicto de "una carpeta, un juego".
+    validate_folder(&local_path, Some(args.save_id.as_str()))?;
 
     let (mut cli_state, path) = CliState::load_default()?;
     let preset = presets::builtin_preset_for(&args.game_slug).map(str::to_string);
@@ -1054,7 +1322,7 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
     if path_buf.as_os_str().is_empty() {
         anyhow::bail!("Path can't be empty.");
     }
-    validate_folder(&path_buf)?;
+    validate_folder(&path_buf, Some(save_id))?;
 
     let (mut cli_state, path) = CliState::load_default()?;
     let entry = cli_state
@@ -1078,7 +1346,10 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detected_paths_in, local_detection, prune_poisoned_rows, CachedDetection};
+    use super::{
+        apply_excluded_paths, detected_paths_in, local_detection, prune_poisoned_rows,
+        resolve_processes, CachedDetection,
+    };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
     };
@@ -1175,6 +1446,7 @@ mod tests {
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: None,
             install_dir: None,
+            steam_cloud: false,
         }
     }
 
@@ -1245,7 +1517,7 @@ mod tests {
             &[],
             Confidence::High,
         )]);
-        let d = local_detection(Some(&one), "celeste");
+        let d = local_detection(Some(&one), "celeste", &[]);
         assert_eq!(
             d.unambiguous().unwrap().path,
             PathBuf::from("/saves/celeste")
@@ -1258,26 +1530,189 @@ mod tests {
             Confidence::High,
         )]);
         // Dos candidatas: elige el usuario, la card no ofrece atajo.
-        assert!(local_detection(Some(&two), "celeste")
+        assert!(local_detection(Some(&two), "celeste", &[])
             .unambiguous()
             .is_none());
 
         let none = cached(vec![game("celeste", &[], &[], Confidence::High)]);
-        assert!(local_detection(Some(&none), "celeste")
+        assert!(local_detection(Some(&none), "celeste", &[])
             .unambiguous()
             .is_none());
+    }
+
+    /// Mismo helper que [`game`] pero con nombre visible propio: el parecido se
+    /// mide contra el nombre, no solo contra el slug.
+    fn named(slug: &str, display: &str, paths: &[&str]) -> DetectedGame {
+        DetectedGame {
+            display_name: display.to_string(),
+            ..game(slug, paths, &[Confidence::High; 1], Confidence::High)
+        }
+    }
+
+    /// El caso del informe de jul-2026: la misma copia de un juego rastreada en
+    /// dos equipos que la nombran distinto. El slug de la nube no casa con
+    /// ninguno local, y antes de esto la única salida era el selector de
+    /// carpetas — cazar a mano una ruta que la detección ya tenía.
+    #[test]
+    fn offers_other_detected_games_when_the_slug_doesnt_match() {
+        let c = cached(vec![
+            named("raccoin-gog", "Raccoin", &["/home/u/.local/share/raccoin"]),
+            named("celeste", "Celeste", &["/saves/celeste"]),
+        ]);
+        let d = local_detection(Some(&c), "raccoin", &[]);
+        // Nada bajo ese slug exacto…
+        assert!(d.paths.is_empty());
+        // …pero sí un juego que se llama igual, y va primero.
+        assert_eq!(d.candidates.len(), 2);
+        assert_eq!(d.candidates[0].game_slug, "raccoin-gog");
+        assert_eq!(d.candidates[0].affinity, 2);
+        assert_eq!(
+            d.candidates[0].paths[0].path,
+            PathBuf::from("/home/u/.local/share/raccoin")
+        );
+        assert_eq!(d.candidates[1].affinity, 0);
+    }
+
+    /// Una carpeta que ya rastrea otro save no se ofrece: dos saves sobre una
+    /// misma carpeta es justo lo que el escaneo automático evita.
+    #[test]
+    fn candidates_skip_already_tracked_folders() {
+        let c = cached(vec![
+            named("celeste", "Celeste", &["/saves/celeste"]),
+            named("hades", "Hades", &["/saves/hades"]),
+        ]);
+        let d = local_detection(Some(&c), "raccoin", &[PathBuf::from("/saves/celeste")]);
+        assert_eq!(d.candidates.len(), 1);
+        assert_eq!(d.candidates[0].game_slug, "hades");
+    }
+
+    /// Sin carpeta que ofrecer no hay candidata, y el propio slug no se
+    /// duplica: ese ya sale en `paths`.
+    #[test]
+    fn candidates_exclude_pathless_games_and_the_slug_itself() {
+        let c = cached(vec![
+            game("celeste", &["/saves/celeste"], &[], Confidence::High),
+            game("hades", &[], &[], Confidence::High),
+        ]);
+        let d = local_detection(Some(&c), "celeste", &[]);
+        assert_eq!(d.paths.len(), 1);
+        assert!(d.candidates.is_empty());
+    }
+
+    /// La contención pide 4 caracteres —si no, un nombre corto se declara
+    /// pariente de media biblioteca—, pero la IGUALDAD no mide longitud: «Ori»
+    /// es «ori» por corto que sea.
+    #[test]
+    fn short_names_match_exactly_but_never_by_containment() {
+        let c = cached(vec![
+            named("origin-story", "Origin Story", &["/saves/origin"]),
+            named("ori-and-the-blind-forest", "Ori", &["/saves/ori"]),
+        ]);
+        let d = local_detection(Some(&c), "ori", &[]);
+        assert_eq!(d.candidates[0].display_name, "Ori");
+        assert_eq!(d.candidates[0].affinity, 2);
+        // «ori» dentro de «originstory» NO cuenta: bajo 4 caracteres la
+        // contención empareja demasiado.
+        assert_eq!(d.candidates[1].display_name, "Origin Story");
+        assert_eq!(d.candidates[1].affinity, 0);
     }
 
     #[test]
     fn never_scanned_is_distinct_from_scanned_and_empty() {
         // Sin caché: no lo sabemos ⇒ el frontend ofrece escanear.
-        let cold = local_detection(None, "celeste");
+        let cold = local_detection(None, "celeste", &[]);
         assert!(cold.scanned_at.is_none());
         assert!(cold.paths.is_empty());
 
         // Con caché pero sin el slug: sí lo sabemos, y la respuesta es "nada".
-        let scanned = local_detection(Some(&cached(vec![])), "celeste");
+        let scanned = local_detection(Some(&cached(vec![])), "celeste", &[]);
         assert!(scanned.scanned_at.is_some());
         assert!(scanned.paths.is_empty());
+    }
+
+    /// El manifiesto declara el ejecutable de ~18k juegos; antes de cablearlo
+    /// esto devolvía lista vacía para todo salvo minecraft y factorio, y la
+    /// primera sesión de un juego nunca disparaba "arrancó".
+    #[test]
+    fn processes_come_from_the_manifest_launch_block() {
+        let procs = resolve_processes("stardew-valley");
+        assert!(
+            procs.iter().any(|p| p.contains("stardew")),
+            "expected the manifest executable, got {procs:?}"
+        );
+    }
+
+    /// El catálogo built-in no se pierde al añadir el manifiesto, y no duplica.
+    #[test]
+    fn builtin_processes_survive_and_dont_duplicate() {
+        let procs = resolve_processes("factorio");
+        assert!(procs.iter().any(|p| p == "factorio.exe"));
+        assert!(procs.iter().any(|p| p == "factorio"));
+        let mut sorted = procs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), procs.len(), "duplicados en {procs:?}");
+    }
+
+    /// Un slug que no está en el catálogo no inventa procesos.
+    #[test]
+    fn an_unknown_slug_yields_no_processes() {
+        assert!(resolve_processes("not-a-real-game-slug-xyzzy").is_empty());
+    }
+
+    fn excl_game(slug: &str, paths: &[&str]) -> DetectedGame {
+        DetectedGame {
+            slug: slug.into(),
+            display_name: slug.into(),
+            found_paths: paths.iter().map(PathBuf::from).collect(),
+            path_confidences: vec![Confidence::High; paths.len()],
+            confidence: Confidence::High,
+            source: DetectionSource::FilesystemHeuristic,
+            steam_app_id: None,
+            install_dir: None,
+            steam_cloud: false,
+        }
+    }
+
+    fn report_of(games: Vec<DetectedGame>) -> DetectionReport {
+        DetectionReport {
+            games,
+            catalog_size: 0,
+            steam_apps_found: 0,
+            scanned_at_ms: 0,
+            stats: Default::default(),
+        }
+    }
+
+    /// Regresión (Windows, 30-jul-2026): el filtro de exclusión borraba también
+    /// las filas que NUNCA tuvieron rutas — que son justo la alerta ámbar "elige
+    /// carpeta". El usuario perdía la única forma de arreglar esos juegos.
+    #[test]
+    fn excluding_paths_never_removes_a_pick_a_folder_row() {
+        let mut state = CliState::default();
+        state.add_excluded_path(PathBuf::from("/junk"));
+        let mut report = report_of(vec![
+            excl_game("sin-rutas", &[]),                 // alerta ámbar: se queda
+            excl_game("todo-descartado", &["/junk/x"]),  // pierde todo: fuera
+            excl_game("parcial", &["/junk/y", "/real"]), // conserva la buena
+            excl_game("intacto", &["/real/z"]),
+        ]);
+        apply_excluded_paths(&mut report, &state);
+
+        let slugs: Vec<&str> = report.games.iter().map(|g| g.slug.as_str()).collect();
+        assert_eq!(slugs, ["sin-rutas", "parcial", "intacto"]);
+        let parcial = &report.games[1];
+        assert_eq!(parcial.found_paths, vec![PathBuf::from("/real")]);
+        assert_eq!(parcial.path_confidences.len(), 1);
+    }
+
+    /// Sin exclusiones el informe no se toca en absoluto.
+    #[test]
+    fn no_exclusions_is_a_no_op() {
+        let before = report_of(vec![excl_game("a", &[]), excl_game("b", &["/x"])]);
+        let mut after = report_of(vec![excl_game("a", &[]), excl_game("b", &["/x"])]);
+        apply_excluded_paths(&mut after, &CliState::default());
+        assert_eq!(after.games.len(), before.games.len());
+        assert_eq!(after.games[1].found_paths, before.games[1].found_paths);
     }
 }

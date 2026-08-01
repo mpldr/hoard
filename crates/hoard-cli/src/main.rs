@@ -114,6 +114,17 @@ enum Commands {
         /// roots, deeper walks. Slower; mirrors the Library deep-scan tile.
         #[arg(long)]
         deep: bool,
+        /// Stop offering this folder (and anything under it) in future scans.
+        /// Repeatable. Excluding by folder is what sticks when a phase-4
+        /// find keeps coming back under a different name.
+        #[arg(long = "exclude", value_name = "PATH")]
+        exclude: Vec<String>,
+        /// Undo `--exclude` for this exact folder. Repeatable.
+        #[arg(long = "unexclude", value_name = "PATH")]
+        unexclude: Vec<String>,
+        /// Print the excluded folders and exit.
+        #[arg(long)]
+        list_excluded: bool,
     },
     /// Manage save namespaces
     Save {
@@ -277,7 +288,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Whoami => commands::auth::whoami().await,
         Commands::Games { action } => commands::games::run(action).await,
         Commands::Cloud { action } => commands::cloud::run(action).await,
-        Commands::Scan { verbose, deep } => commands::scan::run(verbose, deep).await,
+        Commands::Scan {
+            verbose,
+            deep,
+            exclude,
+            unexclude,
+            list_excluded,
+        } => commands::scan::run(verbose, deep, exclude, unexclude, list_excluded).await,
         Commands::Save { action } => commands::saves::run(action).await,
         Commands::Snapshots { action } => snapshots_dispatch(action).await,
         Commands::Backup {

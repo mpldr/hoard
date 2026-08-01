@@ -107,6 +107,13 @@ export type DetectedGame = {
    * as a hint near the folder picker; never use as a backup path.
    */
   install_dir?: string | null;
+  /**
+   * The catalog says this game supports Steam Cloud. Purely a note for the
+   * user — it must not reorder, re-rank or gate anything. Steam Cloud only
+   * covers the Steam copy, can be turned off per game, and keeps no history
+   * to roll back to, so wanting a second copy on top of it is normal.
+   */
+  steam_cloud?: boolean;
 };
 
 export type DetectionReport = {
@@ -134,6 +141,18 @@ export type DetectedPath = {
   confidence: Confidence;
 };
 
+/** A game detected on THIS machine offered as a link target, so a cloud save
+ *  can be bound by picking the *game* instead of hunting for its folder. */
+export type LinkCandidate = {
+  game_slug: string;
+  display_name: string;
+  /** Save folders, strongest-first. Never empty. */
+  paths: DetectedPath[];
+  /** 2 = same normalised name as the cloud slug, 1 = one contains the other,
+   *  0 = unrelated. Already sorted on; the UI badges the 2s. */
+  affinity: number;
+};
+
 /** What local detection knows about one slug — the offer behind "Vincular a
  *  esta máquina". */
 export type LocalDetection = {
@@ -141,6 +160,9 @@ export type LocalDetection = {
   /** Candidates, strongest-first. Exactly one means the match is unambiguous
    *  and the orphan card can offer a direct "Vincular a <ruta>" button. */
   paths: DetectedPath[];
+  /** Every OTHER game detected here, best name match first — the way out when
+   *  the two machines slug the same game differently. */
+  candidates: LinkCandidate[];
   /**
    * When this machine last scanned, or `null` if it never did. `null` with
    * empty `paths` means "unknown", not "nothing here" — offer a scan instead
@@ -219,13 +241,19 @@ export function cachedDetection(): Promise<DetectionReport | null> {
   return invoke<DetectionReport | null>("cached_detection");
 }
 
-/** Save folders local detection already knows for a slug, read from the scan
- *  cache. Cheap (in-memory lookup, no scan) — safe to call per orphan row. */
+/** Save folders local detection already knows for a slug, plus every other
+ *  game detected here as a link target. Read from the scan cache — cheap
+ *  (in-memory lookup, no scan), safe to call per orphan row.
+ *
+ *  `tracked_paths` are the folders this machine already tracks; they're
+ *  dropped from the candidates so no two saves end up on one folder. */
 export function detectedPathsForGame(
   game_slug: string,
+  tracked_paths: string[] = [],
 ): Promise<LocalDetection> {
   return invoke<LocalDetection>("detected_paths_for_game", {
     gameSlug: game_slug,
+    trackedPaths: tracked_paths,
   });
 }
 
@@ -501,6 +529,10 @@ export type AgentEvent =
       type: "backup_skipped_empty";
       save_id: string;
       game_slug: string;
+      /** The save has never produced a snapshot AND its folder is empty —
+       *  almost always a wrong tracked path rather than a real state change.
+       *  See `AgentEvent::BackupSkippedEmpty` for why the two cases differ. */
+      likely_wrong_path?: boolean;
     }
   | {
       /** Auto-restore has failed repeatedly on the same cloud version: the
@@ -662,6 +694,14 @@ export type TrayStateName =
 /** Read the prefs file from disk. */
 export function getPrefs(): Promise<Prefs> {
   return invoke<Prefs>("get_prefs");
+}
+
+/** Avisa al backend de que la UI ya ha pintado su primer frame, para que
+ *  muestre la ventana (nace oculta; ver `commands/window.rs`). Idempotente y
+ *  con red de seguridad en Rust, así que no pasa nada si tarda o si el
+ *  arranque es silencioso — en ese caso el backend la ignora. */
+export function uiReady(): Promise<void> {
+  return invoke<void>("ui_ready");
 }
 
 /** Persist prefs. Returns the saved object so the caller can hydrate stores. */

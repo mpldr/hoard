@@ -210,7 +210,8 @@ pub async fn run_scan(app: &AppHandle) {
         }
     };
 
-    let tracked = match crate::commands::library::list_tracked_saves(app.state()).await {
+    let tracked = match crate::commands::library::list_tracked_saves(app.clone(), app.state()).await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "automatic scan: couldn't list tracked saves");
@@ -308,7 +309,7 @@ pub async fn run_scan(app: &AppHandle) {
             label: orphan.label.clone(),
             local_path: path.to_string_lossy().into_owned(),
         };
-        match crate::commands::library::adopt_save(args, app.state()).await {
+        match crate::commands::library::adopt_save(app.clone(), args, app.state()).await {
             Ok(_) => tracked_count += 1,
             Err(e) => {
                 tracing::warn!(slug = %orphan.game_slug, error = %e, "automatic scan: couldn't adopt cloud save")
@@ -331,7 +332,7 @@ pub async fn run_scan(app: &AppHandle) {
         };
         // Don't abort the batch over one game — a single 422/409 on an old
         // server shouldn't stop the other nine from being tracked.
-        match crate::commands::library::add_game_to_tracking(args, app.state()).await {
+        match crate::commands::library::add_game_to_tracking(app.clone(), args, app.state()).await {
             Ok(_) => tracked_count += 1,
             Err(e) => {
                 tracing::warn!(slug = %game.slug, error = %e, "automatic scan: couldn't track game")

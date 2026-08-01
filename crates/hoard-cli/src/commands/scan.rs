@@ -18,18 +18,51 @@ use hoard_agent::detection::{self, Confidence};
 use hoard_agent::manifest::Os;
 use hoard_agent::state::CliState;
 
-pub async fn run(verbose: bool, deep: bool) -> Result<()> {
+pub async fn run(
+    verbose: bool,
+    deep: bool,
+    exclude: Vec<String>,
+    unexclude: Vec<String>,
+    list_excluded: bool,
+) -> Result<()> {
+    // Gestión de carpetas descartadas. Va antes del escaneo para que un
+    // `--exclude` y el escaneo de la misma invocación ya lo reflejen.
+    for p in &exclude {
+        hoard_agent::library::exclude_path(std::path::Path::new(p.trim()))?;
+        println!("Excluded {p}");
+    }
+    for p in &unexclude {
+        hoard_agent::library::unexclude_path(std::path::Path::new(p.trim()))?;
+        println!("No longer excluded: {p}");
+    }
+    if list_excluded {
+        let paths = hoard_agent::library::list_excluded_paths()?;
+        if paths.is_empty() {
+            println!("No folders are excluded from scanning.");
+        } else {
+            for p in paths {
+                println!("{}", p.display());
+            }
+        }
+        return Ok(());
+    }
+
     let os = Os::current();
     // Load overrides so the bench mirrors what the app actually scans.
     let (cli_state, _) = CliState::load_default()?;
 
     let start = Instant::now();
-    let report = if deep {
+    let mut report = if deep {
         detection::detect_all_deep(os, &cli_state, |_done, _total| {}).await?
     } else {
         detection::detect_all(os, &cli_state, |_done, _total| {}).await?
     };
     let elapsed = start.elapsed();
+
+    // Mismos filtros de borde que aplica el desktop, para que el bench
+    // refleje lo que el usuario ve y no una lista distinta.
+    report.games.retain(|g| !cli_state.is_ignored(&g.slug));
+    hoard_agent::library::apply_excluded_paths(&mut report, &cli_state);
 
     let (mut high, mut medium, mut low, mut with_paths) = (0usize, 0usize, 0usize, 0usize);
     for g in &report.games {

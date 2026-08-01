@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **A shareable card at the bottom of Hoard-Wrapped.** The recap now ends in a
+  wide camera button that opens your card: photo, name, a random line that
+  riffs on your most-played game (22 games, eight languages — play a Fallout
+  and it says "war never changes"), your stats for the last week, month or
+  year, and a row of cubes for that range (a week is seven big ones). Photo,
+  name, line and range are editable and stay **on this device only** — nothing
+  is uploaded or synced. A separate camera button takes the shot and drops the
+  PNG in your gallery (`Pictures/Hoard/`), branded with hoard.services both on
+  the image and in its PNG metadata.
+- **Link a cloud save by picking the game, not the folder.** "Link to this
+  machine" now lists the games detection already found here, best name match
+  first, so a save synced from another device can be bound in one click.
+  Games whose folder another save already tracks are left out, and the folder
+  picker stays as the fallback for what detection genuinely missed.
+
+### Fixed
+- **"Link to this machine" opened the file manager again.** The 1.0.4 UI
+  rewrite dropped the wiring for the link dialog added in 1.0.3, so the button
+  went straight to the OS folder picker — making you hand-find a save folder
+  Hoard had already detected. The dialog is back.
+
 ## [1.1.0] — 2026-07-28
 
 ### Added

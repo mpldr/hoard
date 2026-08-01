@@ -245,6 +245,19 @@ pub struct Observation {
     // ---- Evidencia de proceso ------------------------------------------
     /// El proceso del juego está vivo en la tabla de procesos este tick.
     pub process_alive: bool,
+    /// Algún fichero del save está **abierto en exclusiva por otro proceso**:
+    /// el juego está escribiendo AHORA MISMO.
+    ///
+    /// Señal independiente de la tabla de procesos, y por eso vale: no depende
+    /// de reconocer el ejecutable, así que cubre el juego cuyo nombre no casa
+    /// con nada y cuya correlación aún no existe. Copiar la carpeta en ese
+    /// momento captura un save a medio escribir; restaurar encima es peor.
+    ///
+    /// Hoy sólo la puede afirmar Windows (`ERROR_SHARING_VIOLATION`); en
+    /// Linux/macOS un `open()` de lectura nunca falla porque otro proceso
+    /// escriba, así que llega `false` y mandan los guards de siempre. Ver
+    /// `hoard_agent::locks`.
+    pub save_files_locked: bool,
 
     // ---- Cabeza del server ---------------------------------------------
     /// Última versión cloud conocida para este save. `None` = desconocida

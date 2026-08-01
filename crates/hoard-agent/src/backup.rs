@@ -265,15 +265,57 @@ fn is_transient_lock(name: &str) -> bool {
 }
 
 pub fn walk_source(root: &Path) -> Result<Vec<UploadFile>> {
+    // Save de fichero suelto: el `local_path` ES el fichero. Sale un único
+    // `UploadFile` con su nombre base como ruta relativa, de modo que el
+    // snapshot tiene exactamente la misma forma que el de una carpeta con un
+    // fichero dentro — y todo lo de aguas abajo (firma, dedup, restore) sigue
+    // funcionando sin enterarse. Más de 8.000 entradas del manifiesto son así:
+    // `<winAppData>/Game/save.dat`, `<base>/140.sav`.
+    if root.is_file() {
+        let meta =
+            std::fs::metadata(root).with_context(|| format!("reading {}", root.display()))?;
+        let name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("save file has no usable name: {}", root.display()))?;
+        return Ok(vec![UploadFile {
+            relative_path: name.to_string(),
+            absolute_path: root.to_path_buf(),
+            size_bytes: meta.len(),
+            modified: meta.modified().ok(),
+        }]);
+    }
+
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in
-            std::fs::read_dir(&dir).with_context(|| format!("reading dir {}", dir.display()))?
-        {
-            let entry = entry?;
+        // Un subdirectorio ilegible se salta; sólo la raíz es error duro.
+        //
+        // Antes esto era `?` para cualquier nivel, así que UNA carpeta sin
+        // permiso abortaba el backup entero del juego. En Windows es la norma,
+        // no la excepción: las junctions legacy del perfil
+        // (`AppData\Local\Application Data`, que apunta a su propio padre)
+        // devuelven acceso denegado y además son un ciclo. Perder una
+        // subcarpeta ilegible es infinitamente mejor que perder el backup.
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) if dir != root => {
+                tracing::warn!(path = %dir.display(), error = %e, "skipping unreadable directory");
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading dir {}", dir.display()));
+            }
+        };
+        for entry in read {
+            // Igual que arriba: una entrada que desaparece o no se puede
+            // interrogar a mitad del paseo no invalida el resto.
+            let Ok(entry) = entry else { continue };
             let path = entry.path();
-            let ft = entry.file_type()?;
+            let Ok(ft) = entry.file_type() else {
+                tracing::warn!(path = %path.display(), "skipping entry with unreadable type");
+                continue;
+            };
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
@@ -342,8 +384,10 @@ where
     let source = source
         .canonicalize()
         .with_context(|| format!("source path does not exist: {}", source.display()))?;
-    if !source.is_dir() {
-        bail!("source must be a directory: {}", source.display());
+    // Una carpeta o un fichero suelto; cualquier otra cosa (un socket, un
+    // dispositivo) no es un save.
+    if !source.is_dir() && !source.is_file() {
+        bail!("source must be a folder or a file: {}", source.display());
     }
 
     let files = walk_source(&source)?;
@@ -835,8 +879,8 @@ where
     let canonical = source
         .canonicalize()
         .with_context(|| format!("source path does not exist: {}", source.display()))?;
-    if !canonical.is_dir() {
-        bail!("source must be a directory: {}", canonical.display());
+    if !canonical.is_dir() && !canonical.is_file() {
+        bail!("source must be a folder or a file: {}", canonical.display());
     }
     let files = walk_source(&canonical)?;
     if files.is_empty() {
@@ -1061,5 +1105,75 @@ mod tests {
         let after = compute_content_signature(&a).await.unwrap();
         assert_ne!(before, after);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Una subcarpeta sin permiso no puede tumbar el backup del juego entero:
+    /// en Windows las junctions legacy del perfil devuelven acceso denegado de
+    /// forma rutinaria.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdir_is_skipped_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("save.dat"), b"real save").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inner.dat"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let files = walk_source(root).expect("un subdir ilegible no debe abortar el walk");
+        // Restaura permisos para que el tempdir se pueda limpiar.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["save.dat"],
+            "el save legible debe seguir estando"
+        );
+    }
+
+    /// La raíz sí es error duro: si no se puede leer, no hay backup que hacer
+    /// y decirlo en voz alta es lo correcto.
+    #[test]
+    fn an_unreadable_root_is_still_an_error() {
+        let missing = std::path::Path::new("/definitely/not/here/hoard-test");
+        assert!(walk_source(missing).is_err());
+    }
+
+    /// Save de fichero suelto: 4.900 juegos del catálogo sólo tienen
+    /// plantillas que apuntan a un fichero. El snapshot sale con la misma
+    /// forma que el de una carpeta con un fichero dentro, así que firma,
+    /// dedup y restore siguen funcionando sin cambios.
+    #[test]
+    fn a_single_file_save_walks_to_one_entry_named_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ssr_save.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+
+        let files = walk_source(&file).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "ssr_save.bin");
+        assert_eq!(files[0].absolute_path, file);
+        assert_eq!(files[0].size_bytes, 10);
+        assert!(files[0].modified.is_some());
+    }
+
+    /// Y su firma se comporta como cualquier otra: cambia con el contenido,
+    /// que es lo que hace que el skip-by-set-hash siga siendo correcto.
+    #[test]
+    fn a_single_file_saves_signature_tracks_its_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("save.dat");
+        std::fs::write(&file, b"a").unwrap();
+        let before = compute_set_signature(&walk_source(&file).unwrap());
+        // Un tamaño distinto mueve la firma aunque el mtime tenga poca
+        // resolución en este sistema de ficheros.
+        std::fs::write(&file, b"bbbb").unwrap();
+        let after = compute_set_signature(&walk_source(&file).unwrap());
+        assert_ne!(before, after);
     }
 }

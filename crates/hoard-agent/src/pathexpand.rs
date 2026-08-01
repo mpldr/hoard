@@ -52,6 +52,123 @@ pub fn expand_path(template: &str, os: Os) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The pieces of a template that can only be resolved against **live** host
+/// state, so [`expand_path`] (which is pure) can't do it alone.
+///
+/// Two thirds of the manifest's templates are useless without this:
+/// `<base>` alone leads 15.8k of them ("the game's own install folder"),
+/// and dropping those templates is why a third of the catalog produced no
+/// path at all on a machine that had the game installed.
+#[derive(Debug, Default, Clone)]
+pub struct PathScope {
+    /// Where this specific game is installed — resolves `<base>`. Several
+    /// candidates are normal: the same folder name can exist in more than
+    /// one Steam library.
+    pub install_dirs: Vec<PathBuf>,
+    /// Storefront roots (the Steam install root(s)) — resolves `<root>`.
+    pub store_roots: Vec<PathBuf>,
+}
+
+impl PathScope {
+    pub fn is_empty(&self) -> bool {
+        self.install_dirs.is_empty() && self.store_roots.is_empty()
+    }
+}
+
+/// Expand a template that may reference the game's install dir.
+///
+/// Superset of [`expand_path_globbed`]:
+///
+/// * `<base>` → each of `scope.install_dirs`
+/// * `<root>` → each of `scope.store_roots`
+/// * `<storeUserId>` → `*` (globbed): the Steam account id isn't knowable
+///   from a template, but the glob machinery resolves it against the real
+///   directory. 5.8k templates carry it mid-path and used to expand to a
+///   literal `<storeUserId>` segment that could never exist.
+/// * `<osUserName>` → the current user name.
+///
+/// Anything else falls through to [`expand_path_globbed`] unchanged. A
+/// template whose scope placeholder has no candidates yields nothing — the
+/// game isn't installed here, so there is nothing to stat.
+pub fn expand_path_scoped(template: &str, os: Os, scope: &PathScope) -> Vec<PathBuf> {
+    let substituted = substitute_inline(template);
+    let Some((placeholder, tail)) = split_placeholder(&substituted) else {
+        // A literal that isn't absolute would resolve against the process
+        // CWD — never a save location.
+        if !is_absolute_literal(&substituted) {
+            return Vec::new();
+        }
+        return expand_path_globbed(&substituted, os);
+    };
+
+    let scoped_bases: Option<&[PathBuf]> = match placeholder.as_str() {
+        "base" => Some(&scope.install_dirs),
+        "root" => Some(&scope.store_roots),
+        _ => None,
+    };
+    let Some(bases) = scoped_bases else {
+        return expand_path_globbed(&substituted, os);
+    };
+
+    let tail_clean = tail.trim_start_matches(['/', '\\']);
+    let mut out = Vec::new();
+    for base in bases {
+        if tail_clean.is_empty() {
+            // `<base>` on its own is the install directory: never a save
+            // location, and offering it would snapshot the whole game.
+            continue;
+        }
+        if has_glob(tail_clean) {
+            expand_glob_tail(base, tail_clean, &mut out);
+        } else {
+            out.push(base.join(tail_clean));
+        }
+    }
+    out
+}
+
+/// Replace the placeholders that resolve the same way wherever they appear
+/// in a template (not just at the front).
+fn substitute_inline(template: &str) -> String {
+    let mut s = template.to_string();
+    if s.contains("<storeUserId>") {
+        // Not knowable from the template; the glob resolves it on disk.
+        s = s.replace("<storeUserId>", "*");
+    }
+    if s.contains("<osUserName>") {
+        if let Some(user) = os_user_name() {
+            s = s.replace("<osUserName>", &user);
+        }
+    }
+    s
+}
+
+fn os_user_name() -> Option<String> {
+    for key in ["USER", "USERNAME", "LOGNAME"] {
+        if let Some(v) = std::env::var_os(key) {
+            let v = v.to_string_lossy().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    home_dir()?
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+}
+
+/// True for a path we can stat without a placeholder: rooted on Unix, or
+/// carrying a drive letter / UNC prefix on Windows.
+fn is_absolute_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.starts_with('/')
+        || s.starts_with("\\\\")
+        || (b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && (b[2] == b'\\' || b[2] == b'/'))
+}
+
 /// Maximum number of directory entries to consider per glob segment.
 /// Caps the fan-out so a wildcard in a path like `<home>/Downloads/*/Saves`
 /// doesn't enumerate thousands of entries on a busy folder.
@@ -314,7 +431,13 @@ fn expand_placeholder(name: &str, os: Os) -> Vec<PathBuf> {
     match (os, name) {
         // -------- Cross-platform basics
         (_, "home") => home_dir().into_iter().collect(),
-        (_, "root") => vec![PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" })],
+        // `<root>` is the STOREFRONT root (the Steam install dir), not the
+        // filesystem root — 2.7k of its 3.1k uses are
+        // `<root>/userdata/<storeUserId>/<appid>/remote`. Mapping it to `/`
+        // produced `/userdata/...`, which never exists, so those templates
+        // were dead weight either way. It needs live Steam state, so it is
+        // resolved by `expand_path_scoped`; here there is nothing to give.
+        (_, "root") => Vec::new(),
 
         // -------- Windows
         (Os::Windows, "winAppData") => env_dir("APPDATA"),
@@ -928,5 +1051,94 @@ mod tests {
         assert_eq!(out, vec![PathBuf::from("C:\\Users\\Tester\\Saves\\Game")]);
 
         let _ = hkcu.delete_subkey_all(subkey);
+    }
+
+    // ---- <base> / <root> ------------------------------------------------
+
+    #[test]
+    fn base_resolves_against_each_install_dir() {
+        let scope = PathScope {
+            install_dirs: vec![
+                PathBuf::from("/lib1/common/Game"),
+                PathBuf::from("/lib2/Game"),
+            ],
+            store_roots: Vec::new(),
+        };
+        assert_eq!(
+            expand_path_scoped("<base>/saves", Os::Linux, &scope),
+            vec![
+                PathBuf::from("/lib1/common/Game/saves"),
+                PathBuf::from("/lib2/Game/saves"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_without_install_dirs_yields_nothing() {
+        // The game isn't installed here — there is nothing to stat, and
+        // guessing a path would be worse than reporting no candidates.
+        let scope = PathScope::default();
+        assert!(expand_path_scoped("<base>/saves", Os::Linux, &scope).is_empty());
+    }
+
+    #[test]
+    fn bare_base_is_never_a_save_location() {
+        // `<base>` alone is the install directory. Offering it would
+        // snapshot the whole multi-GB game.
+        let scope = PathScope {
+            install_dirs: vec![PathBuf::from("/lib/Game")],
+            store_roots: Vec::new(),
+        };
+        assert!(expand_path_scoped("<base>", Os::Linux, &scope).is_empty());
+        assert!(expand_path_scoped("<base>/", Os::Linux, &scope).is_empty());
+    }
+
+    #[test]
+    fn root_resolves_to_the_store_root_not_the_filesystem_root() {
+        // The old mapping turned `<root>/userdata/...` into `/userdata/...`.
+        let scope = PathScope {
+            install_dirs: Vec::new(),
+            store_roots: vec![PathBuf::from("/home/u/.steam/steam")],
+        };
+        assert_eq!(
+            expand_path_scoped("<root>/config", Os::Linux, &scope),
+            vec![PathBuf::from("/home/u/.steam/steam/config")]
+        );
+        // And with no Steam on the box, nothing at all.
+        assert!(expand_path_scoped("<root>/config", Os::Linux, &PathScope::default()).is_empty());
+    }
+
+    #[test]
+    fn store_user_id_becomes_a_glob() {
+        // 5.8k templates carry `<storeUserId>` mid-path; expanding it
+        // literally produced a segment that can never exist on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp
+            .path()
+            .join("userdata")
+            .join("76561198000000000")
+            .join("413150");
+        std::fs::create_dir_all(&real).unwrap();
+        let scope = PathScope {
+            install_dirs: Vec::new(),
+            store_roots: vec![tmp.path().to_path_buf()],
+        };
+        let out = expand_path_scoped("<root>/userdata/<storeUserId>/413150", Os::Linux, &scope);
+        assert_eq!(out, vec![real]);
+    }
+
+    #[test]
+    fn a_relative_literal_is_dropped_rather_than_resolved_against_the_cwd() {
+        assert!(expand_path_scoped("saves/slot1", Os::Linux, &PathScope::default()).is_empty());
+    }
+
+    #[test]
+    fn scoped_expansion_falls_through_for_ordinary_placeholders() {
+        with_env(&[("HOME", Some("/home/tester"))], || {
+            assert_eq!(
+                expand_path_scoped("<home>/.local/share/Game", Os::Linux, &PathScope::default()),
+                vec![PathBuf::from("/home/tester/.local/share/Game")]
+            );
+        });
     }
 }

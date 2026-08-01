@@ -1066,6 +1066,15 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
         // El estado de proceso lo posee `process_poll` (ya con su sticky de
         // 6 s); aquí es un passthrough para la stickiness del kernel.
         process_alive: slot.is_running,
+        // Sonda de bloqueo: "el juego está escribiendo el save AHORA", dicho
+        // por el sistema de ficheros y no por casar un proceso. Sólo se paga
+        // cuando de verdad puede cambiar una decisión — si el slot ya está
+        // corriendo, el veto salta antes y sondear sería `open()` por fichero
+        // cada dos segundos para nada. En POSIX siempre es `false` (no hay
+        // bloqueo obligatorio); ver `crate::locks`.
+        save_files_locked: !slot.is_running
+            && !slot.save.track_only
+            && crate::locks::any_file_locked(&slot.save.local_path),
         cloud_version: cloud.versions.get(&slot.save.save_id).copied(),
         // La marca es del *feed*, no del save: el manifest viene entero, así que
         // un save ausente de él tiene `cloud_version: None` con la marca igual
@@ -3034,7 +3043,7 @@ async fn files_have_equal_bytes(a: &Path, b: &Path) -> Result<bool> {
 /// overwrite the field.
 fn arm_watcher(slot: &mut SaveSlot, fs_tx: &mpsc::Sender<PathBuf>) {
     let path = slot.save.local_path.clone();
-    if !path.is_dir() {
+    if !path.is_dir() && !path.is_file() {
         tracing::info!(
             save_id = %slot.save.save_id,
             path = %path.display(),
@@ -3068,7 +3077,23 @@ fn build_watcher(
     path: &Path,
     fs_tx: mpsc::Sender<PathBuf>,
 ) -> Result<Debouncer<notify::RecommendedWatcher>> {
+    // Save de fichero suelto: se vigila el DIRECTORIO PADRE y se filtra por
+    // nombre. Vigilar el inodo directamente no sirve con los juegos que
+    // guardan "a lo seguro" — escriben un temporal, borran el original y
+    // renombran el temporal encima —, porque el fichero que se estaba
+    // vigilando deja de existir y el watch muere con él. El padre sobrevive a
+    // ese baile. `watch_root` sigue siendo la ruta del save, que es lo que el
+    // bucle usa para casar el evento con su slot.
     let watch_root = path.to_path_buf();
+    let single_file = path.is_file();
+    let (watch_target, want_name) = if single_file {
+        (
+            path.parent().unwrap_or(path).to_path_buf(),
+            path.file_name().map(|s| s.to_os_string()),
+        )
+    } else {
+        (path.to_path_buf(), None)
+    };
     let mut debouncer = new_debouncer(
         // Internal aggregation window for notify-debouncer-mini. We use a
         // small value (2 s) here and apply our larger product debounce by
@@ -3077,15 +3102,25 @@ fn build_watcher(
         Duration::from_secs(2),
         move |res: DebounceEventResult| {
             if let Ok(events) = res {
-                if !events.is_empty() {
+                // Con un fichero suelto vigilamos su carpeta, así que hay que
+                // descartar los eventos de los vecinos: si no, cualquier otro
+                // save en la misma carpeta despertaría a éste.
+                let relevant = match &want_name {
+                    Some(name) => events.iter().any(|e| e.path.file_name() == Some(name)),
+                    None => !events.is_empty(),
+                };
+                if relevant {
                     let _ = fs_tx.try_send(watch_root.clone());
                 }
             }
         },
     )?;
-    debouncer
-        .watcher()
-        .watch(path, notify::RecursiveMode::Recursive)?;
+    let mode = if single_file {
+        notify::RecursiveMode::NonRecursive
+    } else {
+        notify::RecursiveMode::Recursive
+    };
+    debouncer.watcher().watch(&watch_target, mode)?;
     Ok(debouncer)
 }
 
@@ -3111,6 +3146,10 @@ fn match_save_for_path(slots: &HashMap<String, SaveSlot>, path: &Path) -> Option
 /// dirs/entries are skipped rather than erroring; a best-effort estimate is
 /// all the scheduler needs.
 pub fn dir_size_bytes(root: &Path) -> u64 {
+    // Un save de fichero suelto ocupa lo que ocupa ese fichero.
+    if root.is_file() {
+        return std::fs::metadata(root).map(|m| m.len()).unwrap_or(0);
+    }
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -3194,6 +3233,7 @@ async fn run_backup_with_retry(
                 .send(AgentEvent::BackupSkippedEmpty {
                     save_id: save.save_id.clone(),
                     game_slug: save.game_slug.clone(),
+                    likely_wrong_path: save.known_version.is_none(),
                 })
                 .await;
         }
@@ -3566,11 +3606,29 @@ async fn run_backup_with_retry(
                 // empty `Repo/saves`). Clear has_pending so a later write isn't
                 // blocked, and settle without a red "falló".
                 if e.chain().any(|c| c.is::<crate::backup::EmptySource>()) {
-                    tracing::info!(
-                        save_id = %save.save_id,
-                        game_slug = %save.game_slug,
-                        "agent: backup skipped — source has no files to upload"
-                    );
+                    // Nunca ha subido nada Y está vacía: casi siempre es una
+                    // ruta mal detectada (la carpeta nativa rastreada mientras
+                    // el juego corre por Proton, el contenedor en vez de su
+                    // `remote/`, una conjetura de fase 4). Se dice fuerte, con
+                    // la ruta delante, en vez de dejarlo en un INFO que nadie
+                    // lee. Si ya había subido antes, vaciarse es un cambio de
+                    // estado legítimo y no se molesta al usuario.
+                    let likely_wrong_path = save.known_version.is_none();
+                    if likely_wrong_path {
+                        tracing::warn!(
+                            save_id = %save.save_id,
+                            game_slug = %save.game_slug,
+                            path = %save.local_path.display(),
+                            "agent: nothing to back up and this save has never had a snapshot — \
+                             the tracked folder is probably not where the game saves"
+                        );
+                    } else {
+                        tracing::info!(
+                            save_id = %save.save_id,
+                            game_slug = %save.game_slug,
+                            "agent: backup skipped — source has no files to upload"
+                        );
+                    }
                     let _ = done_tx.try_send(BackupDone {
                         save_id: save.save_id.clone(),
                         new_set_hash: None,
@@ -3582,6 +3640,7 @@ async fn run_backup_with_retry(
                         .send(AgentEvent::BackupSkippedEmpty {
                             save_id: save.save_id.clone(),
                             game_slug: save.game_slug.clone(),
+                            likely_wrong_path,
                         })
                         .await;
                     return;
@@ -4164,13 +4223,28 @@ fn process_poll(
             && !reported_heavy.contains(pid)
             && crate::correlation::is_game_like(&name, proc.exe())
         {
+            // El aviso enseña el TÍTULO cuando el manifiesto reconoce el
+            // ejecutable (18k juegos lo declaran en `launch:`), y sólo cae al
+            // nombre crudo del proceso si no. "Detectado posible juego:
+            // Hollow Knight" en vez de "hollow_knight.x86_64". El nombre real
+            // sigue en la línea de log de aquí al lado para diagnóstico.
+            let raw = proc.name().to_string_lossy().into_owned();
+            let title = hoard_manifest::ludusavi::title_for_exe(&raw)
+                .or_else(|| {
+                    proc.exe()
+                        .and_then(|e| e.file_name())
+                        .and_then(|e| e.to_str())
+                        .and_then(hoard_manifest::ludusavi::title_for_exe)
+                })
+                .map(str::to_string);
             tracing::info!(
                 process = %name,
+                title = %title.as_deref().unwrap_or("-"),
                 cpu = proc.cpu_usage(),
                 "agent: heavy untracked game-like process; requesting detection scan"
             );
             let _ = events_tx.try_send(AgentEvent::HeavyProcessDetected {
-                name: proc.name().to_string_lossy().into_owned(),
+                name: title.unwrap_or(raw),
             });
             reported_heavy.insert(*pid);
         }

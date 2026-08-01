@@ -267,6 +267,13 @@ fn decide_backup(
     if !(next.has_pending && local_diverged(next, obs)) {
         return None;
     }
+    // El juego está escribiendo el save ahora mismo: subirlo capturaría un
+    // fichero a medias. Es un freno de ritmo, no un error — en cuanto suelte
+    // el fichero, el siguiente tick sube. Antes que los backoffs porque es más
+    // específico: da el motivo real en vez de "esperando".
+    if obs.save_files_locked {
+        return Some(hold("save files are open in another process"));
+    }
     // Backoff de error (429 de subida / reintentos de backup agotados): nunca se
     // salta — saltárselo es martillear un backend caído o quemar la cuota.
     if next.next_backup_at.is_some_and(|t| now < t) {
@@ -1586,6 +1593,11 @@ mod tests {
                 local_empty,
                 local_fingerprint: local_fp,
                 process_alive,
+                // El proptest no modela la sonda de bloqueo: es un freno de
+                // ritmo del shell (sólo Windows la puede afirmar) y dejarla
+                // siempre en falso mantiene el espacio de estados en lo que
+                // este test cubre.
+                save_files_locked: false,
                 cloud_version,
                 cloud_version_as_of: cloud_as_of.map(at),
                 cloud_feed_expected_since: cloud_expected.map(at),

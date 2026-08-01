@@ -40,16 +40,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::correlation::{self, CorrelationStore};
+use crate::junkdirs;
 use crate::launchers::{self, LauncherApp};
 use crate::manifest::Os;
 use crate::pathexpand::{
-    expand_path_globbed, expand_path_in_prefix, expand_path_in_prefix_as_user, expand_registry_path,
+    self, expand_path_in_prefix, expand_path_in_prefix_as_user, expand_path_scoped,
+    expand_registry_path,
 };
 use crate::roots;
 use crate::scoring;
 use crate::state::CliState;
 use crate::steam::{self, SteamApp};
 use crate::wine_prefixes::{self, PrefixKind};
+use crate::wrappers;
 
 /// How sure we are that the game is actually installed locally.
 ///
@@ -107,6 +110,15 @@ pub struct DetectedGame {
     /// folder picker — **must not** be used as a backup path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_dir: Option<PathBuf>,
+    /// The catalog says this game supports Steam Cloud.
+    ///
+    /// **Informational only.** It is deliberately not an input to confidence,
+    /// ordering, or auto-track: plenty of people want a second copy precisely
+    /// *because* Steam Cloud exists (it only covers the Steam copy, it can be
+    /// disabled per-game, and it has no history to roll back to). The UI just
+    /// says so next to the game; nothing in the pipeline reads it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steam_cloud: bool,
 }
 
 /// Aggregate result of a detection pass. The numeric counts let the UI show a
@@ -128,7 +140,16 @@ pub struct DetectionReport {
 /// scan cache and in the `Detection complete` log line — to make scan cost
 /// and per-stage yield measurable across machines instead of guessed.
 /// Counters are "slugs this stage merged/added", not raw path candidates.
+///
+/// `#[serde(default)]` va en el **contenedor**, no campo a campo: así una
+/// caché escrita por una versión anterior —a la que le falta el contador que
+/// se acaba de añadir— sigue cargando, y la siguiente que se añada tampoco
+/// romperá nada. Sin esto, `wrapper_slugs` tiró la caché de detección entera
+/// del usuario al actualizar ("detection cache malformed; ignoring: missing
+/// field `wrapper_slugs`"): se repara sola al siguiente escaneo, pero la
+/// biblioteca arranca en frío y eso no debería pasar por sumar un contador.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DetectionStats {
     pub duration_ms: u64,
     pub steam_appid_matches: usize,
@@ -141,6 +162,9 @@ pub struct DetectionStats {
     pub proton_slugs: usize,
     pub generic_prefix_slugs: usize,
     pub steam_cloud_slugs: usize,
+    /// Saves found inside a Steam-emulator / repack wrapper (`GSE Saves`,
+    /// `CODEX`, …), where the subfolder name is the Steam appid.
+    pub wrapper_slugs: usize,
     pub walker_slugs: usize,
     pub phase4_new_games: usize,
     pub phase4_merged_paths: usize,
@@ -301,6 +325,7 @@ where
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
                 install_dir: Some(app.install_dir.clone()),
+                steam_cloud: false,
             },
         );
     }
@@ -339,6 +364,16 @@ where
     // Filesystem heuristic: spawn one blocking task per game, gated by the
     // semaphore. Each task expands every Windows/Linux/Mac template that
     // applies to the current OS and stat()s every candidate path.
+    // `<base>`-relative templates need to know where each game is installed.
+    // Built once, shared by every task.
+    let store_roots = steam::detect_steam_libraries(os);
+    let install_index = install_dir_index(os, &steam_apps);
+    tracing::info!(
+        install_dirs = install_index.len(),
+        store_roots = store_roots.len(),
+        "install-dir index built (resolves <base>)"
+    );
+
     let mut tasks = Vec::new();
     for entry in catalog {
         let templates: Vec<String> = paths_for_os(entry, os);
@@ -347,6 +382,14 @@ where
         }
         let slug = entry.slug.clone();
         let display_name = entry.display_name.clone();
+        let scope = scope_for(
+            entry,
+            &install_index,
+            &store_roots,
+            by_slug
+                .get(&entry.slug)
+                .and_then(|g| g.install_dir.as_deref()),
+        );
         let permit = semaphore.clone().acquire_owned().await?;
         tasks.push(tokio::task::spawn_blocking(move || {
             // _permit drops at end of closure, releasing the slot.
@@ -355,7 +398,7 @@ where
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut root_matched = false;
             for tmpl in &templates {
-                let candidates = expand_path_globbed(tmpl, os);
+                let candidates = expand_path_scoped(tmpl, os, &scope);
                 if candidates.is_empty() {
                     // Unknown placeholder or unset env var — pathexpand
                     // already returns vec![] for those. Useful to log
@@ -638,6 +681,66 @@ where
         }
     }
 
+    // Steam-emulator / repack wrappers: `<APPDATA>/GSE Saves/<appid>/remote`
+    // and friends. The subfolder IS the Steam appid, so the game resolves
+    // against the catalog with its real name and cover instead of whatever
+    // the generic walk guessed — that guess is where "GSE Saves tracked under
+    // the Windows username" came from. On Linux the same repacks run under
+    // Proton, so the prefixes get the same treatment.
+    {
+        let mut hits: Vec<wrappers::WrapperHit> = wrappers::discover_wrappers(os);
+        if os == Os::Linux {
+            let prefixes = if deep {
+                wine_prefixes::list_wine_prefixes_deep(os)
+            } else {
+                wine_prefixes::list_wine_prefixes(os)
+            };
+            for p in &prefixes {
+                for user in roots::prefix_windows_users(&p.prefix_root) {
+                    hits.extend(wrappers::discover_wrappers_in_prefix(&p.prefix_root, &user));
+                }
+            }
+        }
+        let mut merged = 0usize;
+        for hit in hits {
+            // An appid resolves to the catalog entry; without one, the folder
+            // name is the best label available (it's usually the game's).
+            let (slug, display_name) = match hit.app_id.and_then(ludusavi::find_by_steam_app_id) {
+                Some(entry) => (entry.slug.clone(), entry.display_name.clone()),
+                None => {
+                    let name = hit
+                        .app_id
+                        .and_then(ludusavi::title_for_app_id)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| hit.folder.clone());
+                    let slug = ludusavi::slugify(&name);
+                    if slug.is_empty() {
+                        continue;
+                    }
+                    (slug, name)
+                }
+            };
+            merged += 1;
+            tracing::debug!(
+                wrapper = hit.wrapper,
+                slug = %slug,
+                path = %hit.path.display(),
+                "repack wrapper save merged"
+            );
+            merge_fs_hit_graded(
+                &mut by_slug,
+                slug,
+                display_name,
+                vec![hit.path],
+                &corr_store,
+            );
+        }
+        stats.wrapper_slugs = merged;
+        if merged > 0 {
+            tracing::info!(slugs = merged, "repack/emulator wrapper saves merged");
+        }
+    }
+
     // Promote confidence wherever both signals fired.
     for game in by_slug.values_mut() {
         if matches!(game.source, DetectionSource::Both) {
@@ -745,6 +848,7 @@ where
                             source: DetectionSource::FilesystemHeuristic,
                             steam_app_id: None,
                             install_dir: None,
+                            steam_cloud: false,
                         },
                     );
                     new_games += 1;
@@ -779,11 +883,16 @@ where
         let catalog_by_slug: HashMap<&str, &LudusaviEntry> =
             catalog.iter().map(|e| (e.slug.as_str(), e)).collect();
         for (slug, game) in by_slug.iter_mut() {
+            let entry = catalog_by_slug.get(slug.as_str());
             if game.steam_app_id.is_none() {
-                if let Some(entry) = catalog_by_slug.get(slug.as_str()) {
+                if let Some(entry) = entry {
                     game.steam_app_id = entry.steam_app_id;
                 }
             }
+            // Nota informativa, nada más. Se rellena aquí y NO se vuelve a
+            // leer: ni ordena, ni puntúa, ni cambia el auto-track. Lo pinta la
+            // UI y ya.
+            game.steam_cloud = entry.is_some_and(|e| e.cloud_steam);
         }
     }
 
@@ -818,6 +927,98 @@ where
         scanned_at_ms: started,
         stats,
     })
+}
+
+/// Directory names under a Steam library that are Steam's own plumbing, so
+/// a game folder scan doesn't offer them as install candidates.
+const LIB_SYSTEM_DIRS: &[&str] = &[
+    "steamapps",
+    "steam",
+    "userdata",
+    "config",
+    "appcache",
+    "logs",
+    "dumps",
+    "bin",
+    "package",
+    "public",
+    "clientui",
+    "controller_base",
+    "music",
+    "compatibilitytools.d",
+];
+
+/// Every install folder on this host, keyed by lowercase folder name.
+///
+/// This is what resolves `<base>`: a manifest entry says "I install into a
+/// folder called `ELDEN RING`", and this map says where that folder actually
+/// is. Built once per scan from two sources, cheapest first:
+///
+/// 1. the parsed Steam appmanifests (exact, no extra I/O — we already have
+///    them), and
+/// 2. one `read_dir` of each library's `steamapps/common` **and** of the
+///    library root itself, which is where portable and repack installs sit
+///    (`D:\Games\<Game>` next to `D:\steamapps`).
+///
+/// Listing beats stat-per-candidate by a wide margin here: ~19k catalog
+/// entries carry an `installDir` name, and probing each against every
+/// library would be tens of thousands of syscalls for a handful of hits.
+fn install_dir_index(os: Os, steam_apps: &[SteamApp]) -> HashMap<String, PathBuf> {
+    let mut out: HashMap<String, PathBuf> = HashMap::new();
+    let mut add = |path: PathBuf| {
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            out.entry(name.to_lowercase()).or_insert(path);
+        }
+    };
+    // Installed Steam games win: the appmanifest is authoritative.
+    for app in steam_apps {
+        add(app.install_dir.clone());
+    }
+    for lib in steam::detect_steam_libraries(os) {
+        for dir in [lib.join("steamapps").join("common"), lib.clone()] {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                if !ft.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if LIB_SYSTEM_DIRS.contains(&name.to_lowercase().as_str()) {
+                    continue;
+                }
+                add(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// The `<base>` / `<root>` candidates for one catalog entry.
+fn scope_for(
+    entry: &LudusaviEntry,
+    index: &HashMap<String, PathBuf>,
+    store_roots: &[PathBuf],
+    steam_install: Option<&Path>,
+) -> pathexpand::PathScope {
+    let mut install_dirs: Vec<PathBuf> = Vec::new();
+    // The game's own Steam install dir is the most reliable answer.
+    if let Some(p) = steam_install {
+        install_dirs.push(p.to_path_buf());
+    }
+    for name in &entry.install_dirs {
+        if let Some(p) = index.get(&name.to_lowercase()) {
+            if !install_dirs.contains(p) {
+                install_dirs.push(p.clone());
+            }
+        }
+    }
+    pathexpand::PathScope {
+        install_dirs,
+        store_roots: store_roots.to_vec(),
+    }
 }
 
 /// Pull the list of save-path template strings that apply to the requested
@@ -890,6 +1091,7 @@ fn apply_steam_name_fallback(
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
                 install_dir: Some(app.install_dir.clone()),
+                steam_cloud: false,
             },
         );
         if via_fuzzy {
@@ -993,6 +1195,7 @@ fn apply_launcher_name_fallback(
                         source: DetectionSource::SteamLibrary,
                         steam_app_id: None,
                         install_dir: Some(app.install_dir.clone()),
+                        steam_cloud: false,
                     },
                 );
             }
@@ -1053,7 +1256,16 @@ fn build_prefix_root_by_slug(os: Os) -> HashMap<String, PathBuf> {
                 };
                 entry.slug.clone()
             }
-            PrefixKind::Lutris | PrefixKind::Bottles => ludusavi::slugify(&prefix.identifier),
+            // Lutris names its prefix directory after its own game slug, and
+            // the manifest carries that slug (`id.lutris`, 4.1k entries), so
+            // it resolves exactly. Slugifying the directory name is the
+            // fallback for Bottles — and for the Lutris games the manifest
+            // doesn't list — but it only works when the folder happens to be
+            // named like the game.
+            PrefixKind::Lutris => ludusavi::find_by_lutris_slug(&prefix.identifier)
+                .map(|e| e.slug.clone())
+                .unwrap_or_else(|| ludusavi::slugify(&prefix.identifier)),
+            PrefixKind::Bottles => ludusavi::slugify(&prefix.identifier),
             // Generic prefixes have no per-game identifier — a single prefix
             // holds many games. They're handled by the dedicated generic-prefix
             // scan in `detect_all`, not the slug-keyed aggressive walker.
@@ -1084,6 +1296,30 @@ fn merge_fs_hit(
     display_name: String,
     hits: Vec<PathBuf>,
 ) {
+    // Single choke point for every catalog-driven stage: a template that
+    // resolves to a whole profile or a shared engine root is a loose
+    // template, not a save. Offering it would have the user back up their
+    // Documents folder — or every RenPy game at once.
+    let offered = hits.len();
+    let hits: Vec<PathBuf> = hits
+        .into_iter()
+        .filter(|p| {
+            let broad = is_too_broad(p);
+            if broad {
+                tracing::debug!(slug = %slug, path = %p.display(),
+                    "dropping candidate: it is a profile/engine root, not one game's save folder");
+            }
+            !broad
+        })
+        .collect();
+    // Se ofrecieron rutas y TODAS eran demasiado anchas: no hay nada que
+    // enseñar y tampoco hay que inventar una fila. Ojo: esto no es lo mismo
+    // que un `hits` vacío de entrada — eso es la señal deliberada de "vi el
+    // juego en disco pero no su carpeta de saves", que sí crea la fila con
+    // `found_paths` vacío para que la UI pida elegir carpeta.
+    if offered > 0 && hits.is_empty() && !by_slug.contains_key(&slug) {
+        return;
+    }
     match by_slug.get_mut(&slug) {
         Some(existing) => {
             // Both signals — strongest possible match.
@@ -1107,6 +1343,7 @@ fn merge_fs_hit(
                     source: DetectionSource::FilesystemHeuristic,
                     steam_app_id: None,
                     install_dir: None,
+                    steam_cloud: false,
                 },
             );
         }
@@ -1177,13 +1414,55 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
 
     let mut refined: Vec<PathBuf> = Vec::new();
     for hit in hits {
+        // El candidato es un FICHERO. Más de 4.900 juegos del catálogo sólo
+        // tienen plantillas así (`<winAppData>/Game/save.dat`, `<base>/140.sav`)
+        // y hasta ahora se perdían enteros: el refinado buscaba una subcarpeta
+        // de save, no la encontraba —un fichero no tiene subcarpetas— y lo
+        // tiraba, dejando al juego con la alerta ámbar "elige carpeta".
+        //
+        // Se prefiere la CARPETA que lo contiene, que es lo que el usuario
+        // espera respaldar y agrupa los saves hermanos. Sólo cuando esa
+        // carpeta es demasiado ancha para ofrecerla (el perfil, Documentos, la
+        // raíz de instalación del juego) se rastrea el fichero suelto.
+        if hit.is_file() {
+            let candidate = match hit.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() && !is_too_broad(parent) => {
+                    parent.to_path_buf()
+                }
+                _ => hit.clone(),
+            };
+            if !refined.contains(&candidate) {
+                refined.push(candidate);
+            }
+            continue;
+        }
         if segment_matches_save_pattern(&hit) {
             if !refined.contains(&hit) {
                 refined.push(hit);
             }
             continue;
         }
-        let mut subdirs = find_save_subdirs(&hit);
+        let subdirs_found = find_save_subdirs(&hit);
+        if subdirs_found.is_empty() && hit_name_suggests_saves(&hit) && !dir_is_empty(&hit) {
+            // El catálogo apuntó AQUÍ y el nombre de la carpeta lo dice
+            // ("SavedArksLocal", "SaveData"), pero no es una de las grafías
+            // exactas de `SAVE_PATTERNS` y dentro no hay ninguna subcarpeta
+            // save-named que refinar. Tirarla era perder el acierto: en el
+            // Windows del usuario, `<base>/ShooterGame/Saved/SavedArksLocal`
+            // de ARK existía con partidas dentro y salía como alerta ámbar
+            // "elige carpeta" en vez de rastrearse.
+            //
+            // Se exige que el NOMBRE hable de saves, no sólo que la carpeta
+            // exista: una plantilla que apunta a la raíz del juego (el caso
+            // Paradox, `.../Paradox Interactive/Stellaris` con `mod/` y
+            // `settings/`) no lo cumple y sigue dando la alerta ámbar, que
+            // es lo correcto — ahí no sabemos cuál de las subcarpetas es.
+            if !refined.contains(&hit) {
+                refined.push(hit);
+            }
+            continue;
+        }
+        let mut subdirs = subdirs_found;
         // Content validation (ADR 0019): when a single hit yields several
         // save-named subdirs, prefer the ones that actually hold a recent
         // save-like file. Disambiguates real save folders from editor /
@@ -1208,6 +1487,21 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
         }
     }
     refined
+}
+
+/// El último segmento **habla** de saves sin ser una de las grafías exactas:
+/// `SavedArksLocal`, `SaveData`, `save_games`. Más laxo que
+/// [`name_matches_save_pattern`] a propósito, y sólo se usa para decidir si
+/// conservar un acierto que el catálogo ya señaló — no para inventar
+/// candidatos de la nada.
+fn hit_name_suggests_saves(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(junkdirs::looks_like_save_dir_name)
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut r| r.next().is_none())
 }
 
 /// True iff the path's last segment matches one of [`SAVE_PATTERNS`]
@@ -1272,6 +1566,7 @@ fn apply_manual_overrides(
                     source: DetectionSource::ManualOverride,
                     steam_app_id: entry.steam_app_id,
                     install_dir: None,
+                    steam_cloud: false,
                 },
             );
             applied += 1;
@@ -1295,8 +1590,8 @@ fn apply_manual_overrides(
 /// for the slug being diagnosed. `kind` names the step
 /// (`"manual_override"`, `"steam_appid"`, `"name_fallback"`,
 /// `"launcher_fallback"`, `"filesystem"`, `"registry"`, `"proton_prefix"`,
-/// `"generic_prefix"`, `"steam_cloud"`, `"refine"`, `"aggressive_walk"`,
-/// `"correlation"`).
+/// `"generic_prefix"`, `"steam_cloud"`, `"wrapper"`, `"refine"`,
+/// `"aggressive_walk"`, `"correlation"`).
 ///
 /// `template` is the input the step worked from (a Ludusavi save-path
 /// template, a Steam appid, a slugified name, …). `expanded` is what the
@@ -1516,6 +1811,15 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
     // One step per save-path template that applies to the current OS.
     // Collects raw hits to feed into the refinement step below.
     let templates = paths_for_os(entry, os);
+    // Same `<base>`/`<root>` resolution the real pass uses — a diagnostic
+    // that expanded templates differently would describe a pipeline that
+    // doesn't exist.
+    let diag_scope = scope_for(
+        entry,
+        &install_dir_index(os, &steam_apps),
+        &steam::detect_steam_libraries(os),
+        install_dir_hint.as_deref(),
+    );
     let mut raw_hits: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for tmpl in &templates {
@@ -1526,12 +1830,18 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
             kept: Vec::new(),
             dropped: Vec::new(),
         };
-        let candidates = expand_path_globbed(tmpl, os);
+        let candidates = expand_path_scoped(tmpl, os, &diag_scope);
         if candidates.is_empty() {
             step.dropped.push(DroppedPath {
                 path: tmpl.clone(),
-                reason: "expand_path produced no candidates (unknown placeholder or unset env)"
-                    .into(),
+                reason: if tmpl.starts_with("<base>") && diag_scope.install_dirs.is_empty() {
+                    "template is relative to the install dir (<base>) and the game's \
+                     install folder wasn't found on this machine"
+                        .into()
+                } else {
+                    "expand_path produced no candidates (unknown placeholder or unset env)"
+                        .to_string()
+                },
             });
         }
         for c in candidates {
@@ -1725,6 +2035,51 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
                     reason: "no remote/ dir for this appid under this Steam user".into(),
                 });
             }
+        }
+        attempts.push(step);
+    }
+
+    // ---- Step 9b: wrapper --------------------------------------------
+    // Steam-emulator / repack containers, keyed by appid, plus the same
+    // containers inside every Wine prefix on Linux. Mirrors the pipeline's
+    // stage: whatever it finds is already narrowed to the save dir.
+    {
+        let mut step = TraceStep {
+            kind: "wrapper".into(),
+            template: Some("<repack wrappers>/<appid>".into()),
+            expanded: Vec::new(),
+            kept: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let mut hits = wrappers::discover_wrappers(os);
+        if os == Os::Linux {
+            for p in wine_prefixes::list_wine_prefixes(os) {
+                for user in roots::prefix_windows_users(&p.prefix_root) {
+                    hits.extend(wrappers::discover_wrappers_in_prefix(&p.prefix_root, &user));
+                }
+            }
+        }
+        for hit in hits {
+            let hit_slug = match hit.app_id.and_then(ludusavi::find_by_steam_app_id) {
+                Some(e) => e.slug.clone(),
+                None => ludusavi::slugify(&hit.folder),
+            };
+            step.expanded.push(hit.path.display().to_string());
+            if hit_slug == slug {
+                step.kept.push(hit.path.display().to_string());
+                merged_direct.push(hit.path);
+            } else {
+                step.dropped.push(DroppedPath {
+                    path: hit.path.display().to_string(),
+                    reason: format!("wrapper entry belongs to '{hit_slug}', not this slug"),
+                });
+            }
+        }
+        if step.expanded.is_empty() {
+            step.dropped.push(DroppedPath {
+                path: slug.into(),
+                reason: "no repack/emulator wrapper folders on this machine".into(),
+            });
         }
         attempts.push(step);
     }
@@ -1999,19 +2354,28 @@ pub(crate) fn aggressive_discover_with(
 
     if let Some(prefix) = prefix_root {
         // Proton prefixes mirror a Windows `C:\` drive under `drive_c/`.
-        // The user-writable areas (AppData, Documents, save folders) all
-        // live under `drive_c/users/steamuser/`, so walking from there
-        // avoids the `drive_c/windows` / `drive_c/Program Files` noise.
-        let user = prefix.join("drive_c/users/steamuser");
-        if user.is_dir() {
-            walk_root_collecting(
-                &user,
-                max_depth,
-                timeout_per_root,
-                &mut out,
-                &mut seen,
-                store,
-            );
+        // The user-writable areas (AppData, Documents, save folders) all live
+        // under a user's profile there, so walking from those avoids the
+        // `drive_c/windows` / `drive_c/Program Files` noise.
+        //
+        // `steamuser` used to be hardcoded here, which is right for Steam's
+        // own prefixes and wrong for every other launcher: Heroic, Lutris and
+        // Bottles name the profile after the real account, so their prefixes
+        // yielded nothing at all. `prefix_windows_users` takes whichever
+        // profiles actually exist — the same rule the generic-prefix stage
+        // has always used.
+        for user in roots::prefix_windows_users(prefix) {
+            let home = prefix.join("drive_c/users").join(&user);
+            if home.is_dir() {
+                walk_root_collecting(
+                    &home,
+                    max_depth,
+                    timeout_per_root,
+                    &mut out,
+                    &mut seen,
+                    store,
+                );
+            }
         }
     }
 
@@ -2070,6 +2434,9 @@ pub struct AttributedSave {
     pub path: PathBuf,
     pub confidence: Confidence,
     pub reason: String,
+    /// Set when the attribution landed on a catalog entry that carries an
+    /// appid — the cover art and the cross-device identity come from it.
+    pub steam_app_id: Option<u64>,
 }
 
 /// Phase 4 (ADR 0020): catalog-free discovery + attribution.
@@ -2120,21 +2487,200 @@ pub fn discover_unattributed_mode(
     discover_in_roots(walk_roots, store, known_paths, deep)
 }
 
-/// Scan ONE user-chosen folder (the Library "add from folder" button) and
-/// attribute every save-like dir inside it to a game name, Ludusavi-style:
-/// the user points Hoard at a folder and gets back "we found <Game> here".
+/// Scan ONE user-chosen folder (the Library's "scan folder" / "track another
+/// folder" / "no save folder yet" flows) and attribute every folder that holds
+/// data to a game name: the user points Hoard at a place and gets back "we
+/// found <Game> here".
 ///
-/// Always uses the relaxed (`deep`) gate and depth: the user explicitly asked
-/// us to look here, so surfacing weak/static-only maybes for them to confirm
-/// is the whole point — unlike the periodic scan, there's no risk of minting
-/// phantom games across the whole disk. `known_paths` still skips folders
-/// already covered by a tracked save so the list only shows new candidates.
+/// **This is deliberately not the periodic scan's question.** Out in the broad
+/// roots the question is "does this look enough like a save to mint a game?",
+/// and a weak candidate has to be dropped or the Library fills with phantoms.
+/// Here the user has already answered it — they pointed at this folder — so the
+/// question becomes the much simpler "which folders under it hold their own
+/// data?". Scoring still runs, but only to *grade* a hit (so the UI can rank
+/// and label it), never to veto one. That's what makes a folder full of saves
+/// with a proprietary extension — the common case in `Saved Games`, where the
+/// scored walk found one game in four — come back complete.
+///
+/// The walk emits a folder and stops descending as soon as it holds files of
+/// its own, so:
+///
+/// * `…/Saved Games` (only `desktop.ini` + one dir per game) yields one
+///   candidate per game, not the container;
+/// * `…/Saved Games/Surviving Mars Relaunched` — the folder the user picked
+///   *is* the save folder — yields itself. The old walk only ever classified
+///   the children of the root, so pointing straight at a game's own folder
+///   found nothing at all;
+/// * a game whose saves sit in `…/<Game>/slot1/` yields `slot1`, attributed to
+///   `<Game>` by the ancestor rule.
+///
+/// `known_paths` still skips folders already covered by a tracked save, so the
+/// list only ever offers new candidates.
 pub fn discover_in_folder(
     root: &Path,
     store: &CorrelationStore,
     known_paths: &HashSet<PathBuf>,
 ) -> Vec<AttributedSave> {
-    discover_in_roots(vec![root.to_path_buf()], store, known_paths, true)
+    let mut out: Vec<AttributedSave> = Vec::new();
+    let start = Instant::now();
+    let mut entries_checked: usize = 0;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= EXPLICIT_WALK_MAX_CANDIDATES {
+            break;
+        }
+        if entries_checked.is_multiple_of(TIMEOUT_CHECK_INTERVAL)
+            && start.elapsed() >= EXPLICIT_WALK_TIMEOUT
+        {
+            break;
+        }
+        entries_checked += 1;
+
+        let is_root = depth == 0;
+        if !is_root && (is_internal_or_trash(&dir) || is_too_broad(&dir)) {
+            continue;
+        }
+        // La carpeta que el usuario eligió se ofrece pase lo que pase; para las
+        // de dentro, un nombre de config/caché/logs es un no rotundo (y además
+        // un callejón sin salida: tampoco se baja por él).
+        if !is_root && dir_name_is_negative(&dir) {
+            continue;
+        }
+        if holds_own_data(&dir) {
+            if !path_already_known(&dir, known_paths) {
+                push_attributed(&mut out, &dir, store);
+            }
+            // Emitida: no se sigue bajando. El usuario quiere la carpeta del
+            // juego, no cada subcarpeta de partidas que haya dentro.
+            //
+            // Salvo en la que él eligió: ahí sí se baja igualmente, porque una
+            // carpeta puede ser las dos cosas. `Documents` tiene ficheros
+            // sueltos Y una carpeta por juego dentro; parar en ella devolvería
+            // un único resultado inútil y escondería justo lo que buscaba.
+            if !is_root {
+                continue;
+            }
+        }
+        if depth >= EXPLICIT_WALK_MAX_DEPTH {
+            continue;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if is_skip_dir(name_str) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+
+    out
+}
+
+/// Profundidad y presupuesto del barrido de carpeta explícita. Más generoso
+/// que el periódico —es una petición puntual del usuario, con la app esperando
+/// delante— pero acotado igual: sin tope, apuntar a `C:\` sería un paseo por
+/// todo el disco.
+const EXPLICIT_WALK_MAX_DEPTH: usize = 6;
+const EXPLICIT_WALK_TIMEOUT: Duration = Duration::from_millis(8000);
+/// Tope de hallazgos. Muy por encima de los 16 del barrido periódico: aquí una
+/// sola carpeta legítima —`Saved Games`— ya trae una decena de juegos, y
+/// cortar a 16 volvería a esconder justo lo que el usuario buscaba.
+const EXPLICIT_WALK_MAX_CANDIDATES: usize = 64;
+
+/// Ficheros que no cuentan como "datos propios" de una carpeta: los que crea
+/// el sistema operativo o el explorador de archivos. Sin esta lista el
+/// `desktop.ini` que Windows deja en `Saved Games` convertiría el contenedor
+/// entero en un único candidato y taparía los juegos que hay dentro.
+const OS_JUNK_FILES: &[&str] = &["desktop.ini", "thumbs.db", ".ds_store", "icon\r"];
+
+/// `true` si el directorio guarda datos suyos: al menos un fichero que no sea
+/// ruido del sistema, y no siendo todo imágenes (eso son capturas).
+///
+/// Es el predicado que separa "contenedor por el que hay que bajar" de "esta
+/// es la carpeta". No mira nombres ni extensiones a propósito: la extensión
+/// propietaria es justo lo que el barrido puntuado no sabe reconocer.
+fn holds_own_data(dir: &Path) -> bool {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut files = 0usize;
+    let mut images = 0usize;
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        if OS_JUNK_FILES.contains(&lower.as_str()) {
+            continue;
+        }
+        files += 1;
+        if matches!(
+            lower.rsplit_once('.').map(|(_, e)| e),
+            Some("png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp")
+        ) {
+            images += 1;
+        }
+    }
+    files > 0 && images < files
+}
+
+/// `true` si el nombre de la carpeta la delata como config/caché/logs/capturas
+/// — nunca la carpeta de partidas de un juego.
+fn dir_name_is_negative(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| {
+            let lower = n.to_lowercase();
+            scoring::NEGATIVE_NAME_VOCAB.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
+/// Attribute one discovered folder to a game and append it. The scoring runs
+/// only to grade the hit (`Low` when it wouldn't even qualify on its own) —
+/// in this walk it never decides whether the folder makes the list.
+fn push_attributed(out: &mut Vec<AttributedSave>, dir: &Path, store: &CorrelationStore) {
+    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    let graded = classify_dir_as_save_like(dir, name, store);
+    let display_name = attribute_game_name(dir, store);
+    let slug = ludusavi::slugify(&display_name);
+    if slug.is_empty() {
+        return;
+    }
+    let steam_app_id = catalog_app_id(&display_name);
+    out.push(AttributedSave {
+        slug,
+        display_name,
+        path: dir.to_path_buf(),
+        confidence: graded
+            .as_ref()
+            .map(|g| g.confidence)
+            .unwrap_or(Confidence::Low),
+        reason: graded
+            .map(|g| g.reason)
+            .unwrap_or_else(|| "folder holds data (you pointed us here)".to_string()),
+        steam_app_id,
+    });
+}
+
+/// Appid del catálogo para un nombre ya atribuido, si lo nombra exactamente.
+/// Sólo confirma lo que [`attribute_game_name`] resolvió — no vuelve a
+/// adivinar — y es lo que le da carátula al hallazgo.
+fn catalog_app_id(display_name: &str) -> Option<u64> {
+    ludusavi::find_by_canon_name(display_name).and_then(|e| e.steam_app_id)
 }
 
 /// Shared core of [`discover_unattributed_mode`] and [`discover_in_folder`]:
@@ -2178,12 +2724,14 @@ fn discover_in_roots(
             if slug.is_empty() {
                 continue;
             }
+            let steam_app_id = catalog_app_id(&display_name);
             out.push(AttributedSave {
                 slug,
                 display_name,
                 path: hit.path,
                 confidence: hit.confidence,
                 reason: hit.reason,
+                steam_app_id,
             });
         }
     }
@@ -2228,36 +2776,91 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 ///    generic container segments; the first "real" segment names the game
 ///    (`…/My Games/Skyrim/Saves` → `Skyrim`).
 fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
-    if let Some(proc) = store.attributed_name(path) {
-        let trimmed = proc.trim();
-        // Una atribución envenenada de antes del fix `is_installer_like`
-        // (p.ej. `Codex Windows Sandbox Setup.exe`) sigue en el store persistido;
-        // no dejes que rebautice un save perfectamente nombrado por su carpeta.
-        // Cae al fallback por nombre de carpeta ancestral en ese caso.
-        if !trimmed.is_empty() && crate::correlation::is_game_like(trimmed, None) {
-            return prettify_process_name(trimmed);
-        }
-    }
-    let mut cur = Some(path);
-    while let Some(dir) = cur {
-        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
-            let lower = name.to_lowercase();
-            let generic = GENERIC_SEGMENTS.contains(&lower.as_str());
-            // A purely-numeric segment is an account/user id, not a game name
-            // — SteamID64 (17 digits), per-user numeric profile dirs, etc.
-            // `…/Gaddy Games/Plan B Terraform/76561197960287930/saves` must
-            // attribute to "Plan B Terraform", not the SteamID. Keep climbing.
-            let id_like = name.len() >= 6 && name.chars().all(|c| c.is_ascii_digit());
-            if !generic && !id_like && !scoring::name_recognised(name) {
-                return name.to_string();
+    let obs = store.signal_for(path);
+    // Nombre de proceso atribuido, sólo si sigue superando las reglas ACTUALES:
+    // una atribución envenenada de antes del fix `is_installer_like` (p.ej.
+    // `Codex Windows Sandbox Setup.exe`) sigue en el store persistido y no debe
+    // rebautizar un save perfectamente nombrado por su carpeta.
+    let proc_name: Option<&str> = obs
+        .map(|o| o.process_name.trim())
+        .filter(|n| !n.is_empty() && crate::correlation::is_game_like(n, None));
+
+    // --- Señales que el CATÁLOGO puede confirmar, de más a menos directa ---
+    //
+    // Cualquiera de las tres da un título autoritativo, y por eso van todas
+    // antes que los nombres crudos: un nombre crudo es inestable (el churn
+    // ChatGPT → opencode → code) y a veces sencillamente peor que el dato que
+    // ya tenemos delante.
+    if let Some(name) = proc_name {
+        // 1. El ejecutable, cuando pertenece a un solo juego del manifiesto.
+        for probe in [name.to_string(), format!("{name}.exe")] {
+            if let Some(title) = ludusavi::title_for_exe(&probe) {
+                return title.to_string();
             }
         }
-        cur = dir.parent();
+    }
+    // 2. La CARPETA DE INSTALACIÓN del ejecutable. Vale cuando el nombre del
+    //    exe es ambiguo: `Mars.exe` lo reclaman dos juegos del catálogo, así
+    //    que el paso 1 se veta (correctamente) — pero el exe vive en
+    //    `C:\Games\Surviving Mars Relaunched\Mars.exe` y esa carpeta no deja
+    //    lugar a dudas. Es el mismo truco que `process_identity_candidates`
+    //    usa para casar procesos vivos.
+    if let Some(dir) = obs
+        .and_then(|o| o.exe.as_deref())
+        .and_then(|e| e.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+    {
+        if let Some(entry) = ludusavi::find_by_canon_name(dir) {
+            return entry.display_name.clone();
+        }
+    }
+    // 3. El primer ancestro con nombre propio del save, si es un juego del
+    //    catálogo. `…/Saved Games/Surviving Mars Relaunched/<steamid>` lo es.
+    let ancestor = meaningful_ancestor(path);
+    if let Some(entry) = ancestor.and_then(ludusavi::find_by_canon_name) {
+        return entry.display_name.clone();
+    }
+    // 4. El mismo ancestro, pero con el título del catálogo como PREFIJO: la
+    //    carpeta lleva un calificador que el catálogo no tiene (`Surviving Mars
+    //    Relaunched`, `… Definitive Edition`). Sin esto cada edición se
+    //    convierte en un juego fantasma con nombre propio.
+    if let Some(entry) = ancestor.and_then(ludusavi::find_by_name_prefix) {
+        return entry.display_name.clone();
+    }
+
+    // --- Y si el catálogo no reconoce nada, los nombres crudos ---
+    if let Some(name) = proc_name {
+        // Sin la extensión: el nombre va a la UI, no a un matcher.
+        return prettify_process_name(name.strip_suffix(".exe").unwrap_or(name));
+    }
+    if let Some(name) = ancestor {
+        return name.to_string();
     }
     path.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// El primer segmento subiendo desde `path` que puede ser el nombre de un
+/// juego: ni un contenedor genérico (`AppData`, `Saved Games`), ni un id de
+/// cuenta (`…/Plan B Terraform/76561197960287930/saves` debe dar "Plan B
+/// Terraform", no el SteamID), ni una palabra de save.
+fn meaningful_ancestor(path: &Path) -> Option<&str> {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+            let lower = name.to_lowercase();
+            let generic = GENERIC_SEGMENTS.contains(&lower.as_str());
+            let id_like = name.len() >= 6 && name.chars().all(|c| c.is_ascii_digit());
+            if !generic && !id_like && !scoring::name_recognised(name) {
+                return Some(name);
+            }
+        }
+        cur = dir.parent();
+    }
+    None
 }
 
 /// Turn a raw process name into a presentable Library display name:
@@ -2361,10 +2964,33 @@ fn walk_root_collecting(
     }
 }
 
-/// True iff the directory name is in [`WALK_SKIP`] (case-insensitive).
+/// True iff the walker should not descend into a directory with this name:
+/// the asset/build denylist, or anything that is regenerable cache.
+///
+/// The cache half is [`junkdirs::is_cache_dir_name`], which matches by
+/// **suffix** on a separator-stripped name — so `AnvilDX12Cache`,
+/// `FortniteShaderCache` and `Shader Cache` are all caught. The old
+/// exact-match negative vocabulary in `scoring` only ever saw a bare
+/// `shadercache`, and it merely subtracted score instead of pruning the walk.
 fn is_skip_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
-    WALK_SKIP.contains(&lower.as_str())
+    WALK_SKIP.contains(&lower.as_str()) || junkdirs::is_cache_dir_name(name)
+}
+
+/// Roots that must never be offered as one game's save folder, resolved once.
+fn blocked_roots() -> &'static HashSet<PathBuf> {
+    static BLOCKED: std::sync::OnceLock<HashSet<PathBuf>> = std::sync::OnceLock::new();
+    BLOCKED.get_or_init(|| junkdirs::blocked_roots(Os::current()))
+}
+
+/// `true` when a candidate IS a whole profile/engine root rather than one
+/// game's folder inside it (see [`junkdirs::blocked_roots`]).
+///
+/// Exact match on purpose: `AppData/Roaming/RenPy` is every RenPy game on the
+/// machine and must never be a save, while `AppData/Roaming/RenPy/MyGame` is
+/// exactly right.
+fn is_too_broad(path: &Path) -> bool {
+    blocked_roots().contains(path)
 }
 
 /// True if `path` lives inside Hoard's own state dir (conflict backups,
@@ -2445,6 +3071,11 @@ fn classify_dir_as_save_like(
     name: &str,
     store: &CorrelationStore,
 ) -> Option<DiscoveredSavePath> {
+    // Same rule as the catalog stages, at the walk's funnel: a profile or
+    // shared-engine root is never one game's save, however well it scores.
+    if is_too_broad(path) {
+        return None;
+    }
     // DETECCIÓN (fase 1+3, ADR 0020): el booleano name-only se sustituye por
     // el scoring graduado (`scoring::score_dir`: nombre + contenido +
     // recencia + negativas) MÁS el bonus de correlación proceso↔escritura
@@ -2590,6 +3221,7 @@ mod tests {
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(42),
                 install_dir: Some(PathBuf::from("/steam/x")),
+                steam_cloud: false,
             },
         );
 
@@ -2697,6 +3329,11 @@ mod tests {
             steam_app_id: app_id,
             paths: hoard_manifest::ludusavi::LudusaviPaths::default(),
             registry: Vec::new(),
+            install_dirs: Vec::new(),
+            launch_exes: Vec::new(),
+            steam_extra_ids: Vec::new(),
+            lutris_slug: None,
+            cloud_steam: false,
         }
     }
 
@@ -2749,6 +3386,7 @@ mod tests {
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(999),
                 install_dir: Some(PathBuf::from("/steam/Test Game")),
+                steam_cloud: false,
             },
         );
 
@@ -2845,6 +3483,7 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: Some(281990),
                 install_dir: Some(PathBuf::from("/steam/stellaris")),
+                steam_cloud: false,
             },
         );
         let mut overrides = HashMap::new();
@@ -3138,6 +3777,49 @@ mod tests {
         );
     }
 
+    /// El walker tenía `steamuser` fijo, así que un prefijo de Heroic, Lutris
+    /// o Bottles —que nombran el perfil con la cuenta real— no daba nada.
+    #[test]
+    fn the_walker_reaches_a_prefix_whose_user_is_not_steamuser() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().join("prefix");
+        let save_dir = prefix.join("drive_c/users/insider/AppData/Roaming/MyGame/Saves");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::fs::write(save_dir.join("slot1.sav"), b"binary").unwrap();
+
+        let hits = aggressive_discover(
+            "my-game",
+            "My Game",
+            None,
+            Some(&prefix),
+            AGGRESSIVE_WALK_TIMEOUT,
+            AGGRESSIVE_WALK_MAX_DEPTH,
+        );
+        assert_eq!(hits.len(), 1, "esperado un hallazgo, salió {hits:?}");
+        assert_eq!(hits[0].path, save_dir);
+    }
+
+    /// Y el caso de Steam sigue funcionando igual.
+    #[test]
+    fn the_walker_still_reaches_a_steamuser_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().join("pfx");
+        let save_dir = prefix.join("drive_c/users/steamuser/Documents/My Games/G/Saves");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::fs::write(save_dir.join("a.sav"), b"binary").unwrap();
+
+        let hits = aggressive_discover(
+            "g",
+            "G",
+            None,
+            Some(&prefix),
+            AGGRESSIVE_WALK_TIMEOUT,
+            AGGRESSIVE_WALK_MAX_DEPTH,
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, save_dir);
+    }
+
     /// A `save/` dir nested under a `bin/` denylist entry must not be
     /// walked into — `WALK_SKIP` is honoured even when the inner dir name
     /// matches the save patterns.
@@ -3280,6 +3962,197 @@ mod tests {
         assert_eq!(hit.confidence, Confidence::High);
     }
 
+    /// Una caché de detección escrita por una versión ANTERIOR tiene que
+    /// seguir cargando. Regresión real (Windows, 30-jul-2026): añadir
+    /// `wrapper_slugs` sin default hizo que serde rechazara el `detection.json`
+    /// existente entero y la biblioteca arrancara en frío tras actualizar.
+    #[test]
+    fn an_older_cached_report_still_loads() {
+        // Stats de antes de `wrapper_slugs` (y de cualquier contador futuro).
+        let json = r#"{
+            "games": [],
+            "catalog_size": 21687,
+            "steam_apps_found": 11,
+            "scanned_at_ms": 1,
+            "stats": {
+                "duration_ms": 4648,
+                "steam_appid_matches": 5,
+                "fs_template_slugs": 16,
+                "walker_slugs": 2,
+                "phase4_new_games": 3,
+                "manual_applied": 1
+            }
+        }"#;
+        let report: DetectionReport =
+            serde_json::from_str(json).expect("una caché vieja debe seguir cargando");
+        assert_eq!(report.stats.fs_template_slugs, 16);
+        assert_eq!(
+            report.stats.wrapper_slugs, 0,
+            "el contador nuevo por defecto"
+        );
+
+        // Y un report sin bloque `stats` en absoluto (más viejo todavía).
+        let older = r#"{"games":[],"catalog_size":1,"steam_apps_found":0,"scanned_at_ms":1}"#;
+        let report: DetectionReport = serde_json::from_str(older).unwrap();
+        assert_eq!(report.stats, DetectionStats::default());
+    }
+
+    /// Y una fila de juego cacheada por una versión anterior también.
+    #[test]
+    fn an_older_cached_game_row_still_loads() {
+        let json = r#"{
+            "slug": "factorio", "display_name": "Factorio",
+            "found_paths": ["/a/b"], "confidence": "high",
+            "source": "filesystem_heuristic", "steam_app_id": 427520
+        }"#;
+        let g: DetectedGame = serde_json::from_str(json).unwrap();
+        assert_eq!(g.slug, "factorio");
+        assert!(!g.steam_cloud, "el aviso nuevo por defecto");
+        assert!(g.path_confidences.is_empty());
+    }
+
+    /// Caso real (Windows del usuario, 30-jul-2026): con `<base>` resuelto, la
+    /// plantilla de ARK apuntaba a `…/ShooterGame/Saved/SavedArksLocal`, que
+    /// existía con partidas dentro — y el refinado la tiraba por no ser una
+    /// grafía exacta de `SAVE_PATTERNS`, dejando una alerta ámbar sobre un
+    /// acierto perfecto.
+    #[test]
+    fn a_hit_whose_name_speaks_of_saves_is_kept_even_if_not_an_exact_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hit = tmp.path().join("SavedArksLocal");
+        std::fs::create_dir_all(hit.join("Extinction_WP")).unwrap();
+        std::fs::write(hit.join("Most Recent Template.arkcharactersetting"), b"x").unwrap();
+
+        assert_eq!(
+            refine_save_dir("ark-survival-ascended", vec![hit.clone()]),
+            vec![hit]
+        );
+    }
+
+    /// Pero la raíz de un juego que mezcla saves con mods y config sigue
+    /// dando la alerta ámbar: ahí no sabemos cuál de las subcarpetas es, y
+    /// rastrearla entera subiría los mods.
+    #[test]
+    fn a_game_root_without_save_subdirs_still_yields_the_amber_alert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Stellaris");
+        std::fs::create_dir_all(root.join("mod")).unwrap();
+        std::fs::create_dir_all(root.join("settings")).unwrap();
+
+        assert!(refine_save_dir("stellaris", vec![root]).is_empty());
+    }
+
+    /// Y la regla nueva no se aplica a una carpeta VACÍA: no hay nada que
+    /// respaldar y ofrecerla sólo produciría snapshots vacíos. (Una grafía
+    /// EXACTA de `SAVE_PATTERNS` sí se conserva aunque esté vacía — eso es
+    /// comportamiento previo: la carpeta existe y el juego escribirá ahí.)
+    #[test]
+    fn the_relaxed_rule_does_not_offer_an_empty_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hit = tmp.path().join("SavedArksLocal");
+        std::fs::create_dir_all(&hit).unwrap();
+        assert!(refine_save_dir("x", vec![hit]).is_empty());
+    }
+
+    /// Plantilla que apunta a un FICHERO (4.900 juegos del catálogo sólo
+    /// tienen de estas). Antes el refinado no encontraba subcarpeta de save y
+    /// tiraba el hallazgo, dejando al juego con la alerta ámbar. Ahora se
+    /// ofrece la carpeta que lo contiene, que es lo que el usuario espera
+    /// respaldar y agrupa los saves hermanos.
+    #[test]
+    fn a_file_hit_resolves_to_its_containing_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Sonic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ssr_save.bin");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(refine_save_dir("sonic", vec![file]), vec![dir]);
+    }
+
+    /// Pero si esa carpeta es demasiado ancha para ofrecerla, se rastrea el
+    /// fichero suelto en vez de proponer el perfil entero.
+    #[test]
+    fn a_file_in_a_too_broad_folder_is_tracked_on_its_own() {
+        let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
+            return;
+        };
+        let docs = home.join("Documents");
+        if !docs.is_dir() {
+            return;
+        }
+        // No se crea nada en el home del usuario: basta con que la ruta
+        // exista como fichero para el refinado, así que se usa uno real si lo
+        // hay y si no se sale.
+        let Some(existing) = std::fs::read_dir(&docs).ok().and_then(|mut r| {
+            r.find_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+        }) else {
+            return;
+        };
+        assert_eq!(
+            refine_save_dir("some-game", vec![existing.clone()]),
+            vec![existing],
+            "Documentos entero no puede ser el save; el fichero sí"
+        );
+    }
+
+    /// Una plantilla laxa que resuelve al perfil entero (o a una raíz de motor
+    /// compartida) no puede acabar como carpeta de save de un juego: sería
+    /// sincronizar Documentos enteros, o mezclar todos los juegos RenPy.
+    #[test]
+    fn a_profile_or_engine_root_is_never_merged_as_a_save() {
+        let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
+            return;
+        };
+        let mut by_slug: HashMap<String, DetectedGame> = HashMap::new();
+        merge_fs_hit(
+            &mut by_slug,
+            "loose-template-game".into(),
+            "Loose Template Game".into(),
+            vec![home.clone(), home.join("Documents")],
+        );
+        assert!(
+            by_slug.is_empty(),
+            "no debería haber creado nada: {by_slug:?}"
+        );
+
+        // La carpeta de UN juego dentro de esa misma raíz sí entra.
+        merge_fs_hit(
+            &mut by_slug,
+            "real-game".into(),
+            "Real Game".into(),
+            vec![home.join("Documents/My Games/Real Game")],
+        );
+        assert_eq!(by_slug.len(), 1);
+    }
+
+    /// El walk tampoco puede rescatarla por score.
+    #[test]
+    fn the_walk_refuses_to_classify_a_blocked_root() {
+        let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
+            return;
+        };
+        let store = CorrelationStore::default();
+        assert!(classify_dir_as_save_like(&home, "home", &store).is_none());
+    }
+
+    /// La caché con el nombre del juego delante (`AnvilDX12Cache`) es justo la
+    /// que el set exacto de `scoring` no atrapaba.
+    #[test]
+    fn the_walk_skips_prefixed_cache_dirs() {
+        for n in [
+            "AnvilDX12Cache",
+            "FortniteShaderCache",
+            "Shader Cache",
+            "logs",
+        ] {
+            assert!(is_skip_dir(n), "{n} debería saltarse");
+        }
+        assert!(!is_skip_dir("saves"));
+        assert!(!is_skip_dir("SaveGames"));
+    }
+
     /// Atribución (fase 4): el nombre del proceso que escribió la carpeta gana
     /// sobre la heurística de ancestro; sin proceso, se usa el primer segmento
     /// no genérico subiendo por el árbol.
@@ -3301,6 +4174,83 @@ mod tests {
             }],
         );
         assert_eq!(attribute_game_name(&path, &store), "EldenRing");
+    }
+
+    /// El título del catálogo gana al nombre crudo del proceso. Es lo que
+    /// estabiliza la atribución: el proceso que se lleva la correlación cambia
+    /// entre escaneos (la carpeta de Planet S pasó por ChatGPT, opencode y
+    /// code), y cada nombre nuevo creaba un slug nuevo y una fila nueva.
+    #[test]
+    fn attribution_prefers_the_catalog_title_over_the_process_name() {
+        let path = PathBuf::from("/home/u/.factorio/saves");
+        let mut store = CorrelationStore::default();
+        store.record(
+            &path,
+            &[crate::correlation::GameProcess {
+                name: "factorio.exe".into(),
+                exe: None,
+            }],
+        );
+        let expected =
+            ludusavi::title_for_exe("factorio.exe").expect("el manifiesto declara este ejecutable");
+        assert_eq!(attribute_game_name(&path, &store), expected);
+        // Y el slug resultante es estable, que es lo que evita la fila nueva.
+        assert_eq!(ludusavi::slugify(expected), "factorio");
+    }
+
+    /// Caso real del Windows del usuario (30-jul-2026): `Mars.exe` lo reclaman
+    /// DOS juegos del catálogo, así que el veto de ambigüedad lo rechaza — bien,
+    /// porque adivinar habría bautizado el save como "Mars Underground". Lo que
+    /// estaba mal era caer al nombre crudo teniendo delante dos señales que el
+    /// catálogo sí confirma: la carpeta del ejecutable y el ancestro del save.
+    /// El resultado era un juego llamado "Mars" y una segunda fila ámbar para
+    /// la MISMA carpeta bajo el slug bueno.
+    #[test]
+    fn an_ambiguous_exe_falls_back_to_the_catalog_not_to_the_raw_name() {
+        let save = PathBuf::from("/home/u/Saved Games/Surviving Mars Relaunched/76561197960271872");
+        let mut store = CorrelationStore::default();
+        store.record(
+            &save,
+            &[crate::correlation::GameProcess {
+                name: "Mars.exe".into(),
+                exe: Some(PathBuf::from("/games/Surviving Mars Relaunched/Mars.exe")),
+            }],
+        );
+        // El veto sigue en pie: `mars.exe` no resuelve por sí solo.
+        assert!(
+            ludusavi::title_for_exe("mars.exe").is_none(),
+            "mars.exe lo reclama más de un juego; no debe resolver"
+        );
+        let name = attribute_game_name(&save, &store);
+        assert_eq!(name, "Surviving Mars: Relaunched");
+        assert_eq!(ludusavi::slugify(&name), "surviving-mars-relaunched");
+    }
+
+    /// Y con la carpeta del save opaca, la del ejecutable basta.
+    #[test]
+    fn the_executables_install_folder_names_the_game() {
+        let save = PathBuf::from("/home/u/.local/share/a1b2c3d4-guid/data");
+        let mut store = CorrelationStore::default();
+        store.record(
+            &save,
+            &[crate::correlation::GameProcess {
+                name: "Mars.exe".into(),
+                exe: Some(PathBuf::from("/opt/Surviving Mars Relaunched/Mars.exe")),
+            }],
+        );
+        assert_eq!(
+            attribute_game_name(&save, &store),
+            "Surviving Mars: Relaunched"
+        );
+    }
+
+    /// Una carpeta que se llama como un juego del catálogo sale con su título
+    /// bonito, no con el nombre crudo del directorio.
+    #[test]
+    fn attribution_upgrades_a_folder_name_to_its_catalog_title() {
+        let path = PathBuf::from("/home/u/.local/share/StardewValley/Saves");
+        let name = attribute_game_name(&path, &CorrelationStore::default());
+        assert_eq!(name, "Stardew Valley");
     }
 
     #[test]
@@ -3427,5 +4377,138 @@ mod tests {
         assert!(skipped.iter().all(|a| a.path != saves));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Carpeta temporal única para los tests del barrido explícito.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hoard-{tag}-{uniq}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regresión: apuntar directamente a la carpeta de partidas de un juego
+    /// (`…/Saved Games/Surviving Mars Relaunched`) no encontraba nada, porque
+    /// el walk sólo clasificaba a los HIJOS de la raíz elegida. La carpeta que
+    /// el usuario señala es un candidato como cualquier otro.
+    #[test]
+    fn discover_in_folder_offers_the_chosen_folder_itself() {
+        let base = scratch_dir("scan-self");
+        let game = base.join("Surviving Mars Relaunched");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("MyColony.sav"), b"savedata").unwrap();
+
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&game, &store, &HashSet::new());
+        assert!(
+            found.iter().any(|a| a.path == game),
+            "the folder the user picked must be offered: {:?}",
+            found.iter().map(|a| &a.path).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Una carpeta puede ser save Y contenedor: `Documents` tiene ficheros
+    /// sueltos y una carpeta por juego dentro. Se ofrece ella (es la elegida)
+    /// pero sin tapar lo que hay debajo.
+    #[test]
+    fn discover_in_folder_descends_past_a_chosen_folder_that_also_holds_files() {
+        let base = scratch_dir("scan-both");
+        std::fs::write(base.join("notes.txt"), b"x").unwrap();
+        let game = base.join("My Games").join("Stellaris");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("empire.sav"), b"savedata").unwrap();
+
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&base, &store, &HashSet::new());
+        assert!(
+            found.iter().any(|a| a.path == game),
+            "loose files in the chosen folder must not hide the games under it: {:?}",
+            found.iter().map(|a| &a.path).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regresión: escanear `Saved Games` devolvía un juego de cuatro, porque
+    /// una carpeta de partidas con extensión propietaria no pasa el listón del
+    /// barrido puntuado. Con la carpeta elegida a mano el listón no aplica.
+    ///
+    /// Cubre además el `desktop.ini` que Windows deja en `Saved Games`: sin
+    /// filtrarlo, el contenedor contaría como carpeta con datos propios y
+    /// taparía a los cuatro juegos de dentro.
+    #[test]
+    fn discover_in_folder_lists_every_game_under_a_container() {
+        let base = scratch_dir("scan-container");
+        std::fs::write(base.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        for (game, file) in [
+            ("JWE 3", "slot0.sav"),
+            ("Surviving Mars Relaunched", "colony.autosave"),
+            ("Shift At Midnight", "profile.pss"),
+            ("Planet S", "world.dat"),
+        ] {
+            let dir = base.join(game);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), b"savedata").unwrap();
+        }
+
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&base, &store, &HashSet::new());
+        assert_eq!(
+            found.len(),
+            4,
+            "every game folder must surface, not just the ones with a known save extension: {:?}",
+            found.iter().map(|a| &a.path).collect::<Vec<_>>()
+        );
+        assert!(
+            found.iter().all(|a| a.path != base),
+            "the container itself is not a save folder — its desktop.ini doesn't make it one"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Config/caché/logs no son partidas por mucho que tengan ficheros, y una
+    /// carpeta de capturas tampoco.
+    #[test]
+    fn discover_in_folder_skips_config_and_screenshots() {
+        let base = scratch_dir("scan-negative");
+        for (dir, file) in [
+            ("Config", "settings.ini"),
+            ("Logs", "run.log"),
+            ("Screenshots", "shot.png"),
+            ("Saves", "slot1.sav"),
+        ] {
+            let d = base.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), b"x").unwrap();
+        }
+
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&base, &store, &HashSet::new());
+        let paths: Vec<_> = found.iter().map(|a| a.path.clone()).collect();
+        assert_eq!(paths, vec![base.join("Saves")], "got {paths:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// El calificador de la carpeta (`Relaunched`, `Definitive Edition`…) no
+    /// puede inventar un juego nuevo cuando el catálogo tiene el título dentro.
+    #[test]
+    fn name_prefix_resolves_edition_folders_to_the_catalog_game() {
+        // Contra el catálogo real: si "Surviving Mars" está en él, la carpeta
+        // con calificador debe resolver a ese título y no a sí misma.
+        let Some(entry) = ludusavi::find_by_slug("surviving-mars") else {
+            return; // catálogo recortado en este build: nada que comprobar
+        };
+        let resolved = ludusavi::find_by_name_prefix("Surviving Mars Relaunched");
+        assert_eq!(resolved.map(|e| &e.slug), Some(&entry.slug));
+        // Y el guardarraíl: un título de una sola palabra no se traga otro juego.
+        assert!(ludusavi::find_by_name_prefix("Fallout New Vegas")
+            .is_none_or(|e| e.slug != "fallout"));
     }
 }

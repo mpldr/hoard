@@ -58,6 +58,13 @@ pub fn veto_reason(state: &State, obs: &Observation, world: &World) -> Option<&'
     if state.is_running {
         return Some("game process is running");
     }
+    // Un fichero del save abierto en exclusiva es "el juego está escribiendo",
+    // afirmado por el sistema de ficheros y no por reconocer un proceso. Va
+    // justo detrás de `is_running` porque significa lo mismo, y cubre el caso
+    // que `is_running` no ve: el juego cuyo ejecutable no casa con nada.
+    if obs.save_files_locked {
+        return Some("save files are open in another process");
+    }
     if state.has_pending {
         return Some("un-flushed local changes pending");
     }
@@ -318,6 +325,29 @@ mod tests {
             mid_session_decision(&quiet(), &future, &w),
             Decision::Act(Action::Pull),
             "un mtime en el futuro no es evidencia de escritura reciente",
+        );
+    }
+
+    /// Un fichero del save abierto en exclusiva veta el pull aunque NINGÚN
+    /// otro guard salte: es el caso que los demás no ven — el juego cuyo
+    /// ejecutable no casa con nada, guardando la partida ahora mismo.
+    #[test]
+    fn a_locked_save_file_vetoes_the_pull_on_its_own() {
+        let w = world(NOW);
+        let obs = Observation {
+            save_files_locked: true,
+            ..aged_folder(NOW)
+        };
+        assert_eq!(
+            mid_session_decision(&quiet(), &obs, &w),
+            Decision::Hold {
+                reason: "save files are open in another process"
+            },
+        );
+        // Y sin bloqueo, el mismo slot es perfectamente pulleable.
+        assert_eq!(
+            mid_session_decision(&quiet(), &aged_folder(NOW), &w),
+            Decision::Act(Action::Pull),
         );
     }
 }

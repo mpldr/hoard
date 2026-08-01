@@ -131,6 +131,18 @@ pub struct CliState {
     /// the other. `default` keeps older `state.json` files loading.
     #[serde(default)]
     pub playtime_excluded: HashSet<String>,
+    /// Carpetas que el usuario ha descartado: la detección no vuelve a
+    /// ofrecerlas, ni ellas ni nada por debajo.
+    ///
+    /// Complementa a [`Self::ignored_slugs`], que no basta para esto: el
+    /// nombre de un hallazgo de fase 4 sale de la atribución, y la atribución
+    /// cambia entre escaneos (la carpeta de Planet S pasó por ChatGPT,
+    /// opencode y code). Con un slug distinto cada vez, ignorar por slug no
+    /// sujeta nada — la misma carpeta reaparece con nombre nuevo. Por ruta sí.
+    ///
+    /// `default` mantiene cargando los `state.json` antiguos.
+    #[serde(default)]
+    pub excluded_paths: Vec<PathBuf>,
     /// Slugs que [`cleanse`] marcó al cargar: bien formados pero **degenerados**
     /// (tokens de fontanería o el nombre de usuario del sistema). No se
     /// persiste (`skip`): se recalcula en cada carga a partir de lo que hay en
@@ -160,6 +172,11 @@ struct DevicePrefs {
     ignored_slugs: HashSet<String>,
     #[serde(default)]
     playtime_excluded: HashSet<String>,
+    /// Carpetas descartadas por el usuario. Es preferencia del DISPOSITIVO,
+    /// no de la cuenta: una carpeta que aquí es basura puede ser legítima en
+    /// otra máquina.
+    #[serde(default)]
+    excluded_paths: Vec<PathBuf>,
 }
 
 /// On-disk shape of `contexts/<id>.json`: the per-context `saves` map (save_id
@@ -353,6 +370,7 @@ impl CliState {
         DevicePrefs {
             manual_paths: self.manual_paths.clone(),
             ignored_slugs: self.ignored_slugs.clone(),
+            excluded_paths: self.excluded_paths.clone(),
             playtime_excluded: self.playtime_excluded.clone(),
         }
     }
@@ -372,6 +390,7 @@ impl CliState {
             manual_paths: prefs.manual_paths,
             ignored_slugs: prefs.ignored_slugs,
             playtime_excluded: prefs.playtime_excluded,
+            excluded_paths: prefs.excluded_paths,
             quarantined_slugs: HashSet::new(),
             quarantined_save_ids: HashSet::new(),
         };
@@ -457,6 +476,46 @@ impl CliState {
     /// the UI. Idempotent: re-adding an existing slug is a no-op.
     pub fn add_ignored_slug(&mut self, slug: String) {
         self.ignored_slugs.insert(slug);
+    }
+
+    /// `true` si `path` está en una carpeta descartada por el usuario.
+    ///
+    /// La comparación es **por frontera de segmento**, así que descartar
+    /// `…/Games` tapa `…/Games/X` pero no `…/GamesOther`. En Windows y macOS
+    /// ignora mayúsculas, como hacen esos sistemas de ficheros.
+    pub fn is_path_excluded(&self, path: &Path) -> bool {
+        if self.excluded_paths.is_empty() {
+            return false;
+        }
+        let norm = |p: &Path| -> PathBuf {
+            if cfg!(any(windows, target_os = "macos")) {
+                PathBuf::from(p.to_string_lossy().to_lowercase())
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let target = norm(path);
+        // `starts_with` compara por COMPONENTES, que es justo la semántica de
+        // frontera que queremos (y por eso bajar a minúsculas la cadena entera
+        // no altera nada: los separadores siguen donde estaban).
+        self.excluded_paths
+            .iter()
+            .any(|root| target.starts_with(norm(root)))
+    }
+
+    /// Descarta una carpeta. Idempotente, y absorbe lo que ya cubriera:
+    /// excluir un padre deja sin sentido a sus hijas ya excluidas.
+    pub fn add_excluded_path(&mut self, path: PathBuf) {
+        if self.is_path_excluded(&path) {
+            return;
+        }
+        self.excluded_paths.retain(|p| !p.starts_with(&path));
+        self.excluded_paths.push(path);
+    }
+
+    /// Deja de descartar exactamente esta carpeta (no las que la contengan).
+    pub fn remove_excluded_path(&mut self, path: &Path) {
+        self.excluded_paths.retain(|p| p != path);
     }
 
     /// Drop the blacklist entry for `slug` so the next detection pass
@@ -807,5 +866,43 @@ mod tests {
         let empty_json = serde_json::to_string(&empty).unwrap();
         let parsed_empty: CliState = serde_json::from_str(&empty_json).unwrap();
         assert!(parsed_empty.ignored_slugs.is_empty());
+    }
+
+    #[test]
+    fn excluding_a_folder_covers_everything_under_it_but_not_a_sibling() {
+        let mut s = CliState::default();
+        s.add_excluded_path(PathBuf::from("/home/u/Games"));
+        assert!(s.is_path_excluded(Path::new("/home/u/Games")));
+        assert!(s.is_path_excluded(Path::new("/home/u/Games/X/saves")));
+        // Frontera de segmento: `GamesOther` NO cae dentro de `Games`.
+        assert!(!s.is_path_excluded(Path::new("/home/u/GamesOther")));
+        assert!(!s.is_path_excluded(Path::new("/home/u")));
+    }
+
+    #[test]
+    fn excluding_a_parent_absorbs_its_children_and_is_idempotent() {
+        let mut s = CliState::default();
+        s.add_excluded_path(PathBuf::from("/a/b/c"));
+        s.add_excluded_path(PathBuf::from("/a/b"));
+        assert_eq!(s.excluded_paths, vec![PathBuf::from("/a/b")]);
+        // Re-excluir algo ya cubierto no añade nada.
+        s.add_excluded_path(PathBuf::from("/a/b/d"));
+        assert_eq!(s.excluded_paths, vec![PathBuf::from("/a/b")]);
+    }
+
+    #[test]
+    fn unexcluding_removes_only_the_exact_folder() {
+        let mut s = CliState::default();
+        s.add_excluded_path(PathBuf::from("/a/b"));
+        s.remove_excluded_path(Path::new("/a/b/c"));
+        assert!(s.is_path_excluded(Path::new("/a/b/c")), "sólo la exacta");
+        s.remove_excluded_path(Path::new("/a/b"));
+        assert!(!s.is_path_excluded(Path::new("/a/b/c")));
+    }
+
+    #[test]
+    fn an_empty_exclude_list_costs_nothing_and_excludes_nothing() {
+        let s = CliState::default();
+        assert!(!s.is_path_excluded(Path::new("/anything/at/all")));
     }
 }

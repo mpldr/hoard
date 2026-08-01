@@ -206,6 +206,18 @@ pub enum AgentEvent {
     BackupSkippedEmpty {
         save_id: String,
         game_slug: String,
+        /// `true` when this save has **never** produced a snapshot, which
+        /// makes an empty folder a wrong tracked path far more often than a
+        /// real state change (the native folder tracked while the game runs
+        /// under Proton, a container tracked instead of its `remote/`, a
+        /// phase-4 guess). The UI escalates that case into "check the folder"
+        /// instead of the ordinary "nothing to back up" notice.
+        ///
+        /// A save that has backed up before and is empty *now* is a state
+        /// change, not a detection error — R.E.P.O. wipes its own directory
+        /// at the menu, which is why it ships a preset — so it stays quiet.
+        #[serde(default)]
+        likely_wrong_path: bool,
     },
     /// The diff-based auto-restore found N files where the remote snapshot
     /// was newer than the local copy (ADR 0014). Before overwriting, the
@@ -225,7 +237,9 @@ pub enum AgentEvent {
     /// launch. Emitted at most once per PID until that process exits, so a
     /// game running for hours triggers a single scan, not one per tick.
     HeavyProcessDetected {
-        /// Process name, for the toast ("Detectado posible juego: …") and logs.
+        /// What to call it in the toast ("Detectado posible juego: …"): the
+        /// catalog title when the manifest recognises the executable, the raw
+        /// process name otherwise. The agent log always carries the raw name.
         name: String,
     },
     /// An update from another device is ready to pull, but the save's

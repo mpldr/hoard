@@ -4508,7 +4508,8 @@ mod tests {
         let resolved = ludusavi::find_by_name_prefix("Surviving Mars Relaunched");
         assert_eq!(resolved.map(|e| &e.slug), Some(&entry.slug));
         // Y el guardarraíl: un título de una sola palabra no se traga otro juego.
-        assert!(ludusavi::find_by_name_prefix("Fallout New Vegas")
-            .is_none_or(|e| e.slug != "fallout"));
+        assert!(
+            ludusavi::find_by_name_prefix("Fallout New Vegas").is_none_or(|e| e.slug != "fallout")
+        );
     }
 }

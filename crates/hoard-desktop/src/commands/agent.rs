@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 
 use hoard_agent::agent::WatchedSave;
 use hoard_agent::prefs::Prefs;
-use hoard_core::ipc::{AgentSlotStatus, Request};
+use hoard_core::ipc::{AgentSlotStatus, EngineDownReason, Request, ServerSession, ServerUser};
 use tauri::{AppHandle, Manager, State};
 
 use crate::daemon::{self, AgentStatus};
@@ -74,6 +74,17 @@ pub async fn start_agent(
         );
     }
 
+    // Auto-reparación: el servicio dice que no tiene sesión y nosotros tenemos
+    // una puesta. Entonces la entrega anterior se perdió —el servicio se reinstaló
+    // y arrancó de cero, o el login ocurrió mientras estaba caído— y esperar no lo
+    // arregla: sin sesión el motor no vuelve solo por mucho backoff que cumpla.
+    // Volver a entregarla es idempotente y cuesta un round-trip por arranque de la
+    // app, así que se hace sin preguntar.
+    let status = match maybe_rehand_session(&state, &status).await {
+        Some(refreshed) => refreshed,
+        None => status,
+    };
+
     // Push servidor→app del self-hosted (SSE). Cloud lo recibe por Supabase
     // Realtime, así que sólo se levanta con una sesión self-hosted viva. Se
     // decide con lo que ya hay en memoria: sondear `/v1/health` sólo para esto
@@ -88,15 +99,44 @@ pub async fn start_agent(
         crate::commands::selfhosted_events::start(&app);
     }
 
-    let running = status.engine.running;
-    let watched_count = status.slots.len().max(status.engine.watched);
-    let reported = AgentStatus {
-        running,
-        watched_count,
-        service_notifies: status.notifications,
-    };
+    let reported = AgentStatus::from_daemon(&status);
     daemon::emit_status(&app, &reported);
     Ok(reported)
+}
+
+/// Reentrega la sesión self-hosted si el motor está caído **por no tenerla** y
+/// este proceso sí la tiene prestada. Devuelve el estado nuevo cuando la entrega
+/// sale bien; `None` cuando no había nada que hacer o no se pudo.
+///
+/// Sólo actúa sobre [`EngineDownReason::NoSession`], a propósito: con el llavero
+/// ilegible o el token caducado, reentregar lo mismo no arregla nada y sólo
+/// añadiría ruido al log de un servicio que ya está diciendo qué le pasa.
+async fn maybe_rehand_session(
+    state: &State<'_, AppState>,
+    status: &hoard_core::ipc::DaemonStatus,
+) -> Option<hoard_core::ipc::DaemonStatus> {
+    if status.engine.running || status.engine.reason != EngineDownReason::NoSession {
+        return None;
+    }
+    let creds = hoard_agent::credentials::lent()?;
+    let session = ServerSession {
+        server_url: creds.url,
+        token: creds.token,
+        user: creds.user.map(|u| ServerUser {
+            user_id: u.user_id,
+            username: u.username,
+            is_admin: u.is_admin,
+        }),
+    };
+    if let Err(err) = state.daemon.adopt_server_session(session).await {
+        tracing::warn!(error = %format!("{err:#}"), "the service didn't take the session we re-handed");
+        return None;
+    }
+    tracing::info!("re-handed our session to a service that had none");
+    // El daemon reinicia el motor al adoptar, así que el estado que acabamos de
+    // leer ya es viejo. Volver a preguntar es lo que hace que la ventana pinte
+    // "arriba" en este mismo arranque en vez de en el siguiente sondeo.
+    state.daemon.status().await.ok()
 }
 
 /// Desengancha la app del servicio (logout, cierre).

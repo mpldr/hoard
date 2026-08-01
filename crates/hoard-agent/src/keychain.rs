@@ -56,6 +56,34 @@ impl std::fmt::Display for KeyringTimeout {
 
 impl std::error::Error for KeyringTimeout {}
 
+/// El llavero **contestó**, y dijo que no. Sin D-Bus en una sesión sin escritorio,
+/// entrada corrupta, o —el caso que nos interesa— una ACL de macOS que autoriza
+/// sólo al binario que creó el ítem, que no es el que lo está leyendo.
+///
+/// Tipo propio por lo mismo que [`KeyringTimeout`]: "no te lo doy" y "no hay
+/// sesión" llevan a consejos opuestos. En el primero el usuario **sí** entró y
+/// volver a entrar lo arregla de raíz (reescribe el ítem a nombre de quien lo
+/// lee); en el segundo no ha entrado nunca. Confundirlos manda al usuario a
+/// buscar un problema que no tiene.
+#[derive(Debug)]
+pub struct KeyringUnreadable {
+    /// Qué se estaba haciendo, para el log y el `last_error`.
+    pub doing: &'static str,
+}
+
+impl std::fmt::Display for KeyringUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the system keyring refused to hand over the saved session while {} \
+             — signing in again rewrites it under the service, which fixes it for good",
+            self.doing
+        )
+    }
+}
+
+impl std::error::Error for KeyringUnreadable {}
+
 type KeyringJob = Box<dyn FnOnce() + Send>;
 
 /// Cola del **único** hilo que habla con el llavero.

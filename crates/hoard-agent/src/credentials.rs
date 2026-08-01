@@ -42,7 +42,7 @@ use std::path::PathBuf;
 
 use crate::api::Whoami;
 use crate::config::CliConfig;
-use crate::keychain::{keyring_op, KeyringTimeout, KEYRING_TIMEOUT};
+use crate::keychain::{keyring_op, KeyringTimeout, KeyringUnreadable, KEYRING_TIMEOUT};
 
 const KEYRING_SERVICE: &str = "hoard-desktop";
 const KEYRING_USER: &str = "default";
@@ -182,6 +182,18 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
 /// present yet (e.g. fresh install) — that is not an error. Un llavero
 /// bloqueado, en cambio, **sí** lo es: ver [`pick_token`].
 pub fn load() -> Result<Option<Credentials>> {
+    Ok(load_detailed()?.map(|(creds, _)| creds))
+}
+
+/// Como [`load`], pero diciendo **de dónde** salió el token.
+///
+/// Lo necesita el daemon: un token que venía del fichero significa que el ítem del
+/// llavero no existe o no es suyo, y entonces le toca subirlo él
+/// ([`promote_to_keyring`]) para ser el dueño de la ACL. Sin esa distinción la
+/// promoción tendría que reescribir el llavero en cada arranque —una escritura
+/// inútil por arranque, y en macOS otro diálogo— o no hacerse nunca, que es lo que
+/// deja al usuario de macOS con un ítem que su servicio no puede leer.
+pub fn load_detailed() -> Result<Option<(Credentials, TokenStorage)>> {
     // Un logout que no pudo borrar el ítem del llavero (cliente sin servicio) lo
     // deja dicho aquí. Se comprueba **antes** que nada: la recuperación de más
     // abajo resucitaría la sesión desde el blob huérfano.
@@ -194,11 +206,14 @@ pub fn load() -> Result<Option<Credentials>> {
         Ok(Some(session)) if !session.server.url.is_empty() => {
             let from_file = session.auth.as_ref().map(|a| a.token.clone());
             match pick_token(try_keyring_get(), from_file)? {
-                Some(token) => Ok(Some(Credentials {
-                    url: session.server.url,
-                    token,
-                    user: session.user,
-                })),
+                Some((token, storage)) => Ok(Some((
+                    Credentials {
+                        url: session.server.url,
+                        token,
+                        user: session.user,
+                    },
+                    storage,
+                ))),
                 None => Ok(None),
             }
         }
@@ -231,7 +246,7 @@ pub fn load() -> Result<Option<Credentials>> {
                         auth: None,
                         signed_out: false,
                     });
-                    return Ok(Some(creds));
+                    return Ok(Some((creds, TokenStorage::Keyring)));
                 }
             }
             // Nothing recoverable from the keychain. Surface a real read error;
@@ -257,22 +272,56 @@ pub fn load() -> Result<Option<Credentials>> {
 fn pick_token(
     from_keyring: Result<Option<KeyringBlob>>,
     from_file: Option<String>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, TokenStorage)>> {
     let from_file = from_file.filter(|t| !t.is_empty());
     match from_keyring {
-        Ok(Some(blob)) if !blob.token.is_empty() => Ok(Some(blob.token)),
+        Ok(Some(blob)) if !blob.token.is_empty() => Ok(Some((blob.token, TokenStorage::Keyring))),
         // Sin entrada (o con una vacía): no hay fallo que contar, cae al fichero.
-        Ok(_) => Ok(from_file),
+        Ok(_) => Ok(from_file.map(|t| (t, TokenStorage::File))),
         Err(e) => match from_file {
             Some(token) => {
                 tracing::debug!(error = %e, "keyring ilegible; usando el token del fichero");
-                Ok(Some(token))
+                Ok(Some((token, TokenStorage::File)))
             }
             // Un tope agotado ya se explica solo; a cualquier otro fallo se le
-            // añade dónde ocurrió.
+            // añade el motivo tipado, que es lo que la UI mira para decir "vuelve
+            // a entrar" en vez del banner genérico.
             None if e.is::<KeyringTimeout>() => Err(e),
-            None => Err(e.context("leyendo la sesión self-hosted del keyring")),
+            None => Err(e.context(KeyringUnreadable {
+                doing: "reading the self-hosted session",
+            })),
         },
+    }
+}
+
+/// Sube al llavero una sesión que estaba sólo en el fichero, **como dueño**.
+///
+/// La llama el daemon después de arrancar con un token que venía del fichero
+/// 0600: el que dejó ahí un cliente sin servicio ([`save_unlocked`]), o el que
+/// quedó cuando el llavero estaba bloqueado. A partir de la siguiente lectura el
+/// ítem es suyo, que es lo único que en macOS evita el diálogo de contraseña por
+/// arranque (la ACL autoriza al binario que **crea** el ítem, D.20).
+///
+/// Best-effort de verdad: devuelve `false` y no toca nada más si el llavero no
+/// está. Un servicio que se negara a sincronizar porque no pudo guardar el token
+/// donde prefiere sería mucho peor que uno que sigue leyendo del fichero.
+///
+/// **No borra la copia del fichero**, a diferencia de [`save`]. Aquí el llavero
+/// acaba de demostrar que no era legible o no existía, así que quitar el único
+/// respaldo que funciona es exactamente la jugada que deja al usuario sin sync la
+/// próxima vez que se bloquee. El fichero es 0600 y ya contenía ese token.
+pub fn promote_to_keyring(creds: &Credentials) -> bool {
+    match try_keyring_set(creds) {
+        Ok(()) => {
+            tracing::info!(
+                "credentials: la sesión self-hosted pasa al llavero a nombre del servicio"
+            );
+            true
+        }
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "credentials: el llavero no acepta la sesión; se queda en el fichero");
+            false
+        }
     }
 }
 
@@ -653,7 +702,39 @@ mod tests {
         let got = pick_token(Err(stuck()), Some("hoard_v1_del-fichero".to_string()))
             .expect("el fichero salva la sesión")
             .expect("token");
-        assert_eq!(got, "hoard_v1_del-fichero");
+        assert_eq!(
+            got,
+            ("hoard_v1_del-fichero".to_string(), TokenStorage::File)
+        );
+    }
+
+    /// El origen viaja con el token, y no es cosmético: es lo que le dice al
+    /// daemon que el ítem del llavero no es suyo (o no está) y que le toca
+    /// subirlo con [`promote_to_keyring`]. Sin este dato la promoción sería una
+    /// escritura por arranque, y en macOS un diálogo por arranque.
+    #[test]
+    fn the_token_says_where_it_came_from() {
+        let (_, storage) = pick_token(in_the_keyring("hoard_v1_x"), None)
+            .expect("ok")
+            .expect("token");
+        assert_eq!(storage, TokenStorage::Keyring);
+
+        let (_, storage) = pick_token(Ok(None), Some("hoard_v1_x".to_string()))
+            .expect("ok")
+            .expect("token");
+        assert_eq!(storage, TokenStorage::File);
+    }
+
+    /// Un llavero que contesta "no" (la ACL de macOS que autoriza a otro binario,
+    /// una sesión sin D-Bus) sale con **su** motivo tipado, distinto del tope.
+    /// La UI los pinta igual —"vuelve a entrar"— pero el log tiene que poder
+    /// distinguir un llavero bloqueado de uno que deniega.
+    #[test]
+    fn a_refusing_keyring_is_typed_as_unreadable() {
+        let err = pick_token(Err(anyhow::anyhow!("access denied")), None)
+            .expect_err("sin fichero que salve, sale entero");
+        assert!(err.downcast_ref::<KeyringUnreadable>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<KeyringTimeout>().is_none());
     }
 
     /// Un fallo del llavero que no es el tope (sin D-Bus, entrada corrupta) llega
@@ -673,7 +754,7 @@ mod tests {
     /// como quedan las de una sesión a medio borrar) se cae al fichero.
     #[test]
     fn a_healthy_keyring_wins_and_an_empty_one_falls_back() {
-        let got = pick_token(
+        let (got, _) = pick_token(
             in_the_keyring("hoard_v1_del-llavero"),
             Some("hoard_v1_del-fichero".to_string()),
         )
@@ -685,12 +766,14 @@ mod tests {
         assert_eq!(
             pick_token(Ok(None), from_file.clone())
                 .expect("ok")
+                .map(|(t, _)| t)
                 .as_deref(),
             Some("hoard_v1_del-fichero")
         );
         assert_eq!(
             pick_token(in_the_keyring(""), from_file)
                 .expect("ok")
+                .map(|(t, _)| t)
                 .as_deref(),
             Some("hoard_v1_del-fichero")
         );

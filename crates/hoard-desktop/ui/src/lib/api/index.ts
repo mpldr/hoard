@@ -432,7 +432,25 @@ export type AgentStatus = {
    *  backend isn't wired yet (Windows, macOS) — means the notification is
    *  still ours to send, exactly as before. */
   service_notifies?: boolean;
+  /** Why there's no engine, when there isn't one. Until 1.1.0 the window only
+   *  knew *that* the service was down, never why: the reason existed inside the
+   *  daemon and was dropped on the way here, which is how two self-hosted users
+   *  went days without backups with nothing to report but "it says offline".
+   *  Absent (older service) means unknown — the banner falls back to the
+   *  generic line. */
+  reason?: EngineDownReason;
+  /** Raw text of the last start failure, for the detail line and for the user
+   *  to paste into a report. The translated sentence comes from `reason`. */
+  last_error?: string | null;
 };
+
+/** Mirrors `hoard_core::ipc::EngineDownReason` (snake_case on the wire). */
+export type EngineDownReason =
+  | "unknown"
+  | "no_session"
+  | "keyring_unreadable"
+  | "session_expired"
+  | "other";
 
 /** Per-slot diagnostic snapshot. Mirrors
  * `hoard_agent::agent::AgentSlotStatus`. Empty array = agent not running. */

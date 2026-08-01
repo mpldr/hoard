@@ -31,7 +31,7 @@ use hoard_core::ipc::CloudToken;
 use crate::api::ApiClient;
 use crate::cloud_auth;
 use crate::config::CliConfig;
-use crate::credentials;
+use crate::credentials::{self, Credentials};
 use crate::state;
 use crate::supervisor::Finished;
 
@@ -297,20 +297,58 @@ pub async fn resolve_borrowed(
 /// la task del keeper —la que el apagado aborta— eso es media mitad del fallo de
 /// D.19, así que la lectura va al pool de bloqueo igual que la de Cloud.
 async fn selfhosted_owned() -> Result<Active> {
-    let stored = tokio::task::spawn_blocking(credentials::load)
+    let stored = tokio::task::spawn_blocking(credentials::load_detailed)
         .await
         .map_err(|join| anyhow::Error::new(join).context("leyendo la sesión self-hosted"))??;
-    if let Some(creds) = stored {
-        state::set_active_context(Some(state::selfhosted_context(&creds.url)));
-        let client = ApiClient::new(creds.url.clone(), creds.token)?;
-        return Ok(Active {
-            client,
-            is_cloud: false,
-            server: creds.url,
-            cloud: None,
-        });
+
+    // El token venía del fichero 0600: o lo dejó ahí un cliente sin servicio, o el
+    // llavero estaba mudo cuando se guardó. Subirlo **ahora**, desde el daemon, es
+    // lo que le da la propiedad del ítem — y en macOS la propiedad es la diferencia
+    // entre leerlo callando y un diálogo de contraseña en cada arranque del motor.
+    // Best-effort y en el pool de bloqueo, como toda escritura del llavero.
+    if let Some((creds, credentials::TokenStorage::File)) = &stored {
+        let creds = creds.clone();
+        let _ = tokio::task::spawn_blocking(move || credentials::promote_to_keyring(&creds)).await;
     }
-    selfhosted_from_config()
+
+    let creds = pick_selfhosted(stored.map(|(creds, _)| creds), config_session()?)?;
+    state::set_active_context(Some(state::selfhosted_context(&creds.url)));
+    let client = ApiClient::new(creds.url.clone(), creds.token)?;
+    Ok(Active {
+        client,
+        is_cloud: false,
+        server: creds.url,
+        cloud: None,
+    })
+}
+
+/// **La precedencia, y nada más.** Pura y con tests porque este `or` *es* el bug
+/// que rompió el self-hosted en la 1.1.0: el orden vivía implícito en un `if` que
+/// sólo miraba `config.toml`, no había nada que lo fijara, y romperlo no ponía
+/// rojo a nadie. Un test que compila el orden en la suite es lo que impide que
+/// vuelva sin que CI se entere.
+fn pick_selfhosted(
+    stored: Option<Credentials>,
+    from_config: Option<Credentials>,
+) -> Result<Credentials> {
+    stored
+        .or(from_config)
+        .ok_or_else(|| anyhow::Error::new(NoSession))
+}
+
+/// La sesión de `config.toml`, si la hay. `None` no es un error: es el caso normal
+/// de quien nunca ha usado la CLI.
+fn config_session() -> Result<Option<Credentials>> {
+    let (cfg, _) = CliConfig::load_default()?;
+    Ok(cfg
+        .auth
+        .token
+        .filter(|t| !t.is_empty())
+        .map(|token| Credentials {
+            url: cfg.server.url,
+            token,
+            user: None,
+        }))
 }
 
 /// La sesión self-hosted de un **cliente**: la que el servicio le presta, y si no
@@ -338,23 +376,38 @@ fn selfhosted_borrowed(lent: Option<hoard_core::ipc::ServerSession>) -> Result<A
 /// `config.toml`: el camino headless, texto plano y sin llavero. Lo escribe
 /// `hoard login --token` y lo documenta la guía de self-hosting.
 fn selfhosted_from_config() -> Result<Active> {
-    let (cfg, _) = CliConfig::load_default()?;
-    let token = cfg
-        .require_token()
-        .context(
-            "no session. Sign in with `hoard login` (Cloud) or \
-             `hoard login --token <token>` (self-host).",
-        )?
-        .to_string();
-    state::set_active_context(Some(state::selfhosted_context(&cfg.server.url)));
-    let client = ApiClient::new(cfg.server.url.clone(), token)?;
+    let creds = config_session()?.ok_or_else(|| anyhow::Error::new(NoSession))?;
+    state::set_active_context(Some(state::selfhosted_context(&creds.url)));
+    let client = ApiClient::new(creds.url.clone(), creds.token)?;
     Ok(Active {
         client,
         is_cloud: false,
-        server: cfg.server.url,
+        server: creds.url,
         cloud: None,
     })
 }
+
+/// No hay sesión que usar en esta máquina.
+///
+/// Tipo propio y no un `anyhow!("no session")` porque el daemon lo clasifica por
+/// downcast para que la ventana pueda decir *esto* en vez de "el servicio está
+/// desconectado" — el banner genérico que costó dos hilos de soporte en julio de
+/// 2026, con dos usuarios que no tenían forma de saber que les faltaba la sesión.
+/// El texto se mantiene igual que el de antes: es el que sale en el `last_error`
+/// y en el log del servicio.
+#[derive(Debug)]
+pub struct NoSession;
+
+impl std::fmt::Display for NoSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "no session. Sign in with `hoard login` (Cloud) or \
+             `hoard login --token <token>` (self-host).",
+        )
+    }
+}
+
+impl std::error::Error for NoSession {}
 
 /// El token self-hosted que el daemon presta a un cliente
 /// (`Request::ServerToken`). `None` = no hay sesión self-hosted en esta máquina.
@@ -642,6 +695,53 @@ pub async fn refresh_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn creds(url: &str, token: &str) -> Credentials {
+        Credentials {
+            url: url.to_string(),
+            token: token.to_string(),
+            user: None,
+        }
+    }
+
+    /// **El test del bug de la 1.1.0.** El motor resolvía la sesión self-hosted
+    /// mirando sólo `config.toml`, que escribe únicamente `hoard login --token`,
+    /// mientras la app guardaba la suya en `credentials`. Quien entraba a su
+    /// servidor sólo por la app tenía un motor sin sesión, cero backups, y una
+    /// ventana que decía "el servicio está desconectado" sin más.
+    ///
+    /// Que el almacén gane no es una preferencia: es la sesión que el usuario ve
+    /// en la app y la que tocan todos los logins nuevos.
+    #[test]
+    fn the_session_store_beats_config_toml() {
+        let picked = pick_selfhosted(
+            Some(creds("https://saves.example", "hoard_v1_de-la-app")),
+            Some(creds("http://localhost:12421", "hoard_v1_del-config")),
+        )
+        .expect("hay sesión");
+        assert_eq!(picked.token, "hoard_v1_de-la-app");
+        assert_eq!(picked.url, "https://saves.example");
+    }
+
+    /// Y `config.toml` sigue siendo el camino headless: sin almacén (una máquina
+    /// donde sólo se ha usado la CLI, que es lo que documenta la guía de
+    /// self-hosting) manda él. Arreglar el bug no podía romper esto.
+    #[test]
+    fn config_toml_still_serves_the_headless_path() {
+        let picked = pick_selfhosted(None, Some(creds("http://nas.local:12421", "hoard_v1_cli")))
+            .expect("hay sesión");
+        assert_eq!(picked.token, "hoard_v1_cli");
+    }
+
+    /// Sin ninguna de las dos, el motivo va **tipado**: es lo que el daemon
+    /// clasifica para que la ventana diga "no hay sesión, vuelve a entrar" en vez
+    /// del banner genérico.
+    #[test]
+    fn no_session_anywhere_is_typed() {
+        let err = pick_selfhosted(None, None).expect_err("no hay sesión");
+        assert!(err.downcast_ref::<NoSession>().is_some(), "{err:#}");
+        assert!(format!("{err:#}").contains("no session"), "{err:#}");
+    }
 
     #[test]
     fn announces_the_death_once_and_then_stays_quiet() {

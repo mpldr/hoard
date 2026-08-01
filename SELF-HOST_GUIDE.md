@@ -166,3 +166,51 @@ hoard backup <SAVE_ID> --from ~/.config/StardewValley/Saves --remember
 hoard snapshots list <SAVE_ID>
 hoard restore <SAVE_ID>
 ```
+## The client side: where things live
+
+The desktop app and the CLI are thin clients of a local service (`hoardd`, one
+per user) that does the actual syncing and outlives the window. When something
+looks wrong, these are the four places worth opening. Paths are Linux; on
+Windows use `%APPDATA%\hoard\hoard\config\…` and
+`%LOCALAPPDATA%\hoard\hoard\cache\…`, on macOS `~/Library/…`.
+
+| What | Where |
+| --- | --- |
+| Service log | `~/.cache/hoard/logs/hoardd.log` |
+| App log | `~/.cache/hoard/logs/agent.log` (daily) |
+| CLI session | `~/.config/hoard/config.toml` (written by `hoard login`) |
+| App session | `~/.config/hoard/desktop/session.toml` + the OS keyring |
+| IPC socket | `$XDG_RUNTIME_DIR/hoard/hoardd.sock` |
+
+The service starts on demand — any client spawns it if it isn't running — and
+`hoard sync start` also registers it to start at login. **An AppImage can't do
+the login part**: its binary lives in a temporary mount that doesn't survive a
+reboot, so sync runs whenever Hoard is open and no earlier. Use the `.deb`/`.rpm`
+if you want it up before you open the app.
+
+### The service is running but "offline"
+
+That banner means the service is up and its *engine* isn't. Since 1.1.1 the
+window tells you which of these it is; on 1.1.0 it doesn't, and the log does:
+
+```sh
+tail -n 50 ~/.cache/hoard/logs/hoardd.log
+```
+
+- `no session` — the engine has no credentials. **On 1.1.0 this hits every
+  self-hosted user who signed in through the app**: the service only read
+  `config.toml`, which just `hoard login --token` writes. Upgrade to 1.1.1, or
+  write that file by hand (`[server] url` + `[auth] token`) and restart the
+  service.
+- `the system keyring didn't answer` / `refused to hand over` — the keyring is
+  locked, absent (headless, no D-Bus), or the item belongs to another binary.
+  Signing in again rewrites it under the service.
+- Anything else — the line carries the real error; that's what to put in a bug
+  report.
+
+To watch it in the foreground, stop the running one first (it owns the socket,
+so a second copy just exits):
+
+```sh
+pkill -x hoardd && hoardd     # or ./squashfs-root/usr/bin/hoardd from an extracted AppImage
+```

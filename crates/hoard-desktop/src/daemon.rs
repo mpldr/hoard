@@ -55,8 +55,8 @@ use hoard_agent::agent::{AgentConfig, AgentEvent};
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
 use hoard_core::ipc::{
-    AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, IpcError, Payload, Request,
-    ServerSession,
+    AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, EngineDownReason, IpcError, Payload,
+    Request, ServerSession,
 };
 use hoardd::client::{Client, Push};
 use hoardd::endpoint::Endpoint;
@@ -109,6 +109,15 @@ pub struct AgentStatus {
     /// todavía no sabe notificar (Windows, macOS) llega `false` y el aviso sigue
     /// siendo del frontend, igual que antes de este slice.
     pub service_notifies: bool,
+    /// **Por qué** no hay motor, cuando no lo hay. Hasta la 1.1.0 este dato moría
+    /// aquí: el daemon lo tenía tipado, este struct lo tiraba, y la ventana sólo
+    /// podía enseñar "el servicio está desconectado" — con lo que dos usuarios de
+    /// self-hosted pasaron días sin backups sin manera de saber que lo que les
+    /// faltaba era la sesión. Lo que la UI pinta sale de aquí.
+    pub reason: EngineDownReason,
+    /// El texto crudo del último fallo, para el detalle y para que el usuario
+    /// pueda copiarlo en un reporte. La frase traducida sale de `reason`.
+    pub last_error: Option<String>,
 }
 
 impl AgentStatus {
@@ -122,6 +131,27 @@ impl AgentStatus {
             running: false,
             watched_count: 0,
             service_notifies: false,
+            // No hemos hablado con el servicio: no sabemos por qué, y decirlo es
+            // más honesto que inventar un motivo.
+            reason: EngineDownReason::Unknown,
+            last_error: None,
+        }
+    }
+
+    /// Traduce el estado del daemon a lo que la UI conoce. Un solo sitio: había
+    /// dos construcciones a mano y la del bucle de estado se olvidaba de la mitad
+    /// de los campos nuevos.
+    pub fn from_daemon(status: &hoard_core::ipc::DaemonStatus) -> Self {
+        Self {
+            running: status.engine.running,
+            watched_count: status.slots.len().max(status.engine.watched),
+            service_notifies: status.notifications,
+            reason: status.engine.reason,
+            // Sólo cuando hay algo roto: el último error de un motor que ya está
+            // arriba es ruido que la ventana no debe enseñar.
+            last_error: (!status.engine.running)
+                .then(|| status.engine.last_error.clone())
+                .flatten(),
         }
     }
 }
@@ -520,11 +550,7 @@ async fn status_loop(app: AppHandle) -> Finished {
         match state.daemon.status().await {
             Ok(status) => {
                 announce_slots(&app, &status.slots, &mut armed);
-                let now = AgentStatus {
-                    running: status.engine.running,
-                    watched_count: status.slots.len().max(status.engine.watched),
-                    service_notifies: status.notifications,
-                };
+                let now = AgentStatus::from_daemon(&status);
                 if !now.running {
                     tracing::debug!(
                         reason = status.engine.last_error.as_deref().unwrap_or("starting"),

@@ -33,7 +33,7 @@
   import Modal from "../lib/components/Modal.svelte";
   import SaveGameCard from "../lib/components/SaveGameCard.svelte";
   import * as api from "../lib/api";
-  import type { TrackedSave } from "../lib/api";
+  import type { EngineDownReason, TrackedSave } from "../lib/api";
   import { refreshQuota, signOut } from "../lib/stores/auth";
   import { activity, status } from "../lib/stores/agent";
   import {
@@ -281,6 +281,34 @@
     }
   });
 
+  /** Which sentence explains an engine that isn't up. An older service (or a
+   *  failure we don't classify) reports nothing, and then the generic line is
+   *  the honest answer — inventing a cause would be worse than "it's down". */
+  function offlineMessageKey(reason: EngineDownReason | undefined): string {
+    switch (reason) {
+      case "no_session":
+        return "dashboard.service_offline_no_session";
+      case "keyring_unreadable":
+        return "dashboard.service_offline_keyring";
+      case "session_expired":
+        return "dashboard.service_offline_expired";
+      default:
+        return "dashboard.service_offline_banner";
+    }
+  }
+
+  /** Signing in again is the actual fix for the session cases: it hands the
+   *  service a session and, when the keyring is the problem, rewrites the item
+   *  under the service so it can read it from then on. For anything else the
+   *  button would be a placebo, so it isn't shown. */
+  function fixableBySigningIn(reason: EngineDownReason | undefined): boolean {
+    return (
+      reason === "no_session" ||
+      reason === "keyring_unreadable" ||
+      reason === "session_expired"
+    );
+  }
+
   async function handleLogout() {
     signingOut = true;
     try {
@@ -364,14 +392,30 @@
     </div>
   </header>
 
-  <!-- Sync service down: the stores report it (`status.running`); we only
-       give the state the visual weight it deserves — no invented logic. -->
+  <!-- Sync service down — and, since 1.1.1, *why*. The service reports a typed
+       reason (`AgentStatus.reason`); this banner says it and offers the one
+       action that fixes the session cases. The generic line stays as the
+       fallback for an older service or an unclassified failure. -->
   {#if !loading && !$status.running}
     <div
-      class="mb-5 flex items-center gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-200"
+      class="mb-5 flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-200"
     >
-      <AlertTriangle size={15} class="shrink-0 text-amber-400" />
-      {$_("dashboard.service_offline_banner")}
+      <AlertTriangle size={15} class="mt-0.5 shrink-0 text-amber-400" />
+      <div class="min-w-0 flex-1">
+        <p>{$_(offlineMessageKey($status.reason))}</p>
+        <!-- El texto crudo del servicio. No es para el usuario medio, es para
+             que pueda pegarlo en un reporte sin tener que encontrar el log. -->
+        {#if $status.last_error}
+          <p class="mt-1 break-words font-mono text-[11px] text-amber-200/60">
+            {$status.last_error}
+          </p>
+        {/if}
+      </div>
+      {#if fixableBySigningIn($status.reason)}
+        <Button variant="ghost" onclick={handleLogout} loading={signingOut}>
+          {$_("dashboard.service_offline_signin")}
+        </Button>
+      {/if}
     </div>
   {/if}
 

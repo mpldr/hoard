@@ -24,6 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   picker stays as the fallback for what detection genuinely missed.
 
 ### Fixed
+- **Self-hosted sync was dead in 1.1.0 if you only ever signed in through the
+  app.** Moving the engine into the background service also moved where it
+  looks for your session: it read only `config.toml`, which just the CLI
+  (`hoard login --token`) writes, while the app keeps its own. So the service
+  started with no session, no save was ever backed up, and all the window could
+  say was "the sync service is offline". The service now uses the app's session
+  first and keeps `config.toml` as the headless fallback — nothing to redo, it
+  picks up the session you already have on the next start.
+- **"The sync service is offline" now says why, and offers the fix.** The
+  reason existed inside the service and was dropped on the way to the window.
+  It travels now: no session, a keyring that won't hand it over, an expired
+  session — each with its own sentence, the raw error underneath for a bug
+  report, and a "Sign in again" button on the cases that actually fixes.
+- **The service takes ownership of the saved session.** When it starts from a
+  session that was left in the file (a client that had no service to hand it
+  to, or a keyring that was locked at the time), it now stores it in the
+  keyring itself. On macOS that's what stops the password prompt on every
+  engine start, since a keychain item only authorises the binary that created
+  it.
+- **The app re-hands its session to a service that has none.** If the service
+  reports "no session" while the app has one, it hands it over instead of
+  waiting out a backoff that can't fix anything on its own.
 - **"Link to this machine" opened the file manager again.** The 1.0.4 UI
   rewrite dropped the wiring for the link dialog added in 1.0.3, so the button
   went straight to the OS folder picker — making you hand-find a save folder

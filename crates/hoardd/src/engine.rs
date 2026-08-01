@@ -38,7 +38,7 @@ use hoard_agent::presence::PresenceHandle;
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::Finished;
 use hoard_agent::{cloud_live, library, presence};
-use hoard_core::ipc::EngineStatus;
+use hoard_core::ipc::{EngineDownReason, EngineStatus};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -190,16 +190,18 @@ impl Engine {
             watched,
             since: Some(OffsetDateTime::now_utc()),
             last_error: None,
+            reason: EngineDownReason::Unknown,
         };
         // Un motor previo (por ejemplo el que murió y estamos reemplazando) se
         // tira aquí: `Running::aux` aborta sus tareas al soltarse.
         guard.running = Some(running);
     }
 
-    fn note_error(&self, error: String) {
+    fn note_error(&self, error: String, reason: EngineDownReason) {
         let mut guard = self.lock();
         guard.status.running = false;
         guard.status.last_error = Some(error);
+        guard.status.reason = reason;
         guard.running = None;
     }
 
@@ -359,13 +361,46 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             }
             Err(err) => {
                 let text = format!("{err:#}");
-                tracing::warn!(error = %text, retry_in_secs = backoff.as_secs(), "hoardd: couldn't start the engine");
-                engine.note_error(text);
+                let reason = classify(&err);
+                tracing::warn!(error = %text, ?reason, retry_in_secs = backoff.as_secs(), "hoardd: couldn't start the engine");
+                engine.note_error(text, reason);
                 engine.nap(backoff).await;
                 backoff = (backoff * 2).min(START_BACKOFF_MAX);
             }
         }
     }
+}
+
+/// Por qué no arrancó, para que la ventana pueda decirlo.
+///
+/// **Por downcast, nunca por el texto del error.** Un mensaje se reescribe sin
+/// pensar —y este en concreto se ha reescrito ya— y con `contains("no session")`
+/// la clasificación se rompería en silencio, que es justo el fallo invisible que
+/// todo esto viene a matar. Cada rama cuelga de un tipo que existe precisamente
+/// para ser reconocido aquí.
+fn classify(err: &anyhow::Error) -> EngineDownReason {
+    if err
+        .downcast_ref::<hoard_agent::session::NoSession>()
+        .is_some()
+    {
+        return EngineDownReason::NoSession;
+    }
+    // El llavero tiene dos formas de fallar (no contesta / contesta que no) y un
+    // solo consejo para el usuario: vuelve a entrar, que reescribe el ítem a
+    // nombre del servicio. Se separan en el log, no en la pantalla.
+    if err
+        .downcast_ref::<hoard_agent::keychain::KeyringTimeout>()
+        .is_some()
+        || err
+            .downcast_ref::<hoard_agent::keychain::KeyringUnreadable>()
+            .is_some()
+    {
+        return EngineDownReason::KeyringUnreadable;
+    }
+    if hoard_agent::cloud_auth::is_session_expired(err) {
+        return EngineDownReason::SessionExpired;
+    }
+    EngineDownReason::Other
 }
 
 struct Started {
@@ -640,4 +675,49 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
     let watched = desired_ids.len();
     engine.set_watched(watched);
     Ok(watched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El motivo tiene que sobrevivir a las capas de contexto que le pone el
+    /// camino real: `resolve_owned` envuelve el error un par de veces antes de
+    /// llegar aquí. Si la clasificación sólo mirase la capa de fuera, el caso más
+    /// importante —no hay sesión— saldría como `Other` y la ventana volvería a
+    /// enseñar el banner genérico.
+    #[test]
+    fn no_session_survives_the_context_layers() {
+        let err = anyhow::Error::new(hoard_agent::session::NoSession)
+            .context("resolviendo la sesión del servicio")
+            .context("arrancando el motor");
+        assert_eq!(classify(&err), EngineDownReason::NoSession);
+    }
+
+    /// Las dos formas de fallar del llavero comparten motivo: el consejo al
+    /// usuario es el mismo.
+    #[test]
+    fn both_keyring_failures_read_as_unreadable() {
+        let stuck = anyhow::Error::new(hoard_agent::keychain::KeyringTimeout {
+            doing: "reading the self-hosted session",
+            after: std::time::Duration::from_secs(5),
+        })
+        .context("leyendo la sesión");
+        assert_eq!(classify(&stuck), EngineDownReason::KeyringUnreadable);
+
+        let refused =
+            anyhow::anyhow!("access denied").context(hoard_agent::keychain::KeyringUnreadable {
+                doing: "reading the self-hosted session",
+            });
+        assert_eq!(classify(&refused), EngineDownReason::KeyringUnreadable);
+    }
+
+    /// Y lo que no reconocemos se dice que no se reconoce, en vez de disfrazarse
+    /// del último motivo que se nos ocurra: `last_error` lleva el detalle y el
+    /// banner cae al texto genérico, que para un fallo desconocido es honesto.
+    #[test]
+    fn anything_else_stays_other() {
+        let err = anyhow::anyhow!("the server hung up").context("arrancando el motor");
+        assert_eq!(classify(&err), EngineDownReason::Other);
+    }
 }

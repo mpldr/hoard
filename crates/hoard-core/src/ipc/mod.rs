@@ -543,6 +543,44 @@ pub struct EngineStatus {
     /// D.11/D.12 costaron dos sesiones.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// El mismo motivo, en un tipo que la UI puede traducir y sobre el que puede
+    /// ofrecer el botón que arregla el caso. Campo nuevo con `default`, así que
+    /// un cliente viejo lo lee como [`EngineDownReason::Unknown`] y pinta lo que
+    /// pintaba antes (C.6: append-only, el protocolo no sube).
+    #[serde(default)]
+    pub reason: EngineDownReason,
+}
+
+/// Por qué no hay motor, clasificado en origen.
+///
+/// `last_error` es para el log y para nosotros; esto es para la pantalla. Nace de
+/// dos hilos de soporte (jul-2026, self-hosted 1.1.0) en los que el usuario sólo
+/// podía decir "the sync service is offline": el motivo existía aquí dentro y se
+/// perdía antes de llegar a la ventana, así que ninguno de los dos pudo contar lo
+/// único que hacía falta para diagnosticarlo.
+///
+/// Se clasifica por **downcast tipado**, no mirando el texto del error: un
+/// mensaje se reescribe sin pensar y nadie se entera de que la clasificación se
+/// rompió, que es exactamente la clase de fallo silencioso que esto viene a matar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineDownReason {
+    /// Nadie ha dicho nada: el motor está arriba, arrancando, o lo reporta un
+    /// daemon anterior a este campo.
+    #[default]
+    Unknown,
+    /// No hay ninguna sesión que usar. Lo arregla entrar; nada más lo arregla.
+    NoSession,
+    /// Hay sesión guardada y el llavero no la suelta: bloqueado, sin D-Bus en una
+    /// sesión sin escritorio, o una ACL de macOS que no autoriza a este binario.
+    /// Se distingue de [`Self::NoSession`] porque el consejo es el contrario:
+    /// aquí el usuario **sí** entró, y volver a entrar reescribe el ítem a nombre
+    /// de quien lo lee.
+    KeyringUnreadable,
+    /// Sesión terminalmente caducada (Cloud): sólo un login nuevo la arregla.
+    SessionExpired,
+    /// Cualquier otra cosa. `last_error` lleva el detalle.
+    Other,
 }
 
 #[cfg(test)]
@@ -804,6 +842,35 @@ mod tests {
         )
         .unwrap();
         assert!(!old.notifications);
+    }
+
+    /// El motivo tipado del motor caído es append-only: un daemon anterior no lo
+    /// manda y el cliente lo lee como `Unknown` (banner genérico, como hasta
+    /// ahora) en vez de fallar el parseo entero del estado — que dejaría al
+    /// cliente sin *ningún* dato del daemon por un campo informativo.
+    #[test]
+    fn an_engine_without_a_reason_reads_as_unknown() {
+        let old: DaemonStatus = serde_json::from_str(
+            r#"{"daemon_version":"1.1.0","protocol":1,"pid":1,"epoch":"e",
+                "uptime_secs":0,"cursor":0,
+                "engine":{"running":false,"last_error":"no session"},"slots":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.engine.reason, EngineDownReason::Unknown);
+        assert_eq!(old.engine.last_error.as_deref(), Some("no session"));
+    }
+
+    /// Y en el cable va en `snake_case`, que es lo que la UI compara.
+    #[test]
+    fn the_engine_reason_travels_in_snake_case() {
+        let json = serde_json::to_string(&EngineStatus {
+            running: false,
+            reason: EngineDownReason::KeyringUnreadable,
+            ..EngineStatus::default()
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["reason"], "keyring_unreadable");
     }
 
     /// El préstamo del token: el `rejected` es opcional en el cable (un cliente

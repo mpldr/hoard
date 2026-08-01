@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use hoard_core::ipc::{
-    Backlog, ClientFrame, CloudToken, DaemonStatus, Hello, JournalEntry, Payload, Reply, Request,
-    ServerFrame, Welcome, PROTOCOL_VERSION,
+    AdoptedSession, Backlog, ClientFrame, CloudToken, DaemonStatus, Hello, JournalEntry, Payload,
+    Reply, Request, ServerFrame, ServerSession, Welcome, PROTOCOL_VERSION,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 
@@ -260,6 +260,58 @@ impl Client {
         match self.request(Request::CloudToken { rejected }).await? {
             Payload::CloudToken(token) => Ok(token),
             other => bail!("unexpected answer to cloud_token: {other:?}"),
+        }
+    }
+
+    /// Entrega al daemon una sesión Cloud recién acuñada, para que la guarde
+    /// **él**. La contrapartida de [`Client::cloud_token`]: el cliente acuña
+    /// (acaba el OAuth) y presta; el daemon guarda, rota y presta de vuelta.
+    ///
+    /// Escribirla aquí es el bug de macOS que esto viene a matar: el ítem del
+    /// llavero queda a nombre de quien lo crea, y el servicio —otro binario—
+    /// tendría que pedirle permiso al usuario en cada lectura.
+    pub async fn adopt_session(&mut self, session: AdoptedSession) -> Result<()> {
+        match self.request(Request::AdoptSession { session }).await? {
+            Payload::Ack => Ok(()),
+            other => bail!("unexpected answer to adopt_session: {other:?}"),
+        }
+    }
+
+    /// Dile al daemon que olvide la sesión Cloud (logout). Borrar el ítem del
+    /// llavero también hay que autorizarlo, así que lo hace su dueño.
+    pub async fn forget_session(&mut self) -> Result<()> {
+        match self.request(Request::ForgetSession).await? {
+            Payload::Ack => Ok(()),
+            other => bail!("unexpected answer to forget_session: {other:?}"),
+        }
+    }
+
+    /// Entrega al daemon la sesión self-hosted que este cliente acaba de validar.
+    /// El gemelo de [`Client::adopt_session`].
+    pub async fn adopt_server_session(&mut self, session: ServerSession) -> Result<()> {
+        match self
+            .request(Request::AdoptServerSession { session })
+            .await?
+        {
+            Payload::Ack => Ok(()),
+            other => bail!("unexpected answer to adopt_server_session: {other:?}"),
+        }
+    }
+
+    /// Dile al daemon que olvide la sesión self-hosted (logout).
+    pub async fn forget_server_session(&mut self) -> Result<()> {
+        match self.request(Request::ForgetServerSession).await? {
+            Payload::Ack => Ok(()),
+            other => bail!("unexpected answer to forget_server_session: {other:?}"),
+        }
+    }
+
+    /// Pide prestada la sesión self-hosted (URL + token + quién eres). Un token
+    /// `hoard_v1_` no caduca, así que basta pedirla una vez por proceso.
+    pub async fn server_session(&mut self) -> Result<ServerSession> {
+        match self.request(Request::ServerToken).await? {
+            Payload::ServerSession(session) => Ok(session),
+            other => bail!("unexpected answer to server_token: {other:?}"),
         }
     }
 

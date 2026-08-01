@@ -54,7 +54,10 @@ use anyhow::{anyhow, Context, Result};
 use hoard_agent::agent::{AgentConfig, AgentEvent};
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
-use hoard_core::ipc::{AgentSlotStatus, CloudToken, DaemonStatus, IpcError, Payload, Request};
+use hoard_core::ipc::{
+    AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, IpcError, Payload, Request,
+    ServerSession,
+};
 use hoardd::client::{Client, Push};
 use hoardd::endpoint::Endpoint;
 use serde::Serialize;
@@ -273,6 +276,62 @@ impl DaemonLink {
         match self.request(Request::CloudToken { rejected }).await? {
             Payload::CloudToken(token) => Ok(token),
             other => Err(anyhow!("unexpected answer to cloud_token: {other:?}")),
+        }
+    }
+
+    /// Entrega al servicio la sesión Cloud que el OAuth acaba de acuñar.
+    ///
+    /// El desktop no la escribe: el dueño del secreto es el servicio. En macOS eso
+    /// es la diferencia entre una app que funciona y una que pide la contraseña
+    /// del llavero cada pocos segundos — el ítem lo autoriza sólo el binario que
+    /// lo creó, y el que lo lee (el motor) vive en `hoardd`.
+    pub async fn adopt_session(&self, session: AdoptedSession) -> Result<()> {
+        match self.request(Request::AdoptSession { session }).await? {
+            Payload::Ack => Ok(()),
+            other => Err(anyhow!("unexpected answer to adopt_session: {other:?}")),
+        }
+    }
+
+    /// Dile al servicio que olvide la sesión Cloud (logout).
+    pub async fn forget_session(&self) -> Result<()> {
+        match self.request(Request::ForgetSession).await? {
+            Payload::Ack => Ok(()),
+            other => Err(anyhow!("unexpected answer to forget_session: {other:?}")),
+        }
+    }
+
+    /// Entrega al servicio la sesión self-hosted que la app acaba de validar.
+    pub async fn adopt_server_session(&self, session: ServerSession) -> Result<()> {
+        match self
+            .request(Request::AdoptServerSession { session })
+            .await?
+        {
+            Payload::Ack => Ok(()),
+            other => Err(anyhow!(
+                "unexpected answer to adopt_server_session: {other:?}"
+            )),
+        }
+    }
+
+    /// Dile al servicio que olvide la sesión self-hosted (logout).
+    pub async fn forget_server_session(&self) -> Result<()> {
+        match self.request(Request::ForgetServerSession).await? {
+            Payload::Ack => Ok(()),
+            other => Err(anyhow!(
+                "unexpected answer to forget_server_session: {other:?}"
+            )),
+        }
+    }
+
+    /// Pide prestada la sesión del server propio: URL, token y quién eres.
+    ///
+    /// El token `hoard_v1_` es estático —no caduca ni se rota—, así que esto se
+    /// pide una vez y se guarda en el hueco de `hoard_agent::credentials` para que
+    /// lo vea también el enviador de logs, que no puede pedir nada por IPC.
+    pub async fn server_session(&self) -> Result<ServerSession> {
+        match self.request(Request::ServerToken).await? {
+            Payload::ServerSession(session) => Ok(session),
+            other => Err(anyhow!("unexpected answer to server_token: {other:?}")),
         }
     }
 

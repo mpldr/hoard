@@ -17,6 +17,24 @@
 //!
 //! The desktop app uses a separate file from `hoard-cli`'s `config.toml` so
 //! that running the CLI does not stomp the GUI's session and vice versa.
+//!
+//! ## Quién escribe, quién lee (D.20)
+//!
+//! **El dueño es el daemon**, igual que en `cloud_auth`: [`save`] y [`clear`]
+//! tocan el llavero, y en macOS un ítem del llavero sólo autoriza al binario que
+//! lo creó — con la app escribiendo y `hoardd` leyendo, cada lectura del servicio
+//! era un diálogo de contraseña. Un cliente que acaba de validar un token lo
+//! **entrega** (`Request::AdoptServerSession`) y lo pide prestado cuando lo
+//! necesita (`Request::ServerToken`).
+//!
+//! Un cliente, por tanto, **no llama a [`load`]**: usa [`current`], que devuelve
+//! el préstamo que le hayan puesto en el hueco ([`set_lent`]) y sólo cae al
+//! almacén cuando nadie lo ha rellenado — que es el caso del daemon, el dueño.
+//! Para lo que no es secreto (URL y usuario) está [`load_public`], que lee el
+//! fichero y no toca el llavero.
+//!
+//! Sin servicio a quien entregar existen [`save_unlocked`] y
+//! [`forget_unlocked`]: fichero 0600 y nunca el llavero.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -56,6 +74,22 @@ struct Session {
     /// operation this is `None` and the token lives in the keyring.
     #[serde(default)]
     auth: Option<AuthSection>,
+    /// El usuario cerró sesión y **nadie ha podido borrar el ítem del llavero**
+    /// (un cliente sin servicio al alcance: borrarlo es del dueño).
+    ///
+    /// Es load-bearing que exista. [`load`] recupera la sesión del blob del
+    /// llavero cuando el fichero se ha perdido —el arreglo de la ACL que un build
+    /// viejo de Windows dejaba clavada— y eso, sin esta marca, resucitaría la
+    /// sesión que el usuario acaba de cerrar. Un fichero borrado y un fichero
+    /// ilegible se parecen demasiado para distinguirlos por su ausencia, así que
+    /// el logout deja dicho lo que hizo. [`save`] escribe un `Session` nuevo, así
+    /// que el siguiente login la limpia sin acordarse de ella.
+    #[serde(default, skip_serializing_if = "is_false")]
+    signed_out: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +144,11 @@ pub fn session_path() -> Result<PathBuf> {
 
 /// Persist credentials. Token goes to the OS keychain when available, with a
 /// transparent file fallback otherwise.
+/// **Sólo el daemon.** Es la escritura que crea el ítem del llavero, y en macOS
+/// su ACL autoriza únicamente al binario que lo crea: si lo escribiera un cliente,
+/// cada lectura del servicio le pediría la contraseña al usuario (D.20). Un
+/// cliente entrega la sesión por IPC (`Request::AdoptServerSession`), o usa
+/// [`save_unlocked`] si no hay servicio a quien entregarla.
 pub fn save(creds: &Credentials) -> Result<TokenStorage> {
     let session = Session {
         server: ServerSection {
@@ -117,6 +156,7 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
         },
         user: creds.user.clone(),
         auth: None,
+        signed_out: false,
     };
     write_session(&session)?;
 
@@ -142,6 +182,12 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
 /// present yet (e.g. fresh install) — that is not an error. Un llavero
 /// bloqueado, en cambio, **sí** lo es: ver [`pick_token`].
 pub fn load() -> Result<Option<Credentials>> {
+    // Un logout que no pudo borrar el ítem del llavero (cliente sin servicio) lo
+    // deja dicho aquí. Se comprueba **antes** que nada: la recuperación de más
+    // abajo resucitaría la sesión desde el blob huérfano.
+    if matches!(read_session(), Ok(Some(s)) if s.signed_out) {
+        return Ok(None);
+    }
     match read_session() {
         // Normal path: the on-disk cache is readable and has a server URL. The
         // token comes from the keychain, falling back to the file copy.
@@ -183,6 +229,7 @@ pub fn load() -> Result<Option<Credentials>> {
                         },
                         user: creds.user.clone(),
                         auth: None,
+                        signed_out: false,
                     });
                     return Ok(Some(creds));
                 }
@@ -230,6 +277,10 @@ fn pick_token(
 }
 
 /// Wipe stored credentials. Idempotent — clearing twice is fine.
+///
+/// **Del daemon**, por lo mismo que [`save`]: borrar un ítem del llavero también
+/// se autoriza. Un cliente manda `Request::ForgetServerSession` y, si no hay
+/// servicio, [`forget_unlocked`].
 pub fn clear() -> Result<()> {
     // Best-effort: errors here mean the entry didn't exist, which is fine.
     let _ = try_keyring_delete();
@@ -238,6 +289,115 @@ pub fn clear() -> Result<()> {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Persiste la sesión **sin tocar el llavero**: fichero 0600 y nada más.
+///
+/// El camino de un cliente que acaba de validar un token y no tiene servicio a
+/// quien entregarlo. Escribir el llavero aquí sería el bug de D.20 —el ítem
+/// quedaría a nombre del cliente y el servicio pediría permiso en cada lectura—,
+/// mientras que dejándolo en el fichero el daemon lo lee tal cual al arrancar y lo
+/// sube al llavero él mismo, ya como dueño.
+pub fn save_unlocked(creds: &Credentials) -> Result<()> {
+    write_session(&Session {
+        server: ServerSection {
+            url: creds.url.clone(),
+        },
+        user: creds.user.clone(),
+        auth: Some(AuthSection {
+            token: creds.token.clone(),
+        }),
+        signed_out: false,
+    })
+}
+
+/// Cierra sesión **sin tocar el llavero**: deja la tumba (`signed_out`) en el
+/// fichero.
+///
+/// No basta con borrar el fichero, y ésa es la diferencia con Cloud: [`load`]
+/// recupera la sesión del blob del llavero cuando el fichero no está, así que
+/// borrarlo la resucitaría. La marca dice "esto no es un fichero perdido, es un
+/// logout", y el ítem huérfano que quede en el llavero no autoriza nada por su
+/// cuenta — lo pisa el siguiente login, y hasta entonces nadie lo lee.
+pub fn forget_unlocked() -> Result<()> {
+    write_session(&Session {
+        server: ServerSection::default(),
+        user: None,
+        auth: None,
+        signed_out: true,
+    })
+}
+
+/// Lo que **no** es secreto de la sesión: a qué server y quién. Sale del fichero,
+/// sin tocar el llavero.
+///
+/// Es lo que un cliente puede leer por su cuenta, y con lo que le basta para
+/// arrancar: el desktop pinta el usuario y la URL al abrir (síncrono, antes de que
+/// exista el enlace con el servicio) y pide el token prestado cuando de verdad va
+/// a llamar al server.
+pub fn load_public() -> Result<Option<(String, Option<UserSection>)>> {
+    match read_session()? {
+        Some(s) if s.signed_out => Ok(None),
+        Some(s) if !s.server.url.is_empty() => Ok(Some((s.server.url, s.user))),
+        _ => Ok(None),
+    }
+}
+
+/// El hueco del préstamo: la sesión que el servicio nos ha prestado.
+///
+/// Existe porque hay un lector que **no puede** pedirla por IPC: el enviador de
+/// logs (`logship`), que corre en su propio hilo con su propio runtime y relee la
+/// sesión cada pocos segundos. En el daemon el hueco está vacío y lee el almacén,
+/// que es suyo; en un cliente lo rellena quien pide el préstamo y así nadie toca
+/// el llavero ajeno.
+static LENT: std::sync::RwLock<Option<Credentials>> = std::sync::RwLock::new(None);
+
+/// Guarda (o borra, con `None`) la sesión prestada. La llama el cliente en cuanto
+/// el servicio se la presta, y con `None` al cerrar sesión.
+pub fn set_lent(creds: Option<Credentials>) {
+    let mut slot = LENT.write().unwrap_or_else(|p| p.into_inner());
+    *slot = creds;
+}
+
+/// Este proceso es un **cliente**: no toca el almacén, sólo el préstamo.
+static CLIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declara este proceso cliente del servicio, para que [`current`] no caiga nunca
+/// al almacén.
+///
+/// Lo llama el desktop al arrancar. Sin esto, un lector que corre en los dos
+/// procesos —`logship`— leería el llavero en el cliente durante la ventana en la
+/// que el préstamo aún no está puesto, y en macOS esa lectura **es** el diálogo de
+/// contraseña que D.20 viene a matar. Con la marca, un cliente sin préstamo se
+/// queda sin sesión (y no envía logs) en vez de pedir permiso: perder un lote de
+/// diagnóstico opcional es infinitamente mejor que un diálogo.
+///
+/// `hoardd` no la llama nunca: él es el dueño.
+pub fn mark_client() {
+    CLIENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// La sesión prestada, sin caer al almacén. La usa un cliente que **no** puede
+/// tocar el llavero: si el hueco está vacío, lo suyo es pedir el préstamo.
+pub fn lent() -> Option<Credentials> {
+    LENT.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// La sesión que este proceso puede usar: la prestada si la hay, el almacén si
+/// no.
+///
+/// Para lectores que corren en los dos procesos y no pueden pedir nada por IPC
+/// (`logship`): en un cliente el hueco está puesto, y en el daemon está vacío y
+/// entonces el almacén es el suyo. Un cliente que llegue aquí con el hueco vacío
+/// leería el llavero ajeno, así que quien pueda esperar debe usar el préstamo.
+pub fn current() -> Result<Option<Credentials>> {
+    if let Some(creds) = lent() {
+        return Ok(Some(creds));
+    }
+    if CLIENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    load()
 }
 
 /// Cheap shape check on a token string — `hoard_v1_` followed by 64 lowercase
@@ -539,5 +699,116 @@ mod tests {
         assert!(pick_token(Ok(None), Some(String::new()))
             .expect("ok")
             .is_none());
+    }
+
+    /// Aísla el directorio de config. Sólo Linux, que es donde `ProjectDirs` mira
+    /// `XDG_CONFIG_HOME`: en macOS y Windows la ruta sale del sistema y el test
+    /// escribiría en la sesión de verdad de quien ejecuta los tests.
+    #[cfg(target_os = "linux")]
+    fn with_isolated_config(f: impl FnOnce()) {
+        let _guard = crate::test_lock::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        f();
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// El camino sin servicio de D.20: se guarda en el fichero 0600, sin llavero, y
+    /// se lee de vuelta entero — incluido lo que un cliente puede leer solo
+    /// ([`load_public`]).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_stored_without_a_service_lands_in_the_file() {
+        with_isolated_config(|| {
+            let creds = Credentials {
+                url: "https://hoard.example".to_string(),
+                token: format!("hoard_v1_{}", "a".repeat(64)),
+                user: Some(UserSection {
+                    user_id: "u1".to_string(),
+                    username: "rai".to_string(),
+                    is_admin: true,
+                }),
+            };
+            save_unlocked(&creds).expect("escribe");
+
+            let session = read_session().expect("lee").expect("hay fichero");
+            assert_eq!(session.server.url, "https://hoard.example");
+            assert_eq!(
+                session.auth.expect("el token está en el fichero").token,
+                creds.token
+            );
+
+            let (url, user) = load_public().expect("lee").expect("hay sesión");
+            assert_eq!(url, "https://hoard.example");
+            assert_eq!(user.expect("usuario").username, "rai");
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(session_path().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "modo {:o}", mode & 0o777);
+            }
+        });
+    }
+
+    /// La tumba del logout sin servicio, que es la diferencia con Cloud: aquí
+    /// **borrar el fichero no basta**, porque [`load`] recupera la sesión del blob
+    /// del llavero cuando el fichero no está (el arreglo de la ACL de Windows) y
+    /// resucitaría justo lo que el usuario acaba de cerrar. Con la marca puesta,
+    /// `load` contesta "no hay sesión" **sin llegar a mirar el llavero** — que es lo
+    /// que hace este test determinista incluso en una máquina con su ítem de verdad.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logout_without_a_service_cannot_be_resurrected_from_the_keyring() {
+        with_isolated_config(|| {
+            let creds = Credentials {
+                url: "https://hoard.example".to_string(),
+                token: format!("hoard_v1_{}", "b".repeat(64)),
+                user: None,
+            };
+            save_unlocked(&creds).expect("escribe");
+            assert!(load_public().expect("lee").is_some());
+
+            forget_unlocked().expect("olvida");
+            assert!(
+                load_public().expect("lee").is_none(),
+                "sigue habiendo sesión"
+            );
+            assert!(load().expect("lee").is_none(), "la tumba no se respetó");
+            // Y el siguiente login la limpia sin acordarse de ella.
+            save_unlocked(&creds).expect("vuelve a entrar");
+            assert!(load_public().expect("lee").is_some());
+        });
+    }
+
+    /// El hueco del préstamo: en un cliente, `current` no puede caer al almacén ni
+    /// cuando está vacío — esa lectura es el diálogo de contraseña de macOS.
+    #[test]
+    fn a_client_without_a_loan_has_no_session_instead_of_reading_the_store() {
+        let creds = Credentials {
+            url: "https://hoard.example".to_string(),
+            token: format!("hoard_v1_{}", "c".repeat(64)),
+            user: None,
+        };
+        set_lent(Some(creds.clone()));
+        assert_eq!(lent().expect("prestada").token, creds.token);
+        assert_eq!(current().expect("ok").expect("prestada").token, creds.token);
+
+        set_lent(None);
+        mark_client();
+        assert!(lent().is_none());
+        assert!(
+            current().expect("ok").is_none(),
+            "un cliente sin préstamo no puede leer el almacén"
+        );
     }
 }

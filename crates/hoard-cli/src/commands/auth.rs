@@ -71,8 +71,32 @@ async fn login_selfhost(token: String, server: Option<String>) -> Result<()> {
     let client = ApiClient::new(cfg.server.url.clone(), token.clone())?;
     let me = client.whoami().await?;
 
+    // Al servicio, que es el dueño del almacén que resuelve el motor (D.20): sin
+    // esto, en una máquina donde la app ya tenía sesión, este login no cambiaría
+    // con qué server sincroniza el motor.
+    let handed = link::hand_over_server_session(hoard_core::ipc::ServerSession {
+        server_url: cfg.server.url.clone(),
+        token: token.clone(),
+        user: Some(hoard_core::ipc::ServerUser {
+            user_id: me.user_id.clone(),
+            username: me.username.to_string(),
+            is_admin: me.is_admin,
+        }),
+    })
+    .await;
+
+    // Y a `config.toml` igual: es el camino headless y lo que leen los one-shots de
+    // esta misma CLI sin servicio delante. Texto plano y 0600, como siempre — aquí
+    // no hay llavero que envenenar.
     cfg.auth.token = Some(token);
     cfg.save(&path)?;
+    if !handed {
+        // El servicio no se enteró por la entrega. Además hay que quitar de en
+        // medio la sesión que la app pudiera tener guardada: el motor la prefiere,
+        // así que dejarla ahí haría que este login no sirviera de nada.
+        let _ = hoard_agent::credentials::forget_unlocked();
+        link::notify_session_changed().await;
+    }
     println!(
         "connected to self-host ({}) as {} (admin: {}) — saved to {}",
         cfg.server.url,
@@ -203,19 +227,34 @@ async fn login_cloud_email(base: &str) -> Result<()> {
 
 /// Persists the session and sets the Cloud context. Shared by both paths.
 ///
-/// El login es una de las dos únicas escrituras del par de tokens que no hace el
-/// servicio (la otra es el logout, que lo borra): acuñar una sesión no es rotarla.
-/// Lo que sí es del servicio es lo que venga después, así que se le avisa: su
-/// motor está hablando con la cuenta que acaba de dejar de valer.
+/// Acuñar una sesión no es rotarla, así que el login sí es cosa del cliente — pero
+/// **guardarla** es del servicio (D.20): el ítem del llavero sólo autoriza al
+/// binario que lo crea, y el que lo lee en cada arranque del motor es `hoardd`. Se
+/// le entrega por IPC, y con eso el servicio ya sabe que la sesión cambió (no hace
+/// falta el aviso aparte).
 async fn finish_cloud_login(base: &str, tokens: &cloud_auth::Tokens) -> Result<()> {
-    // Wipe any previous session first. `store_tokens` is read-modify-write and
-    // would otherwise keep the old `user` snapshot / server_url, so signing in as
-    // a different account would leave the old identity lingering on disk.
-    let _ = cloud_auth::clear_session();
-    cloud_auth::store_tokens(tokens, base)?;
+    // La entrega incluye olvidar la anterior, para que entrar con otra cuenta no
+    // deje su `user` / `server_url` en disco.
+    let handed = link::hand_over_session(hoard_core::ipc::AdoptedSession {
+        server_url: base.to_string(),
+        access_token: tokens.access.clone(),
+        refresh_token: tokens.refresh.clone(),
+    })
+    .await;
+    if !handed {
+        // Sin servicio: al fichero 0600 y **no** al llavero. El servicio lo recoge
+        // de ahí cuando arranque y lo sube al llavero él mismo, ya como dueño;
+        // escribirlo aquí es lo que dejaba al motor pidiendo permiso.
+        cloud_auth::forget_tokens_unlocked()?;
+        cloud_auth::store_tokens_unlocked(tokens, base)?;
+    }
     let me = cloud_auth::fetch_me(base, &tokens.access).await?;
     state::set_active_context(Some(state::cloud_context(&me.user_id)));
-    link::notify_session_changed().await;
+    if !handed {
+        // El servicio no se enteró del login por la entrega, así que se le avisa
+        // por si arrancó entremedias.
+        link::notify_session_changed().await;
+    }
     println!(
         "connected to Hoard Cloud as {} · plan {}",
         me.email, me.plan
@@ -241,21 +280,36 @@ fn local_hostname() -> Option<String> {
 
 pub async fn logout() -> Result<()> {
     let had_cloud = cloud_auth::load_session()?.is_some();
-    if had_cloud {
-        cloud_auth::clear_session()?;
+    // El par lo borra su dueño (el servicio); si no hay servicio basta con quitar
+    // el fichero de sesión: sin él no hay sesión que resolver.
+    let cloud_forgotten_by_service = had_cloud && link::hand_over_logout().await;
+    if had_cloud && !cloud_forgotten_by_service {
+        cloud_auth::forget_tokens_unlocked()?;
     }
 
     let path = CliConfig::default_path()?;
     let mut cfg = CliConfig::load(&path)?;
-    let had_selfhost = cfg.auth.token.is_some();
-    if had_selfhost {
+    // Las dos fuentes self-hosted: el `config.toml` de esta CLI y el almacén de
+    // sesión que guarda el servicio (donde vive la de la app). Un logout tiene que
+    // cerrar las dos o la máquina seguiría sincronizando.
+    let stored_selfhost = hoard_agent::credentials::load_public()?.is_some();
+    let had_selfhost = cfg.auth.token.is_some() || stored_selfhost;
+    if cfg.auth.token.is_some() {
         cfg.auth.token = None;
         cfg.save(&path)?;
     }
+    let selfhost_forgotten_by_service = stored_selfhost && link::hand_over_server_logout().await;
+    if stored_selfhost && !selfhost_forgotten_by_service {
+        hoard_agent::credentials::forget_unlocked()?;
+    }
 
-    if had_cloud || had_selfhost {
-        // Las credenciales ya no están: que el servicio tire el motor y resuelva
-        // de nuevo, en vez de seguir con un token que acabamos de borrar.
+    // Las credenciales ya no están: que el servicio tire el motor y resuelva de
+    // nuevo, en vez de seguir con un token que acabamos de borrar.
+    // `ForgetSession` ya lo lleva dentro, así que sólo hace falta avisar si no
+    // pasó por ahí.
+    if (had_selfhost && !selfhost_forgotten_by_service)
+        || (had_cloud && !cloud_forgotten_by_service)
+    {
         link::notify_session_changed().await;
     }
 

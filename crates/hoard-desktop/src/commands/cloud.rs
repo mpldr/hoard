@@ -16,13 +16,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use hoard_core::ipc::AdoptedSession;
+
 use crate::commands::auth::classify_cloud;
 use crate::commands::cloud_pull;
 use crate::state::AppState;
 
 const CLOUD_DEFAULT_URL: &str = "https://api.hoard.services";
-const KEYRING_SERVICE: &str = "hoard-desktop-cloud";
-const KEYRING_USER: &str = "default";
 
 // Supabase GoTrue project — the same public project the web app talks to
 // (`web/.env` → `PUBLIC_SUPABASE_*`, baked into the static bundle). The anon
@@ -51,16 +51,22 @@ pub(crate) fn supabase_anon_key() -> String {
 
 // ---- session model ----------------------------------------------------
 
-/// Cached cloud session — Supabase JWT plus the most recent `/v1/me` snapshot.
-/// Persisted to `<config>/desktop/cloud.toml`; the tokens go to the keyring
-/// when available with a 0600 file fallback otherwise.
+/// Cached cloud session — el snapshot de `/v1/me` y a qué Cloud pertenece.
+/// Vive en `<config>/desktop/cloud.toml`.
+///
+/// **El desktop ya no escribe aquí tokens** (D.20): el par vive en el llavero y lo
+/// escribe el servicio, que es su dueño. `auth` sigue modelado porque el servicio
+/// lo usa como fallback en máquinas sin llavero, y este proceso hace
+/// read-modify-write del fichero para su snapshot de cuenta: si no lo conociera,
+/// el round-trip por serde le borraría los tokens al servicio.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CloudSessionFile {
     #[serde(default)]
     server_url: String,
     #[serde(default)]
     user: Option<CloudAccount>,
-    /// Fallback when the OS keyring is unavailable.
+    /// Fallback del **servicio** cuando el llavero no está disponible. Aquí sólo
+    /// se preserva, nunca se escribe.
     #[serde(default)]
     auth: Option<AuthSection>,
 }
@@ -136,7 +142,8 @@ fn default_storage_status() -> String {
 }
 
 /// Carry the access_token through method calls without persisting it on every
-/// hop. Loaded from the keyring at the top of each command.
+/// hop. Lo presta el servicio al principio de cada comando ([`active_creds`]);
+/// este proceso no lee el llavero desde D.20.
 ///
 /// **Sin refresh token, y eso es el invariante.** Desde el Slice 4c el desktop no
 /// rota: pide un access token prestado al servicio
@@ -152,10 +159,6 @@ pub struct CloudCreds {
     /// label `quota-reached` events. `None` when the session file
     /// pre-dates this snapshot — callers default to "free".
     pub plan: Option<String>,
-    /// Supabase `user_id` from the cached `/v1/me`. Keys the per-account sync
-    /// context (see `hoard_agent::state::cloud_context`). `None` on very old
-    /// session files that never cached the account snapshot.
-    pub user_id: Option<String>,
 }
 
 // ---- helpers ----------------------------------------------------------
@@ -215,110 +218,147 @@ fn write_session(s: &CloudSessionFile) -> Result<()> {
     Ok(())
 }
 
-fn keyring_set(access: &str, refresh: &str) -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    // Pack both tokens as TOML so we don't need two keyring entries.
-    let blob = toml::to_string(&AuthSection {
-        access_token: access.to_string(),
-        refresh_token: refresh.to_string(),
-    })?;
-    entry.set_password(&blob)?;
-    Ok(())
+/// La parte **no secreta** de la sesión: a qué Cloud y de quién es la cuenta.
+///
+/// Es todo lo que el desktop lee de disco desde D.20. El par de tokens no se
+/// toca: vive en el llavero, a nombre del servicio, y el access token se pide
+/// prestado ([`borrow_access_token`]). Lo que este proceso no puede leer no
+/// puede provocar un diálogo de autorización en macOS ni quedarse con una copia
+/// vieja del refresh token.
+struct SessionInfo {
+    plan: Option<String>,
+    user_id: Option<String>,
 }
 
-fn keyring_get() -> Result<Option<AuthSection>> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.get_password() {
-        Ok(blob) => {
-            let parsed: AuthSection = toml::from_str(&blob)?;
-            Ok(Some(parsed))
-        }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn keyring_delete() -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn load_creds() -> Result<Option<CloudCreds>> {
+fn session_info() -> Result<Option<SessionInfo>> {
     let Some(session) = read_session()? else {
         return Ok(None);
     };
-    let auth = match keyring_get() {
-        Ok(Some(a)) => Some(a),
-        _ => session.auth.clone(),
-    };
-    let Some(auth) = auth else {
-        return Ok(None);
-    };
-    if auth.access_token.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(CloudCreds {
-        access_token: auth.access_token,
-        server_url: if session.server_url.is_empty() {
-            cloud_base_url()
-        } else {
-            session.server_url
-        },
+    Ok(Some(SessionInfo {
         plan: session.user.as_ref().map(|u| u.plan.clone()),
         user_id: session.user.as_ref().map(|u| u.user_id.clone()),
     }))
 }
 
-/// Public wrapper used by the cloud-pull poller. Returns the active cloud
-/// session credentials (access token + server URL + cached plan label) or
-/// `None` when the user is signed out.
-pub fn load_active_creds() -> Result<Option<CloudCreds>> {
-    load_creds()
+/// Creds listas para una llamada REST: los campos de disco + un access token
+/// **prestado por el servicio**.
+///
+/// Sustituye al viejo `load_creds`, que sacaba el token del llavero. Sigue
+/// distinguiendo "no hay sesión" (`Ok(None)`, no hay fichero) de "hay sesión y
+/// algo falló" (`Err`), que es lo que los comandos ya ramificaban; lo que cambia
+/// es de dónde sale el token. Un `Err` con [`is_session_expired`] es el veredicto
+/// del servicio: la familia de tokens está revocada y sólo un login nuevo la
+/// arregla.
+pub(crate) async fn active_creds(app: &AppHandle) -> Result<Option<CloudCreds>> {
+    let Some(state) = app.try_state::<AppState>() else {
+        anyhow::bail!("the Hoard service link isn't up yet");
+    };
+    active_creds_via(&state.daemon).await
+}
+
+/// [`active_creds`] para quien tiene el enlace pero no el `AppHandle` (los
+/// comandos que sólo reciben `State<AppState>`).
+pub(crate) async fn active_creds_via(
+    daemon: &crate::daemon::DaemonLink,
+) -> Result<Option<CloudCreds>> {
+    let Some(info) = session_info()? else {
+        return Ok(None);
+    };
+    let token = daemon.cloud_token(None).await?;
+    Ok(Some(CloudCreds {
+        access_token: token.access_token,
+        server_url: token.server_url,
+        plan: info.plan,
+    }))
+}
+
+/// Igual que [`active_creds`] pero con el `String` que la UI espera.
+pub(crate) async fn active_creds_or_msg(app: &AppHandle) -> Result<CloudCreds, String> {
+    match active_creds(app).await {
+        Ok(Some(creds)) => Ok(creds),
+        Ok(None) => Err("Not signed in to Hoard Cloud.".into()),
+        Err(e) => {
+            if is_session_expired(&e) {
+                handle_session_expired(app);
+            }
+            Err(prettify(e))
+        }
+    }
+}
+
+/// `user_id` de la cuenta en disco, sin red ni secretos. Lo usa el arranque para
+/// fijar el contexto de sync.
+pub fn active_user_id() -> Result<Option<String>> {
+    Ok(session_info()?.and_then(|s| s.user_id))
 }
 
 /// Persiste una sesión **recién acuñada** (login). Es la única escritura del par
 /// de tokens que le queda al desktop: crear una sesión no es rotarla, y el
 /// servicio no puede hacerlo por nosotros porque el flujo OAuth acaba aquí. Todo
 /// lo demás (renovar) es del servicio.
-fn save_creds(access: &str, refresh: &str, server_url: &str, user: &CloudAccount) -> Result<()> {
-    // Try the keyring first; fall back to the file if it isn't available.
-    let mut file = CloudSessionFile {
+async fn save_creds(
+    app: &AppHandle,
+    access: &str,
+    refresh: &str,
+    server_url: &str,
+    user: &CloudAccount,
+) -> Result<()> {
+    // Primero el snapshot de la cuenta (sin tokens): es lo que hace que la app se
+    // vea logueada al siguiente arranque, y no es un secreto. El orden importa —
+    // el servicio hace read-modify-write del mismo fichero para dejar sus tokens,
+    // así que si escribiéramos después le pisaríamos el `auth` del fallback.
+    write_session(&CloudSessionFile {
         server_url: server_url.to_string(),
         user: Some(user.clone()),
         auth: None,
+    })?;
+
+    // Y ahora el par: se lo entregamos al servicio, que es su dueño. Lo escribe
+    // él, así que en macOS el ítem del llavero queda a nombre del binario que
+    // luego lo lee (el motor) y no hay nada que autorizar (ADR 0021 D.20).
+    let session = AdoptedSession {
+        server_url: server_url.to_string(),
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
     };
-    match keyring_set(access, refresh) {
-        Ok(()) => write_session(&file),
-        Err(_) => {
-            file.auth = Some(AuthSection {
-                access_token: access.to_string(),
-                refresh_token: refresh.to_string(),
-            });
-            write_session(&file)
-        }
+    let Some(state) = app.try_state::<AppState>() else {
+        anyhow::bail!("the Hoard service link isn't up yet");
+    };
+    if let Err(err) = state.daemon.adopt_session(session).await {
+        // Sin servicio (no arrancó, o está actualizándose) el login no puede
+        // fallar: el usuario acaba de autenticarse y perder eso sería perder la
+        // sesión entera. Se deja en el fichero 0600 y **no** en el llavero: el
+        // servicio lo recoge de ahí al arrancar y en su primer refresh lo sube al
+        // llavero él mismo, ya como dueño. Escribirlo aquí sería reintroducir el
+        // bug que esto arregla.
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "cloud: the service didn't take the new session; leaving it in the 0600 file for it to adopt"
+        );
+        hoard_agent::cloud_auth::store_tokens_unlocked(
+            &hoard_agent::cloud_auth::Tokens {
+                access: access.to_string(),
+                refresh: refresh.to_string(),
+            },
+            server_url,
+        )?;
     }
+    Ok(())
 }
 
 /// Reescribe **sólo** el snapshot de `/v1/me` (y el `server_url`), sin tocar los
-/// tokens ni el keyring.
+/// tokens.
 ///
 /// Existe porque desde el Slice 4c el desktop no escribe el par de tokens: lo
 /// hace el servicio, que es el único rotador. Si al refrescar la cuenta
-/// reescribiéramos también los tokens que acabábamos de leer, bastaría con que el
-/// servicio rotara entremedias para que pisáramos el refresh token nuevo con el
-/// viejo — y el siguiente refresh del servicio dispararía la reuse-detection de
-/// GoTrue, que revoca la familia entera. Ese es exactamente el bug que "un único
-/// rotador" mata, así que aquí no se escriben tokens.
+/// reescribiéramos también los tokens, bastaría con que el servicio rotara
+/// entremedias para que pisáramos el refresh token nuevo con el viejo — y el
+/// siguiente refresh del servicio dispararía la reuse-detection de GoTrue, que
+/// revoca la familia entera.
 ///
-/// Queda una ventana teórica: con el keyring disponible el fichero no lleva
-/// tokens (`auth = None`) y esto no puede pisar nada, pero en el fallback a
-/// fichero el read-modify-write reescribe el `auth` que acaba de leer. Son
-/// milisegundos y sólo sin keyring; se cierra de verdad cuando el estado sea
-/// privado del daemon (Slice 5).
+/// Desde D.20 ni siquiera podríamos: este proceso no lee el par, así que el
+/// read-modify-write preserva el `auth` del fallback tal cual lo encuentra en vez
+/// de reescribir el que acababa de leer. La ventana que quedaba está cerrada.
 fn save_account_snapshot(server_url: &str, user: &CloudAccount) -> Result<()> {
     let mut session = read_session()?.unwrap_or_default();
     if session.server_url.is_empty() {
@@ -328,12 +368,53 @@ fn save_account_snapshot(server_url: &str, user: &CloudAccount) -> Result<()> {
     write_session(&session)
 }
 
-fn clear_creds() -> Result<()> {
-    let _ = keyring_delete();
+/// Deja la máquina desconectada **ya**, sin tocar el llavero: borra el fichero de
+/// sesión, que es lo que decide si hay sesión (nadie mira el llavero sin él).
+///
+/// Es la mitad síncrona del logout, la que no puede fallar ni esperar a nadie.
+/// La otra mitad —borrar el par del llavero— es del servicio, porque el ítem es
+/// suyo: [`forget_session`] y [`forget_session_in_background`].
+fn clear_creds_local() -> Result<()> {
     let path = session_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
+    Ok(())
+}
+
+/// Logout completo: el fichero lo borramos nosotros, el par del llavero lo borra
+/// su dueño. Un servicio que no contesta no bloquea el logout — la sesión ya no
+/// existe para nadie que la lea, y el par huérfano lo pisa el siguiente login.
+async fn forget_session(app: &AppHandle) -> Result<()> {
+    clear_creds_local()?;
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Err(err) = state.daemon.forget_session().await {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "cloud: the service didn't clear its stored session; the local session file is gone anyway"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`forget_session`] desde un camino síncrono (la limpieza de una sesión
+/// caducada, que se dispara desde dentro de closures de `map_err`). El borrado
+/// del fichero es inmediato; el aviso al servicio va en una task, como el resto
+/// de avisos best-effort.
+fn forget_session_in_background(app: &AppHandle) -> Result<()> {
+    clear_creds_local()?;
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Err(err) = state.daemon.forget_session().await {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "cloud: the service didn't clear its stored session"
+                );
+            }
+        }
+    });
     Ok(())
 }
 
@@ -353,30 +434,27 @@ fn clear_creds() -> Result<()> {
 /// proceso que rota. `rejected` es el token con el que acabamos de comer un 401,
 /// para que el servicio sepa que devolvérnoslo no sirve de nada.
 ///
-/// El par completo sigue en disco (keyring + `cloud.toml`) y lo lee `load_creds`;
-/// lo que cambia es que ya no lo **escribimos**.
+/// Desde D.20 tampoco lo **leemos**: el par vive en el llavero a nombre del
+/// servicio, y este proceso sólo maneja el access token que le presta. De disco
+/// salen los campos que no son secretos (plan, `user_id`).
 pub async fn borrow_access_token(app: &AppHandle, rejected: Option<String>) -> Result<CloudCreds> {
     let Some(state) = app.try_state::<AppState>() else {
         anyhow::bail!("the Hoard service link isn't up yet");
     };
     let token = state.daemon.cloud_token(rejected).await?;
-    // Las creds de disco ya llevan el par que el servicio acaba de dejar ahí si
-    // rotó; el access prestado manda por si el keyring va un paso por detrás.
-    let creds = load_creds()?;
-    Ok(match creds {
-        Some(creds) => CloudCreds {
+    Ok(match session_info()? {
+        Some(info) => CloudCreds {
             access_token: token.access_token,
             server_url: token.server_url,
-            ..creds
+            plan: info.plan,
         },
         // Sin fichero de sesión pero con token prestado: el servicio tiene una
-        // sesión que este proceso no ha llegado a leer (recién logueado en la
-        // CLI, keyring que tardó). Se usa lo que nos han dado.
+        // sesión que este proceso aún no ha visto en disco (recién logueado en la
+        // CLI). Se usa lo que nos han dado.
         None => CloudCreds {
             access_token: token.access_token,
             server_url: token.server_url,
             plan: None,
-            user_id: None,
         },
     })
 }
@@ -489,7 +567,9 @@ pub async fn cloud_complete_login(
     }
     let base = cloud_base_url();
     let me = fetch_me(&base, &access).await.map_err(prettify)?;
-    save_creds(&access, &refresh, &base, &me).map_err(|e| format!("Couldn't save session: {e}"))?;
+    save_creds(&app, &access, &refresh, &base, &me)
+        .await
+        .map_err(|e| format!("Couldn't save session: {e}"))?;
     *state.cloud_account.lock().unwrap() = Some(me.clone());
     // The attempt completed: retire its nonce so the callback can't be
     // replayed into a new login later.
@@ -568,9 +648,7 @@ pub async fn cloud_refresh_account(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CloudAccount, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+    let creds = active_creds_or_msg(&app).await?;
     // Try with the cached access token; if it expired, transparently renew it
     // with the refresh token and retry once instead of declaring the session
     // dead (the bug: a restart outlived the ~1h JWT, so this always 401'd).
@@ -603,18 +681,20 @@ pub async fn cloud_refresh_account(
     Ok(me)
 }
 
-/// Drop the cloud session: clears the keyring entry, the on-disk file, and
-/// the in-memory cache. Idempotent.
+/// Drop the cloud session: borra el fichero, pide al servicio que olvide el par
+/// del llavero (el ítem es suyo) y limpia la caché en memoria. Idempotente.
 #[tauri::command]
-pub fn cloud_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    clear_creds().map_err(|e| format!("Couldn't clear session: {e}"))?;
+pub async fn cloud_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    forget_session(&app)
+        .await
+        .map_err(|e| format!("Couldn't clear session: {e}"))?;
     *state.cloud_account.lock().unwrap() = None;
     // Repoint the active context at whatever session remains (a self-hosted
     // login, or none) so a later self-hosted action doesn't keep writing into
     // the logged-out account's context file.
     crate::commands::library::sync_active_context(state.inner());
-    // Stop the cloud-pull poller — otherwise it would keep tickling
-    // `load_active_creds` and quietly do nothing forever.
+    // Stop the cloud-pull poller — otherwise it would keep asking the service
+    // for a token and quietly do nothing forever.
     cloud_pull::stop(&app);
     crate::commands::cloud_realtime::stop(&app);
     // Las credenciales ya no están: que el servicio tire el motor y resuelva de
@@ -648,7 +728,7 @@ pub fn is_session_expired(e: &anyhow::Error) -> bool {
 /// first learns the refresh token is dead (poller, Realtime, or the manual
 /// account refresh).
 pub fn handle_session_expired(app: &AppHandle) {
-    if let Err(e) = clear_creds() {
+    if let Err(e) = forget_session_in_background(app) {
         tracing::warn!(error = %e, "cloud: clearing creds during session-expiry teardown failed");
     }
     if let Some(state) = app.try_state::<AppState>() {
@@ -688,20 +768,16 @@ pub(crate) fn cloud_err_to_string(e: CloudError) -> String {
 /// worker builds the ZIP, and the client polls `cloud_export_status` for the
 /// download link (the server also emails it when email is configured).
 #[tauri::command]
-pub async fn cloud_export_all() -> Result<ExportJob, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_export_all(app: AppHandle) -> Result<ExportJob, String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::export_all(&creds.server_url, &creds.access_token)
         .await
         .map_err(cloud_err_to_string)
 }
 
 #[tauri::command]
-pub async fn cloud_export_status() -> Result<ExportStatus, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_export_status(app: AppHandle) -> Result<ExportStatus, String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::export_status(&creds.server_url, &creds.access_token)
         .await
         .map_err(cloud_err_to_string)
@@ -712,10 +788,8 @@ pub async fn cloud_export_status() -> Result<ExportStatus, String> {
 /// `GET /v1/cloud/storage/games` — per-game freeable footprint + the quota
 /// figures. Drives the "free space" dialog.
 #[tauri::command]
-pub async fn cloud_storage_games() -> Result<StorageGames, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_storage_games(app: AppHandle) -> Result<StorageGames, String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::storage_games(&creds.server_url, &creds.access_token)
         .await
         .map_err(cloud_err_to_string)
@@ -725,10 +799,8 @@ pub async fn cloud_storage_games() -> Result<StorageGames, String> {
 /// quota now, keeps it downloadable for 7 days, then a cron purges it. The local
 /// save on disk is never touched.
 #[tauri::command]
-pub async fn cloud_archive_save(save_id: String) -> Result<ArchiveResult, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_archive_save(app: AppHandle, save_id: String) -> Result<ArchiveResult, String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::archive_save(&creds.server_url, &creds.access_token, &save_id)
         .await
         .map_err(cloud_err_to_string)
@@ -738,10 +810,8 @@ pub async fn cloud_archive_save(save_id: String) -> Result<ArchiveResult, String
 /// upgrading to Pro / freeing space). Re-references its blobs; errors if it no
 /// longer fits the plan or the 7-day window already elapsed.
 #[tauri::command]
-pub async fn cloud_reactivate_save(save_id: String) -> Result<(), String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_reactivate_save(app: AppHandle, save_id: String) -> Result<(), String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::reactivate_save(&creds.server_url, &creds.access_token, &save_id)
         .await
         .map_err(cloud_err_to_string)
@@ -753,15 +823,18 @@ pub async fn cloud_reactivate_save(save_id: String) -> Result<(), String> {
 /// can sign back in and reactivate (see [`cloud_reactivate_account`]). The
 /// desktop clears the local session either way.
 #[tauri::command]
-pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_delete_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::delete_account(&creds.server_url, &creds.access_token)
         .await
         .map_err(cloud_err_to_string)?;
     // Clear local state regardless of body contents.
-    clear_creds().map_err(|e| format!("Couldn't clear local session: {e}"))?;
+    forget_session(&app)
+        .await
+        .map_err(|e| format!("Couldn't clear local session: {e}"))?;
     *state.cloud_account.lock().unwrap() = None;
     Ok(())
 }
@@ -773,10 +846,11 @@ pub async fn cloud_delete_account(state: State<'_, AppState>) -> Result<(), Stri
 /// during the grace window, sees they're scheduled for deletion, and taps
 /// "Reactivar".
 #[tauri::command]
-pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<CloudAccount, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+pub async fn cloud_reactivate_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CloudAccount, String> {
+    let creds = active_creds_or_msg(&app).await?;
     cloud_account::reactivate_account(&creds.server_url, &creds.access_token)
         .await
         .map_err(cloud_err_to_string)?;
@@ -796,9 +870,7 @@ pub async fn cloud_reactivate_account(state: State<'_, AppState>) -> Result<Clou
 /// retries once on a 401, mirroring `cloud_refresh_account`.
 #[tauri::command]
 pub async fn cloud_entitlements(app: AppHandle) -> Result<CloudEntitlements, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+    let creds = active_creds_or_msg(&app).await?;
     match cloud_account::entitlements(&creds.server_url, &creds.access_token).await {
         Ok(ent) => {
             tracing::info!(
@@ -860,9 +932,7 @@ pub async fn cloud_activate_feature(
     app: AppHandle,
     feature: String,
 ) -> Result<FeatureState, String> {
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+    let creds = active_creds_or_msg(&app).await?;
     match cloud_account::activate_feature(&creds.server_url, &creds.access_token, &feature).await {
         Ok(st) => Ok(st),
         Err(CloudError::Unauthorized) => {
@@ -1014,13 +1084,13 @@ pub async fn cloud_sync_playtime(
         rows: store.upload_rows(),
     };
 
-    let Some(creds) = load_creds().map_err(|e| e.to_string())? else {
+    let Some(creds) = active_creds(&app).await.map_err(|e| e.to_string())? else {
         // No cloud session. In self-hosted mode the recap reads the user's OWN
         // hoard-server, scoped to that server's user — one machine is one user,
         // so the recap is that user's history on their server. Empty summary
         // when there's no self-hosted session either, or its server is
         // unreachable — never this machine's local store.
-        return sync_playtime_selfhosted(&body)
+        return sync_playtime_selfhosted(&app, &body)
             .await
             .map(Ok)
             .unwrap_or_else(empty);
@@ -1082,9 +1152,11 @@ pub async fn cloud_sync_playtime(
 /// at a cloud server (handled by the cloud path, not here), or when the server
 /// is unreachable — the caller then shows an empty recap, never the local store.
 async fn sync_playtime_selfhosted(
+    app: &AppHandle,
     body: &PlaytimeUploadBody,
 ) -> Option<hoard_agent::playtime::PlaytimeSummary> {
-    let creds = hoard_agent::credentials::load().ok().flatten()?;
+    // Prestada por el servicio: el ítem del llavero es suyo (D.20).
+    let creds = crate::commands::auth::server_session(app).await.ok()??;
     let base = creds.url.trim_end_matches('/').to_string();
     if base.is_empty() || creds.token.is_empty() {
         return None;

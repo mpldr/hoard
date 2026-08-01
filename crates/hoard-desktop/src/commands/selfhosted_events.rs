@@ -99,8 +99,9 @@ fn signed_in(app: &AppHandle) -> bool {
 }
 
 /// Self-hosted session creds: `(base_url, bearer_token)`. `None` when signed
-/// out or the keychain entry is missing.
-fn session(app: &AppHandle) -> Option<(String, String)> {
+/// out — o cuando el servicio, que es quien guarda el token (D.20), no está para
+/// prestarlo.
+async fn session(app: &AppHandle) -> Option<(String, String)> {
     let base = app
         .state::<AppState>()
         .user
@@ -108,7 +109,10 @@ fn session(app: &AppHandle) -> Option<(String, String)> {
         .unwrap()
         .as_ref()
         .map(|u| u.server_url.clone())?;
-    let token = hoard_agent::credentials::load().ok().flatten()?.token;
+    let token = crate::commands::auth::server_session(app)
+        .await
+        .ok()??
+        .token;
     Some((base, token))
 }
 
@@ -151,7 +155,9 @@ async fn run_loop(app: AppHandle) {
 /// One connection lifecycle: open the stream and pump frames until the socket
 /// dies, the keep-alive gap is exceeded, or the user signs out.
 async fn connect_once(app: &AppHandle, client: &reqwest::Client) -> anyhow::Result<()> {
-    let (base, token) = session(app).ok_or_else(|| anyhow::anyhow!("signed out"))?;
+    let (base, token) = session(app)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("signed out"))?;
     let url = format!("{}/v1/events", base.trim_end_matches('/'));
 
     let resp = client

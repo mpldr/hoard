@@ -140,6 +140,95 @@ pub async fn notify_session_changed() {
     .await;
 }
 
+/// Entrega al servicio la sesión que `hoard login` acaba de acuñar, para que la
+/// guarde **él**. `false` = no había servicio a quien entregársela.
+///
+/// La CLI es un tercer binario, y en macOS eso importa: el ítem del llavero sólo
+/// autoriza al binario que lo crea, así que un login desde la terminal escribiendo
+/// el llavero dejaría al servicio pidiéndole la contraseña al usuario en cada
+/// lectura (ADR 0021 D.20). Aquí se acuña y se entrega; el que guarda es el dueño.
+///
+/// Va precedido de un olvido en la **misma** conexión: guardar es
+/// read-modify-write, así que sin borrar antes, entrar con otra cuenta dejaría en
+/// disco el `user` y el `server_url` de la anterior.
+pub async fn hand_over_session(session: hoard_core::ipc::AdoptedSession) -> bool {
+    let Some(mut client) = attached("login").await else {
+        return false;
+    };
+    if let Err(err) = client.forget_session().await {
+        tracing::warn!(error = %format!("{err:#}"), "cli: the service couldn't drop the previous session");
+        return false;
+    }
+    match client.adopt_session(session).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cli: the service didn't take the new session");
+            false
+        }
+    }
+}
+
+/// Entrega al servicio la sesión self-hosted que `hoard login --token` acaba de
+/// validar, para que la guarde **él**: es el almacén que resuelve el motor, así
+/// que sin esto un login desde la terminal no cambiaría con qué sesión sincroniza
+/// la máquina si la app ya tenía una. `false` = no había servicio.
+pub async fn hand_over_server_session(session: hoard_core::ipc::ServerSession) -> bool {
+    let Some(mut client) = attached("login").await else {
+        return false;
+    };
+    match client.adopt_server_session(session).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cli: the service didn't take the new self-hosted session");
+            false
+        }
+    }
+}
+
+/// Dile al servicio que olvide la sesión self-hosted. `false` = no hay servicio.
+pub async fn hand_over_server_logout() -> bool {
+    let Some(mut client) = attached("logout").await else {
+        return false;
+    };
+    match client.forget_server_session().await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cli: the service didn't clear its stored self-hosted session");
+            false
+        }
+    }
+}
+
+/// Pide prestada la sesión self-hosted. `None` = no hay servicio a quien pedirla,
+/// o no hay sesión de este tipo en la máquina; en los dos casos el que llama cae a
+/// `config.toml`, que es el camino headless de siempre.
+pub async fn borrow_server_session() -> Option<hoard_core::ipc::ServerSession> {
+    let mut client = attached("server token").await?;
+    match client.server_session().await {
+        Ok(session) => Some(session),
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "cli: couldn't borrow the self-hosted session");
+            None
+        }
+    }
+}
+
+/// Dile al servicio que olvide la sesión Cloud. `false` = no hay servicio, así que
+/// el llavero se queda con un par huérfano (inofensivo: sin fichero de sesión no
+/// hay sesión, y el siguiente login lo pisa).
+pub async fn hand_over_logout() -> bool {
+    let Some(mut client) = attached("logout").await else {
+        return false;
+    };
+    match client.forget_session().await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cli: the service didn't clear its stored session");
+            false
+        }
+    }
+}
+
 /// Pide prestado un token Cloud al servicio. `None` cuando no hay servicio a
 /// quien pedírselo.
 ///
@@ -179,11 +268,13 @@ pub async fn resolve_session() -> Result<Active> {
     // self-hosted, y el servicio contestaría "no hay sesión Cloud" — un error
     // inventado sobre algo que a este comando no le hace falta.
     if hoard_agent::cloud_auth::load_session()?.is_none() {
-        return session::resolve_borrowed(None).await;
+        // Self-hosted: la sesión de la app la guarda el servicio (D.20), así que se
+        // pide prestada. Sin servicio se cae a `config.toml`, como siempre.
+        return session::resolve_borrowed(None, borrow_server_session().await).await;
     }
     let lent = borrow_cloud_token(None).await?;
     let borrowed = lent.is_some();
-    match session::resolve_borrowed(lent).await {
+    match session::resolve_borrowed(lent, None).await {
         Ok(active) => Ok(active),
         Err(err) if !borrowed => Err(hint_stale_session(err)),
         Err(err) => Err(err),

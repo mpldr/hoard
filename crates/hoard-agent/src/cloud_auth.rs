@@ -13,6 +13,19 @@
 //! revés — una única sesión Cloud por máquina. El campo `user` (snapshot de
 //! `/v1/me`) se **preserva tal cual** (raw TOML) en las reescrituras del CLI,
 //! para no pisar el cache de cuenta del desktop.
+//!
+//! ## Quién escribe el llavero (D.20)
+//!
+//! **Sólo el daemon.** Un ítem del llavero en macOS lleva una ACL con los
+//! binarios autorizados, y el único que entra en ella es el que lo **crea**: con
+//! el login escribiéndolo desde la app o la CLI, cada lectura del servicio era un
+//! binario ajeno pidiéndole la contraseña del llavero al usuario — y como el
+//! keeper reintenta el arranque del motor con backoff, salía un diálogo cada
+//! pocos segundos. Por eso [`store_tokens`] y [`clear_session`] son del daemon, y
+//! un cliente que acuña una sesión la entrega por IPC
+//! (`Request::AdoptSession`). Sin servicio a quien entregarla existen
+//! [`store_tokens_unlocked`] y [`forget_tokens_unlocked`], que se quedan en el
+//! fichero 0600 y dejan que el daemon suba el par al llavero cuando arranque.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -577,6 +590,13 @@ fn pick_auth(
 
 /// Persiste el par de tokens conservando el `user` y el `server_url` ya en
 /// disco (read-modify-write). Keyring primero; si no hay, cae al fichero 0600.
+///
+/// **Sólo el daemon llama a esto.** Es la escritura que crea el ítem del llavero,
+/// y en macOS quien lo crea es el único binario que su ACL autoriza: si lo
+/// escribiera un cliente, cada lectura del servicio sería un binario ajeno
+/// pidiéndole la contraseña al usuario (ADR 0021 D.20). Un cliente que acaba de
+/// acuñar una sesión la **entrega** por IPC (`Request::AdoptSession`); si no hay
+/// servicio a quien entregarla, usa [`store_tokens_unlocked`].
 pub fn store_tokens(tokens: &Tokens, server_url: &str) -> Result<()> {
     let mut session = read_session_file()?.unwrap_or_default();
     if session.server_url.is_empty() {
@@ -594,9 +614,52 @@ pub fn store_tokens(tokens: &Tokens, server_url: &str) -> Result<()> {
     write_session_file(&session)
 }
 
+/// Persiste el par **sin tocar el llavero**: fichero 0600 y nada más.
+///
+/// Es el camino de un cliente que acaba de acuñar una sesión y no tiene servicio
+/// a quien entregarla (el daemon no arrancó, o se está actualizando). Escribir el
+/// llavero aquí "funcionaría" y sería justo el bug de D.20: el ítem quedaría a
+/// nombre del cliente y el servicio pediría permiso en cada lectura. Dejándolo en
+/// el fichero, el daemon lo recoge tal cual al arrancar ([`pick_auth`] cae al
+/// fichero cuando el llavero no tiene entrada) y en su primer refresh lo mueve al
+/// llavero él mismo, ya como dueño. O sea: se cura solo, y sin un diálogo.
+///
+/// El fichero es 0600 en el directorio de config del usuario — la misma
+/// protección que ya tiene el fallback de las máquinas sin llavero.
+pub fn store_tokens_unlocked(tokens: &Tokens, server_url: &str) -> Result<()> {
+    let mut session = read_session_file()?.unwrap_or_default();
+    if session.server_url.is_empty() {
+        session.server_url = server_url.to_string();
+    }
+    session.auth = Some(AuthSection {
+        access_token: tokens.access.clone(),
+        refresh_token: tokens.refresh.clone(),
+    });
+    write_session_file(&session)
+}
+
 /// Borra la sesión Cloud (keyring + fichero).
+///
+/// **Del daemon**, por lo mismo que [`store_tokens`]: borrar un ítem del llavero
+/// también se autoriza, y sólo su dueño lo hace sin preguntar. Un cliente manda
+/// `Request::ForgetSession` y, si no hay servicio, [`forget_tokens_unlocked`].
 pub fn clear_session() -> Result<()> {
     let _ = keyring_delete();
+    let path = session_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path).with_context(|| format!("borrando {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Cierra sesión **sin tocar el llavero**: borra el fichero y ya.
+///
+/// El pareja de [`store_tokens_unlocked`], para un logout sin servicio. Basta
+/// para que la máquina quede desconectada: sin fichero de sesión no hay sesión
+/// ([`load_session`] arranca por ahí), aunque el ítem del llavero siga existiendo
+/// con un par que ya no vale. Lo pisa el siguiente login, y mientras tanto no
+/// autoriza nada — un refresh token huérfano no es una sesión.
+pub fn forget_tokens_unlocked() -> Result<()> {
     let path = session_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("borrando {}", path.display()))?;
@@ -828,5 +891,74 @@ mod tests {
             .expect("tokens");
         assert_eq!(got.access_token, "jwt-del-fichero");
         assert!(pick_auth(Ok(None), None).expect("ok").is_none());
+    }
+
+    /// Aísla el directorio de config en un tempdir. Sólo Linux: es donde
+    /// `ProjectDirs` mira `XDG_CONFIG_HOME`. En macOS y Windows la ruta sale de
+    /// APIs del sistema y un test así escribiría en la sesión de verdad de quien
+    /// ejecuta los tests, que es exactamente lo que no puede pasar.
+    #[cfg(target_os = "linux")]
+    fn with_isolated_config(f: impl FnOnce()) {
+        let _guard = crate::test_lock::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        f();
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// El camino degradado de D.20: un cliente que acuña una sesión y no tiene
+    /// servicio a quien entregarla la deja en el fichero 0600 y **no** en el
+    /// llavero. Lo que se comprueba es que el par queda donde el daemon lo va a
+    /// encontrar (`pick_auth` cae al fichero cuando el llavero no tiene entrada),
+    /// que es lo que hace que se cure solo en el primer refresh del servicio.
+    ///
+    /// Que no toque el llavero no se puede afirmar desde un test sin leer el
+    /// llavero de verdad; lo sostiene el tipo: esta función no tiene ninguna
+    /// llamada a `keyring_*`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_stored_without_a_service_lands_in_the_file() {
+        with_isolated_config(|| {
+            let tokens = Tokens {
+                access: "jwt-sin-servicio".to_string(),
+                refresh: "refresh-sin-servicio".to_string(),
+            };
+            store_tokens_unlocked(&tokens, "https://api.hoard.services").expect("escribe");
+
+            let file = read_session_file().expect("lee").expect("hay fichero");
+            assert_eq!(file.server_url, "https://api.hoard.services");
+            let auth = file.auth.clone().expect("el par está en el fichero");
+            assert_eq!(auth.access_token, "jwt-sin-servicio");
+            assert_eq!(auth.refresh_token, "refresh-sin-servicio");
+
+            // Con el llavero sin entrada (lo normal en este camino), el par del
+            // fichero es el que gana: el daemon arranca con la sesión.
+            let picked = pick_auth(Ok(None), file.auth)
+                .expect("ok")
+                .expect("hay tokens");
+            assert_eq!(picked.refresh_token, "refresh-sin-servicio");
+
+            // Y 0600: es el mismo grado de protección que el fallback histórico.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(session_path().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "modo {:o}", mode & 0o777);
+            }
+
+            // El logout sin servicio: sin fichero no hay sesión que resolver, dé
+            // lo que dé el llavero.
+            forget_tokens_unlocked().expect("olvida");
+            assert!(read_session_file().expect("lee").is_none());
+        });
     }
 }

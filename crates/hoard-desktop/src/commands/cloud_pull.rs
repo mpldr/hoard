@@ -358,7 +358,7 @@ pub async fn restart_if_enabled(app: &AppHandle) -> anyhow::Result<()> {
 async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>) {
     let _ = app.emit("agent://cloud-pull-started", ());
 
-    let creds = match crate::commands::cloud::load_active_creds() {
+    let creds = match crate::commands::cloud::active_creds(app).await {
         Ok(Some(c)) => c,
         Ok(None) => {
             // Session disappeared between polls (user logged out). The logout
@@ -369,7 +369,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
             return;
         }
         Err(e) => {
-            tracing::warn!(error = %e, "cloud-pull: couldn't read session");
+            tracing::warn!(error = %e, "cloud-pull: couldn't get a token for the session");
             let _ = app.emit("agent://offline", ());
             return;
         }

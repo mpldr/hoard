@@ -159,11 +159,11 @@ where
 /// rotarlo aquí (ADR 0021: un único rotador). Returns the response body on 2xx,
 /// `None` (logged) otherwise.
 async fn authed_get(app: &AppHandle, path_and_query: &str) -> Option<String> {
-    let creds = match crate::commands::cloud::load_active_creds() {
+    let creds = match crate::commands::cloud::active_creds(app).await {
         Ok(Some(c)) => c,
         Ok(None) => return None, // signed out between kicks — quiet exit
         Err(e) => {
-            tracing::debug!(error = %e, "cloud-feed: couldn't read session");
+            tracing::debug!(error = %e, "cloud-feed: couldn't get a token for the session");
             return None;
         }
     };
@@ -304,13 +304,11 @@ pub async fn devices_refresh(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn notification_dismiss(app: AppHandle, id: String) -> Result<(), String> {
     use crate::commands::cloud::{
-        borrow_access_token, cloud_err_to_string, handle_session_expired, is_session_expired,
-        load_active_creds,
+        active_creds_or_msg, borrow_access_token, cloud_err_to_string, handle_session_expired,
+        is_session_expired,
     };
     use hoard_agent::cloud_account::{self, CloudError};
-    let Some(creds) = load_active_creds().map_err(|e| e.to_string())? else {
-        return Err("Not signed in to Hoard Cloud.".into());
-    };
+    let creds = active_creds_or_msg(&app).await?;
     match cloud_account::dismiss_notification(&creds.server_url, &creds.access_token, &id).await {
         Ok(()) => Ok(()),
         Err(CloudError::Unauthorized) => {

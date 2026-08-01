@@ -164,7 +164,7 @@ async fn run_loop(app: &AppHandle) -> supervisor::Finished {
 /// One connection lifecycle: connect, join the channel, pump heartbeats and
 /// incoming changes until the socket dies or the lifetime cap fires.
 async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
-    let mut creds = match cloud::load_active_creds()? {
+    let mut creds = match cloud::active_creds(app).await? {
         Some(c) => c,
         None => anyhow::bail!("signed out"),
     };

@@ -3197,7 +3197,6 @@ dependencies = [
  "hoard-core",
  "hoard-manifest",
  "hoardd",
- "keyring",
  "minisign-verify",
  "reqwest 0.12.28",
  "serde",

@@ -892,6 +892,7 @@ pub enum RemoteUpgradeOutcome {
 /// on `is_admin` so this is a defence-in-depth check, not the primary one.
 #[tauri::command]
 pub async fn trigger_server_upgrade(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RemoteUpgradeOutcome, AppError> {
     let server_url = state
@@ -903,7 +904,9 @@ pub async fn trigger_server_upgrade(
         .ok_or_else(|| {
             AppError::new("updates.error.title", "updates.error.server_not_logged_in")
         })?;
-    let token = hoard_agent::credentials::load()
+    // Prestado por el servicio: el ítem del llavero es suyo (D.20).
+    let token = crate::commands::auth::server_session(&app)
+        .await
         .ok()
         .flatten()
         .map(|c| c.token)

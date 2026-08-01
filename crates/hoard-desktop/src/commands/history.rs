@@ -71,11 +71,12 @@ fn snapshot_to_wire(s: hoard_agent::api::Snapshot) -> SnapshotWire {
 /// (recoverable until the server's retention window passes).
 #[tauri::command]
 pub async fn list_save_snapshots(
+    app: AppHandle,
     save_id: String,
     include_deleted: bool,
     state: State<'_, AppState>,
 ) -> Result<Vec<SnapshotWire>, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     // Cloud now exposes the full version history via a dedicated endpoint
     // (the sync manifest still only carries the latest). One row per version.
     if client.is_cloud().await {
@@ -96,11 +97,12 @@ pub async fn list_save_snapshots(
 /// row on the History page.
 #[tauri::command]
 pub async fn save_snapshot_detail(
+    app: AppHandle,
     save_id: String,
     version: i64,
     state: State<'_, AppState>,
 ) -> Result<SnapshotDetailWire, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     // Cloud stores a whole-archive blob with no per-file index. We still want
     // History to show what's inside, so we fetch the version's metadata from
     // the history endpoint and stream the blob to read its tar headers (paths +
@@ -159,11 +161,12 @@ pub async fn save_snapshot_detail(
 /// `include_deleted=true` queries can still see it.
 #[tauri::command]
 pub async fn delete_snapshot(
+    app: AppHandle,
     save_id: String,
     version: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     // Cloud now deletes a single version (blob + row) and repoints the latest
     // pointer; the whole save is removed only when no versions remain. The
     // server handles that fallback, so this stays per-version.
@@ -181,8 +184,11 @@ pub async fn delete_snapshot(
 
 /// Current per-user "max versions per save" cap. `None` = unlimited.
 #[tauri::command]
-pub async fn get_max_versions(state: State<'_, AppState>) -> Result<Option<i64>, String> {
-    let client = current_client(&state)?;
+pub async fn get_max_versions(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<i64>, String> {
+    let client = current_client(&app, &state).await?;
     client.get_max_versions().await.map_err(pretty_error)
 }
 
@@ -191,10 +197,11 @@ pub async fn get_max_versions(state: State<'_, AppState>) -> Result<Option<i64>,
 /// a cap that would actually prune something.
 #[tauri::command]
 pub async fn preview_max_versions(
+    app: AppHandle,
     max_versions: i64,
     state: State<'_, AppState>,
 ) -> Result<i64, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     client
         .preview_max_versions(max_versions)
         .await
@@ -206,10 +213,11 @@ pub async fn preview_max_versions(
 /// the change on their next refresh.
 #[tauri::command]
 pub async fn set_max_versions(
+    app: AppHandle,
     max_versions: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     client
         .set_max_versions(max_versions)
         .await
@@ -219,11 +227,12 @@ pub async fn set_max_versions(
 /// Pull a snapshot back out of the trash. Inverse of `delete_snapshot`.
 #[tauri::command]
 pub async fn undelete_snapshot(
+    app: AppHandle,
     save_id: String,
     version: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
     if client.is_cloud().await {
         return Err("Restoring snapshots from trash isn't supported on Hoard Cloud.".to_string());
     }
@@ -286,7 +295,7 @@ pub async fn restore_snapshot(
     destination_override: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<RestoreOutcome, String> {
-    let client = current_client(&state)?;
+    let client = current_client(&app, &state).await?;
 
     // Resolve the destination. Priority: explicit override > CliState lookup.
     // If neither yields a path we surface a structured error the frontend

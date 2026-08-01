@@ -51,12 +51,11 @@ tauri-plugin-deep-link = "2"
 # binding (Ctrl+O for the Pro overlay) is registered at runtime by the UI only
 # when the Pro layer is present — the community build ships the plugin unused.
 tauri-plugin-global-shortcut = "2"
-keyring = { version = "3", default-features = false, features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-    "crypto-rust",
-] }
+# Sin `keyring`: desde D.20 (ADR 0021) el desktop no toca el almacén de secretos.
+# El par de tokens Cloud lo escribe y lo lee el servicio, que es su dueño — en
+# macOS el ítem sólo autoriza al binario que lo creó, así que compartirlo entre dos
+# binarios era un diálogo de contraseña por lectura. No volver a añadirla aquí: si
+# un comando necesita el token, se lo pide al servicio (`DaemonLink::cloud_token`).
 toml = { workspace = true }
 # Ed25519 minisign verifier — gates the auto-updater so an installer is only
 # run (as root, via pkexec) after its signature matches the embedded release

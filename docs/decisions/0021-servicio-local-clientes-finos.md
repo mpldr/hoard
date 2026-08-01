@@ -1626,3 +1626,133 @@ notificaciones, que ni existen todavía.
 
 **Siguiente:** Slice 5 — estado en SQLite (C.4), con el plan de migración de
 D.1.2 como prerrequisito.
+
+### D.20 — El dueño del secreto es el servicio: `AdoptSession` (2026-07-30)
+
+**Reporte real, 1.1.0, macOS 26.6:** "i continuously get password prompts from
+hoard after the 1.1.0 update". No era un login de Hoard: era el diálogo del
+Llavero (`hoardd quiere usar tu información confidencial almacenada en
+hoard-desktop-cloud`), una y otra vez.
+
+**Causa raíz.** En macOS cada ítem del llavero lleva una ACL con los binarios
+autorizados, y el único que entra en ella es el que **crea** el ítem. Hasta 1.0.x
+lo creaba y lo leía el mismo binario (la app). El Slice 4 se llevó el motor a
+`hoardd` y con él las lecturas, pero dejó la escritura en el login del cliente
+(`cloud.rs::save_creds`, `hoard-cli`): creador y lector pasaron a ser binarios
+distintos, así que **cada lectura del servicio pedía autorización**. Y no una vez:
+
+1. el build de macOS va sin firmar (`tauri.conf.json` sin `signingIdentity`, las
+   `APPLE_*` de `release-desktop.yml` comentadas), así que "Permitir siempre" no
+   se puede anclar a un requirement estable — ni sobrevive a un update, que es
+   por lo que empieza justo al actualizar;
+2. sin fallback: con el llavero escrito, `cloud.toml` va con `auth = None`, así
+   que `pick_auth` propaga el error en vez de caer al fichero;
+3. y el keeper reintenta el arranque del motor con backoff 5s→5min
+   (`engine.rs`), y cada intento vuelve a leer → un diálogo por intento.
+
+Linux (Secret Service) y Windows (Credential Manager) no atan el secreto al
+binario: por eso el dogfooding no lo vio nunca.
+
+**Decisiones a no deshacer:**
+
+- **Escribe el que lee: el daemon.** `Request::AdoptSession` (cliente → daemon,
+  con el par) y `Request::ForgetSession`. `cloud_auth::store_tokens` y
+  `clear_session` son del servicio y lo dicen en su doc. Un cliente que acuña una
+  sesión (el OAuth acaba en la app, y `hoard login` en la terminal) la **entrega**;
+  no la guarda. Es la contrapartida exacta de `CloudToken`: el cliente acuña y
+  presta hacia dentro, el daemon guarda, rota y presta hacia fuera.
+- **El refresh token viaja en una sola dirección y una sola vez.** Hacia dentro
+  en `AdoptSession`; de vuelta sólo el access token. Un cliente que no lo tiene no
+  puede rotarlo: la regla de "un único rotador" (D.17) sigue siendo de tipos.
+- **`AdoptedSession` tiene `Debug` a mano y redactado.** El derivado imprimiría
+  los dos tokens, y basta un `?request` en un log del daemon para publicar la
+  sesión en el journal del sistema, que es texto plano y sobrevive al logout. Hay
+  test de que viaja entera por el cable y no aparece nunca en el `Debug`.
+- **Sin servicio, al fichero 0600 y nunca al llavero.** `store_tokens_unlocked` /
+  `forget_tokens_unlocked`. Un login no puede fallar porque el daemon no esté
+  (el usuario acaba de autenticarse), pero escribir el llavero ahí sería
+  reintroducir el bug. Dejándolo en el fichero, el daemon lo recoge al arrancar
+  (`pick_auth` cae al fichero sin entrada en el llavero) y lo sube al llavero en
+  su primer refresh, ya como dueño: se cura solo y sin un diálogo.
+- **El desktop ya no lee el llavero tampoco.** Si lo leyera, el diálogo saldría al
+  revés (el ítem ahora es del daemon). De disco sale sólo lo que no es secreto
+  (`SessionInfo`: plan y `user_id`) y el token lo presta el servicio
+  (`active_creds`, `current_client` ahora `async`). `keyring` **se ha caído de las
+  deps de `hoard-desktop`**, con nota en el `Cargo.toml` para que no vuelva: el
+  par `keyring_set`/`keyring_get` sin tope que D.19 dejó anotado ahí ya no existe.
+- **`AdoptSession`/`ForgetSession` implican reiniciar el motor.** Acabamos de
+  aprender (u olvidar) la sesión: el motor que hubiera está hablando con la
+  anterior. `RestartEngine` sigue existiendo para el token self-hosted, que el
+  cliente sí escribe.
+- **Adoptar no borra el fichero.** El desktop escribe su snapshot de cuenta
+  (`user`) *antes* de entregar, y `store_tokens` es read-modify-write: si adoptar
+  hiciera un `clear_session` implícito se llevaría ese snapshot y la app
+  arrancaría deslogueada. Quien necesita "olvida la anterior y toma ésta" es la
+  CLI, que manda las dos peticiones en la misma conexión.
+
+**Firmar/notarizar sigue pendiente**, y no arregla esto por sí solo (dos binarios
+distintos siguen siendo dos ACLs), pero es lo que hace que cualquier autorización
+que el usuario dé aguante un update.
+
+### D.20.1 — Y lo mismo para self-hosted, donde había además un almacén huérfano
+
+Extender D.20 al server propio destapó un bug mayor que los diálogos: **el motor
+no veía la sesión del desktop en absoluto.** La app guardaba en `credentials`
+(llavero `hoard-desktop` + `session.toml`) y `session::selfhosted()` resolvía
+leyendo `config.toml`, que sólo escribe `hoard login --token`. Dos almacenes
+disjuntos y ningún puente: quien entraba a su server sólo por la app tenía un
+`last_error` de "no session. Sign in with `hoard login`", cero sincronización, y
+una UI que mientras tanto decía "conectado". La causa es la misma que la de los
+diálogos —nadie era el dueño de la sesión— así que el arreglo es el mismo.
+
+**Decisiones a no deshacer:**
+
+- **Tres peticiones gemelas de las de Cloud**: `AdoptServerSession`,
+  `ForgetServerSession` y `ServerToken` (préstamo). La sesión viaja en las **dos**
+  direcciones y aquí eso es correcto: un token `hoard_v1_` es estático, no se rota,
+  así que "entregar" y "prestar" son la misma forma (`ServerSession`). En Cloud no
+  lo son y por eso allí hay dos tipos.
+- **`selfhosted()` resuelve `credentials` primero y `config.toml` después.** Es lo
+  que cierra el bug del almacén huérfano. Manda `credentials` porque es la sesión
+  que el usuario ve en la app y la que tocan los logins nuevos —el de la app y el
+  de la CLI, que ahora la entrega también—; `config.toml` se queda como el camino
+  headless de siempre (texto plano, sin llavero, el que documenta la guía) y como
+  fallback de las instalaciones que ya lo tenían. `lend_server_session` sirve las
+  dos fuentes **en el mismo orden**, para que lo que usa el cliente y lo que usa el
+  motor no puedan divergir.
+- **La CLI escribe las dos.** `hoard login --token` entrega al servicio *y* guarda
+  en `config.toml`: lo primero para que el motor sincronice con lo que acabas de
+  poner, lo segundo para que los one-shots de la propia CLI (`hoard games`,
+  `hoard saves`) sigan funcionando sin servicio delante. Y si no hay servicio a
+  quien entregar, borra la sesión guardada de la app: el motor la prefiere, así que
+  dejarla ahí haría que el login de la terminal no sirviera de nada.
+- **`signed_out` en `session.toml` (la tumba).** Aquí borrar el fichero **no** es
+  un logout: `credentials::load` recupera la sesión del blob del llavero cuando el
+  fichero no está —el arreglo de la ACL que un build viejo de Windows dejaba
+  clavada— y resucitaría lo que el usuario acaba de cerrar. Un cliente sin servicio
+  no puede borrar el ítem (es del dueño), así que deja dicho lo que hizo y `load`
+  lo respeta **antes de mirar el llavero**. `save` escribe un `Session` nuevo, así
+  que el siguiente login la limpia sin acordarse de ella. Cloud no necesita nada de
+  esto porque su `load_session` arranca por el fichero.
+- **`mark_client()` + el hueco del préstamo.** Hay un lector que no puede pedir
+  nada por IPC: `logship`, que corre en su propio hilo con su propio runtime y
+  relee la sesión cada pocos segundos. Lee `credentials::current()`, que en un
+  cliente devuelve **sólo** el préstamo: el desktop se declara cliente al arrancar,
+  y así un hueco vacío significa "sin sesión" en vez de una lectura del llavero
+  ajeno. Perder un lote de diagnóstico opcional es infinitamente mejor que un
+  diálogo de contraseña.
+- **El arranque del desktop lee `load_public()`**, que da URL y usuario del
+  fichero y no toca el llavero. Es lo único que necesita para pintar, y encima corre
+  antes de que exista el enlace con el servicio.
+- **La lectura del llavero en el motor va a `spawn_blocking`.** `selfhosted_owned`
+  corre en la task del keeper, la que el apagado aborta: una lectura síncrona ahí
+  es la mitad del fallo de D.19 otra vez, y esta ruta no la tenía porque antes sólo
+  leía un TOML.
+- **`IpcError::NoServerSession` es variante propia**, no `CloudSessionExpired`
+  reutilizada: un token self-hosted no caduca, y mezclarlas haría que un cliente
+  self-hosted disparara la limpieza de sesión *Cloud* en el desktop.
+
+**Lo que queda igual:** `config.toml` sigue siendo texto plano 0600 y no pasa por
+el llavero, así que no tiene el problema de ACL de nadie. Y el desktop ya no llama
+a `credentials::{load,save,clear}` en ningún sitio — el único que lo hace es
+`hoardd`.

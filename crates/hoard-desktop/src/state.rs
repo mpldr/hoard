@@ -60,10 +60,18 @@ impl AppState {
     /// on-disk session. Failures are logged but never fatal — the user just
     /// goes back through the onboarding wizard.
     pub fn from_disk() -> Self {
-        let user = match hoard_agent::credentials::load() {
-            Ok(Some(creds)) => {
-                let server_url = creds.url.clone();
-                creds.user.map(|u| UserInfo {
+        // Este proceso es un cliente del servicio: que nada de aquí toque el
+        // almacén de secretos, ni siquiera los lectores que viven en el agente y
+        // corren en los dos lados (`logship`). Ver `credentials::mark_client`.
+        hoard_agent::credentials::mark_client();
+        // `load_public` y no `load`: el arranque necesita la URL y el usuario —que
+        // no son secretos y están en `session.toml`— y el token lo presta el
+        // servicio cuando haga falta. Leer aquí el llavero es lo que le pedía la
+        // contraseña al usuario en macOS, y encima esto corre antes de que exista
+        // el enlace con el servicio (D.20).
+        let user = match hoard_agent::credentials::load_public() {
+            Ok(Some((server_url, cached))) => {
+                cached.map(|u| UserInfo {
                     user_id: u.user_id,
                     username: u.username,
                     is_admin: u.is_admin,

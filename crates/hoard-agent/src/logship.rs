@@ -10,7 +10,9 @@
 //! POSTs them to the server. It only ships when the user has opted in
 //! (`prefs.anonymous_telemetry`), a valid session exists (`credentials::load`),
 //! and the server advertises a log-ingest level via `/v1/health`; otherwise
-//! events are discarded. The opt-in is read fresh each cycle, so toggling it
+//! events are discarded (la sesión sale de `credentials::current`, o sea del
+//! préstamo del servicio cuando esto corre en un cliente). The opt-in is read
+//! fresh each cycle, so toggling it
 //! off stops shipping within a few seconds without a restart. The server
 //! dictates the minimum level (self-hosted: DEBUG, cloud: INFO), so the client
 //! filters at source and never sends below it.
@@ -274,7 +276,10 @@ async fn resolve_policy(client: &reqwest::Client) -> Option<Policy> {
     if !telemetry_enabled() {
         return None;
     }
-    let creds = credentials::load().ok().flatten()?;
+    // `current` y no `load`: en un cliente esto es el préstamo del servicio, que es
+    // el dueño del llavero (D.20). Este lector corre en su propio hilo y no puede
+    // pedir nada por IPC, así que lee el hueco que el cliente le deja puesto.
+    let creds = credentials::current().ok().flatten()?;
     let base = creds.url.trim_end_matches('/').to_string();
 
     let health: Health = client
@@ -316,7 +321,7 @@ fn telemetry_enabled() -> bool {
 /// Cheap re-check: is there still a session whose token matches the policy we
 /// resolved? Avoids a full health round-trip on every batch.
 fn session_matches(policy: &Policy) -> bool {
-    matches!(credentials::load(), Ok(Some(c)) if c.token == policy.token)
+    matches!(credentials::current(), Ok(Some(c)) if c.token == policy.token)
 }
 
 async fn post_batch(

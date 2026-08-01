@@ -265,9 +265,67 @@ pub enum Request {
         #[serde(default)]
         rejected: Option<String>,
     },
-    /// La sesión en disco cambió (el usuario entró con otra cuenta Cloud, o
-    /// cerró sesión): tira el motor y deja que el keeper lo levante resolviendo
-    /// las credenciales de nuevo.
+    /// **Toma esta sesión Cloud recién acuñada y guárdala tú.** El cliente
+    /// acaba de terminar un OAuth (o un login por email) y entrega el par en vez
+    /// de escribirlo: el daemon es el único que toca el almacén de secretos.
+    ///
+    /// No es simetría por gusto con [`Request::CloudToken`], es lo que arregla
+    /// los diálogos de contraseña en macOS. Ahí cada ítem del llavero lleva una
+    /// ACL con los binarios autorizados, y quien **crea** el ítem es el único de
+    /// la lista: con el login escribiendo desde la app y el motor leyendo desde
+    /// `hoardd`, cada lectura del servicio era un binario ajeno pidiendo permiso
+    /// → un diálogo por lectura, y el keeper reintentando cada pocos segundos.
+    /// Escribiéndolo el daemon, creador y lector son el mismo binario y no hay
+    /// nada que autorizar. En Linux (Secret Service) y Windows (Credential
+    /// Manager) el secreto no está atado al binario, así que allí esto es sólo
+    /// coherencia: "el motor es el dueño del secreto, los clientes son vistas".
+    ///
+    /// Implica el efecto de [`Request::RestartEngine`]: acabamos de aprender una
+    /// sesión nueva, y el motor que hubiera está hablando con la anterior.
+    AdoptSession {
+        session: AdoptedSession,
+    },
+    /// **Olvida la sesión Cloud** (logout, o cuenta borrada). Lo pide el cliente
+    /// por la misma razón que [`Request::AdoptSession`]: borrar un ítem del
+    /// llavero también hay que autorizarlo, y el que puede hacerlo sin
+    /// preguntarle nada al usuario es su dueño. Implica reiniciar el motor.
+    ForgetSession,
+    /// **Toma esta sesión self-hosted y guárdala tú.** El gemelo de
+    /// [`Request::AdoptSession`] para un server propio: el cliente valida el
+    /// token contra `/v1/auth/whoami` y entrega `(url, token, user)`.
+    ///
+    /// Arregla dos cosas de una, y la segunda es la gorda. La primera es la misma
+    /// ACL del llavero de macOS que [`Request::AdoptSession`]. La segunda es que
+    /// **el motor no veía la sesión del desktop en absoluto**: la app guardaba en
+    /// `credentials` (llavero + `session.toml`) y el motor resolvía self-hosted
+    /// leyendo `config.toml`, que sólo escribe `hoard login --token`. Dos
+    /// almacenes disjuntos, así que quien entraba sólo por la app tenía un motor
+    /// que no sincronizaba nada. Con un único dueño hay un único almacén.
+    ///
+    /// Implica el efecto de [`Request::RestartEngine`], como su gemelo.
+    AdoptServerSession {
+        session: ServerSession,
+    },
+    /// **Olvida la sesión self-hosted** (logout). Igual que
+    /// [`Request::ForgetSession`], pero del server propio.
+    ForgetServerSession,
+    /// **Préstame el token del server propio.** El gemelo de
+    /// [`Request::CloudToken`] para self-hosted, y mucho más simple: un token
+    /// `hoard_v1_…` es estático (no caduca ni se rota), así que aquí no hay
+    /// rotación que decidir — sólo el almacén, que es del daemon.
+    ///
+    /// Devuelve también `user` para que un cliente que perdió su `session.toml`
+    /// (la ACL que un build viejo de Windows dejaba clavada) recupere quién es
+    /// sin esperar a que el daemon le repare el fichero.
+    ServerToken,
+    /// La sesión en disco cambió: tira el motor y deja que el keeper lo levante
+    /// resolviendo las credenciales de nuevo.
+    ///
+    /// Ya no lo necesita ningún login: las cuatro peticiones de sesión
+    /// (`AdoptSession`/`ForgetSession` y sus gemelos self-hosted) lo llevan
+    /// dentro. Se queda porque sigue siendo la forma de decir "he tocado el disco
+    /// por debajo" — un `hoard login --token` sin servicio al alcance, un
+    /// `config.toml` editado a mano.
     ///
     /// Distinto de [`Request::Reload`], que sólo re-hidrata el conjunto de
     /// saves: un cambio de cuenta invalida el `ApiClient`, el contexto de
@@ -303,6 +361,78 @@ pub enum Payload {
     Status(DaemonStatus),
     Backlog(Backlog),
     CloudToken(CloudToken),
+    /// La sesión self-hosted prestada (respuesta a [`Request::ServerToken`]).
+    ServerSession(ServerSession),
+}
+
+/// Una sesión Cloud que un cliente **entrega** al daemon
+/// ([`Request::AdoptSession`]).
+///
+/// Es el único sitio del protocolo por donde viaja un refresh token, y va en una
+/// dirección: cliente → daemon, una vez, al acuñarse la sesión. De vuelta sólo
+/// se presta el access token ([`CloudToken`]), nunca el refresh: un cliente que
+/// no lo tiene no puede rotarlo, que es la regla que sostiene "un único rotador".
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AdoptedSession {
+    /// A qué Cloud pertenece la sesión.
+    pub server_url: String,
+    /// JWT recién emitido.
+    pub access_token: String,
+    /// Refresh token con el que el daemon renovará a partir de ahora.
+    pub refresh_token: String,
+}
+
+/// A mano y **redactado**: el `Debug` derivado imprimiría los dos tokens, y basta
+/// un `?request` en un log del daemon para que la sesión entera acabe en el
+/// journal del sistema (que es texto plano y sobrevive al logout).
+impl std::fmt::Debug for AdoptedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdoptedSession")
+            .field("server_url", &self.server_url)
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Una sesión self-hosted: a qué server, con qué token y de quién.
+///
+/// Viaja en las dos direcciones, y eso es correcto aquí: el token de un server
+/// propio es estático (`hoard_v1_` + 64 hex) y no se rota, así que "entregarlo"
+/// y "prestarlo" son la misma forma. No es el caso de Cloud, donde el refresh
+/// token sólo entra ([`AdoptedSession`]) y sólo sale el access ([`CloudToken`]).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ServerSession {
+    /// URL del server propio.
+    pub server_url: String,
+    /// El bearer token.
+    pub token: String,
+    /// Snapshot de `/v1/auth/whoami` para que el cliente sepa quién es sin una
+    /// llamada de red. `None` cuando no se pudo consultar.
+    #[serde(default)]
+    pub user: Option<ServerUser>,
+}
+
+/// Igual que [`AdoptedSession`]: `Debug` a mano para que el token no aparezca en
+/// ningún log por accidente.
+impl std::fmt::Debug for ServerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSession")
+            .field("server_url", &self.server_url)
+            .field("token", &"<redacted>")
+            .field("user", &self.user)
+            .finish()
+    }
+}
+
+/// Quién es el usuario en su server propio. Espejo de
+/// `hoard_agent::credentials::UserSection`, que es lo que la app cachea en disco;
+/// vive aquí porque el cable no puede depender del agente.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerUser {
+    pub user_id: String,
+    pub username: String,
+    pub is_admin: bool,
 }
 
 /// Un token Cloud prestado por el daemon (respuesta a [`Request::CloudToken`]).
@@ -353,6 +483,14 @@ pub enum IpcError {
     /// el cable porque quien lo descubre es el daemon.
     #[error("the Hoard Cloud session is gone: {reason}")]
     CloudSessionExpired { reason: String },
+    /// No hay sesión self-hosted en esta máquina. El gemelo de
+    /// [`IpcError::CloudSessionExpired`] para un server propio, y **variante
+    /// aparte a propósito**: un token `hoard_v1_` no caduca, así que esto sólo
+    /// significa "aquí no hay sesión", nunca "caducó". Mezclarlas haría que un
+    /// cliente self-hosted disparara la limpieza de sesión *Cloud*, que es lo que
+    /// `CloudSessionExpired` desencadena en el desktop.
+    #[error("there is no self-hosted session on this machine: {reason}")]
+    NoServerSession { reason: String },
     /// Esa petición no existe en esta versión del protocolo.
     #[error("this Hoard service doesn't support `{op}`")]
     Unsupported { op: String },
@@ -556,12 +694,85 @@ mod tests {
             ),
             (Request::RestartEngine, "restart_engine"),
             (Request::CloudToken { rejected: None }, "cloud_token"),
+            (
+                Request::AdoptSession {
+                    session: AdoptedSession {
+                        server_url: "https://api.hoard.services".into(),
+                        access_token: "jwt".into(),
+                        refresh_token: "r0".into(),
+                    },
+                },
+                "adopt_session",
+            ),
+            (Request::ForgetSession, "forget_session"),
+            (
+                Request::AdoptServerSession {
+                    session: ServerSession {
+                        server_url: "https://hoard.example".into(),
+                        token: "hoard_v1_dead".into(),
+                        user: None,
+                    },
+                },
+                "adopt_server_session",
+            ),
+            (Request::ForgetServerSession, "forget_server_session"),
+            (Request::ServerToken, "server_token"),
             (Request::Shutdown, "shutdown"),
         ];
         for (request, op) in cases {
             let json = serde_json::to_value(&request).unwrap();
             assert_eq!(json["op"], op, "wire name changed for {request:?}");
         }
+    }
+
+    /// La sesión entregada va entera por el cable (si no, el daemon no podría
+    /// guardarla) pero **no** por los logs: el `Debug` es a mano justo para eso.
+    /// Un `?request` en un `tracing::` del daemon no puede acabar publicando el
+    /// refresh token en el journal del sistema.
+    #[test]
+    fn an_adopted_session_travels_whole_but_never_prints() {
+        let session = AdoptedSession {
+            server_url: "https://api.hoard.services".into(),
+            access_token: "the-jwt".into(),
+            refresh_token: "the-refresh".into(),
+        };
+        let wire = serde_json::to_string(&Request::AdoptSession {
+            session: session.clone(),
+        })
+        .unwrap();
+        assert!(wire.contains("the-jwt") && wire.contains("the-refresh"));
+
+        let printed = format!("{session:?}");
+        assert!(!printed.contains("the-jwt"), "{printed}");
+        assert!(!printed.contains("the-refresh"), "{printed}");
+        // El servidor sí es útil verlo: es lo que distingue un login de dev de uno
+        // de producción cuando algo no cuadra.
+        assert!(printed.contains("api.hoard.services"), "{printed}");
+    }
+
+    /// Y lo mismo para la sesión self-hosted, que viaja en las dos direcciones:
+    /// entera por el cable, nunca por el log. Aquí el riesgo es mayor que en
+    /// Cloud — un token `hoard_v1_` no caduca, así que uno filtrado en el journal
+    /// vale para siempre hasta que alguien lo revoque.
+    #[test]
+    fn a_server_session_travels_whole_but_never_prints() {
+        let session = ServerSession {
+            server_url: "https://hoard.example".into(),
+            token: "hoard_v1_secret".into(),
+            user: Some(ServerUser {
+                user_id: "u1".into(),
+                username: "rai".into(),
+                is_admin: true,
+            }),
+        };
+        let wire = serde_json::to_string(&Payload::ServerSession(session.clone())).unwrap();
+        assert!(wire.contains("hoard_v1_secret"));
+
+        let printed = format!("{session:?}");
+        assert!(!printed.contains("hoard_v1_secret"), "{printed}");
+        assert!(printed.contains("hoard.example"), "{printed}");
+        // El usuario no es secreto y es justo lo que hace útil el log.
+        assert!(printed.contains("rai"), "{printed}");
     }
 
     /// Campos nuevos con `default`: un daemon viejo que no emite `server` ni

@@ -31,6 +31,7 @@ use hoard_core::ipc::CloudToken;
 use crate::api::ApiClient;
 use crate::cloud_auth;
 use crate::config::CliConfig;
+use crate::credentials;
 use crate::state;
 use crate::supervisor::Finished;
 
@@ -119,7 +120,7 @@ pub async fn resolve_owned() -> Result<Active> {
     if let Some(sess) = cloud_auth::load_session_async().await? {
         return resolve_cloud_owned(sess).await;
     }
-    let active = selfhosted()?;
+    let active = selfhosted_owned().await?;
     // Cloud siempre está arriba; esperar sólo tiene sentido con un server propio.
     wait_for_server(&active).await;
     Ok(active)
@@ -226,14 +227,18 @@ async fn wait_for_server(active: &Active) {
 /// Resuelve la sesión de un **cliente**: igual que [`resolve_owned`] en cuanto a
 /// qué servidor y qué contexto, pero **sin rotar nada**.
 ///
-/// `lent` es el token que el servicio ha prestado (`Request::CloudToken`).
-/// `None` significa "no había servicio a quien pedirlo": se usa el token de
-/// disco tal cual. Puede estar caducado —nadie lo ha renovado, justamente porque
+/// `lent` es el token Cloud que el servicio ha prestado (`Request::CloudToken`) y
+/// `lent_server` la sesión self-hosted (`Request::ServerToken`); `None` en
+/// cualquiera de los dos significa "no había servicio a quien pedirlo": Cloud usa
+/// el token de disco tal cual y self-hosted cae a `config.toml`. Puede estar caducado —nadie lo ha renovado, justamente porque
 /// el rotador es el servicio— y entonces la llamada fallará con un 401 legible;
 /// [`stale_token_hint`] es la pista que la CLI enseña en ese caso. Degradar así
 /// es a propósito: la alternativa era que un `hoard whoami` arrancara el servicio
 /// de sync como efecto secundario.
-pub async fn resolve_borrowed(lent: Option<CloudToken>) -> Result<Active> {
+pub async fn resolve_borrowed(
+    lent: Option<CloudToken>,
+    lent_server: Option<hoard_core::ipc::ServerSession>,
+) -> Result<Active> {
     if let Some(sess) = cloud_auth::load_session()? {
         let (server_url, access) = match lent {
             Some(token) => (token.server_url, token.access_token),
@@ -267,12 +272,72 @@ pub async fn resolve_borrowed(lent: Option<CloudToken>) -> Result<Active> {
             }
         }
     } else {
-        selfhosted()
+        selfhosted_borrowed(lent_server)
     }
 }
 
-/// Sesión self-hosted desde la config (ni Cloud ni tokens que rotar).
-fn selfhosted() -> Result<Active> {
+/// Sesión self-hosted **del dueño** (ni Cloud ni tokens que rotar): del almacén de
+/// sesión y, si ahí no hay nada, de `config.toml`.
+///
+/// El orden es el arreglo de D.20, y era un bug de los gordos: hasta aquí esto
+/// leía **sólo** `config.toml`, que escribe únicamente `hoard login --token`. La
+/// app guarda su sesión en `credentials` (llavero + `session.toml`), así que quien
+/// entraba a su server sólo por la app tenía un motor que no resolvía sesión
+/// ninguna: "no session, sign in with `hoard login`" en el `last_error`, cero
+/// sincronización, y una UI que mientras tanto decía "conectado". Dos almacenes
+/// disjuntos y ningún puente.
+///
+/// Manda [`credentials`] porque es la sesión que el usuario ve en la app y la que
+/// tocan los logins nuevos (el de la app y el de la CLI, que la entrega también).
+/// `config.toml` se queda como el camino headless de siempre —texto plano, sin
+/// llavero, el que documenta la guía de self-hosting— y sirve de fallback para las
+/// instalaciones que ya lo tenían.
+///
+/// Es `async` porque el llavero es síncrono y bloquea el hilo mientras espera: en
+/// la task del keeper —la que el apagado aborta— eso es media mitad del fallo de
+/// D.19, así que la lectura va al pool de bloqueo igual que la de Cloud.
+async fn selfhosted_owned() -> Result<Active> {
+    let stored = tokio::task::spawn_blocking(credentials::load)
+        .await
+        .map_err(|join| anyhow::Error::new(join).context("leyendo la sesión self-hosted"))??;
+    if let Some(creds) = stored {
+        state::set_active_context(Some(state::selfhosted_context(&creds.url)));
+        let client = ApiClient::new(creds.url.clone(), creds.token)?;
+        return Ok(Active {
+            client,
+            is_cloud: false,
+            server: creds.url,
+            cloud: None,
+        });
+    }
+    selfhosted_from_config()
+}
+
+/// La sesión self-hosted de un **cliente**: la que el servicio le presta, y si no
+/// hay servicio la de `config.toml`.
+///
+/// Nunca el llavero, y eso es el punto: el ítem es del daemon, así que un cliente
+/// que lo leyera volvería a pedirle la contraseña al usuario en macOS (D.20). Sin
+/// servicio se degrada a `config.toml` —el camino headless de siempre— y quien
+/// entró sólo por la app verá "no session" hasta que el servicio esté arriba, que
+/// es quien tiene su sesión.
+fn selfhosted_borrowed(lent: Option<hoard_core::ipc::ServerSession>) -> Result<Active> {
+    if let Some(lent) = lent {
+        state::set_active_context(Some(state::selfhosted_context(&lent.server_url)));
+        let client = ApiClient::new(lent.server_url.clone(), lent.token)?;
+        return Ok(Active {
+            client,
+            is_cloud: false,
+            server: lent.server_url,
+            cloud: None,
+        });
+    }
+    selfhosted_from_config()
+}
+
+/// `config.toml`: el camino headless, texto plano y sin llavero. Lo escribe
+/// `hoard login --token` y lo documenta la guía de self-hosting.
+fn selfhosted_from_config() -> Result<Active> {
     let (cfg, _) = CliConfig::load_default()?;
     let token = cfg
         .require_token()
@@ -289,6 +354,37 @@ fn selfhosted() -> Result<Active> {
         server: cfg.server.url,
         cloud: None,
     })
+}
+
+/// El token self-hosted que el daemon presta a un cliente
+/// (`Request::ServerToken`). `None` = no hay sesión self-hosted en esta máquina.
+///
+/// Sirve las dos fuentes que resuelve [`selfhosted`], en el mismo orden, para que
+/// lo que el cliente usa y lo que el motor usa no puedan divergir.
+pub fn lend_server_session() -> Result<Option<hoard_core::ipc::ServerSession>> {
+    if let Some(creds) = credentials::load()? {
+        return Ok(Some(hoard_core::ipc::ServerSession {
+            server_url: creds.url,
+            token: creds.token,
+            user: creds.user.map(|u| hoard_core::ipc::ServerUser {
+                user_id: u.user_id,
+                username: u.username,
+                is_admin: u.is_admin,
+            }),
+        }));
+    }
+    let (cfg, _) = CliConfig::load_default()?;
+    Ok(cfg
+        .auth
+        .token
+        .filter(|t| !t.is_empty())
+        .map(|token| hoard_core::ipc::ServerSession {
+            server_url: cfg.server.url.clone(),
+            token,
+            // `config.toml` no cachea el whoami: el cliente que lo necesite lo
+            // pregunta al server, que es de donde salía antes.
+            user: None,
+        }))
 }
 
 /// Fija el contexto de sync **sin red**: Cloud por el `sub` del JWT guardado, si

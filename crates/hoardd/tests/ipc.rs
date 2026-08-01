@@ -12,6 +12,13 @@
 //! tocar la sesión de nadie. Lo que decide si hay que rotar es puro y está
 //! testeado en `hoard_agent::session` (`needs_rotation`), y la forma de la
 //! petición y de la respuesta, en el golden de `hoard_core::ipc`.
+//!
+//! `AdoptSession` y `ForgetSession` (D.20) faltan por lo mismo, y con más razón:
+//! **escriben** el llavero y el `cloud.toml` de quien ejecuta los tests, así que
+//! un caso aquí le cambiaría la sesión de verdad. Lo que se puede comprobar sin
+//! tocar secretos está comprobado: la forma por cable y que la sesión entregada
+//! no se imprima nunca (`hoard_core::ipc`), y el camino sin servicio
+//! (`hoard_agent::cloud_auth`).
 
 use std::sync::Arc;
 

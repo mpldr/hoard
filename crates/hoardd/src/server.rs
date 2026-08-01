@@ -138,6 +138,68 @@ impl Daemon {
         }
     }
 
+    /// Guarda la sesión que un cliente acaba de acuñar. **La única escritura del
+    /// par de tokens en todo el sistema**, junto con la del refresher.
+    ///
+    /// Va a `spawn_blocking` porque el llavero es síncrono: aunque ya está
+    /// acotado (`KEYRING_TIMEOUT`), bloquea el hilo mientras espera, y ese hilo
+    /// aquí es el de una conexión IPC — con un llavero lento se quedarían
+    /// esperando también las demás peticiones de ese cliente (D.19).
+    async fn adopt_session(&self, session: hoard_core::ipc::AdoptedSession) -> Result<()> {
+        let tokens = hoard_agent::cloud_auth::Tokens {
+            access: session.access_token,
+            refresh: session.refresh_token,
+        };
+        let server_url = session.server_url;
+        tokio::task::spawn_blocking(move || {
+            hoard_agent::cloud_auth::store_tokens(&tokens, &server_url)
+        })
+        .await
+        .context("storing the Cloud session")?
+    }
+
+    /// Olvida la sesión Cloud. `spawn_blocking` por lo mismo que
+    /// [`Daemon::adopt_session`].
+    async fn forget_session(&self) -> Result<()> {
+        tokio::task::spawn_blocking(hoard_agent::cloud_auth::clear_session)
+            .await
+            .context("clearing the Cloud session")?
+    }
+
+    /// Guarda la sesión self-hosted que un cliente acaba de validar. El gemelo de
+    /// [`Daemon::adopt_session`], y `spawn_blocking` por el mismo motivo.
+    async fn adopt_server_session(&self, session: hoard_core::ipc::ServerSession) -> Result<()> {
+        let creds = hoard_agent::Credentials {
+            url: session.server_url,
+            token: session.token,
+            user: session.user.map(|u| hoard_agent::UserSection {
+                user_id: u.user_id,
+                username: u.username,
+                is_admin: u.is_admin,
+            }),
+        };
+        tokio::task::spawn_blocking(move || hoard_agent::credentials::save(&creds))
+            .await
+            .context("storing the self-hosted session")??;
+        Ok(())
+    }
+
+    /// Olvida la sesión self-hosted.
+    async fn forget_server_session(&self) -> Result<()> {
+        tokio::task::spawn_blocking(hoard_agent::credentials::clear)
+            .await
+            .context("clearing the self-hosted session")?
+    }
+
+    /// Presta la sesión self-hosted. No rota nada (un token `hoard_v1_` es
+    /// estático), así que es sólo leer el almacén — pero leerlo **aquí**, que es
+    /// donde no hay que autorizar nada.
+    async fn lend_server_session(&self) -> Result<Option<hoard_core::ipc::ServerSession>> {
+        tokio::task::spawn_blocking(hoard_agent::session::lend_server_session)
+            .await
+            .context("reading the self-hosted session")?
+    }
+
     /// Despacha todo menos `Subscribe` (que necesita la conexión) y `Shutdown`
     /// (que la dispara). Cada comando del motor es un envío al `AgentHandle`: lo
     /// que pasa después llega por el journal, no por la respuesta.
@@ -182,6 +244,82 @@ impl Daemon {
                     }
                 }
             }
+            // Tampoco pasa por `with_engine`, y por el mismo motivo que
+            // `CloudToken`: guardar la sesión es del daemon, no del motor. Es
+            // más: el motor está caído *precisamente* porque no había sesión, y
+            // esto es lo que lo arregla.
+            Request::AdoptSession { session } => {
+                match self.adopt_session(session).await {
+                    Ok(()) => {
+                        tracing::info!("hoardd: adopted a Cloud session handed over by a client");
+                        // Aprender una sesión nueva es un cambio de sesión: el
+                        // motor que hubiera está hablando con la anterior.
+                        self.engine
+                            .request_restart("a client handed us a new Cloud session");
+                        Reply::Ok(Payload::Ack)
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        tracing::warn!(error = %message, "hoardd: couldn't store the Cloud session a client handed over");
+                        Reply::Error(IpcError::Internal { message })
+                    }
+                }
+            }
+            Request::AdoptServerSession { session } => {
+                match self.adopt_server_session(session).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "hoardd: adopted a self-hosted session handed over by a client"
+                        );
+                        self.engine
+                            .request_restart("a client handed us a new self-hosted session");
+                        Reply::Ok(Payload::Ack)
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        tracing::warn!(error = %message, "hoardd: couldn't store the self-hosted session a client handed over");
+                        Reply::Error(IpcError::Internal { message })
+                    }
+                }
+            }
+            Request::ForgetServerSession => match self.forget_server_session().await {
+                Ok(()) => {
+                    tracing::info!("hoardd: forgot the self-hosted session at a client's request");
+                    self.engine.request_restart("a client signed out");
+                    Reply::Ok(Payload::Ack)
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    tracing::warn!(error = %message, "hoardd: couldn't clear the self-hosted session");
+                    Reply::Error(IpcError::Internal { message })
+                }
+            },
+            // Como `CloudToken`: es del daemon, no del motor. Un motor caído no
+            // puede dejar a la app sin poder hablar con su propio server.
+            Request::ServerToken => match self.lend_server_session().await {
+                Ok(Some(session)) => Reply::Ok(Payload::ServerSession(session)),
+                Ok(None) => Reply::Error(IpcError::NoServerSession {
+                    reason: "sign in to your server from the app, or run `hoard login --token`"
+                        .to_string(),
+                }),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    tracing::warn!(error = %message, "hoardd: couldn't lend the self-hosted session");
+                    Reply::Error(IpcError::Internal { message })
+                }
+            },
+            Request::ForgetSession => match self.forget_session().await {
+                Ok(()) => {
+                    tracing::info!("hoardd: forgot the Cloud session at a client's request");
+                    self.engine.request_restart("a client signed out");
+                    Reply::Ok(Payload::Ack)
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    tracing::warn!(error = %message, "hoardd: couldn't clear the Cloud session");
+                    Reply::Error(IpcError::Internal { message })
+                }
+            },
             // No pasa por `with_engine`: reiniciar un motor caído es
             // precisamente lo que puede hacer que vuelva (el keeper resuelve la
             // sesión otra vez), así que un `EngineDown` aquí sería contestar

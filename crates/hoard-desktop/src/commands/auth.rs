@@ -13,8 +13,9 @@
 
 use hoard_agent::api::{ApiClient, ApiError};
 use hoard_agent::credentials::{self, Credentials, UserSection};
+use hoard_core::ipc::{ServerSession, ServerUser};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppState;
 
@@ -105,11 +106,15 @@ pub async fn login(
         is_cloud_server: classify_cloud(&url),
     };
 
-    credentials::save(&Credentials {
-        url,
-        token,
-        user: Some(UserSection::from(who)),
-    })
+    hand_over(
+        &app,
+        &Credentials {
+            url,
+            token,
+            user: Some(UserSection::from(who)),
+        },
+    )
+    .await
     .map_err(|e| format!("Couldn't save credentials: {e}"))?;
 
     *state.user.lock().unwrap() = Some(user.clone());
@@ -122,10 +127,6 @@ pub async fn login(
     if let Err(e) = crate::commands::automatic::restart_if_enabled(&app).await {
         tracing::warn!(error = %e, "login: couldn't rehydrate automatic schedulers");
     }
-    // Hay sesión nueva en disco: que el servicio resuelva con ella. Sin esto, un
-    // motor que llevaba minutos caído por no tener sesión seguiría esperando su
-    // backoff (hasta 5 min) después de que el usuario ya haya entrado.
-    crate::commands::agent::notify_session_changed(&app);
     Ok(user)
 }
 
@@ -144,14 +145,123 @@ pub fn current_user(state: State<'_, AppState>) -> Option<UserInfo> {
 
 /// Clear stored credentials and the in-memory cache.
 #[tauri::command]
-pub fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    credentials::clear().map_err(|e| format!("Couldn't clear credentials: {e}"))?;
+pub async fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    forget(&app)
+        .await
+        .map_err(|e| format!("Couldn't clear credentials: {e}"))?;
     *state.user.lock().unwrap() = None;
     // Repoint at whatever session remains (a cloud login, or none).
     crate::commands::library::sync_active_context(state.inner());
-    // El motor es del servicio (ADR 0021, Slice 4b) y acaba de quedarse sin las
-    // credenciales que estaba usando: que las resuelva otra vez.
-    crate::commands::agent::notify_session_changed(&app);
+    Ok(())
+}
+
+/// Entrega la sesión al servicio, que es su dueño, y se la queda también en el
+/// hueco del préstamo para no tener que pedirla de vuelta.
+///
+/// La app **no escribe** el llavero desde D.20: en macOS su ACL sólo autoriza al
+/// binario que crea el ítem, y el que lo lee en cada arranque del motor es
+/// `hoardd`. Escribiéndolo el servicio, creador y lector son el mismo binario.
+async fn hand_over(app: &AppHandle, creds: &Credentials) -> anyhow::Result<()> {
+    let session = ServerSession {
+        server_url: creds.url.clone(),
+        token: creds.token.clone(),
+        user: creds.user.as_ref().map(|u| ServerUser {
+            user_id: u.user_id.clone(),
+            username: u.username.clone(),
+            is_admin: u.is_admin,
+        }),
+    };
+    let handed = match app.try_state::<AppState>() {
+        Some(state) => match state.daemon.adopt_server_session(session).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "login: the service didn't take the new session");
+                false
+            }
+        },
+        None => false,
+    };
+    if !handed {
+        // Sin servicio: al fichero 0600 y **no** al llavero. El servicio lo lee de
+        // ahí al arrancar y lo sube al llavero él mismo, ya como dueño.
+        credentials::save_unlocked(creds)?;
+        // Y como no se enteró por la entrega, se le avisa por si arrancó
+        // entremedias: un motor caído por no tener sesión seguiría esperando su
+        // backoff (hasta 5 min) después de que el usuario ya haya entrado.
+        crate::commands::agent::notify_session_changed(app);
+    }
+    // El enviador de logs relee la sesión cada pocos segundos desde su propio hilo
+    // y no puede pedir nada por IPC: se la dejamos puesta.
+    credentials::set_lent(Some(creds.clone()));
+    Ok(())
+}
+
+/// La sesión self-hosted que este proceso puede usar: la que ya nos prestaron o
+/// una que le pedimos al servicio. **Nunca el llavero** — el ítem es suyo (D.20).
+///
+/// `Ok(None)` = no hay sesión self-hosted en esta máquina, que es lo que los
+/// llamadores traducían antes a "not logged in". Un servicio caído sí es `Err`: no
+/// es lo mismo que estar deslogueado y decir que sí manda al usuario al asistente
+/// de alta con su sesión intacta.
+///
+/// Se pide **una vez por ejecución** porque un token `hoard_v1_` es estático: no
+/// caduca, no se rota, no hay nada que refrescar.
+pub(crate) async fn server_session(app: &AppHandle) -> anyhow::Result<Option<Credentials>> {
+    if let Some(creds) = credentials::lent() {
+        return Ok(Some(creds));
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        anyhow::bail!("the Hoard service link isn't up yet");
+    };
+    match state.daemon.server_session().await {
+        Ok(session) => {
+            let creds = Credentials {
+                url: session.server_url,
+                token: session.token,
+                user: session.user.map(|u| UserSection {
+                    user_id: u.user_id,
+                    username: u.username,
+                    is_admin: u.is_admin,
+                }),
+            };
+            credentials::set_lent(Some(creds.clone()));
+            Ok(Some(creds))
+        }
+        Err(err) => match err.downcast_ref::<hoard_core::ipc::IpcError>() {
+            Some(hoard_core::ipc::IpcError::NoServerSession { .. }) => Ok(None),
+            _ => Err(err),
+        },
+    }
+}
+
+/// [`server_session`] o el `String` que la UI ya esperaba.
+pub(crate) async fn require_server_session(app: &AppHandle) -> Result<Credentials, String> {
+    match server_session(app).await {
+        Ok(Some(creds)) => Ok(creds),
+        Ok(None) => Err("Not logged in.".into()),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
+/// Cierra la sesión self-hosted: el fichero lo dejamos marcado nosotros, el ítem
+/// del llavero lo borra su dueño.
+pub(crate) async fn forget(app: &AppHandle) -> anyhow::Result<()> {
+    credentials::set_lent(None);
+    let mut forgotten = false;
+    if let Some(state) = app.try_state::<AppState>() {
+        match state.daemon.forget_server_session().await {
+            Ok(()) => forgotten = true,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "logout: the service didn't clear its stored session");
+            }
+        }
+    }
+    if !forgotten {
+        // La marca, no un borrado: `credentials::load` recupera la sesión del blob
+        // del llavero cuando el fichero no está, así que borrarlo la resucitaría.
+        credentials::forget_unlocked()?;
+        crate::commands::agent::notify_session_changed(app);
+    }
     Ok(())
 }
 
@@ -160,14 +270,12 @@ pub fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
 /// reality without forcing a full re-login. Updates the cached
 /// `UserInfo` in place and returns the new copy for convenience.
 #[tauri::command]
-pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, String> {
+pub async fn refresh_quota(app: AppHandle, state: State<'_, AppState>) -> Result<UserInfo, String> {
     let snapshot = state.user.lock().unwrap().clone();
     let Some(current) = snapshot else {
         return Err("Not logged in.".into());
     };
-    let creds = credentials::load()
-        .map_err(|e| format!("Couldn't load credentials: {e}"))?
-        .ok_or_else(|| "Not logged in.".to_string())?;
+    let creds = require_server_session(&app).await?;
     let url = creds.url.clone();
     let client = ApiClient::new(creds.url, creds.token).map_err(pretty_error)?;
     let who = match client.whoami().await {
@@ -182,7 +290,7 @@ pub async fn refresh_quota(state: State<'_, AppState>) -> Result<UserInfo, Strin
             // on every 30s poll). Other failures (network blips, 5xx) leave
             // the session intact and keep the last known numbers on screen.
             if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::Unauthorized)) {
-                let _ = credentials::clear();
+                let _ = forget(&app).await;
                 *state.user.lock().unwrap() = None;
                 crate::commands::library::sync_active_context(state.inner());
             }

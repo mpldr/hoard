@@ -1,47 +1,76 @@
 /**
  * Shape of the cover frame in the Dashboard grid — a local, per-device
- * preference, like `cardSizes`.
+ * preference, like `cardSizes`, and dragged from the same corner handle:
+ * sideways sizes the card, downwards reshapes the cover.
  *
- * 2:3 is the convention every store shows a game cover in (Steam's
- * `library_600x900`, GOG, Epic), so it's the default. Square is offered
- * because plenty of people curate their own art — emulated or non-Steam games,
- * custom covers — and that art is often 1:1; forcing it into a poster would
- * crop it just as badly as the old landscape capsule cropped in a poster.
+ * The value is the cover's height ÷ width. 1.5 (2:3) is the poster every store
+ * ships (Steam's `library_600x900`, GOG, Epic) and stays the default; 1 is the
+ * square plenty of curated art comes in — emulated or non-Steam games; below
+ * that live the landscape header capsules (Steam's 460×215 ≈ 0.47), which the
+ * old two-value toggle had no way to ask for. Those are just points on the
+ * range now, and `SaveGameCard` snaps to the two canonical ones while dragging
+ * so "exactly 2:3" and "exactly square" stay reachable by hand.
  */
 import { LazyStore } from "@tauri-apps/plugin-store";
 
-export type CoverShape = "portrait" | "square";
+/** 2:3 — the store-standard poster. */
+export const POSTER = 1.5;
+/** 1:1. */
+export const SQUARE = 1;
 
 const STORE = new LazyStore("cover_shape.json");
 const STORE_KEY = "shape";
-const DEFAULT: CoverShape = "portrait";
+const MIN = 0.45;
+const MAX = 1.8;
 
-let shape = $state<CoverShape>(DEFAULT);
+let aspect = $state<number>(POSTER);
 
-export async function hydrateCoverShape(): Promise<void> {
+function clamp(n: number): number {
+  return Math.max(MIN, Math.min(MAX, n));
+}
+
+export async function hydrateCoverAspect(): Promise<void> {
   try {
-    const saved = await STORE.get<CoverShape>(STORE_KEY);
-    if (saved === "portrait" || saved === "square") shape = saved;
+    const saved = await STORE.get<number | string>(STORE_KEY);
+    // Hasta 1.1.0 esto era el interruptor de dos posiciones; se traduce al
+    // número equivalente para que nadie pierda su elección al actualizar.
+    if (saved === "portrait") aspect = POSTER;
+    else if (saved === "square") aspect = SQUARE;
+    else if (typeof saved === "number" && Number.isFinite(saved)) {
+      aspect = clamp(saved);
+    }
   } catch {
     /* first run / unreadable store — the default stands */
   }
 }
 
-export function coverShape(): CoverShape {
-  return shape;
+export function coverAspect(): number {
+  return aspect;
 }
 
-export async function setCoverShape(next: CoverShape): Promise<void> {
-  shape = next;
+// Persistencia diferida, igual que `cardSizes`: esto lo mueve un arrastre.
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function setCoverAspect(next: number): void {
+  if (!Number.isFinite(next)) return;
+  aspect = clamp(next);
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void persist(aspect);
+  }, 250);
+}
+
+async function persist(value: number): Promise<void> {
   try {
-    await STORE.set(STORE_KEY, next);
+    await STORE.set(STORE_KEY, value);
     await STORE.save();
   } catch {
     /* the choice still applies this session */
   }
 }
 
-/** Tailwind aspect class for the current shape. */
-export function coverAspectClass(s: CoverShape = shape): string {
-  return s === "square" ? "aspect-square" : "aspect-[2/3]";
+/** Inline `aspect-ratio` for the cover box — free-form, so no Tailwind class. */
+export function coverAspectStyle(a: number = aspect): string {
+  return `aspect-ratio: 1 / ${a.toFixed(3)}`;
 }

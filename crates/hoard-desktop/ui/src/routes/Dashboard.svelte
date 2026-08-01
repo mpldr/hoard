@@ -23,9 +23,7 @@
     Layers,
     LogOut,
     Plus,
-    RectangleVertical,
     RefreshCw,
-    Square,
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
@@ -43,12 +41,11 @@
     hydrateGameNames,
     setGameName,
   } from "../lib/stores/gameNames";
+  import { cardWidth } from "../lib/stores/cardSizes.svelte";
   import {
-    coverShape,
-    hydrateCoverShape,
-    setCoverShape,
-    type CoverShape,
-  } from "../lib/stores/coverShape.svelte";
+    coverAspect,
+    hydrateCoverAspect,
+  } from "../lib/stores/coverAspect.svelte";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
   import {
     formatBytes,
@@ -67,17 +64,6 @@
   // SERVER-side one (`total_size_bytes`) — the panel never shows local sizes,
   // that's the Library's job.
   let sortBy = $state<"recent" | "size">("recent");
-
-  // Cover framing, per device. 2:3 is the store-standard poster; square is
-  // there for curated/custom art that isn't one.
-  const SHAPES: { value: CoverShape; icon: typeof Square; key: string }[] = [
-    {
-      value: "portrait",
-      icon: RectangleVertical,
-      key: "dashboard.cover_shape_portrait",
-    },
-    { value: "square", icon: Square, key: "dashboard.cover_shape_square" },
-  ];
 
   const sortedSaves = $derived.by(() => {
     const arr = [...saves];
@@ -285,7 +271,7 @@
       })
       .catch(() => {});
     void hydrateGameNames();
-    void hydrateCoverShape();
+    void hydrateCoverAspect();
     try {
       saves = await api.listTrackedSaves();
     } catch (e) {
@@ -389,37 +375,69 @@
     </div>
   {/if}
 
+  <!-- Resumen de toda la biblioteca. Vivía al pie de la rejilla, donde con
+       muchos juegos no se veía sin bajar del todo; estos cuatro números son
+       justo lo que se mira de un vistazo, así que van antes de las tarjetas. -->
   {#if !loading && saves.length > 0}
+    <div
+      class="mb-5 grid grid-cols-2 gap-x-4 gap-y-5 rounded-xl border border-white/[0.08] bg-zinc-900/40 px-6 py-5 md:grid-cols-4"
+    >
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_games")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <Gamepad2 size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{saves.length}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_versions")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <Layers size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{totalVersions}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.total_size")}</p>
+        <p
+          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+        >
+          <HardDrive size={18} class="text-zinc-500" />
+          <span class="tabular-nums">{formatBytes(totalSize)}</span>
+        </p>
+      </div>
+      <div>
+        <p class="text-xs text-zinc-500">{$_("dashboard.last_backup")}</p>
+        {#if lastBackupAt}
+          <p
+            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+          >
+            <Clock size={18} class="text-zinc-500" />
+            {formatRelativeTime(lastBackupAt, now)}
+          </p>
+          <p class="mt-0.5 pl-[26px] text-[11px] tabular-nums text-zinc-500">
+            {formatDateTime(lastBackupAt)}
+          </p>
+        {:else}
+          <p
+            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+          >
+            <Clock size={18} class="text-zinc-500" />
+            <span>{$_("dashboard.never_saved")}</span>
+          </p>
+        {/if}
+      </div>
+    </div>
+
+    <!-- Ya no hay selector de forma de carátula: el tamaño y el encuadre se
+         arrastran desde la esquina de cualquier tarjeta, como en la
+         biblioteca. -->
     <div
       class="mb-5 flex flex-wrap items-center justify-end gap-x-5 gap-y-3"
     >
-      <!-- Cover shape. 2:3 is what stores use; square is for curated/custom
-           art that isn't a poster. Per device, applies to the whole grid. -->
-      <div class="flex items-center gap-2 text-xs text-zinc-400">
-        <span class="text-zinc-500">{$_("dashboard.cover_shape_label")}</span>
-        <div
-          class="flex items-center gap-0.5 rounded-md border border-white/[0.08] bg-zinc-900 p-0.5"
-          role="group"
-          aria-label={$_("dashboard.cover_shape_label")}
-        >
-          {#each SHAPES as opt (opt.value)}
-            <button
-              type="button"
-              onclick={() => setCoverShape(opt.value)}
-              aria-pressed={coverShape() === opt.value}
-              title={$_(opt.key)}
-              aria-label={$_(opt.key)}
-              class="flex h-6 w-7 items-center justify-center rounded transition-colors {coverShape() ===
-              opt.value
-                ? 'bg-emerald-600/20 text-emerald-300'
-                : 'text-zinc-500 hover:bg-white/[0.06] hover:text-zinc-200'}"
-            >
-              <opt.icon size={13} />
-            </button>
-          {/each}
-        </div>
-      </div>
-
       <label class="flex items-center gap-2 text-xs text-zinc-400">
         <span class="text-zinc-500">{$_("dashboard.sort_label")}</span>
         <select
@@ -496,8 +514,13 @@
       </div>
     </Card>
   {:else}
+    <!-- Columnas por ancho mínimo, no por breakpoint: ese ancho es justo lo
+         que mueve la esquina de arrastre de las tarjetas. -->
     <div
-      class="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4"
+      class="grid gap-5"
+      style="grid-template-columns: repeat(auto-fill, minmax(min({cardWidth(
+        'dashboard',
+      )}px, 100%), 1fr))"
     >
       {#each sortedSaves as save (save.save_id)}
         <SaveGameCard
@@ -506,67 +529,13 @@
           versions={versionCounts[save.save_id]}
           agentRunning={$status.running}
           showLabel={dupSlugs.has(save.game_slug)}
-          shape={coverShape()}
+          aspect={coverAspect()}
           onRename={askRename}
           onBackup={backupNow}
           onTogglePause={togglePause}
           onHistory={(s) => push(`/history/${s.save_id}`)}
         />
       {/each}
-    </div>
-
-    <!-- Library-wide summary: same four numbers the mockup's footer shows. -->
-    <div
-      class="mt-6 grid grid-cols-2 gap-x-4 gap-y-5 rounded-xl border border-white/[0.08] bg-zinc-900/40 px-6 py-5 md:grid-cols-4"
-    >
-      <div>
-        <p class="text-xs text-zinc-500">{$_("dashboard.total_games")}</p>
-        <p
-          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
-        >
-          <Gamepad2 size={18} class="text-zinc-500" />
-          <span class="tabular-nums">{saves.length}</span>
-        </p>
-      </div>
-      <div>
-        <p class="text-xs text-zinc-500">{$_("dashboard.total_versions")}</p>
-        <p
-          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
-        >
-          <Layers size={18} class="text-zinc-500" />
-          <span class="tabular-nums">{totalVersions}</span>
-        </p>
-      </div>
-      <div>
-        <p class="text-xs text-zinc-500">{$_("dashboard.total_size")}</p>
-        <p
-          class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
-        >
-          <HardDrive size={18} class="text-zinc-500" />
-          <span class="tabular-nums">{formatBytes(totalSize)}</span>
-        </p>
-      </div>
-      <div>
-        <p class="text-xs text-zinc-500">{$_("dashboard.last_backup")}</p>
-        {#if lastBackupAt}
-          <p
-            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
-          >
-            <Clock size={18} class="text-zinc-500" />
-            {formatRelativeTime(lastBackupAt, now)}
-          </p>
-          <p class="mt-0.5 pl-[26px] text-[11px] tabular-nums text-zinc-500">
-            {formatDateTime(lastBackupAt)}
-          </p>
-        {:else}
-          <p
-            class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
-          >
-            <Clock size={18} class="text-zinc-500" />
-            <span>{$_("dashboard.never_saved")}</span>
-          </p>
-        {/if}
-      </div>
     </div>
   {/if}
 </div>

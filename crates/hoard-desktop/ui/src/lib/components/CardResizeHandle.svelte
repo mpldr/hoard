@@ -1,32 +1,64 @@
 <script lang="ts">
   /**
-   * Drag-to-resize handle for Library grid cards.
+   * Drag-to-resize handle for the card grids.
    *
-   * Place inside a card element. On mousedown the user can drag to change the
-   * minimum column width for the entire section. The parent grid must use
+   * Place inside a card element (the card must be `relative`). On pointerdown
+   * the user drags to change the minimum column width for the entire section.
+   * The parent grid must use
    * `grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr))`
    * and read from the `cardSizes` store.
    *
+   * The vertical axis is opt-in: pass `onVerticalDrag` and the same drag also
+   * reports how far down the pointer went, which the Dashboard turns into the
+   * cover's shape (2:3 ↔ square ↔ landscape). Library grids leave it out — their
+   * height is whatever the content needs — and behave exactly as before.
+   *
    * Usage:
    *   <CardResizeHandle section="tracked" />
+   *   <CardResizeHandle section="dashboard" onVerticalDrag={(dy, w) => …} />
    */
   import type { SectionKey } from "../stores/cardSizes.svelte";
   import { setCardWidth, cardWidth } from "../stores/cardSizes.svelte";
 
-  let { section }: { section: SectionKey } = $props();
+  let {
+    section,
+    onVerticalDrag,
+    title,
+  }: {
+    section: SectionKey;
+    /**
+     * Optional. Called on every move with the pixels dragged down since the
+     * start and the card's laid-out width at that moment — enough to turn the
+     * drag into a ratio without measuring anything mid-gesture.
+     */
+    onVerticalDrag?: (dy: number, startCardWidth: number) => void;
+    title?: string;
+  } = $props();
 
+  let el = $state<HTMLSpanElement | null>(null);
   let dragging = $state(false);
   let startX = $state(0);
+  let startY = $state(0);
   let startW = $state(0);
+  let startCardW = $state(0);
 
   function onPointerDown(e: PointerEvent) {
     e.preventDefault();
     e.stopPropagation();
     dragging = true;
     startX = e.clientX;
+    startY = e.clientY;
     startW = cardWidth(section);
+    // `offsetWidth` del contenedor posicionado (la tarjeta), no
+    // `getBoundingClientRect`: la tarjeta está inclinada por `use:tilt` y el
+    // rect saldría del bbox ya transformado, unos puntos más ancho.
+    const card = el?.offsetParent as HTMLElement | null;
+    startCardW = card?.offsetWidth || startW;
     document.body.style.cursor = "nwse-resize";
     document.body.style.userSelect = "none";
+    // Un aviso de apertura con dy=0: quien escucha ancla ahí su valor de
+    // partida y ya no depende de dónde caiga el primer pointermove.
+    onVerticalDrag?.(0, startCardW);
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
   }
@@ -36,6 +68,7 @@
     const dx = e.clientX - startX;
     // Each px of drag = 1px of card width change.
     setCardWidth(section, startW + dx);
+    onVerticalDrag?.(e.clientY - startY, startCardW);
   }
 
   function onPointerUp() {
@@ -49,8 +82,10 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <span
+  bind:this={el}
   class="absolute bottom-0 right-0 z-10 h-4 w-4 cursor-nwse-resize opacity-0 transition-opacity group-hover:opacity-100"
   onpointerdown={onPointerDown}
+  {title}
 >
   <!-- Three diagonal lines indicating resize -->
   <svg

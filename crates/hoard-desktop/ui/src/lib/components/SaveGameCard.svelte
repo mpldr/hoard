@@ -31,9 +31,15 @@
   import { _ } from "svelte-i18n";
 
   import Button from "./Button.svelte";
+  import CardResizeHandle from "./CardResizeHandle.svelte";
   import Cover from "./Cover.svelte";
   import type { TrackedSave } from "../api";
-  import { coverAspectClass, type CoverShape } from "../stores/coverShape.svelte";
+  import {
+    coverAspectStyle,
+    setCoverAspect,
+    POSTER,
+    SQUARE,
+  } from "../stores/coverAspect.svelte";
   import { activity } from "../stores/agent";
   import { customNames } from "../stores/gameNames";
   import {
@@ -50,7 +56,7 @@
     versions,
     agentRunning,
     showLabel,
-    shape,
+    aspect,
     onRename,
     onBackup,
     onTogglePause,
@@ -68,9 +74,9 @@
     /** True when another tracked save shares this slug: the label chip is
      *  what tells the two folders apart. */
     showLabel: boolean;
-    /** Frame the cover as a 2:3 poster or a square — the user's choice, held
-     *  by the parent so the whole grid agrees. */
-    shape: CoverShape;
+    /** Cover height ÷ width (1.5 = the 2:3 poster, 1 = square). The user drags
+     *  it from the corner handle; the parent holds it so the grid agrees. */
+    aspect: number;
     onRename: (save: TrackedSave) => void;
     onBackup: (save: TrackedSave) => void;
     onTogglePause: (save: TrackedSave) => void;
@@ -220,6 +226,29 @@
   /** Live status pill for this save (LOCAL state — see the invariant). */
   const pill = $derived(pillFor(save));
 
+  /**
+   * Vertical half of the corner drag: how tall the cover is relative to the
+   * card. The handle opens every gesture with `dy = 0`, which is where the
+   * anchor is taken; from there the ratio only ever moves *relative* to it, so
+   * a mis-measured width changes how fast the cover reshapes and nothing
+   * else — it can't make it jump as the drag begins.
+   */
+  let aspectAtDragStart: number | null = null;
+
+  function reshapeCover(dy: number, cardW: number) {
+    if (dy === 0 || aspectAtDragStart === null) aspectAtDragStart = aspect;
+    setCoverAspect(snapCanonical(aspectAtDragStart + dy / cardW));
+  }
+
+  /** 2:3 and 1:1 are the two ratios art is actually authored in — worth
+   *  landing on exactly, not near. Everything between them is free. */
+  function snapCanonical(a: number): number {
+    for (const target of [POSTER, SQUARE]) {
+      if (Math.abs(a - target) < 0.04) return target;
+    }
+    return a;
+  }
+
   // Overflow ("…") menu on the cover. Closes on any pointerdown outside the
   // wrapper (which contains both the trigger and the dropdown).
   let menuOpen = $state(false);
@@ -243,13 +272,22 @@
   class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-900/40 shadow-[0_1px_0_0_rgba(255,255,255,0.03)_inset] transition-all duration-200 hover:-translate-y-1 hover:border-white/[0.14] hover:shadow-[0_16px_40px_-12px_rgba(0,0,0,0.8)]"
   use:tilt
 >
-  <!-- Big cover, framed 2:3 (the store-standard cover ratio) or square, per
-       the user's choice. Rust prefers Steam's vertical `library_600x900`, so
-       most games fill the poster exactly; the ones that only ship the
-       landscape header get letterboxed by `fit="smart"` rather than
-       center-cropped to a third of themselves. Own art beats both: hover the
-       cover → pencil in the corner. -->
-  <div class="relative {coverAspectClass(shape)} w-full overflow-hidden">
+  <!-- Esquina de arrastre, la misma de la biblioteca: a lo ancho manda el
+       tamaño de la tarjeta, a lo alto la forma de la carátula. Sustituye al
+       botón 2:3 / cuadrada, que solo daba dos puntos de todo ese recorrido. -->
+  <CardResizeHandle
+    section="dashboard"
+    onVerticalDrag={reshapeCover}
+    title={$_("dashboard.cover_resize_hint")}
+  />
+
+  <!-- Big cover, framed however the user dragged the corner handle: 2:3 (the
+       store-standard ratio) by default, square, or the landscape capsule.
+       Rust prefers Steam's vertical `library_600x900`, so most games fill the
+       poster exactly; the ones that only ship the landscape header get
+       letterboxed by `fit="smart"` rather than center-cropped to a third of
+       themselves. Own art beats both: hover the cover → pencil in the corner. -->
+  <div class="relative w-full overflow-hidden" style={coverAspectStyle(aspect)}>
     <Cover
       slug={save.game_slug}
       name={displayName}

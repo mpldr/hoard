@@ -26,6 +26,7 @@
     type CloudAccountInfo,
   } from "../api";
   import Cover from "../components/Cover.svelte";
+  import WrappedCard from "./WrappedCard.svelte";
   import {
     Eye,
     EyeOff,
@@ -38,6 +39,7 @@
     Crown,
     Clock,
     Sparkles,
+    Camera,
     X,
   } from "lucide-svelte";
   import { tr, fmtBytes } from "./lib";
@@ -122,6 +124,8 @@
   let daysByKey = $state<Record<string, number>>({});
   // Day whose detail panel is open (its `key`), or null when none.
   let selectedKey = $state<string | null>(null);
+  // La tarjeta compartible (el botón de la cámara, al final de la página).
+  let showCard = $state(false);
   // Year filter — buttons for every year with any playtime, plus the current
   // year (so a fresh account still sees its own year). Latest first.
   let yearsAvailable = $state<number[]>([]);
@@ -793,6 +797,45 @@
         </p>
       {/if}
     </div>
+  {/if}
+
+  <!-- Cierre de la página: la barra de la cámara. Abre la tarjeta
+       compartible — el mismo resumen, en una imagen que se puede enseñar. -->
+  <button
+    type="button"
+    onclick={() => (showCard = !showCard)}
+    class="group mt-4 flex w-full items-center justify-center gap-2.5 rounded-2xl border px-4 py-3.5 transition {showCard
+      ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200'
+      : 'border-white/[0.08] bg-zinc-900/60 text-zinc-300 hover:border-emerald-400/30 hover:bg-emerald-500/[0.06] hover:text-emerald-200'}"
+    aria-expanded={showCard}
+    title={tr({
+      es: "Crea una imagen de tu resumen para compartir",
+      en: "Turn your recap into a shareable image",
+    })}
+  >
+    <span
+      class="grid h-8 w-8 place-items-center rounded-xl bg-emerald-500/15 ring-1 ring-emerald-400/30 transition group-hover:bg-emerald-500/25"
+    >
+      <Camera size={17} class="text-emerald-300" />
+    </span>
+    <span class="text-sm font-medium">
+      {showCard
+        ? tr({ es: "Cerrar la tarjeta", en: "Close the card", de: "Karte schließen", fr: "Fermer la carte", it: "Chiudi la card", ja: "カードを閉じる", pt: "Fechar o card", zh: "关闭卡片" })
+        : tr({ es: "Tu tarjeta para compartir", en: "Your shareable card", de: "Deine Karte zum Teilen", fr: "Ta carte à partager", it: "La tua card da condividere", ja: "共有用カード", pt: "Seu card para compartilhar", zh: "可分享的卡片" })}
+    </span>
+  </button>
+
+  {#if showCard}
+    <WrappedCard
+      daysByKey={daysByKey}
+      dailyByGame={dailyByGame}
+      appIdBySlug={appIdBySlug}
+      sessionName={identity.name}
+      sessionAvatar={identity.avatar}
+      totalGames={totalGames}
+      hoardedBytes={hoardedBytes}
+      onClose={() => (showCard = false)}
+    />
   {/if}
 </div>
 

@@ -11,8 +11,19 @@ deploy/config.toml
 /dist-v1
 /dist-*
 
+# Documentación interna: ADRs y READMEs de crate/carpeta. Se quedan en local.
+# El repo sólo lleva los .md principales de la raíz (README, CHANGELOG,
+# CONTRIBUTING, SELF-HOST_GUIDE, FUNDING), la plantilla de PR y el contenido
+# .md de la web (`web/src/lib/guides/`), que es lo que el sitio compila.
+/docs/
+/crates/hoard-agent/tests/fixtures/README.md
+/crates/hoard-manifest/data/README.md
+/crates/hoard-screen/README.md
+/crates/hoard-pruebas/README.md
+/deploy/docker/README.md
+
 # Local scratch / draft notes that should never be committed.
-# Root-only patterns: docs/**.md and CHANGELOG.md are unaffected.
+# Root-only patterns: CHANGELOG.md y el resto de principales no se ven afectados.
 /guide*.md
 /version*.md
 /plan*.md

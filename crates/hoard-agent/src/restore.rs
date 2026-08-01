@@ -118,6 +118,32 @@ fn restore_byte_cap(declared_expanded: Option<u64>) -> u64 {
     }
 }
 
+/// Dónde se plantan las rutas relativas de un snapshot.
+///
+/// Normalmente es `dest` tal cual. Pero un **save de fichero suelto** guarda
+/// en `local_path` el fichero, no una carpeta, y su snapshot lleva una única
+/// entrada con el nombre base — así que `dest.join("save.dat")` daría
+/// `…/save.dat/save.dat`. En ese caso la raíz es el directorio padre y el
+/// `join` reconstruye exactamente la ruta original.
+///
+/// Se reconoce por dos vías, porque las dos ocurren: el fichero ya está en
+/// disco (lo normal), o la máquina es nueva y no hay nada — y entonces manda
+/// la forma del snapshot: una sola entrada llamada igual que el destino.
+fn extraction_root(dest: &Path, snapshot_names: &[&str]) -> PathBuf {
+    let is_single_file_save = dest.is_file()
+        || (!dest.exists()
+            && matches!(snapshot_names, [only]
+                if Some(*only) == dest.file_name().and_then(|s| s.to_str())));
+    if is_single_file_save {
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    dest.to_path_buf()
+}
+
 /// Resolve the snapshot version to use: the explicit one if supplied, else the
 /// save's `latest_version_num`. Errors if the save has no snapshots yet.
 pub async fn resolve_version(
@@ -165,6 +191,13 @@ pub async fn download_snapshot<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
+    // Misma regla de forma que el alta, y por el mismo motivo: un restore
+    // sobre `C:\Users\<x>` o sobre `~` volcaría un snapshot encima del perfil
+    // del usuario. Aquí importa más aún que en el alta, porque esto ESCRIBE —
+    // y la ruta puede venir de un `state.json` envenenado por una detección
+    // vieja o de otra máquina. La carpeta puede no existir todavía (equipo
+    // nuevo), así que sólo se comprueba la forma.
+    crate::library::validate_path_shape(dest)?;
     if client.is_cloud().await {
         return download_snapshot_cloud(client, save_id, version, dest, options, progress).await;
     }
@@ -176,8 +209,18 @@ where
         .map(|f| (f.relative_path.clone(), f))
         .collect();
 
+    let names: Vec<&str> = detail
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
+    let root = extraction_root(dest, &names);
+    let single_file = root != dest;
+
     if dest.exists() {
-        let empty = std::fs::read_dir(dest)?.next().is_none();
+        // "No vacío" sólo tiene sentido para una carpeta; un save de fichero
+        // suelto que ya existe es exactamente lo que venimos a sustituir.
+        let empty = !single_file && std::fs::read_dir(dest)?.next().is_none();
         if !empty && !options.force {
             bail!(
                 "destination is not empty: {} (set force = true to extract anyway)",
@@ -185,7 +228,7 @@ where
             );
         }
     } else {
-        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     }
 
     let resp = client.snapshot_download(save_id, version).await?;
@@ -236,7 +279,7 @@ where
             None if entry.header().entry_type().is_dir() => continue,
             None => bail!("unsafe path in archive: {}", path_in_tar.display()),
         };
-        let dest_path = dest.join(&safe_rel);
+        let dest_path = root.join(&safe_rel);
 
         if entry.header().entry_type().is_dir() {
             tokio::fs::create_dir_all(&dest_path).await.ok();
@@ -382,8 +425,11 @@ where
 
     let meta = client.cloud_download(save_id, version).await?;
 
+    // Ídem que en la ruta legacy: un save de fichero suelto ya existente no es
+    // un "destino no vacío", es justo lo que venimos a sustituir.
+    let root = extraction_root(dest, &[]);
     if dest.exists() {
-        let empty = std::fs::read_dir(dest)?.next().is_none();
+        let empty = root != dest || std::fs::read_dir(dest)?.next().is_none();
         if !empty && !options.force {
             bail!(
                 "destination is not empty: {} (set force = true to extract anyway)",
@@ -391,7 +437,7 @@ where
             );
         }
     } else {
-        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     }
 
     // 1. Stream the archive to a temp file, hashing as we go.
@@ -617,8 +663,16 @@ async fn restore_cloud_cas<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
+    let names: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
+    let root = extraction_root(dest, &names);
+    let single_file = root != dest;
+
     if dest.exists() {
-        let empty = std::fs::read_dir(dest)?.next().is_none();
+        let empty = !single_file && std::fs::read_dir(dest)?.next().is_none();
         if !empty && !options.force {
             bail!(
                 "destination is not empty: {} (set force = true to extract anyway)",
@@ -626,7 +680,7 @@ where
             );
         }
     } else {
-        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     }
 
     let total: u64 = manifest
@@ -641,7 +695,7 @@ where
     for file in &manifest.files {
         let safe_rel = sanitize(Path::new(&file.relative_path))
             .ok_or_else(|| anyhow!("unsafe path in manifest: {}", file.relative_path))?;
-        jobs.push((file, dest.join(safe_rel)));
+        jobs.push((file, root.join(safe_rel)));
     }
 
     // Dedup against the disk before touching the network. Hashing the folder
@@ -882,6 +936,11 @@ async fn download_and_extract_cloud<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
+    // Ruta legacy (archivo entero, sin manifiesto por fichero): la forma del
+    // snapshot no se conoce de antemano, así que sólo puede reconocerse un
+    // save de fichero suelto porque el fichero ya esté en disco. Basta: esta
+    // ruta sólo la toman versiones antiguas ya subidas.
+    let root = extraction_root(dest, &[]);
     let resp = client.get_presigned(&meta.download).await?;
     let total = resp
         .content_length()
@@ -945,7 +1004,7 @@ where
             None if entry.header().entry_type().is_dir() => continue,
             None => bail!("unsafe path in archive: {}", path_in_tar.display()),
         };
-        let dest_path = dest.join(&safe_rel);
+        let dest_path = root.join(&safe_rel);
 
         if entry.header().entry_type().is_dir() {
             tokio::fs::create_dir_all(&dest_path).await.ok();
@@ -1111,6 +1170,46 @@ pub fn sanitize(p: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La cuenta que importa: `root.join(nombre)` tiene que devolver la ruta
+    /// original del fichero, no `…/save.dat/save.dat`.
+    #[test]
+    fn a_single_file_save_extracts_into_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ssr_save.bin");
+        std::fs::write(&file, b"x").unwrap();
+
+        let root = extraction_root(&file, &["ssr_save.bin"]);
+        assert_eq!(root, tmp.path());
+        assert_eq!(root.join("ssr_save.bin"), file);
+    }
+
+    /// Máquina nueva: el fichero aún no existe, así que decide la forma del
+    /// snapshot — una sola entrada llamada como el destino.
+    #[test]
+    fn a_missing_single_file_save_is_recognised_from_the_snapshot_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("save.dat");
+        assert_eq!(extraction_root(&file, &["save.dat"]), tmp.path());
+        // Con más de una entrada es una carpeta que todavía no existe.
+        assert_eq!(
+            extraction_root(&file, &["a.sav", "b.sav"]),
+            file,
+            "varios ficheros ⇒ el destino es la carpeta"
+        );
+        // Y una entrada con OTRO nombre tampoco lo convierte en fichero suelto.
+        assert_eq!(extraction_root(&file, &["otro.dat"]), file);
+    }
+
+    /// Un save de carpeta normal no se toca.
+    #[test]
+    fn a_folder_save_extracts_into_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Saves");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("slot1.sav"), b"x").unwrap();
+        assert_eq!(extraction_root(&dir, &["slot1.sav"]), dir);
+    }
 
     #[test]
     fn retryable_blob_error_covers_truncation_and_sha() {

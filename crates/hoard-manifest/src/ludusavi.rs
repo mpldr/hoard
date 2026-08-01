@@ -5,29 +5,40 @@
 //! that many entries is impossible — the [Ludusavi][1] community manifest
 //! already does the work and is the de-facto standard for save-sync data.
 //!
-//! ## How the catalog gets loaded
+//! ## Two datasets
+//!
+//! - [`catalog`] — the games we can back up: save paths plus what it takes
+//!   to resolve them (`install_dirs` for `<base>`) and to recognise the game
+//!   while it runs (`launch_exes`).
+//! - [`titles`] — the two thirds of the manifest with **no** save path. They
+//!   can't be tracked, so keeping them in the catalog would only slow every
+//!   scan down; they exist to put a name on a process or an appid.
+//!
+//! ## How they get loaded
 //!
 //! Two sources, in priority order:
 //!
-//! 1. **Runtime override** at `<cache_dir>/hoard/ludusavi-catalog.json`,
+//! 1. **Runtime override** at `<cache_dir>/hoard/ludusavi-{catalog,titles}.json`,
 //!    written by [`save_runtime_override`] after a successful update.
-//!    This lets the desktop refresh its catalog without a re-install.
-//! 2. **Compile-time embedded** [`CATALOG_JSON`] (~7 MB), produced by the
-//!    Python conversion script. Always available, always works offline.
+//!    This lets the desktop refresh without a re-install. An override written
+//!    before `launch:`/`installDir:` existed is detected by shape and ignored,
+//!    so an old file can't silently switch those features off.
+//! 2. **Compile-time embedded** blobs (~1.7 MB of zstd for ~11.6 MB of JSON).
+//!    Always available, always works offline.
 //!
-//! [`catalog`] resolves both lazily on first call and caches in a
-//! `OnceLock`. After [`save_runtime_override`] writes a new JSON, the
-//! next *process* picks it up — we deliberately don't hot-swap the
-//! cached slice mid-run because that would make detection results
-//! inconsistent across concurrent scans.
+//! Both resolve lazily on first call and cache in a `OnceLock`. After
+//! [`save_runtime_override`] writes a new file, the next *process* picks it
+//! up — we deliberately don't hot-swap the cached slice mid-run because that
+//! would make detection results inconsistent across concurrent scans.
 //!
 //! ## Refreshing
 //!
-//! [`fetch_and_save`] downloads the upstream YAML, runs
-//! [`convert_yaml_to_catalog`] (the in-Rust port of
-//! `data/convert-ludusavi.py`), and writes the JSON to the cache dir.
-//! That function is the entry point both for the desktop's "Update
-//! catalog" button and for the background refresh on app startup.
+//! The desktop downloads the upstream YAML and hands it to
+//! [`save_runtime_override`], which runs [`convert_yaml`] and writes both
+//! files to the cache dir. That is the entry point both for the "Update
+//! catalog" button and for the background refresh on app startup — and it is
+//! the *same* conversion the embedded blobs are generated with (see
+//! `data/README.md`), so shipped and refreshed data can't drift apart.
 //!
 //! ## Path syntax
 //!
@@ -46,17 +57,19 @@
 //! [1]: https://github.com/mtkennerly/ludusavi-manifest
 //! [2]: https://www.pcgamingwiki.com/
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-/// Compact JSON produced by `data/convert-ludusavi.py`. ~7 MB. Lives in the
-/// binary as a `&'static str` thanks to `include_str!`.
-const CATALOG_JSON: &str = include_str!("../data/ludusavi-catalog.json");
+/// Compact JSON produced by the `regenerate_embedded_catalog` generator,
+/// zstd-compressed: ~10 MB of JSON becomes ~1 MB of binary. Decompressed
+/// once, lazily, on the first [`catalog`] call.
+const CATALOG_ZST: &[u8] = include_bytes!("../data/ludusavi-catalog.json.zst");
 
-/// Default upstream URL for [`fetch_and_save`].
+/// Default upstream URL the desktop fetches before calling
+/// [`save_runtime_override`].
 pub const DEFAULT_UPSTREAM_URL: &str =
     "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/manifest.yaml";
 
@@ -64,7 +77,16 @@ pub const DEFAULT_UPSTREAM_URL: &str =
 /// overrides. Used by [`runtime_override_path`] / [`save_runtime_override`].
 const RUNTIME_OVERRIDE_REL: &str = "hoard/ludusavi-catalog.json";
 
+/// Same idea for the title-only index, kept in a sibling file so a refresh
+/// updates both together.
+const TITLES_OVERRIDE_REL: &str = "hoard/ludusavi-titles.json";
+
+/// Compact `name / appid / exes` index for the manifest games that carry no
+/// save path. Names processes and appids; never used to detect a save.
+const TITLES_ZST: &[u8] = include_bytes!("../data/ludusavi-titles.json.zst");
+
 static CATALOG: OnceLock<Vec<LudusaviEntry>> = OnceLock::new();
+static TITLES: OnceLock<Vec<TitleEntry>> = OnceLock::new();
 
 /// One game from the Ludusavi catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +106,56 @@ pub struct LudusaviEntry {
     /// non-Windows hosts. See ADR 0011.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry: Vec<RegistryPath>,
+    /// Folder names the game installs into, from the manifest's
+    /// `installDir:` block. These are what `<base>` and `<game>` in a save
+    /// template resolve to: `<base>/saves` means "the `saves` folder inside
+    /// wherever this game is installed". Without them, ~15.7k templates in
+    /// the manifest expand to nothing at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub install_dirs: Vec<String>,
+    /// Executable **basenames** (lowercased) taken from the manifest's
+    /// `launch:` block — `<base>/Binaries/Win64/EYE.exe` contributes
+    /// `eye.exe`. This is the community-maintained answer to "which process
+    /// means the user is playing this game", which the agent otherwise has
+    /// to guess from the slug. Ambiguous names shared by several games are
+    /// vetoed at lookup time, not here (see `exe_index`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_exes: Vec<String>,
+    /// Additional Steam appids the same game ships under — regional SKUs,
+    /// demos, dev builds (`id.steamExtra` upstream). An installed app whose
+    /// id only matches here is still this game, and without them the appid
+    /// cross-reference silently misses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steam_extra_ids: Vec<u64>,
+    /// Lutris game slug (`id.lutris` upstream). Lutris names its prefix
+    /// directory after this, so it resolves a prefix to a game exactly
+    /// instead of by slugifying the folder name and hoping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lutris_slug: Option<String>,
+    /// The game declares Steam Cloud support (`cloud.steam` upstream).
+    /// Purely informational — surfaced to the user as "Steam already syncs
+    /// this one". It must **never** change detection confidence, ordering,
+    /// or auto-track priority.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cloud_steam: bool,
+}
+
+/// A manifest game we know the **name** of but not where it saves.
+///
+/// Two thirds of the upstream manifest is like this: a title, usually a
+/// Steam appid, and a `launch:` block, but no save path. They can't be
+/// tracked, so they don't belong in [`LudusaviEntry`] — but they answer
+/// "what game is this process / appid?", which is what phase-4 attribution
+/// and the untracked-process notice need in order to stop naming a save
+/// after whatever happened to be running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TitleEntry {
+    #[serde(rename = "n")]
+    pub display_name: String,
+    #[serde(default, rename = "s", skip_serializing_if = "Option::is_none")]
+    pub steam_app_id: Option<u64>,
+    #[serde(default, rename = "e", skip_serializing_if = "Vec::is_empty")]
+    pub launch_exes: Vec<String>,
 }
 
 /// A single Windows registry location from the Ludusavi catalog.
@@ -162,6 +234,41 @@ pub fn runtime_override_path() -> Option<PathBuf> {
     Some(dirs.cache_dir().join(RUNTIME_OVERRIDE_REL))
 }
 
+/// `true` when a loaded override carries no `launch:`/`installDir:` data at
+/// all, which for a real manifest is impossible (~18k of ~21k entries have
+/// one or the other) and therefore means the file was written by a build
+/// from before those fields existed. Checking a bounded prefix keeps this
+/// O(1) on a 20k-entry catalog.
+fn is_outdated_override(entries: &[LudusaviEntry]) -> bool {
+    !entries.is_empty()
+        && !entries
+            .iter()
+            .take(2000)
+            .any(|e| !e.launch_exes.is_empty() || !e.install_dirs.is_empty())
+}
+
+/// Sibling of [`runtime_override_path`] for the title-only index.
+pub fn titles_override_path() -> Option<PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    Some(dirs.cache_dir().join(TITLES_OVERRIDE_REL))
+}
+
+/// Load the title index override, or `None` to fall back to the embedded
+/// one. A missing file is normal: an override written by an older build
+/// updated the catalog only.
+fn load_titles_override() -> Option<Vec<TitleEntry>> {
+    let path = titles_override_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Vec<TitleEntry>>(&text) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "runtime title index malformed; falling back to embedded");
+            None
+        }
+    }
+}
+
 /// Try to load a runtime override from the cache dir. Returns `None` if
 /// the file is absent, unreadable, or doesn't parse — in which case the
 /// caller falls back to the embedded catalog.
@@ -178,7 +285,20 @@ fn load_runtime_override() -> Option<Vec<LudusaviEntry>> {
             return None;
         }
     };
+    // An override written before the catalog grew `launch_exes` /
+    // `install_dirs` still deserializes cleanly — every new field has a
+    // default — and would silently switch off process matching and every
+    // `<base>` template until the next refresh. Detect it by shape and
+    // ignore it: the embedded catalog is complete, and the daily refresh
+    // rewrites the override in the new form.
     match serde_json::from_str::<Vec<LudusaviEntry>>(&text) {
+        Ok(entries) if is_outdated_override(&entries) => {
+            tracing::info!(
+                path = %path.display(),
+                "catalog override predates launch/installDir data; using the embedded catalog until the next refresh"
+            );
+            None
+        }
         Ok(entries) => {
             tracing::info!(
                 path = %path.display(),
@@ -206,9 +326,11 @@ pub fn catalog() -> &'static [LudusaviEntry] {
             if let Some(override_) = load_runtime_override() {
                 return override_;
             }
-            // The embedded JSON was emitted by our own script; a parse
+            // The embedded blob was emitted by our own generator; a decode
             // failure is a build-time invariant violation, not user-facing.
-            serde_json::from_str(CATALOG_JSON).unwrap_or_else(|e| {
+            let json = zstd::decode_all(CATALOG_ZST)
+                .unwrap_or_else(|e| panic!("embedded ludusavi catalog must decompress: {e}"));
+            serde_json::from_slice(&json).unwrap_or_else(|e| {
                 tracing::error!("embedded Ludusavi catalog parse failed: {e}");
                 panic!("embedded ludusavi-catalog.json must parse: {e}");
             })
@@ -222,18 +344,216 @@ pub fn catalog_size() -> usize {
     catalog().len()
 }
 
-/// Look up a Ludusavi entry by Steam app id. O(N) — the cross-reference
-/// only happens during detection, where the steam-installed list is small
-/// (~hundreds), so a linear scan beats indexing the full catalog.
-pub fn find_by_steam_app_id(app_id: u64) -> Option<&'static LudusaviEntry> {
-    catalog().iter().find(|e| e.steam_app_id == Some(app_id))
+/// The title-only index: manifest games with a name but no save path.
+pub fn titles() -> &'static [TitleEntry] {
+    TITLES
+        .get_or_init(|| {
+            if let Some(override_) = load_titles_override() {
+                return override_;
+            }
+            // Softer failure than the catalog: without the title index we
+            // fall back to naming things after the process, which is worse
+            // but not broken.
+            zstd::decode_all(TITLES_ZST)
+                .ok()
+                .and_then(|json| serde_json::from_slice(&json).ok())
+                .unwrap_or_else(|| {
+                    tracing::error!("embedded Ludusavi title index unreadable");
+                    Vec::new()
+                })
+        })
+        .as_slice()
 }
 
-/// Look up a Ludusavi entry by its exact slug. O(N) like the appid lookup;
-/// the callers (cover-art resolution for a handful of tracked saves) hit it
-/// rarely and memoise the result, so indexing the full catalog isn't worth it.
+/// Lazily-built lookup tables over [`catalog`] and [`titles`].
+struct Indexes {
+    by_app_id: HashMap<u64, usize>,
+    by_slug: HashMap<&'static str, usize>,
+    /// Lutris game slug → catalog index, for naming a Lutris prefix.
+    by_lutris: HashMap<&'static str, usize>,
+    /// Canonical name (letters+digits only) → catalog index. Recognises the
+    /// same game across the spellings a *folder* uses: `StardewValley`,
+    /// `stardew-valley` and `Stardew Valley` all collapse to one key, which
+    /// `slugify` alone can't do (it never splits CamelCase).
+    by_canon: HashMap<String, usize>,
+    /// Executable basename → catalog index. Only names owned by exactly one
+    /// game are present (see [`exe_owner`] for why).
+    exe_to_slug: HashMap<&'static str, usize>,
+    /// Executable basename → display name, across catalog **and** titles.
+    /// Same uniqueness rule.
+    exe_to_title: HashMap<&'static str, &'static str>,
+    /// Steam appid → display name, across catalog and titles.
+    app_id_to_title: HashMap<u64, &'static str>,
+}
+
+static INDEXES: OnceLock<Indexes> = OnceLock::new();
+
+/// Build the lookup tables once. The uniqueness rule for executables is
+/// load-bearing: 692 names in the manifest (`game.exe` ×730, `launcher.exe`,
+/// `nw.exe`, `dosbox.exe`, `scummvm.exe`, …) are shared by several games, and
+/// treating one of those as "you are playing X" would attribute sessions,
+/// playtime and save folders to an arbitrary title. A name owned by more than
+/// one game is therefore dropped from the index entirely rather than resolved
+/// to a guess — the same rule the agent's correlation filter already applies.
+fn indexes() -> &'static Indexes {
+    INDEXES.get_or_init(|| {
+        let cat = catalog();
+        let tit = titles();
+
+        let mut by_app_id = HashMap::with_capacity(cat.len());
+        let mut by_slug = HashMap::with_capacity(cat.len());
+        let mut by_lutris = HashMap::new();
+        let mut by_canon: HashMap<String, usize> = HashMap::with_capacity(cat.len());
+        for (i, e) in cat.iter().enumerate() {
+            if let Some(id) = e.steam_app_id {
+                by_app_id.entry(id).or_insert(i);
+            }
+            by_slug.entry(e.slug.as_str()).or_insert(i);
+            if let Some(l) = e.lutris_slug.as_deref() {
+                by_lutris.entry(l).or_insert(i);
+            }
+            let canon = hoard_core::ids::canon_token(&e.display_name);
+            // Demasiado corto ⇒ colisiona con cualquier carpeta ("go", "if").
+            if canon.len() >= hoard_core::ids::MIN_IDENTITY_TOKEN_LEN {
+                by_canon.entry(canon).or_insert(i);
+            }
+        }
+        // Secondary appids in a second pass: a primary `steam.id` must always
+        // win over another game's `steamExtra` listing the same number.
+        for (i, e) in cat.iter().enumerate() {
+            for id in &e.steam_extra_ids {
+                by_app_id.entry(*id).or_insert(i);
+            }
+        }
+
+        // Count owners before inserting, so an ambiguous name is never kept.
+        let mut exe_owners: HashMap<&str, u32> = HashMap::new();
+        for e in cat {
+            for x in &e.launch_exes {
+                *exe_owners.entry(x.as_str()).or_default() += 1;
+            }
+        }
+        let mut exe_to_slug = HashMap::new();
+        for (i, e) in cat.iter().enumerate() {
+            for x in &e.launch_exes {
+                if exe_owners.get(x.as_str()) == Some(&1) {
+                    exe_to_slug.insert(x.as_str(), i);
+                }
+            }
+        }
+
+        // The title index widens the same map: a name is unique only if no
+        // *other* game — catalog or title-only — also claims it.
+        let mut title_owners: HashMap<&str, u32> = exe_owners;
+        for t in tit {
+            for x in &t.launch_exes {
+                *title_owners.entry(x.as_str()).or_default() += 1;
+            }
+        }
+        let mut exe_to_title = HashMap::new();
+        let mut app_id_to_title = HashMap::new();
+        for (name, exes, app) in cat
+            .iter()
+            .map(|e| (e.display_name.as_str(), &e.launch_exes, e.steam_app_id))
+            .chain(
+                tit.iter()
+                    .map(|t| (t.display_name.as_str(), &t.launch_exes, t.steam_app_id)),
+            )
+        {
+            for x in exes {
+                if title_owners.get(x.as_str()) == Some(&1) {
+                    exe_to_title.insert(x.as_str(), name);
+                }
+            }
+            if let Some(id) = app {
+                app_id_to_title.entry(id).or_insert(name);
+            }
+        }
+
+        Indexes {
+            by_app_id,
+            by_slug,
+            by_lutris,
+            by_canon,
+            exe_to_slug,
+            exe_to_title,
+            app_id_to_title,
+        }
+    })
+}
+
+/// Look up a catalog entry by a **folder-ish** name: case, spacing and
+/// punctuation are ignored, so `StardewValley` finds "Stardew Valley".
+///
+/// Exact on the canonical form, never fuzzy: this names a folder that is
+/// about to become a tracked game, and a near-miss would file someone's save
+/// under the wrong title.
+pub fn find_by_canon_name(name: &str) -> Option<&'static LudusaviEntry> {
+    let canon = hoard_core::ids::canon_token(name);
+    if canon.len() < hoard_core::ids::MIN_IDENTITY_TOKEN_LEN {
+        return None;
+    }
+    indexes().by_canon.get(&canon).map(|i| &catalog()[*i])
+}
+
+/// Look up a catalog entry by its Lutris slug (the prefix directory name
+/// Lutris creates), so a Lutris prefix resolves to a game exactly.
+pub fn find_by_lutris_slug(slug: &str) -> Option<&'static LudusaviEntry> {
+    indexes()
+        .by_lutris
+        .get(slug.to_ascii_lowercase().as_str())
+        .map(|i| &catalog()[*i])
+}
+
+/// Look up a Ludusavi entry by Steam app id.
+pub fn find_by_steam_app_id(app_id: u64) -> Option<&'static LudusaviEntry> {
+    indexes().by_app_id.get(&app_id).map(|i| &catalog()[*i])
+}
+
+/// Look up a Ludusavi entry by its exact slug.
 pub fn find_by_slug(slug: &str) -> Option<&'static LudusaviEntry> {
-    catalog().iter().find(|e| e.slug == slug)
+    indexes().by_slug.get(slug).map(|i| &catalog()[*i])
+}
+
+/// The catalog game this executable belongs to, when exactly one claims it.
+///
+/// `exe` is matched on the basename, case-insensitively (`"EldenRing.exe"`,
+/// `"eldenring.exe"` and a full path ending in either all resolve the same).
+///
+/// Returns `None` for a name shared by several games. 692 names in the
+/// manifest are (`game.exe` ×730, `launcher.exe`, `nw.exe`, `dosbox.exe`,
+/// `scummvm.exe`, …) and resolving one of those to a guess would attribute a
+/// session, its playtime and its save folder to an arbitrary title, so an
+/// ambiguous name resolves to nothing at all.
+pub fn find_by_exe(exe: &str) -> Option<&'static LudusaviEntry> {
+    let leaf = exe_leaf(exe);
+    indexes()
+        .exe_to_slug
+        .get(leaf.as_str())
+        .map(|i| &catalog()[*i])
+}
+
+/// Display name for an executable, from the catalog or the title-only
+/// index. Wider than [`find_by_exe`]: it also names games we can't track.
+pub fn title_for_exe(exe: &str) -> Option<&'static str> {
+    let leaf = exe_leaf(exe);
+    indexes().exe_to_title.get(leaf.as_str()).copied()
+}
+
+/// Display name for a Steam appid, from the catalog or the title index.
+pub fn title_for_app_id(app_id: u64) -> Option<&'static str> {
+    indexes().app_id_to_title.get(&app_id).copied()
+}
+
+/// Normalise an executable reference to the lowercase basename the index
+/// is keyed on. Accepts a bare name or a full path, either separator.
+fn exe_leaf(exe: &str) -> String {
+    exe.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Fuzzy lookup by display name using normalised Levenshtein over slugs.
@@ -258,6 +578,44 @@ pub fn find_by_slug(slug: &str) -> Option<&'static LudusaviEntry> {
 /// it stays well under the cost of the surrounding pipeline.
 pub fn find_by_fuzzy_name(name: &str, threshold: f32) -> Option<&'static LudusaviEntry> {
     fuzzy_match_in(catalog(), name, threshold)
+}
+
+/// Look up a catalog entry whose slug is a **token prefix** of `name`, longest
+/// first: `"Surviving Mars Relaunched"` → `Surviving Mars`.
+///
+/// This is the case neither exact nor fuzzy matching can reach. Save folders
+/// routinely carry a qualifier the catalog title doesn't have — an edition
+/// (`Relaunched`, `Definitive Edition`), a store suffix, a mod-loader tag — and
+/// the extra word is far more than the ~1-edit-per-7-chars `find_by_fuzzy_name`
+/// tolerates, so today the folder just becomes its own phantom game.
+///
+/// Two guards keep it honest:
+///
+/// * **Token boundary.** The query must continue with `-` after the match, so
+///   `civilization-v` never claims `civilization-vi-saves`.
+/// * **At least two tokens.** A one-word title is too generic to swallow a
+///   longer name — `Fallout` must not claim `Fallout New Vegas`. With the
+///   longest-match rule, a real two-token prefix still wins over a shorter one.
+pub fn find_by_name_prefix(name: &str) -> Option<&'static LudusaviEntry> {
+    let query = slugify(name);
+    if query.is_empty() {
+        return None;
+    }
+    let mut best: Option<&'static LudusaviEntry> = None;
+    for entry in catalog() {
+        if entry.slug.len() >= query.len() || !entry.slug.contains('-') {
+            continue;
+        }
+        // `starts_with` FIRST: only then is `entry.slug.len()` known to be a
+        // char boundary of `query`, and slicing at it safe.
+        if !query.starts_with(&entry.slug) || !query[entry.slug.len()..].starts_with('-') {
+            continue;
+        }
+        if best.is_none_or(|b| entry.slug.len() > b.slug.len()) {
+            best = Some(entry);
+        }
+    }
+    best
 }
 
 /// Catalog-agnostic core of [`find_by_fuzzy_name`]. Exposed `pub(crate)` so the
@@ -367,6 +725,34 @@ struct YamlEntry {
     /// `tags`/`when` payload here and just keep the key.
     #[serde(default)]
     registry: BTreeMap<String, serde::de::IgnoredAny>,
+    /// `installDir:` — a map whose *keys* are the install folder names.
+    #[serde(default, rename = "installDir")]
+    install_dir: BTreeMap<String, serde::de::IgnoredAny>,
+    /// `launch:` — a map whose *keys* are executable paths, usually
+    /// `<base>`-relative. Only the basename is useful to us.
+    #[serde(default)]
+    launch: BTreeMap<String, serde::de::IgnoredAny>,
+    #[serde(default)]
+    cloud: Option<YamlCloud>,
+    #[serde(default)]
+    id: Option<YamlIds>,
+}
+
+/// `cloud:` — which storefronts' cloud sync the game supports. Only Steam
+/// is actionable for us (it's the one that overlaps with what Hoard does).
+#[derive(Debug, Default, Deserialize)]
+struct YamlCloud {
+    #[serde(default)]
+    steam: bool,
+}
+
+/// `id:` — extra store identifiers beyond the primary `steam.id`.
+#[derive(Debug, Default, Deserialize)]
+struct YamlIds {
+    #[serde(default, rename = "steamExtra")]
+    steam_extra: Vec<u64>,
+    #[serde(default)]
+    lutris: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -398,8 +784,25 @@ struct YamlSteamRef {
 /// (alias, no-paths, non-save tags), same OS expansion of empty
 /// `when:` clauses, same slug rules.
 pub fn convert_yaml_to_catalog(yaml_text: &str) -> Result<Vec<LudusaviEntry>, CatalogError> {
+    Ok(convert_yaml(yaml_text)?.0)
+}
+
+/// Full conversion: the save-path catalog **and** the title-only index.
+///
+/// The manifest describes ~53k games but only ~21k of them have a save path
+/// we could ever back up — the rest are entries that carry nothing but a
+/// title, a Steam appid and a `launch:` block. Those are useless for
+/// detecting *saves*, which is why the catalog drops them, but they are
+/// exactly what's needed to put a **name** on a running process or an appid
+/// (see [`TitleEntry`]). Keeping them out of the catalog proper matters:
+/// every detection pass iterates the catalog, so tripling its length to
+/// carry names would slow down the scan for no detection benefit.
+pub fn convert_yaml(
+    yaml_text: &str,
+) -> Result<(Vec<LudusaviEntry>, Vec<TitleEntry>), CatalogError> {
     let parsed: BTreeMap<String, YamlEntry> = serde_yaml::from_str(yaml_text)?;
     let mut out = Vec::with_capacity(parsed.len());
+    let mut titles = Vec::new();
     let mut seen_slugs: HashSet<String> = HashSet::with_capacity(parsed.len());
 
     for (display_name, entry) in parsed {
@@ -408,11 +811,22 @@ pub fn convert_yaml_to_catalog(yaml_text: &str) -> Result<Vec<LudusaviEntry>, Ca
         }
         let paths = transform_files(&entry.files);
         let registry = transform_registry(&entry.registry);
+        let launch_exes = launch_basenames(&entry.launch);
+        let steam_app_id = entry.steam.as_ref().map(|s| s.id);
         if paths.windows.is_empty()
             && paths.linux.is_empty()
             && paths.mac.is_empty()
             && registry.is_empty()
         {
+            // No save path anywhere: keep the name only, and only when it
+            // can actually be looked up by something.
+            if steam_app_id.is_some() || !launch_exes.is_empty() {
+                titles.push(TitleEntry {
+                    display_name,
+                    steam_app_id,
+                    launch_exes,
+                });
+            }
             continue;
         }
 
@@ -434,14 +848,51 @@ pub fn convert_yaml_to_catalog(yaml_text: &str) -> Result<Vec<LudusaviEntry>, Ca
         out.push(LudusaviEntry {
             slug,
             display_name,
-            steam_app_id: entry.steam.as_ref().map(|s| s.id),
+            steam_app_id,
             paths,
             registry,
+            install_dirs: entry.install_dir.keys().cloned().collect(),
+            launch_exes,
+            steam_extra_ids: entry
+                .id
+                .as_ref()
+                .map(|i| i.steam_extra.clone())
+                .unwrap_or_default(),
+            lutris_slug: entry.id.as_ref().and_then(|i| i.lutris.clone()),
+            cloud_steam: entry.cloud.as_ref().is_some_and(|c| c.steam),
         });
     }
 
     out.sort_by(|a, b| a.slug.cmp(&b.slug));
-    Ok(out)
+    titles.sort_by(|a: &TitleEntry, b: &TitleEntry| a.display_name.cmp(&b.display_name));
+    Ok((out, titles))
+}
+
+/// Executable basenames from a `launch:` block, lowercased and deduped.
+///
+/// Keys look like `<base>/Binaries/Win64/Game.exe` or `<base>/run.sh`; only
+/// the leaf identifies the process. Anything that isn't plausibly an
+/// executable leaf is dropped — a launch key can carry a `<base>`-only entry
+/// or a directory, and those would match every process in that folder.
+fn launch_basenames(launch: &BTreeMap<String, serde::de::IgnoredAny>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in launch.keys() {
+        let leaf = key
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        // A leftover placeholder or an empty leaf is not an executable.
+        if leaf.is_empty() || leaf.contains('<') || leaf.len() < 3 {
+            continue;
+        }
+        if !out.contains(&leaf) {
+            out.push(leaf);
+        }
+    }
+    out
 }
 
 /// Download upstream Ludusavi YAML, convert it, and persist as the runtime
@@ -452,7 +903,7 @@ pub fn convert_yaml_to_catalog(yaml_text: &str) -> Result<Vec<LudusaviEntry>, Ca
 /// command fetches it via `reqwest` so this crate doesn't grow an HTTP
 /// dependency.
 pub fn save_runtime_override(yaml_text: &str) -> Result<usize, CatalogError> {
-    let catalog = convert_yaml_to_catalog(yaml_text)?;
+    let (catalog, titles) = convert_yaml(yaml_text)?;
     let path = runtime_override_path().ok_or(CatalogError::NoCacheDir)?;
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -463,9 +914,17 @@ pub fn save_runtime_override(yaml_text: &str) -> Result<usize, CatalogError> {
         }
     }
     write_atomic(&path, &serde_json::to_vec(&catalog)?)?;
+    // Best-effort: a failure here costs nicer names on unknown processes,
+    // never detection itself, so it must not fail the catalog update.
+    if let Some(tp) = titles_override_path() {
+        if let Err(e) = write_atomic(&tp, &serde_json::to_vec(&titles)?) {
+            tracing::warn!(error = %e, "couldn't write the title index override");
+        }
+    }
     tracing::info!(
         path = %path.display(),
         count = catalog.len(),
+        titles = titles.len(),
         "wrote Ludusavi catalog runtime override"
     );
     Ok(catalog.len())
@@ -699,6 +1158,11 @@ Game X:
             steam_app_id,
             paths: LudusaviPaths::default(),
             registry: Vec::new(),
+            install_dirs: Vec::new(),
+            launch_exes: Vec::new(),
+            steam_extra_ids: Vec::new(),
+            lutris_slug: None,
+            cloud_steam: false,
         }
     }
 
@@ -848,5 +1312,161 @@ Registry Only Game:
         assert_eq!(cat.len(), 1);
         assert_eq!(cat[0].slug, "registry-only-game");
         assert_eq!(cat[0].registry.len(), 1);
+    }
+
+    #[test]
+    fn convert_yaml_keeps_launch_installdir_flatpak_and_cloud() {
+        let yaml = "\
+Elden Ring:
+  files:
+    \"<winAppData>/EldenRing\":
+      tags: [save]
+  installDir:
+    ELDEN RING: {}
+  launch:
+    \"<base>/Game/eldenring.exe\": []
+    \"<base>/start_protected_game.exe\": []
+  cloud:
+    steam: true
+  id:
+    steamExtra: [1245621, 1245622]
+    lutris: elden-ring
+  steam:
+    id: 1245620
+";
+        let cat = convert_yaml_to_catalog(yaml).unwrap();
+        assert_eq!(cat.len(), 1);
+        let e = &cat[0];
+        assert_eq!(e.install_dirs, ["ELDEN RING"]);
+        // Basenames only, lowercased, in key order.
+        assert_eq!(e.launch_exes, ["eldenring.exe", "start_protected_game.exe"]);
+        assert_eq!(e.steam_extra_ids, [1245621, 1245622]);
+        assert_eq!(e.lutris_slug.as_deref(), Some("elden-ring"));
+        assert!(e.cloud_steam);
+    }
+
+    #[test]
+    fn a_game_without_save_paths_becomes_a_title_not_a_catalog_entry() {
+        // Two thirds of the manifest looks like this. It must name a
+        // process without ever being offered as something to back up.
+        let yaml = "\
+War Selection:
+  launch:
+    \"<base>/WarSelection.exe\": []
+  steam:
+    id: 1013740
+Nameless:
+  installDir:
+    Nameless: {}
+";
+        let (cat, titles) = convert_yaml(yaml).unwrap();
+        assert!(cat.is_empty(), "no save path ⇒ nothing to track");
+        // "Nameless" has neither appid nor launch: nothing to look it up by.
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles[0].display_name, "War Selection");
+        assert_eq!(titles[0].launch_exes, ["warselection.exe"]);
+        assert_eq!(titles[0].steam_app_id, Some(1013740));
+    }
+
+    #[test]
+    fn launch_basenames_drops_placeholders_and_stubs() {
+        let mut launch: BTreeMap<String, serde::de::IgnoredAny> = BTreeMap::new();
+        for k in ["<base>", "<base>/", "<base>/a", "<base>/dir/Game.EXE"] {
+            launch.insert(k.to_string(), serde_yaml::from_str("~").unwrap());
+        }
+        // Only the real executable survives: a bare `<base>`, a trailing
+        // slash and a 1-char leaf would each match far too much.
+        assert_eq!(launch_basenames(&launch), ["game.exe"]);
+    }
+
+    #[test]
+    fn exe_index_resolves_a_unique_name_and_vetoes_a_shared_one() {
+        // Against the real embedded catalog: an executable that belongs to
+        // exactly one game resolves, and one shared by hundreds must not.
+        assert_eq!(
+            find_by_exe("factorio.exe").map(|e| e.slug.as_str()),
+            Some("factorio"),
+            "a unique executable should resolve to its game"
+        );
+        // Path form and casing are normalised to the same key.
+        assert_eq!(
+            find_by_exe("/home/u/.factorio/bin/x64/Factorio.exe").map(|e| e.slug.as_str()),
+            Some("factorio"),
+        );
+        // `game.exe` is claimed by ~730 games; resolving it to any one of
+        // them would hand a save folder (and its playtime) to a coin flip.
+        assert!(
+            find_by_exe("game.exe").is_none(),
+            "ambiguous exe must be vetoed"
+        );
+        assert!(title_for_exe("game.exe").is_none());
+        for shared in ["launcher.exe", "nw.exe", "dosbox.exe", "scummvm.exe"] {
+            assert!(
+                find_by_exe(shared).is_none(),
+                "{shared} should be ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn titles_name_games_that_have_no_save_path() {
+        // The whole point of the title index: a game with no trackable save
+        // still gets a name, and never shows up as something to back up.
+        assert!(!titles().is_empty());
+        assert!(
+            title_for_app_id(1245620).is_some(),
+            "appid should name a game"
+        );
+    }
+
+    #[test]
+    fn steam_extra_ids_resolve_to_the_same_game() {
+        // A regional/demo appid must find the game rather than nothing. Pick
+        // a real one from the catalog so the test tracks upstream data.
+        let with_extra = catalog()
+            .iter()
+            .find(|e| !e.steam_extra_ids.is_empty())
+            .expect("catalog should carry steamExtra ids");
+        let extra = with_extra.steam_extra_ids[0];
+        assert!(
+            find_by_steam_app_id(extra).is_some(),
+            "secondary appid {extra} should resolve"
+        );
+    }
+
+    /// Regenerates the embedded catalog + title index from a manifest YAML.
+    /// Not a test — a generator, skipped unless asked:
+    ///
+    /// ```sh
+    /// GEN_CATALOG=/path/to/manifest.yaml cargo test -p hoard-manifest -- --ignored regenerate
+    /// ```
+    ///
+    /// Using the real converter (instead of the Python script) is the point:
+    /// what ships can't drift from what a runtime refresh would produce.
+    #[test]
+    #[ignore = "generator; set GEN_CATALOG=<manifest.yaml>"]
+    fn regenerate_embedded_catalog() {
+        let Ok(src) = std::env::var("GEN_CATALOG") else {
+            panic!("set GEN_CATALOG=<path to manifest.yaml>");
+        };
+        let yaml = std::fs::read_to_string(&src).expect("reading manifest");
+        let (cat, titles) = convert_yaml(&yaml).expect("converting manifest");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        for (name, bytes) in [
+            (
+                "ludusavi-catalog.json.zst",
+                serde_json::to_vec(&cat).unwrap(),
+            ),
+            (
+                "ludusavi-titles.json.zst",
+                serde_json::to_vec(&titles).unwrap(),
+            ),
+        ] {
+            let raw = bytes.len();
+            let packed = zstd::encode_all(bytes.as_slice(), 12).unwrap();
+            println!("{name}: {raw} → {} bytes", packed.len());
+            std::fs::write(dir.join(name), packed).unwrap();
+        }
+        println!("catalog: {} entries, titles: {}", cat.len(), titles.len());
     }
 }

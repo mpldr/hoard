@@ -73,6 +73,9 @@ rpassword = "7"
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "zstd", "gzip"] }
 tokio-tar = "0.3"
+# Synchronous zstd for the embedded Ludusavi catalog. Already in the tree as
+# a transitive dep of async-compression, so this costs no extra build.
+zstd = "0.13"
 
 # Time
 time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing", "macros"] }

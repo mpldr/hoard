@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-08-02
+
 ### Added
 - **A shareable card at the bottom of Hoard-Wrapped.** The recap now ends in a
   wide camera button that opens your card: photo, name, a random line that

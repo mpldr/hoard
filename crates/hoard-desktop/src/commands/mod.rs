@@ -25,3 +25,5 @@ pub mod screen;
 pub mod selfhosted_events;
 pub mod supervisor;
 pub mod updates;
+pub mod window;
+pub mod wrapple;

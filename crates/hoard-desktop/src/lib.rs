@@ -231,14 +231,23 @@ pub fn run() {
         .manage(commands::cloud_feed::CloudFeed::default())
         .manage(commands::selfhosted_events::SelfHostedEventsScheduler::default())
         .manage(commands::screen::ScreenProc::default())
+        // La ventana nace oculta (`"visible": false`) y este flag decide si
+        // llega a mostrarse: en un arranque silencioso, no.
+        .manage(commands::window::StartHidden::default())
         .invoke_handler(tauri::generate_handler![
             commands::misc::greet,
+            commands::window::ui_ready,
             commands::misc::open_external,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,
             commands::covers::has_custom_cover,
             commands::covers::set_custom_cover,
             commands::covers::remove_custom_cover,
+            commands::wrapple::wrapple_read_image,
+            commands::wrapple::wrapple_set_avatar,
+            commands::wrapple::wrapple_avatar_bytes,
+            commands::wrapple::wrapple_clear_avatar,
+            commands::wrapple::wrapple_save_card,
             commands::auth::health_check,
             commands::auth::login,
             commands::auth::logout,
@@ -262,6 +271,9 @@ pub fn run() {
             commands::emulators::list_running_processes,
             commands::library::ignore_detected_game,
             commands::library::unignore_detected_game,
+            commands::library::exclude_scan_path,
+            commands::library::unexclude_scan_path,
+            commands::library::list_excluded_scan_paths,
             commands::library::list_ignored_slugs,
             commands::library::detection_diagnostics,
             commands::library::detected_paths_for_game,
@@ -409,19 +421,28 @@ pub fn run() {
                 // toca un servicio que ya esté corriendo.
                 commands::prefs::sync_service_autostart(prefs.autostart);
 
-                // Hide the main window before it paints only on a *silent* boot:
-                // the autostart entry launches Hoard with `--silent` (see the
-                // plugin init above), so login starts quiet (tray only) while a
-                // manual double-click always shows the UI — even with
-                // `start_minimised` on. Without this gate a fresh install would
-                // launch invisibly.
+                // Arranque silencioso: la entrada de autostart lanza Hoard con
+                // `--silent` (ver el init del plugin más arriba), así que al
+                // iniciar sesión la app se queda en la bandeja, mientras que un
+                // doble clic manual siempre enseña la UI — incluso con
+                // `start_minimised` puesto. Sin esta condición una instalación
+                // nueva arrancaría invisible.
+                //
+                // Ya no hace falta esconder la ventana aquí: nace oculta y sólo
+                // se muestra cuando el frontend llama a `ui_ready`. Lo que
+                // marcamos es lo contrario, que en este arranque no debe
+                // mostrarse pase lo que pase.
                 let silent = std::env::args().any(|a| a == "--silent");
-                if prefs.start_minimised && silent {
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.hide();
-                    }
-                }
+                commands::window::mark_start_hidden(
+                    &app.handle().clone(),
+                    prefs.start_minimised && silent,
+                );
             }
+
+            // Y la red de seguridad de esa ventana oculta: si el frontend nunca
+            // llega a pintar, la mostramos igualmente pasado el plazo. Una UI
+            // rota se reporta; una app que "no abre", no.
+            commands::window::spawn_fallback_show(app.handle().clone());
 
             // Kick off a background Ludusavi-catalog refresh if the cached
             // copy is missing or older than a week. Fire-and-forget — the

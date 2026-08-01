@@ -16,6 +16,10 @@ initTheme();
 // before mounting. If we mount eagerly, the first render hits `$_(...)`
 // while no messages are loaded, svelte-i18n throws, and Svelte unwinds —
 // leaving the user with a blank, body-coloured window. (See v1.2.1 bug.)
+//
+// Es lo *único* que bloquea al mount: cargar un diccionario ya registrado. La
+// preferencia de idioma guardada en disco corre en paralelo y tiene su propio
+// plazo dentro de `i18nReady` — ver el módulo de i18n.
 async function bootstrap() {
   await i18nReady;
   return mount(App, {

@@ -22,21 +22,36 @@
   } from "lucide-svelte";
   import { _ } from "svelte-i18n";
 
-  import Language from "./routes/Language.svelte";
-  import ChooseMode from "./routes/ChooseMode.svelte";
-  import Terms from "./routes/Terms.svelte";
-  import ServerSetup from "./routes/ServerSetup.svelte";
-  import TokenSetup from "./routes/TokenSetup.svelte";
-  import OnboardingDone from "./routes/OnboardingDone.svelte";
-  import Dashboard from "./routes/Dashboard.svelte";
-  import LibraryRoute from "./routes/Library.svelte";
-  import SettingsRoute from "./routes/Settings.svelte";
-  import HistoryRoute from "./routes/History.svelte";
-  import LogsRoute from "./routes/Logs.svelte";
-  import DiagnosticsRoute from "./routes/Diagnostics.svelte";
-  import AccountRoute from "./routes/Account.svelte";
-  import HoardScreenRoute from "./routes/HoardScreen.svelte";
-  import HoardWrappedRoute from "./routes/HoardWrapped.svelte";
+  // Las rutas se cargan bajo demanda. Importarlas de forma estática metía las
+  // quince pantallas —Dashboard, Library, Settings, Logs, Diagnostics, el
+  // overlay…— en el chunk de entrada, así que el arranque parseaba media
+  // aplicación antes de pintar la primera. Cada `import()` es un chunk que Vite
+  // separa y el router pide cuando toca; ver `routes` más abajo.
+  import { wrap } from "svelte-spa-router/wrap";
+  import RouteFallback from "./lib/components/RouteFallback.svelte";
+
+  const loadLanguage = () => import("./routes/Language.svelte");
+  const loadChooseMode = () => import("./routes/ChooseMode.svelte");
+  const loadTerms = () => import("./routes/Terms.svelte");
+  const loadServerSetup = () => import("./routes/ServerSetup.svelte");
+  const loadTokenSetup = () => import("./routes/TokenSetup.svelte");
+  const loadOnboardingDone = () => import("./routes/OnboardingDone.svelte");
+  const loadDashboard = () => import("./routes/Dashboard.svelte");
+  const loadLibrary = () => import("./routes/Library.svelte");
+  const loadSettings = () => import("./routes/Settings.svelte");
+  const loadHistory = () => import("./routes/History.svelte");
+  const loadLogs = () => import("./routes/Logs.svelte");
+  const loadDiagnostics = () => import("./routes/Diagnostics.svelte");
+  const loadAccount = () => import("./routes/Account.svelte");
+  const loadHoardScreen = () => import("./routes/HoardScreen.svelte");
+  const loadHoardWrapped = () => import("./routes/HoardWrapped.svelte");
+
+  /** Azúcar para no repetir el `loadingComponent` en cada ruta. */
+  const lazy = (asyncComponent: () => Promise<unknown>) =>
+    wrap({
+      asyncComponent: asyncComponent as never,
+      loadingComponent: RouteFallback as never,
+    });
 
   import Toaster from "./lib/components/Toaster.svelte";
   import TourOverlay from "./lib/components/TourOverlay.svelte";
@@ -104,26 +119,26 @@ import { tilt } from "./lib/actions/tilt";
   // hydrate auth, then `replace()` to the appropriate destination, so we
   // don't need a `*` route here.
   const routes = {
-    "/onboarding/language": Language,
-    "/onboarding/choose": ChooseMode,
-    "/onboarding/terms": Terms,
-    "/onboarding/server": ServerSetup,
-    "/onboarding/token": TokenSetup,
-    "/onboarding/done": OnboardingDone,
-    "/dashboard": Dashboard,
-    "/library": LibraryRoute,
-    "/settings": SettingsRoute,
+    "/onboarding/language": lazy(loadLanguage),
+    "/onboarding/choose": lazy(loadChooseMode),
+    "/onboarding/terms": lazy(loadTerms),
+    "/onboarding/server": lazy(loadServerSetup),
+    "/onboarding/token": lazy(loadTokenSetup),
+    "/onboarding/done": lazy(loadOnboardingDone),
+    "/dashboard": lazy(loadDashboard),
+    "/library": lazy(loadLibrary),
+    "/settings": lazy(loadSettings),
     // The old `/history` index was a duplicate of the Dashboard, so it was
     // dropped from the nav. The per-save timeline still lives here and is
     // reached by clicking a save in the Dashboard / Library.
-    "/history/:saveId": HistoryRoute,
-    "/logs": LogsRoute,
-    "/diagnostics": DiagnosticsRoute,
-    "/account": AccountRoute,
+    "/history/:saveId": lazy(loadHistory),
+    "/logs": lazy(loadLogs),
+    "/diagnostics": lazy(loadDiagnostics),
+    "/account": lazy(loadAccount),
     // Premium feature placeholders (gated in the sidebar; the routes
     // themselves are reachable so an unlocked user lands on the empty state).
-    "/hoard-screen": HoardScreenRoute,
-    "/hoard-wrapped": HoardWrappedRoute,
+    "/hoard-screen": lazy(loadHoardScreen),
+    "/hoard-wrapped": lazy(loadHoardWrapped),
   };
 
   let booted = $state(false);
@@ -352,6 +367,30 @@ import { tilt } from "./lib/actions/tilt";
   );
 
   onMount(async () => {
+    // La ventana nace oculta (`"visible": false` en tauri.conf.json) para que
+    // nadie vea el rectángulo blanco del webview mientras arranca. `onMount`
+    // garantiza el DOM, no el frame: pedimos mostrarla cuando el navegador ha
+    // pintado de verdad, con el spinner de arranque ya en pantalla. Esto va
+    // *antes* de las hidrataciones a propósito — la ventana debe aparecer al
+    // primer frame, no cuando el disco y la nube contesten.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        void api.uiReady().catch(() => {
+          // El backend tiene su propio plazo de gracia; si la invocación falla
+          // la ventana aparece igual. Nada que hacer aquí.
+        });
+      });
+    });
+
+    // Precalienta los dos destinos posibles del arranque mientras hidratamos
+    // la sesión: con sesión se acaba en /dashboard, y sin ella en el asistente.
+    // Cuando el router pida el chunk ya estará en caché, así que dividir por
+    // rutas no le cuesta una espera al camino común. El resto de pantallas se
+    // cargan cuando el usuario las pide.
+    const warm = (load: () => Promise<unknown>) => void load().catch(() => {});
+    warm(loadDashboard);
+    warm(loadLanguage);
+
     // Cheap OS detection so the global stylesheet can swap font-family per
     // platform without pulling `@tauri-apps/plugin-os` (not installed). The
     // Tauri WebView keeps the host UA on each platform, so this heuristic is

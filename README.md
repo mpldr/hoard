@@ -60,24 +60,14 @@ Pricing and free trial at [hoard.services/pricing](https://hoard.services/pricin
 
 ## What devices does Hoard work on?
 
-Works in all -- except phone, you can install in:
+Works in any plataform -- except phone, you can install in:
 [hoard.services/download](https://hoard.services/download):
 
-| Platform | File | Status |
-| --- | --- | --- |
-| Windows 10 / 11 | `Hoard_<version>_x64-setup.exe` (installer) or `…_x64_en-US.msi` | ✅ |
-| Linux (Debian / Ubuntu) | `Hoard_<version>_amd64.deb` | ✅ |
-| Linux (Fedora / openSUSE) | the `.rpm` asset on the release page | ✅ |
-| Linux (any distro) | `Hoard_<version>_amd64.AppImage` | ✅ |
-| macOS (Apple Silicon only) | `Hoard_<version>_aarch64.dmg` -- I dont have a macOS to try it | ⚠️ |
-| SteamOS/Brazzite/CachyOS gamemode | With [Hoard-CLI](https://hoard.services/cli) | ✅ |
+If you are in gamemode in steamos/brazzite/cachyos you can use [Hoard-CLI](https://hoard.services/cli)
 
+|
 
->**Please note:** I'm currently unable to build and test on Mac and steamOS.
-
->No Intel Mac build at the moment — GitHub retired the runner that used to
-produce it. On an Intel Mac, self-host the server or build the desktop app
-from source below; nothing about the app itself is Apple-Silicon-only.
+v
 
 # Hoard-CLI
 

@@ -47,6 +47,7 @@ pub struct AuthSection {
 /// medias. Y si dos procesos arrancan a la vez (el servicio y la app es lo
 /// normal), el que pierde la carrera ve fallar su `rename` y se encuentra el
 /// destino ya creado, que es la respuesta correcta.
+///
 /// Sólo se llama en Windows, pero se compila en todas partes **a propósito**:
 /// código bajo `cfg(windows)` no lo mira el compilador de esta máquina, y esto
 /// decide dónde están los datos del usuario. Compilarlo y probarlo siempre es lo
@@ -189,5 +190,76 @@ impl CliConfig {
             .as_deref()
             .filter(|s| !s.is_empty())
             .context("not logged in: run `hoard login --token <TOKEN>` first")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un directorio con un fichero dentro, para distinguir "se mudó" de "se
+    /// creó vacío" — que es justo la confusión que costó un historial.
+    fn seeded(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let f = dir.join(name);
+        std::fs::write(&f, b"x").unwrap();
+        f
+    }
+
+    #[test]
+    fn el_destino_existente_manda_y_el_origen_no_se_toca() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("local/hoard/data");
+        let new = tmp.path().join("roaming/hoard/data");
+        seeded(&old, "viejo.json");
+        seeded(&new, "bueno.json");
+
+        assert_eq!(relocated_state_dir(&old, &new), new);
+        // Ya migrado: mudar otra vez pisaría lo bueno con lo viejo.
+        assert!(new.join("bueno.json").exists());
+        assert!(old.join("viejo.json").exists());
+    }
+
+    #[test]
+    fn sin_origen_se_usa_el_destino_aunque_no_exista_todavia() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("local/hoard/data");
+        let new = tmp.path().join("roaming/hoard/data");
+
+        // Instalación limpia: nadie ha escrito nada aún. El llamante creará el
+        // directorio cuando le toque.
+        assert_eq!(relocated_state_dir(&old, &new), new);
+    }
+
+    #[test]
+    fn el_estado_se_muda_con_su_contenido() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("local/hoard/data");
+        let new = tmp.path().join("roaming/hoard/data");
+        seeded(&old, "playtime.json");
+        std::fs::create_dir_all(old.join("contexts")).unwrap();
+        std::fs::write(old.join("contexts/cloud-x.json"), b"{}").unwrap();
+
+        assert_eq!(relocated_state_dir(&old, &new), new);
+        assert!(new.join("playtime.json").exists());
+        assert!(new.join("contexts/cloud-x.json").exists());
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn si_la_mudanza_no_sale_se_sigue_leyendo_del_sitio_viejo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("local/hoard/data");
+        seeded(&old, "playtime.json");
+        // Destino imposible: su padre es un fichero, así que ni `create_dir_all`
+        // ni `rename` pueden con él.
+        let blocker = tmp.path().join("roaming");
+        std::fs::write(&blocker, b"no soy un directorio").unwrap();
+        let new = blocker.join("hoard/data");
+
+        // Lo que NO puede pasar es devolver `new`: los datos siguen en `old` y
+        // el llamante crearía una carpeta vacía encima del historial.
+        assert_eq!(relocated_state_dir(&old, &new), old);
+        assert!(old.join("playtime.json").exists());
     }
 }

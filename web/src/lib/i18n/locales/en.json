@@ -164,6 +164,8 @@
   "account.storage_label": "Storage",
   "account.devices_label": "Devices",
   "account.no_devices": "No linked devices yet. Sign in from the desktop app and it will show up here.",
+  "account.devices_error": "Couldn't load your devices.",
+  "account.action_error": "That didn't go through.",
   "account.confirm_unlink": "Unlink this device?",
   "account.export_requested": "Export queued. We'll email you when it's ready.",
   "account.confirm_delete_intro": "This deletes your account and every snapshot. In the next box, type DELETE to confirm.",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "Looking for a different version or architecture? Every build lives on",
   "callback.signing_in": "Signing you in...",
   "callback.failed_title": "Sign-in failed",
-  "callback.failed_generic": "We couldn't finish signing you in. Please try again.",
+  "callback.failed_provider": "Your sign-in provider turned the request down.",
+  "callback.failed_no_session": "This link carried no sign-in to complete.",
+  "callback.failed_timeout": "The sign-in didn't finish in time.",
   "callback.back_to_signin": "Back to sign in",
   "callback.desktop_return": "Signed in! Head back to the Hoard app — you can close this tab.",
   "callback.desktop_reopen": "Didn't open? Click here to reopen Hoard.",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "Loading…",
   "common.error": "Something went wrong.",
+  "err.unreachable": "Couldn't reach the Hoard API. Check your connection and try again.",
+  "err.session_expired": "Your session expired. Sign in again to continue.",
+  "err.http": "The server answered with an error ({status}).",
   "common.retry": "Retry",
   "common.cancel": "Cancel",
   "common.confirm": "Confirm",
@@ -345,6 +352,5 @@
   "link.approve_hint": "Only approve a code you started yourself on a device you own.",
   "link.approved": "Device approved.",
   "link.approved_hint": "You can go back to that machine — it's signing in now.",
-  "link.err_not_found": "That code is invalid or has expired. Start again on your device.",
-  "link.err_generic": "Couldn't approve the device. Try again."
+  "link.err_not_found": "That code is invalid or has expired. Start again on your device."
 }

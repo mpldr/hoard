@@ -8,7 +8,7 @@
    * not to do real-time monitoring (the dashboard is for that).
    */
   import { onMount } from "svelte";
-  import { ArrowLeft, Search, Copy, RefreshCw } from "lucide-svelte";
+  import { ArrowLeft, Search, Copy, RefreshCw } from "@lucide/svelte";
   import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
 

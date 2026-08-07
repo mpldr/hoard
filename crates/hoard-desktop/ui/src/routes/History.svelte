@@ -37,7 +37,7 @@
     FolderOpen,
     Snowflake,
     RotateCw,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
@@ -765,17 +765,33 @@
                   <!-- Self-describing label: `save_v3 · 2026-05-08 14:30`.
                        The plain `v3` was useful but ambiguous in bug
                        reports; the timestamp suffix makes it copy-paste
-                       friendly. -->
+                       friendly.
+
+                       Con la máquina detrás cuando se sabe (`save_v3 ·
+                       2026-05-08 14:30 · ubserver`): con la misma partida
+                       sincronizada en dos equipos, la fecha no basta para
+                       elegir cuál restaurar. Las versiones subidas antes de que
+                       el server lo guardara no traen nombre, y entonces la
+                       etiqueta se queda como estaba en vez de decir
+                       "desconocido", que ocuparía sitio para no informar. -->
                   <span
                     class="font-mono font-medium text-zinc-100"
                     title={formatAbsolute(snap.created_at)}
                   >
-                    {$_("history.snapshot_label", {
-                      values: {
-                        version: snap.version_num,
-                        date: snapshotStamp(snap.created_at),
-                      },
-                    })}
+                    {snap.device_name
+                      ? $_("history.snapshot_label_device", {
+                          values: {
+                            version: snap.version_num,
+                            date: snapshotStamp(snap.created_at),
+                            device: snap.device_name,
+                          },
+                        })
+                      : $_("history.snapshot_label", {
+                          values: {
+                            version: snap.version_num,
+                            date: snapshotStamp(snap.created_at),
+                          },
+                        })}
                   </span>
                   {#if snap.is_pinned}
                     <Pin size={12} class="text-amber-400" />

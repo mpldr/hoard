@@ -13,7 +13,7 @@
   import { activity, status } from "../stores/agent";
   import { auth } from "../stores/auth";
   import { cloud } from "../stores/cloud";
-  import { Gamepad2, Server } from "lucide-svelte";
+  import { Gamepad2, Server } from "@lucide/svelte";
   import OsLogo from "./OsLogo.svelte";
 
   let { now }: { now: number } = $props();

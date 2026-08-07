@@ -66,7 +66,7 @@ fn health_round_trips() {
 fn cloud_health_parses() {
     let h: Health = parses("health_cloud");
     assert_eq!(h.mode.as_deref(), Some("cloud"));
-    assert_eq!(h.log_min_level.as_deref(), Some("info"));
+    assert_eq!(h.log_min_level.as_deref(), Some("warn"));
     assert_eq!(h.uptime_secs, 0, "ausente → default, no error");
 }
 

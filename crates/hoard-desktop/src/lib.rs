@@ -237,6 +237,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::misc::greet,
             commands::window::ui_ready,
+            // HUD sobre el juego (la app normal, no Hoard-Screen).
+            commands::overlay::overlay_toggle,
+            commands::overlay::overlay_set_visible,
+            commands::overlay::overlay_is_visible,
             commands::misc::open_external,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,
@@ -280,6 +284,7 @@ pub fn run() {
             commands::agent::start_agent,
             commands::agent::stop_agent,
             commands::agent::attach_agent_events,
+            commands::agent::agent_snapshot,
             commands::agent::detach_agent_events,
             commands::agent::backup_now,
             commands::agent::sweep_backups,
@@ -420,6 +425,12 @@ pub fn run() {
                 // barata (no reescribe nada si la unidad ya está igual), y **no**
                 // toca un servicio que ya esté corriendo.
                 commands::prefs::sync_service_autostart(prefs.autostart);
+
+                // Y la tercera pata: dejar constancia de qué componentes hay en
+                // esta máquina y que `hoard` se pueda escribir en una terminal.
+                // Va aquí porque quien instala la app desde la web nunca pasa
+                // por `hoard install`.
+                commands::prefs::register_installation();
 
                 // Arranque silencioso: la entrada de autostart lanza Hoard con
                 // `--silent` (ver el init del plugin más arriba), así que al

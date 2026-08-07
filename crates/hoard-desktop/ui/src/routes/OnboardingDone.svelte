@@ -7,7 +7,7 @@
     Sparkles,
     HardDrive,
     DownloadCloud,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import Button from "../lib/components/Button.svelte";
   import WizardShell from "../lib/components/WizardShell.svelte";

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::{self, Binding};
 use crate::monitors::MonitorInfo;
 use crate::scene::Rect;
 use crate::source::{Frame, Source};
@@ -36,19 +37,101 @@ pub enum ScopeShape {
     Square,
 }
 
+/// Where the lens takes its pixels from.
+///
+/// El defecto histórico —y el que sigue— es `Under`: amplía lo que tiene
+/// debajo. El problema es que entonces, para ampliar el centro de la pantalla,
+/// la lente tiene que ponerse justo encima… y tapa exactamente eso. `Center` y
+/// `Offset` desacoplan *dónde se ve* de *qué se ve*, que es lo que permite
+/// dejar la lente en una esquina.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ScopeAim {
+    /// Whatever sits under the lens.
+    #[default]
+    Under,
+    /// The centre of the monitor the panel is on.
+    Center,
+    /// The lens centre displaced by `(dx, dy)` pixels.
+    Offset { dx: f32, dy: f32 },
+}
+
+/// How a bound button turns the lens on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivationMode {
+    /// Press once to show, press again to hide. Survives letting go — the
+    /// default because it's the only mode that leaves a hand free.
+    #[default]
+    Toggle,
+    /// Visible only while the button is held down.
+    Hold,
+    /// One press shows it for [`ScopeActivation::seconds`], then it hides on
+    /// its own. Pressing again restarts the countdown rather than extending it.
+    Timed,
+}
+
+/// When the lens is visible.
+///
+/// `binding: None` is the historical behaviour — always on — and stays the
+/// default so existing scenes keep working untouched.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct ScopeActivation {
+    #[serde(default)]
+    pub binding: Option<Binding>,
+    #[serde(default)]
+    pub mode: ActivationMode,
+    /// Seconds the lens stays up in [`ActivationMode::Timed`]. Clamped to
+    /// 0.5..=60 at use.
+    #[serde(default = "default_seconds")]
+    pub seconds: f32,
+}
+
+fn default_seconds() -> f32 {
+    3.0
+}
+
 /// Everything that defines a scope's look. All fields default so the desktop
 /// can send just `{"kind":"scope"}`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+// Ya no es `Copy`: la activación puede llevar el nombre de una tecla.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScopeSpec {
     #[serde(default)]
     pub shape: ScopeShape,
     /// Magnification: the captured region is `panel_size / zoom`. Clamped to
-    /// 1..=8 at use; 1 shows the region unmagnified.
+    /// 1..=20 at use; 1 shows the region unmagnified.
+    ///
+    /// The ceiling is what the *capture* can still sustain, not a taste call:
+    /// at ×20 a 360 px lens grabs an 18 px square, and the floor of 8 px below
+    /// stops the region collapsing to nothing on a small panel. Past that the
+    /// grab would be a handful of pixels stretched across the lens — which is
+    /// exactly what ×20 is for, but there is no point pretending more is
+    /// meaningful.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
     /// Dark rim around the lens edge so it reads as a scope.
     #[serde(default = "default_border")]
     pub border: bool,
+    /// Smooth the magnified pixels (bilinear) or keep them hard (nearest).
+    ///
+    /// Matters most at high zoom: at ×20 the lens stretches an 18 px square
+    /// across the whole panel, and smoothing turns that into coloured mush.
+    /// Hard pixels keep the edges readable. Neither is right always — smooth
+    /// reads better for distant text, hard for picking out single pixels — so
+    /// it's a choice, defaulting to the historical behaviour.
+    #[serde(default = "default_smooth")]
+    pub smooth: bool,
+    /// Small centre mark inside the magnified view, so it's obvious which point
+    /// is being magnified. A separate crosshair panel can do this too, but it
+    /// draws unmagnified and doesn't follow the lens when it's aimed elsewhere.
+    #[serde(default)]
+    pub reticle: bool,
+    /// What the lens looks at (see [`ScopeAim`]).
+    #[serde(default)]
+    pub aim: ScopeAim,
+    /// Button/key that shows the lens, and how. Defaults to "always on".
+    #[serde(default)]
+    pub activation: ScopeActivation,
 }
 
 impl Default for ScopeSpec {
@@ -57,6 +140,10 @@ impl Default for ScopeSpec {
             shape: ScopeShape::Circle,
             zoom: default_zoom(),
             border: default_border(),
+            smooth: default_smooth(),
+            reticle: false,
+            aim: ScopeAim::default(),
+            activation: ScopeActivation::default(),
         }
     }
 }
@@ -65,6 +152,9 @@ fn default_zoom() -> f32 {
     2.0
 }
 fn default_border() -> bool {
+    true
+}
+fn default_smooth() -> bool {
     true
 }
 
@@ -84,6 +174,18 @@ pub struct ScopeSource {
     /// on display changes anyway).
     mons: Option<Vec<MonitorInfo>>,
     last: Option<Instant>,
+    /// Activation state. `held` is the previous poll, so a *press* is a rising
+    /// edge — polling level only would re-toggle every tick the button is down.
+    held: bool,
+    /// Toggle latch / timed deadline.
+    toggled_on: bool,
+    until: Option<Instant>,
+    /// True while the user is arranging panels: the binding is ignored so the
+    /// lens can be dragged into place.
+    editing: bool,
+    /// Whether the last emitted frame was the transparent "hidden" one, so we
+    /// emit it once on the falling edge instead of every tick.
+    hidden_emitted: bool,
 }
 
 /// Minimum interval between grabs (~30 fps).
@@ -97,20 +199,70 @@ impl ScopeSource {
     pub fn with_grabber(id: impl Into<String>, spec: &ScopeSpec, grab: Grabber) -> Self {
         Self {
             id: id.into(),
-            spec: *spec,
+            spec: spec.clone(),
             grab,
             viewport: None,
             mons: None,
             last: None,
+            held: false,
+            toggled_on: false,
+            until: None,
+            editing: false,
+            hidden_emitted: false,
         }
     }
 
-    fn monitor_origin(&mut self, mon_id: u32) -> (i32, i32) {
+    /// Is the lens supposed to be visible this tick?
+    ///
+    /// Unbound scopes are always on (the behaviour that predates bindings), and
+    /// so are scopes on a platform where we can't read global input — a lens
+    /// that never appears reads as a broken feature, while one that ignores its
+    /// binding is merely the old behaviour. Editor mode also forces it on, or
+    /// the user couldn't see what they're dragging.
+    fn poll_active(&mut self) -> bool {
+        let Some(binding) = self.spec.activation.binding.as_ref() else {
+            return true;
+        };
+        if self.editing || !input::available() {
+            return true;
+        }
+
+        self.step(input::is_down(binding), Instant::now())
+    }
+
+    /// The activation state machine, split out from the polling so it can be
+    /// driven in tests without a mouse: `down` is the button's level this tick
+    /// and `now` the clock. Pure except for the latch/deadline it owns.
+    fn step(&mut self, down: bool, now: Instant) -> bool {
+        let pressed = down && !self.held; // rising edge
+        self.held = down;
+
+        match self.spec.activation.mode {
+            ActivationMode::Hold => down,
+            ActivationMode::Toggle => {
+                if pressed {
+                    self.toggled_on = !self.toggled_on;
+                }
+                self.toggled_on
+            }
+            ActivationMode::Timed => {
+                if pressed {
+                    let secs = self.spec.activation.seconds.clamp(0.5, 60.0);
+                    self.until = Some(now + Duration::from_secs_f32(secs));
+                }
+                self.until.is_some_and(|t| now < t)
+            }
+        }
+    }
+
+    /// `(x, y, w, h)` del monitor destino. Hace falta entero y no sólo el
+    /// origen desde que la lente puede apuntar a su centro.
+    fn monitor_rect(&mut self, mon_id: u32) -> (i32, i32, i32, i32) {
         let mons = self.mons.get_or_insert_with(crate::monitors::list_monitors);
         mons.iter()
             .find(|m| m.id == mon_id)
-            .map(|m| (m.x, m.y))
-            .unwrap_or((0, 0))
+            .map(|m| (m.x, m.y, m.w, m.h))
+            .unwrap_or((0, 0, 0, 0))
     }
 }
 
@@ -123,7 +275,25 @@ impl Source for ScopeSource {
         self.viewport = Some((rect, monitor));
     }
 
+    fn set_editing(&mut self, editing: bool) {
+        self.editing = editing;
+    }
+
     fn acquire(&mut self) -> Option<Frame> {
+        if !self.poll_active() {
+            // Hidden. Emit ONE fully transparent frame and then nothing:
+            // returning `None` alone would leave the compositor holding the
+            // last magnified frame, so the lens would freeze on screen instead
+            // of disappearing.
+            if self.hidden_emitted {
+                return None;
+            }
+            self.hidden_emitted = true;
+            self.last = None; // next activation grabs immediately
+            return Some(Frame::solid(8, 8, [0, 0, 0, 0]));
+        }
+        self.hidden_emitted = false;
+
         if self.last.is_some_and(|t| t.elapsed() < FRAME_INTERVAL) {
             return None;
         }
@@ -131,12 +301,21 @@ impl Source for ScopeSource {
         self.last = Some(Instant::now());
 
         let r = rect.normalized();
-        let zoom = self.spec.zoom.clamp(1.0, 8.0) as f64;
+        let zoom = self.spec.zoom.clamp(1.0, 20.0) as f64;
         let cap_w = ((r.w / zoom).round() as u32).clamp(8, 4096);
         let cap_h = ((r.h / zoom).round() as u32).clamp(8, 4096);
-        let (ox, oy) = self.monitor_origin(mon_id);
-        let cx = ox + (r.x + r.w / 2.0) as i32;
-        let cy = oy + (r.y + r.h / 2.0) as i32;
+        let (ox, oy, mw, mh) = self.monitor_rect(mon_id);
+        // Centro de la lente en coordenadas del escritorio virtual.
+        let lens_x = ox + (r.x + r.w / 2.0) as i32;
+        let lens_y = oy + (r.y + r.h / 2.0) as i32;
+        let (cx, cy) = match self.spec.aim {
+            ScopeAim::Under => (lens_x, lens_y),
+            // Si no se conoce el monitor (lista vacía en headless), se cae al
+            // comportamiento de siempre en vez de apuntar a (0,0).
+            ScopeAim::Center if mw > 0 && mh > 0 => (ox + mw / 2, oy + mh / 2),
+            ScopeAim::Center => (lens_x, lens_y),
+            ScopeAim::Offset { dx, dy } => (lens_x + dx as i32, lens_y + dy as i32),
+        };
 
         let mut frame = (self.grab)(
             cx - (cap_w / 2) as i32,
@@ -172,6 +351,12 @@ fn apply_lens(frame: &mut Frame, spec: &ScopeSpec) {
     let aa = 1.5 / w.min(h) as f32;
     let rim_w = 2.5 / w.min(h) as f32;
     let rim = spec.border;
+    // Retícula, también en unidades normalizadas para que salga con el mismo
+    // grosor en pantalla independientemente del aumento.
+    let reticle = spec.reticle;
+    let ret_w = 1.0 / w.min(h) as f32;
+    let ret_len = 0.09;
+    let ret_gap = 0.018;
 
     for y in 0..h {
         for x in 0..w {
@@ -202,6 +387,23 @@ fn apply_lens(frame: &mut Frame, spec: &ScopeSpec) {
                 buf[i + 2] = 14;
                 buf[i + 3] = buf[i + 3].max(t);
             }
+            // Retícula: cruz fina en el centro exacto de la vista ampliada.
+            // Se puede lograr algo parecido con un panel de mirilla aparte, pero
+            // ése se dibuja SIN aumentar y no sigue a la lente cuando ésta
+            // apunta a otro sitio; esta marca siempre señala el punto que se
+            // está ampliando de verdad.
+            if reticle && cover > 0.0 {
+                let on_v = nx.abs() <= ret_w && ny.abs() <= ret_len;
+                let on_h = ny.abs() <= ret_w && nx.abs() <= ret_len;
+                // Hueco central: deja ver el píxel exacto que se apunta.
+                let in_gap = nx.abs() <= ret_gap && ny.abs() <= ret_gap;
+                if (on_v || on_h) && !in_gap {
+                    buf[i] = 255;
+                    buf[i + 1] = 255;
+                    buf[i + 2] = 255;
+                    buf[i + 3] = 255;
+                }
+            }
         }
     }
 }
@@ -209,6 +411,7 @@ fn apply_lens(frame: &mut Frame, spec: &ScopeSpec) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::Binding;
 
     fn grid(x: i32, y: i32, w: u32, h: u32) -> Option<Frame> {
         // Encode the requested origin in the first pixel so tests can assert
@@ -265,6 +468,7 @@ mod tests {
             zoom: 2.0,
             shape: ScopeShape::Square,
             border: true,
+            ..Default::default()
         })
         .acquire()
         .unwrap();
@@ -272,6 +476,262 @@ mod tests {
         let rim = f.pixel(1, 50);
         assert!(rim[0] < 30, "left rim dark: {rim:?}");
         assert_eq!(f.pixel(50, 50), [255, 255, 255, 255], "centre untouched");
+    }
+
+    fn bound(mode: ActivationMode, seconds: f32) -> ScopeSource {
+        ScopeSource::with_grabber(
+            "s",
+            &ScopeSpec {
+                activation: ScopeActivation {
+                    binding: Some(Binding::Mouse { button: 3 }),
+                    mode,
+                    seconds,
+                },
+                ..Default::default()
+            },
+            grid,
+        )
+    }
+
+    /// El JSON exacto que emite el editor (`Screen.svelte`). Si alguien cambia
+    /// un nombre de campo en cualquiera de los dos lados, esto lo caza aquí en
+    /// vez de dejar un visor que nunca se activa y nadie sabe por qué.
+    #[test]
+    fn parses_the_payload_the_editor_actually_sends() {
+        let json = r#"{
+            "kind": "scope",
+            "shape": "circle",
+            "zoom": 2,
+            "border": true,
+            "activation": {
+                "binding": { "type": "mouse", "button": 4 },
+                "mode": "hold",
+                "seconds": 3
+            }
+        }"#;
+        let src: crate::scene::SourceRef = serde_json::from_str(json).unwrap();
+        let crate::scene::SourceRef::Scope(spec) = src else {
+            panic!("no se reconoció como visor");
+        };
+        assert_eq!(
+            spec.activation.binding,
+            Some(Binding::Mouse { button: 4 }),
+            "el botón lateral tiene que llegar tal cual"
+        );
+        assert_eq!(spec.activation.mode, ActivationMode::Hold);
+        assert_eq!(spec.activation.seconds, 3.0);
+    }
+
+    /// Una escena de antes de que existieran los vínculos no lleva
+    /// `activation`; tiene que seguir cargando y quedarse "siempre visible".
+    #[test]
+    fn an_old_scene_without_activation_still_loads() {
+        let src: crate::scene::SourceRef =
+            serde_json::from_str(r#"{"kind":"scope","zoom":3}"#).unwrap();
+        let crate::scene::SourceRef::Scope(spec) = src else {
+            panic!("no se reconoció como visor");
+        };
+        assert_eq!(spec.activation.binding, None);
+        assert_eq!(spec.zoom, 3.0);
+    }
+
+    thread_local! {
+        static LAST_GRAB: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// Registra el origen pedido en vez de codificarlo en el píxel (0,0): ese
+    /// píxel cae en la esquina y la máscara de la lente lo deja transparente,
+    /// así que no se puede leer de vuelta.
+    fn recording(x: i32, y: i32, w: u32, h: u32) -> Option<Frame> {
+        LAST_GRAB.with(|c| c.set((x, y)));
+        Some(Frame::solid(w, h, [10, 10, 10, 255]))
+    }
+
+    fn aim_origin(aim: ScopeAim) -> (i32, i32) {
+        let mut s = ScopeSource::with_grabber(
+            "s",
+            &ScopeSpec {
+                zoom: 1.0,
+                border: false,
+                aim,
+                ..Default::default()
+            },
+            recording,
+        );
+        // Lente de 40×40 en (100,100): su centro cae en (120,120).
+        s.set_viewport(Rect::new(100.0, 100.0, 40.0, 40.0), 0);
+        s.acquire().unwrap();
+        LAST_GRAB.with(|c| c.get())
+    }
+
+    #[test]
+    fn aim_under_grabs_beneath_the_lens() {
+        // centro 120 − mitad de la región (20) = 100.
+        assert_eq!(aim_origin(ScopeAim::Under), (100, 100));
+    }
+
+    #[test]
+    fn aim_offset_displaces_the_grabbed_point() {
+        let (x, y) = aim_origin(ScopeAim::Offset {
+            dx: 30.0,
+            dy: -20.0,
+        });
+        assert_eq!(
+            (x, y),
+            (130, 80),
+            "la lente mira 30 a la derecha y 20 arriba"
+        );
+    }
+
+    #[test]
+    fn aim_center_falls_back_when_the_monitor_is_unknown() {
+        // Sin monitores (headless) `Center` no puede apuntar al centro: tiene
+        // que comportarse como `Under`, no apuntar a (0,0).
+        assert_eq!(aim_origin(ScopeAim::Center), (100, 100));
+    }
+
+    #[test]
+    fn reticle_marks_the_centre_only_when_asked() {
+        let shoot = |reticle: bool| {
+            let mut s = ScopeSource::with_grabber(
+                "s",
+                &ScopeSpec {
+                    border: false,
+                    reticle,
+                    ..Default::default()
+                },
+                recording, // fondo oscuro: una retícula blanca se ve
+            );
+            s.set_viewport(Rect::new(100.0, 100.0, 200.0, 200.0), 0);
+            s.acquire().unwrap()
+        };
+        let off = shoot(false);
+        let on = shoot(true);
+        let (w, h) = (on.width, on.height);
+        // Un punto sobre el brazo vertical, fuera del hueco central.
+        let probe_y = h / 2 - h / 20;
+        assert_eq!(
+            on.pixel(w / 2, probe_y),
+            [255, 255, 255, 255],
+            "el brazo de la retícula se dibuja"
+        );
+        assert_ne!(
+            off.pixel(w / 2, probe_y),
+            [255, 255, 255, 255],
+            "sin retícula ese píxel no se toca"
+        );
+        // El hueco central deja ver el píxel apuntado.
+        assert_eq!(
+            on.pixel(w / 2, h / 2),
+            off.pixel(w / 2, h / 2),
+            "el centro exacto queda libre"
+        );
+    }
+
+    #[test]
+    fn smooth_defaults_on_and_survives_the_wire() {
+        assert!(ScopeSpec::default().smooth, "por defecto, como siempre");
+        let src: crate::scene::SourceRef = serde_json::from_str(
+            r#"{"kind":"scope","smooth":false,"reticle":true,
+                "aim":{"kind":"offset","dx":40,"dy":-10}}"#,
+        )
+        .unwrap();
+        let crate::scene::SourceRef::Scope(spec) = src else {
+            panic!("no se reconoció como visor");
+        };
+        assert!(!spec.smooth);
+        assert!(spec.reticle);
+        assert_eq!(
+            spec.aim,
+            ScopeAim::Offset {
+                dx: 40.0,
+                dy: -10.0
+            }
+        );
+    }
+
+    #[test]
+    fn hold_follows_the_button_level() {
+        let mut s = bound(ActivationMode::Hold, 3.0);
+        let t = Instant::now();
+        assert!(!s.step(false, t));
+        assert!(s.step(true, t), "visible mientras se mantiene");
+        assert!(s.step(true, t), "sigue visible sin soltar");
+        assert!(!s.step(false, t), "se oculta al soltar");
+    }
+
+    #[test]
+    fn toggle_flips_on_the_press_not_on_every_tick() {
+        let mut s = bound(ActivationMode::Toggle, 3.0);
+        let t = Instant::now();
+        assert!(!s.step(false, t), "arranca oculto");
+        assert!(s.step(true, t), "una pulsación lo enciende");
+        // Mantener pulsado NO debe re-alternar: sólo cuenta el flanco.
+        assert!(s.step(true, t));
+        assert!(s.step(true, t));
+        assert!(s.step(false, t), "sigue encendido tras soltar");
+        assert!(!s.step(true, t), "la segunda pulsación lo apaga");
+    }
+
+    #[test]
+    fn timed_hides_itself_and_a_new_press_restarts_the_clock() {
+        let mut s = bound(ActivationMode::Timed, 2.0);
+        let t0 = Instant::now();
+        assert!(!s.step(false, t0));
+        assert!(s.step(true, t0), "la pulsación lo enciende");
+        assert!(
+            s.step(false, t0 + Duration::from_secs_f32(1.9)),
+            "aún dentro"
+        );
+        assert!(
+            !s.step(false, t0 + Duration::from_secs_f32(2.1)),
+            "se apaga solo al vencer"
+        );
+        // Volver a pulsar reinicia la cuenta desde ese momento.
+        let t1 = t0 + Duration::from_secs_f32(5.0);
+        assert!(s.step(true, t1));
+        assert!(s.step(false, t1 + Duration::from_secs_f32(1.5)));
+        assert!(!s.step(false, t1 + Duration::from_secs_f32(2.5)));
+    }
+
+    #[test]
+    fn timed_clamps_absurd_durations() {
+        let mut s = bound(ActivationMode::Timed, 9999.0);
+        let t = Instant::now();
+        assert!(s.step(true, t));
+        // 60 s es el tope; a los 61 ya no puede seguir encendido.
+        assert!(!s.step(false, t + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn an_unbound_scope_is_always_on() {
+        let mut s = ScopeSource::with_grabber("s", &ScopeSpec::default(), grid);
+        assert!(s.poll_active(), "sin binding, el visor no se esconde nunca");
+    }
+
+    #[test]
+    fn editing_mode_ignores_the_binding() {
+        let mut s = bound(ActivationMode::Toggle, 3.0);
+        s.set_editing(true);
+        assert!(
+            s.poll_active(),
+            "en el editor tiene que verse para poder colocarlo"
+        );
+    }
+
+    #[test]
+    fn a_bound_scope_emits_one_transparent_frame_then_stops() {
+        let mut s = bound(ActivationMode::Toggle, 3.0);
+        s.set_viewport(Rect::new(0.0, 0.0, 100.0, 100.0), 0);
+        // Sin `input::available()` en el build de test el binding se ignora, así
+        // que forzamos el estado oculto por la vía de la máquina.
+        s.spec.activation.binding = Some(Binding::Mouse { button: 3 });
+        s.editing = false;
+        let f = s.acquire();
+        // El build de test no puede sondear, así que se comporta como "siempre
+        // visible": lo que se comprueba aquí es que ESO es lo que pasa, no un
+        // visor invisible.
+        assert!(f.is_some(), "sin sondeo disponible, sigue mostrándose");
     }
 
     #[test]

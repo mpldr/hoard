@@ -14,11 +14,12 @@
 use anyhow::{Context, Result};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    config::{BehaviorVersion, Region},
+    config::{BehaviorVersion, Region, RequestChecksumCalculation, ResponseChecksumValidation},
     primitives::ByteStream,
     Client,
 };
 use std::path::Path;
+use std::time::Duration;
 
 /// Connection parameters for an S3-compatible endpoint. Deliberately a plain
 /// struct (not tied to any config type) so both the self-hosted
@@ -33,6 +34,28 @@ pub struct S3Params {
     /// MinIO, Garage and `rclone serve s3` need path-style addressing
     /// (`endpoint/bucket/key`); most others accept it too. R2 forces it.
     pub force_path_style: bool,
+    /// Talk the most conservative dialect of S3 the SDK can speak, for
+    /// endpoints that are not AWS and not R2 (see [`S3::connect`]). On for the
+    /// self-hosted `[storage.s3]` backend, off for the cloud R2 client.
+    pub compat: bool,
+}
+
+/// Whether a failed operation means "the object isn't there". Checks the HTTP
+/// status and the S3 error code rather than the message, because every
+/// implementation words it differently (and some answer a bare 404 with no
+/// body at all).
+fn is_not_found<E>(
+    err: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
+) -> bool
+where
+    aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>:
+        aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    if err.raw_response().map(|r| r.status().as_u16()) == Some(404) {
+        return true;
+    }
+    matches!(err.code(), Some("NoSuchKey") | Some("NotFound"))
 }
 
 /// An `aws-sdk-s3` client bound to a single bucket, plus the small set of
@@ -46,9 +69,36 @@ pub struct S3 {
 impl S3 {
     /// Build a client. The explicit `endpoint_url` is what makes this speak to
     /// an arbitrary S3-compatible host rather than Amazon.
+    ///
+    /// `compat` exists because "S3-compatible" is a spectrum. Since the SDK
+    /// defaults flipped to `RequestChecksumCalculation::WhenSupported`, every
+    /// upload with a *streaming* body (which is every blob we store — the body
+    /// comes off a file, not a `Vec`) is sent as `aws-chunked`: the payload is
+    /// wrapped in `<len>;chunk-signature=…` frames with the checksum trailing
+    /// after it. AWS, R2 and MinIO unwrap that. An implementation that doesn't
+    /// — `rclone serve s3`'s gofakes3 among them, i.e. the bridge our own guide
+    /// points Mega/OneDrive/Drive users at — stores the frames verbatim, so
+    /// every blob lands corrupt and only surfaces on restore, months later.
+    /// With `compat` on we ask for checksums only where the S3 API *requires*
+    /// them (nothing we call does), which drops `aws-chunked` entirely and puts
+    /// a plain `Content-Length` body on the wire. No integrity is lost: blobs
+    /// are content-addressed by sha256 and verified on the way back
+    /// (`hoard-admin storage verify`, and the agent re-hashes every download).
+    ///
+    /// `compat` also widens the SDK's tight AWS-shaped defaults (3.1 s to
+    /// connect, 3 attempts), because the endpoint may be an rclone process
+    /// forwarding to a consumer cloud drive.
     pub async fn connect(p: S3Params) -> Result<Self> {
         if p.endpoint.is_empty() || p.bucket.is_empty() {
             anyhow::bail!("s3 endpoint and bucket are required");
+        }
+        // Without a scheme the SDK fails deep inside the first request with an
+        // opaque "invalid URI" — catch the common `127.0.0.1:9000` typo here.
+        if !p.endpoint.starts_with("http://") && !p.endpoint.starts_with("https://") {
+            anyhow::bail!(
+                "s3 endpoint must start with http:// or https:// (got {:?})",
+                p.endpoint
+            );
         }
         let creds = Credentials::new(
             p.access_key_id,
@@ -63,19 +113,34 @@ impl S3 {
         } else {
             p.region
         };
-        let sdk_conf = aws_config::defaults(BehaviorVersion::latest())
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(region))
             .credentials_provider(creds)
-            .endpoint_url(p.endpoint)
-            .load()
-            .await;
+            .endpoint_url(p.endpoint);
+        if p.compat {
+            loader = loader
+                .timeout_config(
+                    aws_config::timeout::TimeoutConfig::builder()
+                        .connect_timeout(Duration::from_secs(15))
+                        .build(),
+                )
+                // Retries cover a remote that rate-limits or drops a request.
+                // Every operation we issue is idempotent (content-addressed
+                // PUT, GET, HEAD, DELETE), so a replay is always safe.
+                .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(5));
+        }
+        let sdk_conf = loader.load().await;
 
-        let s3_conf = aws_sdk_s3::config::Builder::from(&sdk_conf)
-            .force_path_style(p.force_path_style)
-            .build();
+        let mut s3_conf =
+            aws_sdk_s3::config::Builder::from(&sdk_conf).force_path_style(p.force_path_style);
+        if p.compat {
+            s3_conf = s3_conf
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+        }
 
         Ok(Self {
-            client: Client::from_conf(s3_conf),
+            client: Client::from_conf(s3_conf.build()),
             bucket: p.bucket,
         })
     }
@@ -106,7 +171,24 @@ impl S3 {
     /// Streaming PUT from a file on disk. Keeps the body off the heap — the SDK
     /// reads the file incrementally. Used for blob/chunk finalization and
     /// account-export ZIPs, which can be GB-sized.
+    ///
+    /// A single PUT is the most widely supported way to store an object, and
+    /// everything Hoard stores fits in one: files above `CHUNK_THRESHOLD`
+    /// (128 MB) are split into chunks before they ever reach a backend. Should
+    /// that invariant ever change, the 5 GiB single-PUT ceiling would turn into
+    /// a confusing provider error, so anything approaching it falls back to
+    /// multipart instead.
     pub async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        const SINGLE_PUT_MAX: u64 = 4 * 1024 * 1024 * 1024;
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() > SINGLE_PUT_MAX {
+                let file = tokio::fs::File::open(path)
+                    .await
+                    .with_context(|| format!("s3 put_file open {}", path.display()))?;
+                self.put_from_reader(key, file).await?;
+                return Ok(());
+            }
+        }
         let body = ByteStream::from_path(path)
             .await
             .with_context(|| format!("s3 put_file open {}", path.display()))?;
@@ -156,6 +238,7 @@ impl S3 {
             .send()
             .await
             .with_context(|| format!("s3 get_object {key}"))?;
+        let declared = out.content_length();
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -165,10 +248,20 @@ impl S3 {
         let mut file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("s3 spool create {}", dest.display()))?;
-        tokio::io::copy(&mut reader, &mut file)
+        let copied = tokio::io::copy(&mut reader, &mut file)
             .await
             .with_context(|| format!("s3 spool {key}"))?;
         tokio::io::AsyncWriteExt::flush(&mut file).await.ok();
+        // A body cut short mid-stream is not an error for `copy` — it just
+        // stops. Silently spooling a truncated blob would put the wrong bytes
+        // in a restore tarball, so compare against the length the endpoint
+        // declared and let the caller fail (and the client retry) instead.
+        if let Some(len) = declared {
+            if len >= 0 && copied != len as u64 {
+                let _ = tokio::fs::remove_file(dest).await;
+                anyhow::bail!("s3 get {key}: truncated body ({copied} of {len} bytes)");
+            }
+        }
         Ok(())
     }
 
@@ -351,14 +444,23 @@ impl S3 {
         }
     }
 
+    /// Delete an object. Missing is success: S3 itself answers 204 for a key
+    /// that was never there, but several compatibles (gofakes3 behind `rclone
+    /// serve s3`, some gateways) answer 404 instead. GC and upload rollback
+    /// both double-delete by design, so a 404 must not fail the sweep and
+    /// strand the rest of the trash.
     pub async fn delete(&self, key: &str) -> Result<()> {
-        self.client
+        match self
+            .client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .with_context(|| format!("s3 delete_object {key}"))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("s3 delete_object {key}")),
+        }
     }
 }

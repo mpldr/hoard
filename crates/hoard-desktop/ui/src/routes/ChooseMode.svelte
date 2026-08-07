@@ -1,7 +1,7 @@
 <script lang="ts">
   import { push } from "svelte-spa-router";
   import { fly } from "svelte/transition";
-  import { Server, Cloud } from "lucide-svelte";
+  import { Server, Cloud } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import WizardShell from "../lib/components/WizardShell.svelte";
   import { saveStep } from "../lib/stores/onboarding";

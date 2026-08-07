@@ -751,6 +751,7 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
         gpu.reconcile_captures(&wanted);
 
         let caps_new = gpu.poll_captures();
+        engine.set_editing(mode == Mode::Editor);
         let notes_new = engine.tick();
         let need_render = caps_new || notes_new || scene_dirty;
 

@@ -364,6 +364,14 @@ pub async fn activate_feature(
 #[derive(Debug, Serialize)]
 pub struct PlaytimeUploadBody {
     pub device_fp: String,
+    /// Este equipo afirma conocer **todo** su pasado, porque su store salió de
+    /// un fichero que existía ([`crate::playtime::PlaytimeStore::is_authoritative`]).
+    ///
+    /// Con `false` el servidor sólo toca los días que van en `rows`: un cliente
+    /// que perdió su fichero no afirma nada sobre los días viejos, así que no
+    /// puede borrarlos. Con `true` reemplaza el dispositivo entero, que es lo
+    /// que hace falta para que retirar un juego del cómputo lo retire de verdad.
+    pub authoritative: bool,
     pub rows: Vec<PlaytimeRow>,
 }
 

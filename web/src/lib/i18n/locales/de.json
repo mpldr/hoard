@@ -164,6 +164,8 @@
   "account.storage_label": "Speicher",
   "account.devices_label": "Geräte",
   "account.no_devices": "Noch keine verknüpften Geräte. Melde dich in der Desktop-App an, dann erscheint es hier.",
+  "account.devices_error": "Deine Geräte konnten nicht geladen werden.",
+  "account.action_error": "Das hat nicht geklappt.",
   "account.confirm_unlink": "Dieses Gerät trennen?",
   "account.export_requested": "Export in der Warteschlange. Wir benachrichtigen dich per E-Mail, sobald er fertig ist.",
   "account.confirm_delete_intro": "Das löscht dein Konto und jeden Snapshot. Tippe im nächsten Feld DELETE zur Bestätigung.",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "Suchst du eine andere Version oder Architektur? Alle Builds gibt es auf",
   "callback.signing_in": "Du wirst angemeldet …",
   "callback.failed_title": "Anmeldung fehlgeschlagen",
-  "callback.failed_generic": "Die Anmeldung konnte nicht abgeschlossen werden. Bitte versuche es erneut.",
+  "callback.failed_provider": "Dein Anmeldeanbieter hat die Anfrage abgelehnt.",
+  "callback.failed_no_session": "Dieser Link enthielt keine Anmeldung zum Abschließen.",
+  "callback.failed_timeout": "Die Anmeldung wurde nicht rechtzeitig abgeschlossen.",
   "callback.back_to_signin": "Zurück zur Anmeldung",
   "callback.desktop_return": "Angemeldet! Geh zurück zur Hoard-App — diesen Tab kannst du schließen.",
   "callback.desktop_reopen": "Nicht geöffnet? Hier klicken, um Hoard erneut zu öffnen.",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "Wird geladen …",
   "common.error": "Etwas ist schiefgelaufen.",
+  "err.unreachable": "Die Hoard-API war nicht erreichbar. Prüfe deine Verbindung und versuch es erneut.",
+  "err.session_expired": "Deine Sitzung ist abgelaufen. Melde dich erneut an, um fortzufahren.",
+  "err.http": "Der Server hat mit einem Fehler geantwortet ({status}).",
   "common.retry": "Erneut versuchen",
   "common.cancel": "Abbrechen",
   "common.confirm": "Bestätigen",
@@ -345,6 +352,5 @@
   "link.approve_hint": "Bestätige nur einen Code, den du selbst auf einem eigenen Gerät gestartet hast.",
   "link.approved": "Gerät bestätigt.",
   "link.approved_hint": "Du kannst zu diesem Gerät zurückkehren – es meldet sich gerade an.",
-  "link.err_not_found": "Dieser Code ist ungültig oder abgelaufen. Starte auf deinem Gerät neu.",
-  "link.err_generic": "Gerät konnte nicht bestätigt werden. Versuch es erneut."
+  "link.err_not_found": "Dieser Code ist ungültig oder abgelaufen. Starte auf deinem Gerät neu."
 }

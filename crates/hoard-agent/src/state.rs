@@ -454,6 +454,10 @@ impl CliState {
     /// exactly `[path]` and whose source is `ManualOverride`, regardless of
     /// what the heuristics produced.
     pub fn set_manual_path(&mut self, slug: &str, path: PathBuf) {
+        // Fijar la ruta a mano ES la desmentida de la heurística: lo que
+        // propuso no valía y ésta es la respuesta. Se emite aquí, que es por
+        // donde pasan los dos frontends, y no en cada command.
+        crate::telemetry::manual_path(slug, &path);
         self.manual_paths.insert(slug.to_string(), path);
     }
 

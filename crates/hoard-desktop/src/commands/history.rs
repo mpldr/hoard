@@ -33,6 +33,10 @@ pub struct SnapshotWire {
     pub file_count: i64,
     pub total_size_bytes: i64,
     pub is_pinned: bool,
+    /// De qué máquina salió esta versión. `None` en lo subido antes de que se
+    /// guardara: la etiqueta se queda como estaba en vez de inventarse un
+    /// equipo.
+    pub device_name: Option<String>,
     pub created_at: String,
     pub deleted_at: Option<String>,
 }
@@ -62,6 +66,7 @@ fn snapshot_to_wire(s: hoard_agent::api::Snapshot) -> SnapshotWire {
         file_count: s.file_count,
         total_size_bytes: s.total_size_bytes,
         is_pinned: s.is_pinned,
+        device_name: s.device_name,
         created_at: fmt_time(s.created_at),
         deleted_at: s.deleted_at.map(fmt_time),
     }
@@ -307,6 +312,13 @@ pub async fn restore_snapshot(
         if p.as_os_str().is_empty() {
             return Err("Destination path can't be empty.".to_string());
         }
+        // Misma guarda estructural que el alta y que el propio restore: esta
+        // ruta no sólo recibe el snapshot, se **persiste** más abajo como la
+        // carpeta del save, así que un destino imposible (un perfil entero, un
+        // prefijo de Proton) quedaría fijado para todos los backups siguientes.
+        // Aquí no bastaba con la validación del agente: este comando escribe el
+        // `local_path` por su cuenta.
+        hoard_agent::library::validate_path_shape(&p).map_err(|e| e.to_string())?;
         // Auto-create the folder if it's missing — the user explicitly
         // picked it as the restore target, so creating an empty dir is
         // less surprising than failing.

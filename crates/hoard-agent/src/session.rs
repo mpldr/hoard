@@ -140,6 +140,7 @@ async fn resolve_cloud_owned(sess: cloud_auth::Session) -> Result<Active> {
         access: access.clone(),
         refresh: Some(refresh),
     });
+    lend_to_logship(&sess.server_url, &access);
 
     match cloud_auth::fetch_me(&sess.server_url, &access).await {
         Ok(me) => {
@@ -609,6 +610,19 @@ fn adopt(client: &ApiClient, sess: &mut cloud_auth::Session, tokens: cloud_auth:
     client.set_token(&tokens.access);
     sess.access = tokens.access;
     sess.refresh = tokens.refresh;
+    // El enviador de logs no puede pedir nada por IPC y no ve `cloud.toml`: se
+    // le deja puesto el token recién rotado, o se quedaría enviando con el
+    // viejo hasta comerse un 401.
+    lend_to_logship(&sess.server_url, &sess.access);
+}
+
+/// Deja la sesión Cloud en el hueco que lee `logship`. La llama **el dueño** (el
+/// servicio) en cuanto tiene un JWT válido: al arrancar y en cada rotación.
+fn lend_to_logship(url: &str, token: &str) {
+    credentials::set_lent_cloud(Some(credentials::CloudLease {
+        url: url.to_string(),
+        token: token.to_string(),
+    }));
 }
 
 /// Una sesión en disco cuyo refresh token no es el muerto — o sea, el usuario

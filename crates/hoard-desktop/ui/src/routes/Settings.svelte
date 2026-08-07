@@ -31,7 +31,9 @@
     HardDrive,
     Server,
     ServerCog,
-  } from "lucide-svelte";
+    MousePointer2,
+    Gamepad2,
+  } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
   import Button from "../lib/components/Button.svelte";
@@ -45,6 +47,17 @@
     accentHue,
     setAccentHue,
   } from "../lib/stores/theme";
+  import {
+    motionIntensity,
+    setMotionIntensity,
+  } from "../lib/stores/motion";
+  import {
+    overlayEnabled,
+    overlayHotkey,
+    setOverlayEnabled,
+    setOverlayHotkey,
+    DEFAULT_HOTKEY,
+  } from "../lib/stores/gameOverlay";
   import { auth, signOut } from "../lib/stores/auth";
   import { cloud, planLabel } from "../lib/stores/cloud";
   import { supportedLocales, setLocale } from "../lib/i18n";
@@ -89,6 +102,65 @@
   function resetAccent(): void {
     setAccentHue(null);
   }
+
+  // Intensidad del relieve: 0 lo apaga, 100 son los 8° históricos, 50 —el
+  // defecto— la mitad. En `oninput` (no `onchange`) para que se note mientras
+  // se arrastra.
+  function onMotionInput(e: Event): void {
+    const v = Number((e.currentTarget as HTMLInputElement).value);
+    if (Number.isFinite(v)) setMotionIntensity(v);
+  }
+
+  // ── Captura del atajo del overlay ────────────────────────────────────
+  //
+  // Se escucha en fase de captura para que la combinación no active nada de la
+  // página mientras se está asignando. Sólo se acepta cuando hay al menos un
+  // modificador: un atajo global de una sola tecla se comería esa tecla en
+  // TODAS las aplicaciones, que es una forma muy rápida de romperle el teclado
+  // a alguien.
+  let capturingHotkey = $state(false);
+
+  const MODS: [string, string][] = [
+    ["ctrlKey", "Ctrl"],
+    ["altKey", "Alt"],
+    ["shiftKey", "Shift"],
+    ["metaKey", "Super"],
+  ];
+
+  function accelFrom(e: KeyboardEvent): string | null {
+    const parts = MODS.filter(([k]) => e[k as keyof KeyboardEvent]).map(
+      ([, name]) => name,
+    );
+    if (parts.length === 0) return null;
+    const code = e.code;
+    let key: string | null = null;
+    if (/^Key[A-Z]$/.test(code)) key = code.slice(3);
+    else if (/^Digit[0-9]$/.test(code)) key = code.slice(5);
+    else if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) key = code;
+    else if (code === "Space") key = "Space";
+    if (!key) return null;
+    return [...parts, key].join("+");
+  }
+
+  function onHotkeyDown(e: KeyboardEvent) {
+    if (!capturingHotkey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.code === "Escape") {
+      capturingHotkey = false;
+      return;
+    }
+    const accel = accelFrom(e);
+    if (!accel) return; // aún sólo modificadores: se sigue esperando
+    capturingHotkey = false;
+    setOverlayHotkey(accel);
+  }
+
+  $effect(() => {
+    if (!capturingHotkey) return;
+    window.addEventListener("keydown", onHotkeyDown, true);
+    return () => window.removeEventListener("keydown", onHotkeyDown, true);
+  });
 
   // The single user-facing operating mode, derived from the internal flags.
   const syncMode = $derived(
@@ -719,6 +791,107 @@
               {$_("settings.accent_reset")}
             </button>
           </div>
+
+          <!-- Intensidad del relieve. Va aquí, junto al tema y al acento,
+               porque es lo mismo: aspecto puro, guardado en el navegador y sin
+               pasar por Rust. Tres niveles en vez de un interruptor — apagarlo
+               del todo era la única salida para quien lo encuentra excesivo, y
+               se llevaba por delante un efecto que a otros les gusta. -->
+          <div class="mt-4 flex items-center gap-3 border-t border-white/[0.08] pt-4">
+            <MousePointer2 size={16} class="shrink-0 text-zinc-500" />
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium text-zinc-100">
+                {$_("settings.motion_label")}
+              </p>
+              <p class="mt-0.5 text-xs text-zinc-500">
+                {$_("settings.motion_desc")}
+              </p>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              value={$motionIntensity}
+              oninput={onMotionInput}
+              class="motion-slider w-40 shrink-0"
+              aria-label={$_("settings.motion_label")}
+              aria-valuetext="{$motionIntensity}%"
+            />
+            <span class="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-400">
+              {$motionIntensity}%
+            </span>
+          </div>
+        </Card>
+      </section>
+
+      <!-- ── Overlay sobre el juego ─────────────────────────────────── -->
+      <section>
+        <h2
+          class="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500"
+        >
+          {$_("settings.section_overlay")}
+        </h2>
+        <Card>
+          <div class="flex items-start gap-3">
+            <Gamepad2 size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium text-zinc-100">
+                {$_("settings.overlay_label")}
+              </p>
+              <p class="mt-0.5 text-xs leading-relaxed text-zinc-500">
+                {$_("settings.overlay_desc")}
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={$overlayEnabled}
+              aria-label={$_("settings.overlay_label")}
+              onclick={() => setOverlayEnabled(!$overlayEnabled)}
+              class="mt-0.5 flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors {$overlayEnabled
+                ? 'bg-emerald-600'
+                : 'bg-zinc-700'}"
+            >
+              <span
+                class="h-5 w-5 rounded-full bg-white transition-transform {$overlayEnabled
+                  ? 'translate-x-5'
+                  : ''}"
+              ></span>
+            </button>
+          </div>
+
+          {#if $overlayEnabled}
+            <div class="mt-4 flex items-center gap-3 border-t border-white/[0.08] pt-4">
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium text-zinc-100">
+                  {$_("settings.overlay_hotkey_label")}
+                </p>
+                <p class="mt-0.5 text-xs text-zinc-500">
+                  {$_("settings.overlay_hotkey_desc")}
+                </p>
+              </div>
+              <button
+                type="button"
+                onclick={() => (capturingHotkey = true)}
+                class="w-56 shrink-0 rounded-md border px-3 py-1.5 text-xs transition-colors {capturingHotkey
+                  ? 'animate-pulse border-emerald-500 bg-emerald-600/20 text-emerald-200'
+                  : 'border-white/[0.08] text-zinc-200 hover:bg-zinc-800/40'}"
+              >
+                {capturingHotkey
+                  ? $_("settings.overlay_hotkey_capture")
+                  : $overlayHotkey}
+              </button>
+              {#if $overlayHotkey !== DEFAULT_HOTKEY && !capturingHotkey}
+                <button
+                  type="button"
+                  onclick={() => setOverlayHotkey(DEFAULT_HOTKEY)}
+                  class="shrink-0 rounded-md border border-white/[0.08] px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-100"
+                  >{$_("settings.overlay_hotkey_reset")}</button
+                >
+              {/if}
+            </div>
+          {/if}
         </Card>
       </section>
 

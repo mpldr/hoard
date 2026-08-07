@@ -164,6 +164,8 @@
   "account.storage_label": "Almacenamiento",
   "account.devices_label": "Dispositivos",
   "account.no_devices": "Aún no hay dispositivos vinculados. Inicia sesión desde la app de escritorio y aparecerá aquí.",
+  "account.devices_error": "No se han podido cargar tus dispositivos.",
+  "account.action_error": "La acción no se ha completado.",
   "account.confirm_unlink": "¿Desvincular este dispositivo?",
   "account.export_requested": "Exportación en cola. Te avisamos por email cuando esté lista.",
   "account.confirm_delete_intro": "Esto borra tu cuenta y todos los snapshots. En el siguiente cuadro, escribe DELETE para confirmar.",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "¿Buscas otra versión o arquitectura? Todas las builds están en",
   "callback.signing_in": "Iniciando sesión...",
   "callback.failed_title": "Error al iniciar sesión",
-  "callback.failed_generic": "No pudimos terminar el inicio de sesión. Inténtalo de nuevo.",
+  "callback.failed_provider": "El proveedor de acceso ha rechazado la petición.",
+  "callback.failed_no_session": "Este enlace no traía ninguna sesión que completar.",
+  "callback.failed_timeout": "El inicio de sesión no ha terminado a tiempo.",
   "callback.back_to_signin": "Volver al inicio de sesión",
   "callback.desktop_return": "¡Sesión iniciada! Vuelve a la app de Hoard, ya puedes cerrar esta pestaña.",
   "callback.desktop_reopen": "¿No se abrió? Haz clic aquí para reabrir Hoard.",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "Cargando…",
   "common.error": "Algo ha fallado.",
+  "err.unreachable": "No se ha podido contactar con la API de Hoard. Revisa la conexión y vuelve a intentarlo.",
+  "err.session_expired": "Tu sesión ha caducado. Vuelve a iniciar sesión para continuar.",
+  "err.http": "El servidor ha respondido con un error ({status}).",
   "common.retry": "Reintentar",
   "common.cancel": "Cancelar",
   "common.confirm": "Confirmar",
@@ -345,6 +352,5 @@
   "link.approve_hint": "Aprueba solo un código que hayas iniciado tú en un dispositivo tuyo.",
   "link.approved": "Dispositivo aprobado.",
   "link.approved_hint": "Vuelve a esa máquina: ya está iniciando sesión.",
-  "link.err_not_found": "Ese código no es válido o ha caducado. Empieza de nuevo en tu dispositivo.",
-  "link.err_generic": "No se pudo aprobar el dispositivo. Inténtalo de nuevo."
+  "link.err_not_found": "Ese código no es válido o ha caducado. Empieza de nuevo en tu dispositivo."
 }

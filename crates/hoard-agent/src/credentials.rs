@@ -408,6 +408,36 @@ pub fn set_lent(creds: Option<Credentials>) {
     *slot = creds;
 }
 
+/// El gemelo Cloud del hueco de arriba, y existe por el mismo lector: `logship`.
+///
+/// La sesión Cloud **no vive aquí** —vive en `cloud_auth`/`cloud.toml`, y su JWT
+/// lo rota el servicio— así que un lector que sólo mirase [`current`] no la ve
+/// nunca. Ése era el bug: con la app en Cloud, el enviador de logs resolvía
+/// `None` en cada vuelta y no ha mandado una sola línea desde que existe.
+///
+/// Lo rellena quien tiene un token fresco: el servicio en cada rotación
+/// ([`crate::session::refresh_loop`]) y un cliente en cuanto se lo prestan. Con
+/// `None` al cerrar sesión.
+static LENT_CLOUD: std::sync::RwLock<Option<CloudLease>> = std::sync::RwLock::new(None);
+
+/// A qué Cloud y con qué JWT, para el lector que no puede pedirlo por IPC.
+#[derive(Debug, Clone)]
+pub struct CloudLease {
+    pub url: String,
+    pub token: String,
+}
+
+/// Guarda (o borra, con `None`) el token Cloud prestado.
+pub fn set_lent_cloud(lease: Option<CloudLease>) {
+    let mut slot = LENT_CLOUD.write().unwrap_or_else(|p| p.into_inner());
+    *slot = lease;
+}
+
+/// El token Cloud prestado, si hay sesión Cloud viva en este proceso.
+pub fn lent_cloud() -> Option<CloudLease> {
+    LENT_CLOUD.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
 /// Este proceso es un **cliente**: no toca el almacén, sólo el préstamo.
 static CLIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

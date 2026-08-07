@@ -15,6 +15,7 @@
    */
   import { onMount } from "svelte";
   import { push } from "svelte-spa-router";
+  import { tilt } from "../lib/actions/tilt";
   import {
     AlertTriangle,
     Clock,
@@ -24,7 +25,7 @@
     LogOut,
     Plus,
     RefreshCw,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
@@ -424,7 +425,8 @@
        justo lo que se mira de un vistazo, así que van antes de las tarjetas. -->
   {#if !loading && saves.length > 0}
     <div
-      class="mb-5 grid grid-cols-2 gap-x-4 gap-y-5 rounded-xl border border-white/[0.08] bg-zinc-900/40 px-6 py-5 md:grid-cols-4"
+      class="tilt panel relative mb-5 grid grid-cols-2 gap-x-4 gap-y-5 px-6 py-5 md:grid-cols-4"
+      use:tilt
     >
       <div>
         <p class="text-xs text-zinc-500">{$_("dashboard.total_games")}</p>

@@ -37,6 +37,9 @@ impl R2Store {
             secret_access_key: cfg.secret_access_key.clone(),
             // R2 requires path-style addressing.
             force_path_style: true,
+            // R2 implements the full modern S3 dialect (aws-chunked bodies,
+            // flexible checksums), so this one client keeps the SDK defaults.
+            compat: false,
         })
         .await?;
         Ok(Self {

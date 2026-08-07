@@ -1,7 +1,7 @@
 <script lang="ts">
   import { push } from "svelte-spa-router";
   import { fly } from "svelte/transition";
-  import { ArrowRight, Server, CheckCircle2 } from "lucide-svelte";
+  import { ArrowRight, Server, CheckCircle2 } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import Button from "../lib/components/Button.svelte";
   import Input from "../lib/components/Input.svelte";

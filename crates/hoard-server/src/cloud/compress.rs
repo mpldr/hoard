@@ -36,7 +36,11 @@
 //! is how a ≥`batch` cohort of them once turned the drain loop into a
 //! permanent hot loop of HEADs (~10/s of Class B ops, 2026-07-18). For the
 //! same reason the drain only keeps going while a batch actually makes
-//! progress: persistent failures wait for the next tick.
+//! progress: persistent failures wait for the next tick — and, after
+//! [`MAX_ATTEMPTS`] of them, stop being picked up at all. "Waits for the
+//! next tick" is not an exit: a blob that fails deterministically (stored
+//! bytes that don't hash to `sha256`) retried every tick forever until the
+//! attempt counter was added.
 //!
 //! Crash at any point is healed on retry: the claim keeps the blob in the
 //! sweep, and a final object whose size differs from `size_bytes` is
@@ -63,6 +67,20 @@ use crate::config::CompressionConfig;
 /// Don't bother below this raw size: zstd frame overhead and the extra
 /// Class A ops eat the win on tiny blobs.
 const MIN_BLOB_BYTES: i64 = 4096;
+
+/// Give up on a blob after this many failed attempts. The terminal states
+/// above ('raw', 'missing') only cover blobs the sweep *evaluated*; a blob
+/// that keeps failing used to have no exit, because the verification path
+/// un-claims the row back to `encoding IS NULL` — exactly what the
+/// eligibility query picks up. A blob whose stored bytes don't hash to
+/// `sha256` therefore re-downloaded, re-compressed and re-verified itself
+/// every tick forever (six of them ran from 2026-07-11 to 2026-08-03,
+/// ~1.7k attempts/day of GET + multipart PUT + verify GET, for nothing).
+/// The cap makes permanent failure cost a bounded number of R2 ops. It
+/// counts *attempts*, not consecutive failures, so a transient R2 error
+/// spends one too — with five of them a real blip still gets retried, and
+/// a blob that is genuinely broken stops after ~25 minutes.
+const MAX_ATTEMPTS: i16 = 5;
 
 pub fn spawn(state: CloudState) {
     let Some(cfg) = state.config.cloud.as_ref().map(|c| c.compression.clone()) else {
@@ -121,6 +139,7 @@ async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Resu
         SELECT user_id, sha256, r2_key, size_bytes
           FROM cloud_blobs
          WHERE (encoding IS NULL OR (encoding = 'zstd' AND stored_bytes IS NULL))
+           AND compress_attempts < $5
            AND size_bytes >= $1
            AND refcount > 0
            AND purge_after IS NULL
@@ -135,6 +154,7 @@ async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Resu
     .bind(cfg.min_age_hours as i32)
     .bind(cfg.idle_hours as i32)
     .bind(cfg.batch as i64)
+    .bind(MAX_ATTEMPTS)
     .fetch_all(&state.pool)
     .await?;
 
@@ -148,7 +168,48 @@ async fn sweep_once(state: &CloudState, cfg: &CompressionConfig) -> anyhow::Resu
         match compress_one(state, cfg, user_id, &sha, &key, raw_size).await {
             Ok(()) => ok += 1,
             Err(e) => {
-                tracing::warn!(error = %e, %user_id, sha, "blob compress failed; will retry");
+                // Charge the attempt. Once it hits the cap the eligibility
+                // query stops returning this blob, so a permanently broken
+                // one can't keep spending R2 ops every tick.
+                let attempts: Option<i16> = sqlx::query_scalar(
+                    "UPDATE cloud_blobs SET compress_attempts = compress_attempts + 1
+                      WHERE user_id = $1 AND sha256 = $2
+                      RETURNING compress_attempts",
+                )
+                .bind(user_id)
+                .bind(&sha)
+                .fetch_optional(&state.pool)
+                .await?;
+                if attempts.is_some_and(|a| a >= MAX_ATTEMPTS) {
+                    // Terminal, and deliberately *without* un-claiming. A row
+                    // giving up while still `encoding='zstd', stored_bytes
+                    // NULL` keeps being served through the decompressing
+                    // proxy, which costs egress the presigned path wouldn't —
+                    // but resetting it to NULL is not the fix. That state is
+                    // ambiguous: phase 4 may have already overwritten the
+                    // object with zstd bytes and died before `finalize`, and
+                    // calling that raw would hand clients compressed bytes as
+                    // if they were the save. Cheap and correct beats cheaper
+                    // and corrupt; the healing path reclaims it if it can.
+                    //
+                    // The object stays readable either way — but a blob that
+                    // never round-trips to its own content hash is a blob
+                    // whose stored bytes disagree with what the client
+                    // uploaded, and every version referencing it restores
+                    // wrong.
+                    tracing::error!(
+                        error = %e,
+                        %user_id,
+                        sha,
+                        attempts = MAX_ATTEMPTS,
+                        "blob compress gave up after {MAX_ATTEMPTS} attempts — \
+                         left raw and dropped from the sweep; if this was a \
+                         verification failure the stored object does not match \
+                         its content hash and needs investigating"
+                    );
+                } else {
+                    tracing::warn!(error = %e, %user_id, sha, "blob compress failed; will retry");
+                }
             }
         }
     }

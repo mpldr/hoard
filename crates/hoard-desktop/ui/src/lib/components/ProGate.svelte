@@ -14,8 +14,8 @@
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
   import { _ } from "svelte-i18n";
-  import { Lock } from "lucide-svelte";
-  import { openUpgradePage } from "../stores/cloud";
+  import { Lock } from "@lucide/svelte";
+  import { push } from "svelte-spa-router";
   import {
     entitlements,
     refreshEntitlements,
@@ -103,7 +103,7 @@
     </span>
     <p class="max-w-sm text-sm text-zinc-500">{$_("pro.locked_desc")}</p>
     <button
-      onclick={() => openUpgradePage("pro")}
+      onclick={() => push(`/pro?feature=${feature}`)}
       class="mt-1 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
     >
       {$_("pro.upgrade")}

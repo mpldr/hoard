@@ -20,7 +20,7 @@
    * itself when that's the save folder.
    */
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FolderSearch, Check, Plus, Search } from "lucide-svelte";
+  import { FolderOpen, FolderSearch, Check, Plus, Search } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Modal from "./Modal.svelte";
@@ -129,7 +129,12 @@
   async function choose(game: DetectedGame) {
     const path = game.found_paths[0];
     if (!path) return;
-    if (target) {
+    // Sólo el juego que se buscaba se devuelve como "su carpeta". Un resultado
+    // de OTRO juego es la carpeta de ese otro: bindearla al objetivo escribía un
+    // override manual permanente (`device.json`, sobrevive a todo) y dejaba al
+    // dueño real sin poder rastrear lo suyo. Ago-2026: Horizon Forbidden West
+    // acabó apuntando a la carpeta de Surviving Mars. Se añade como lo que es.
+    if (target && game.slug === target.slug) {
       usePath(path);
       return;
     }
@@ -159,6 +164,15 @@
     onPick?.(path);
     close();
   }
+
+  /** En modo dirigido, TODOS los resultados que no son el juego buscado. La
+   *  salida de emergencia sigue disponible —el usuario puede saber algo que la
+   *  detección no—, pero con el aviso de a quién pertenece esa carpeta. Son
+   *  todos y no el primero: una carpeta madre puede tener varios juegos dentro,
+   *  y nombrar solo a uno haría creer que los demás no están en juego. */
+  const foreignOwners = $derived(
+    target ? results.filter((g) => g.slug !== target.slug) : [],
+  );
 
   /** True when the scanned folder is itself among the results — then the
    *  "use the folder as-is" escape hatch would be a duplicate row. */
@@ -310,7 +324,9 @@
                   disabled={trackingSlug !== null}
                 >
                   <Plus size={13} />
-                  {target ? $_("scan_folder.use") : $_("scan_folder.track")}
+                  {target && game.slug === target.slug
+                    ? $_("scan_folder.use")
+                    : $_("scan_folder.track")}
                 </Button>
               {/if}
             </li>
@@ -336,6 +352,15 @@
         <span class="mt-0.5 block truncate font-mono text-[11px] text-zinc-500">
           {folder}
         </span>
+        {#if foreignOwners.length > 0}
+          <span class="mt-1 block text-[11px] text-amber-300">
+            {$_("scan_folder.belongs_to_other", {
+              values: {
+                name: foreignOwners.map((g) => g.display_name).join(", "),
+              },
+            })}
+          </span>
+        {/if}
       </button>
     {/if}
   </div>

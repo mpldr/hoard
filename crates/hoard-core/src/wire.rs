@@ -284,6 +284,14 @@ mod sha_opt {
 // POST /v1/logs  (el namespace cloud monta este mismo cuerpo)
 // ---------------------------------------------------------------------------
 
+/// El `target` de las **desmentidas**: los eventos que dicen dónde se equivocó
+/// la detección y qué hizo el humano para arreglarlo (`hoard_agent::telemetry`).
+///
+/// Vive aquí porque es contrato de los dos lados: el cliente lo exime de su
+/// filtro por nivel y el server lo acepta aunque esté por debajo del mínimo que
+/// anuncia. Un `where target = 'hoard::telemetry'` es toda la consulta.
+pub const TELEMETRY_TARGET: &str = "hoard::telemetry";
+
 /// Metadatos del dispositivo, una vez por lote.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviceMeta {
@@ -333,9 +341,90 @@ pub struct LogIngestResponse {
     pub accepted: usize,
 }
 
+/// Orden de los niveles, para comparar sin depender de `tracing` (el server no
+/// lo tiene). Un nivel desconocido vale INFO: nunca se tira por no reconocerlo.
+pub fn level_rank(level: &str) -> u8 {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "trace" => 0,
+        "debug" => 1,
+        "warn" => 3,
+        "error" => 4,
+        _ => 2, // info y cualquier cosa que no conozcamos
+    }
+}
+
+/// Mínimo que Cloud guarda: WARN. Con toda la población enviando, el INFO
+/// operativo llena la tabla de ruido y la poda a 14 días se lleva por delante
+/// los casos raros, que son los que sirven.
+pub const CLOUD_MIN_RANK: u8 = 3;
+
+/// **La** regla de qué línea viaja y cuál se guarda, una sola vez para los dos
+/// lados: el cliente la usa para filtrar en origen y el server para no fiarse
+/// del cliente.
+///
+/// Estaba escrita tres veces —agente, server, cloud— y eso es una fuga
+/// esperando: si el cliente filtra a un nivel y el server a otro, o se envía lo
+/// que el server tira (ancho de banda para nada) o se tira lo que el cliente
+/// manda (datos que nadie vuelve a ver), y en los dos casos en silencio. Es el
+/// mismo motivo por el que `LogEntry` vive aquí y no duplicado (ADR 0021 C.6).
+///
+/// La excepción por `target` es el corazón del asunto: las desmentidas de
+/// detección son INFO y tienen que entrar en Cloud, cuyo mínimo es WARN.
+pub fn ships_at(entry: &LogEntry, min_rank: u8) -> bool {
+    entry.target.as_deref() == Some(TELEMETRY_TARGET) || level_rank(&entry.level) >= min_rank
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(level: &str, target: &str) -> LogEntry {
+        LogEntry {
+            level: level.to_string(),
+            target: Some(target.to_string()),
+            message: String::new(),
+            fields: None,
+            ts: None,
+        }
+    }
+
+    /// La matriz entera de la regla compartida. Cliente y server llaman aquí,
+    /// así que este test es el que impide que vuelvan a separarse.
+    #[test]
+    fn one_rule_decides_what_travels_and_what_is_stored() {
+        // Cloud (WARN): el ruido operativo se queda fuera.
+        for level in ["trace", "debug", "info", "notice", "TRACE"] {
+            assert!(
+                !ships_at(&entry(level, "hoard_agent::agent"), CLOUD_MIN_RANK),
+                "{level} no debería entrar en Cloud"
+            );
+        }
+        for level in ["warn", "WARN", " error ", "error"] {
+            assert!(
+                ships_at(&entry(level, "hoard_agent::agent"), CLOUD_MIN_RANK),
+                "{level} sí debería entrar en Cloud"
+            );
+        }
+        // Las desmentidas entran en Cloud aunque sean INFO, que es su nivel.
+        assert!(ships_at(&entry("info", TELEMETRY_TARGET), CLOUD_MIN_RANK));
+        // …y hasta un DEBUG con ese target, por si algún día baja de nivel.
+        assert!(ships_at(&entry("debug", TELEMETRY_TARGET), CLOUD_MIN_RANK));
+        // Self-hosted (DEBUG) se queda con casi todo, pero no con TRACE.
+        assert!(ships_at(&entry("debug", "hoard_agent::agent"), 1));
+        assert!(!ships_at(&entry("trace", "hoard_agent::agent"), 1));
+        // Sin target (cliente viejo o entrada a medias) manda el nivel.
+        let mut naked = entry("info", "x");
+        naked.target = None;
+        assert!(!ships_at(&naked, CLOUD_MIN_RANK));
+    }
+
+    /// Un nivel que no conocemos no se tira por no conocerlo: cuenta como INFO.
+    #[test]
+    fn an_unknown_level_ranks_as_info() {
+        assert_eq!(level_rank("notice"), level_rank("info"));
+        assert_eq!(level_rank(""), level_rank("info"));
+        assert_eq!(level_rank(" WARN "), level_rank("warn"));
+    }
 
     /// Los timestamps salen con el sufijo `Z` de la release, y vuelven a entrar
     /// tanto en esa forma como en la que emite el namespace cloud (`+00:00`).

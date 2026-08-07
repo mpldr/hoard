@@ -281,6 +281,22 @@ pub async fn run_scan(app: &AppHandle) {
         }
         if g.confidence == Confidence::High {
             let path = g.found_paths[0].clone();
+            // Carpeta sin un solo fichero y sin fila en el servidor: no hay nada
+            // que respaldar ni que restaurar todavía. Se deja para el escaneo
+            // siguiente, que llega en minutos. No se reserva la ruta: si en esta
+            // misma vuelta otro hallazgo la reclama, que la reclame.
+            if hoard_agent::library::auto_track_decision(
+                &path,
+                orphans_by_slug.contains_key(&g.slug),
+            ) == hoard_agent::library::AutoTrack::SkipEmpty
+            {
+                tracing::debug!(
+                    slug = %g.slug,
+                    path = %path.display(),
+                    "automatic scan: folder is empty and the server has nothing; waiting for the game to write"
+                );
+                continue;
+            }
             if let Some(orphan) = orphans_by_slug.remove(&g.slug) {
                 adopt.push((orphan, path.clone()));
             } else {
@@ -312,7 +328,12 @@ pub async fn run_scan(app: &AppHandle) {
         match crate::commands::library::adopt_save(app.clone(), args, app.state()).await {
             Ok(_) => tracked_count += 1,
             Err(e) => {
-                tracing::warn!(slug = %orphan.game_slug, error = %e, "automatic scan: couldn't adopt cloud save")
+                // "save del servidor", no "cloud": un huérfano es un save que el
+                // servidor conoce y esta máquina no tiene mapeado, y eso pasa
+                // igual en self-hosted. Decir "cloud" aquí mandó un diagnóstico
+                // por el camino equivocado en ago-2026 — el log parecía probar
+                // que el usuario estaba en Cloud cuando self-hosteaba.
+                tracing::warn!(slug = %orphan.game_slug, error = %e, "automatic scan: couldn't adopt server-side save")
             }
         }
     }

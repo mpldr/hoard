@@ -74,17 +74,19 @@ pub struct Prefs {
     #[serde(default)]
     pub seen_tray_hint: bool,
 
-    /// Opt-in for sharing diagnostic logs with the connected server. When
-    /// `true`, the `tracing` log shipper (`logship.rs`) forwards events to
-    /// `/v1/cloud/logs` (cloud) or `/v1/logs` (self-hosted) at the server's
-    /// advertised level, tagged with hostname, OS, app version, and a
-    /// `SHA256(machine-id|hostname)` fingerprint. When `false` (the default)
-    /// nothing is shipped — the flag is read fresh on every ship cycle, so
-    /// turning it off stops the stream within seconds, no restart needed.
+    /// Consentimiento para compartir logs de diagnóstico con el servidor
+    /// conectado. Con `true`, el enviador (`logship.rs`) manda los eventos a
+    /// `/v1/cloud/logs` (cloud) o `/v1/logs` (self-hosted) al nivel que el
+    /// servidor anuncia, etiquetados con hostname, SO, versión de la app y una
+    /// huella `SHA256(machine-id|hostname)`. Con `false` no sale nada — la
+    /// bandera se relee en cada ciclo, así que apagarla para el envío en
+    /// segundos, sin reiniciar.
     ///
-    /// Note: the payload is diagnostic logs, not an anonymous aggregate
-    /// counter, and it carries a device fingerprint — the UI label should make
-    /// that clear rather than implying fully anonymous pings.
+    /// **Es opt-out: por defecto está a `true`** (ver [`Prefs::default`]). El
+    /// nombre del campo dice "anonymous" y el payload lleva una huella de
+    /// dispositivo, así que no lo es; lo que sí garantiza el enviador es que las
+    /// rutas salen sin el segmento del perfil (`logship::redact`), y eso es lo
+    /// que la etiqueta de Ajustes cuenta ahora tal cual.
     #[serde(default)]
     pub anonymous_telemetry: bool,
 

@@ -187,6 +187,8 @@ impl Overlay {
         if self.exit || self.width == 0 || self.height == 0 {
             return;
         }
+        let editing = self.mode == Mode::Editor;
+        self.engine.set_editing(editing);
         self.engine.tick();
 
         let (w, h) = (self.width, self.height);

@@ -5,7 +5,7 @@
   // active trial. The `ProFeature` shell starts the one-week trial the first
   // time this page is opened and shows the days-left strip while it runs;
   // Free-expired / signed-out fall back to the gate inside it.
-  import { MonitorPlay } from "lucide-svelte";
+  import { MonitorPlay } from "@lucide/svelte";
   import ProFeature from "../lib/components/ProFeature.svelte";
   import { PRO, Screen } from "$pro";
 </script>

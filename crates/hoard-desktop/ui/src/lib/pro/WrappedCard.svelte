@@ -30,7 +30,7 @@
     X,
     Lock,
     Loader2,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { tr, fmtBytes } from "./lib";
   import { pickQuote } from "./phrases";
   import {

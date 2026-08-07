@@ -67,13 +67,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
 
       - name: Build release binaries
+        # `-p hoardd` no es opcional ni un extra: desde el Slice 4 de la ADR 0021
+        # `hoard` es un cliente fino del servicio, así que un tarball con `hoard`
+        # y sin `hoardd` instala una cara sin motor — arranca y no puede
+        # sincronizar nada. `hoard-cli` depende de `hoardd` como *lib*, y cargo
+        # no construye el binario de una dependencia, así que hay que pedirlo.
         shell: bash
         run: |
           if [ "${{ matrix.full }}" = "true" ]; then
             cargo build --release --target ${{ matrix.target }} \
-              -p hoard-server -p hoard-admin -p hoard-cli
+              -p hoard-server -p hoard-admin -p hoard-cli -p hoardd
           else
-            cargo build --release --target ${{ matrix.target }} -p hoard-cli
+            cargo build --release --target ${{ matrix.target }} -p hoard-cli -p hoardd
           fi
 
       - name: Package
@@ -86,7 +91,15 @@ jobs:
           EXT=""
           [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
           mkdir -p "dist/$ARTIFACT"
-          cp "$BIN/hoard$EXT" "dist/$ARTIFACT/"
+          # El componente `core` de `hoard_agent::install`: las dos piezas viajan
+          # juntas siempre. Si una falta, el tarball se queda sin publicar en vez
+          # de instalar media cosa.
+          cp "$BIN/hoard$EXT"  "dist/$ARTIFACT/"
+          cp "$BIN/hoardd$EXT" "dist/$ARTIFACT/"
+          for REQUIRED in hoard hoardd; do
+            test -x "dist/$ARTIFACT/$REQUIRED$EXT" \
+              || { echo "::error::$REQUIRED$EXT missing or not executable in the core tarball"; exit 1; }
+          done
           if [ "${{ matrix.full }}" = "true" ]; then
             cp "$BIN/hoard-server$EXT" "dist/$ARTIFACT/"
             cp "$BIN/hoard-admin$EXT"  "dist/$ARTIFACT/"

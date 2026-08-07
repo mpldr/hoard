@@ -266,6 +266,14 @@ pub fn dangerous_sync_root(path: &Path) -> Option<String> {
     let lower = p.to_lowercase();
     let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
 
+    // Los prefijos de Wine/Proton se miran antes que nada y por la COLA: uno
+    // puede estar bajo `~/.local/share/Steam`, bajo una biblioteca en otro
+    // disco, o donde lo dejen Lutris/Bottles. Lo que lo delata es cómo acaba la
+    // ruta, no dónde empieza.
+    if let Some(reason) = dangerous_wine_prefix(&segs) {
+        return Some(reason);
+    }
+
     // Windows: `C:` como primer segmento.
     if let Some(first) = segs.first() {
         if first.len() == 2 && first.ends_with(':') {
@@ -273,6 +281,36 @@ pub fn dangerous_sync_root(path: &Path) -> Option<String> {
         }
     }
     dangerous_unix_root(&segs)
+}
+
+/// Raíces de un prefijo de Wine/Proton. Un prefijo **es un Windows entero
+/// emulado**: su `drive_c` con el perfil, `ProgramData`, el registro y todo lo
+/// que el juego instaló. Rastrearlo sube cientos de MB de los que la partida
+/// son unos pocos KB, y el resto se rehace solo en cualquier máquina.
+///
+/// Reportado en ago-2026: una Steam Deck acabó monitorizando
+/// `…/steamapps/compatdata/423230/pfx` — 308,6 MB— para un save que vive en
+/// `pfx/drive_c/users/steamuser/AppData/LocalLow/TheGameBakers/Furi`.
+fn dangerous_wine_prefix(segs: &[&str]) -> Option<String> {
+    let say = |s: &str| Some(s.to_string());
+
+    // Dentro del prefijo, `drive_c` **es** la raíz de un Windows: las reglas de
+    // Windows ya saben qué es un perfil entero o un AppData entero, así que se
+    // reusan tal cual en vez de escribirlas dos veces. `rposition` por si
+    // alguien anida prefijos (Bottles lo hace).
+    if let Some(i) = segs.iter().rposition(|s| *s == "drive_c") {
+        if let Some(reason) = dangerous_windows_root(&segs[i + 1..]) {
+            return Some(reason);
+        }
+    }
+
+    match segs {
+        [.., "pfx"] => say("it is a whole Wine/Proton prefix"),
+        [.., "compatdata"] => say("it is Steam's whole compatibility-data folder"),
+        // `compatdata/<appid>` — el contenedor del prefijo de UN juego.
+        [.., "compatdata", _] => say("it is a game's whole Proton prefix folder"),
+        _ => None,
+    }
 }
 
 fn dangerous_windows_root(rest: &[&str]) -> Option<String> {
@@ -365,6 +403,29 @@ mod tests {
             ("/home/insider/.local/share", ".local/share"),
             ("/home/insider/.config", ".config"),
             ("/home/insider/Documents", "documents"),
+            // Prefijos de Wine/Proton — el caso de la Steam Deck (ago-2026).
+            // Se reconocen por la cola, así que valen en cualquier biblioteca.
+            (
+                "/home/clock/.local/share/Steam/steamapps/compatdata/423230/pfx",
+                "prefix",
+            ),
+            ("/mnt/juegos/SteamLibrary/steamapps/compatdata/620/pfx", "prefix"),
+            ("/home/clock/.local/share/Steam/steamapps/compatdata/423230", "prefix"),
+            ("/home/clock/.local/share/Steam/steamapps/compatdata", "compatibility-data"),
+            // Y dentro del prefijo mandan las reglas de Windows: `drive_c` es
+            // una unidad entera, y su perfil, un perfil entero.
+            (
+                "/home/clock/.local/share/Steam/steamapps/compatdata/423230/pfx/drive_c",
+                "drive",
+            ),
+            (
+                "/home/clock/.local/share/Steam/steamapps/compatdata/423230/pfx/drive_c/users/steamuser",
+                "profile",
+            ),
+            (
+                "/home/clock/.local/share/Steam/steamapps/compatdata/423230/pfx/drive_c/users/steamuser/AppData/LocalLow",
+                "application-data",
+            ),
         ] {
             let reason = dangerous_sync_root(Path::new(p));
             assert!(reason.is_some(), "{p} debería rechazarse");
@@ -385,6 +446,11 @@ mod tests {
             "/home/insider/.config/unity3d/Studio/Game",
             "/home/insider/Documents/My Games/EU5/save games",
             "/mnt/ssd/Games/Factorio/saves",
+            // La carpeta buena DENTRO del prefijo: es el destino al que apunta
+            // el mensaje de «pick the game's own save folder inside it», así
+            // que rechazarla convertiría la guarda en un callejón sin salida.
+            "/home/clock/.local/share/Steam/steamapps/compatdata/423230/pfx/drive_c/users/steamuser/AppData/LocalLow/TheGameBakers/Furi",
+            "/home/clock/.local/share/Steam/steamapps/compatdata/620/pfx/drive_c/users/steamuser/Saved Games/Portal2",
         ] {
             assert!(
                 dangerous_sync_root(Path::new(p)).is_none(),

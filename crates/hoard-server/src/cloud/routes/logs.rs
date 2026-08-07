@@ -1,8 +1,14 @@
 //! `POST /v1/cloud/logs` — ingest of client diagnostic logs (cloud).
 //!
 //! Cloud stores only *key events*: the client already filters to the level
-//! advertised in `/v1/health` (INFO+), and we re-filter here as defense in
+//! advertised in `/v1/health` (WARN+), and we re-filter here as defense in
 //! depth so a misbehaving client can't dump DEBUG/TRACE into the SaaS DB.
+//!
+//! El mínimo es WARN y no INFO porque con toda la población enviando, el INFO
+//! operativo llena la tabla de ruido y la poda a 14 días se lleva por delante
+//! justo los casos raros. La excepción es [`TELEMETRY_TARGET`]: las desmentidas
+//! de detección entran sea cual sea su nivel — son la señal que se recoge a
+//! propósito, y filtrarlas por nivel sería recoger todo menos lo que importa.
 //!
 //! The wire shape and batch caps are shared with the self-hosted route
 //! (`crate::routes::logs`). On top of that we resolve `device_id` by matching
@@ -14,11 +20,8 @@ use uuid::Uuid;
 use crate::cloud::auth::CloudUser;
 use crate::cloud::errors::CloudError;
 use crate::cloud::state::CloudState;
-use crate::routes::logs::{level_rank, MAX_BATCH_ENTRIES};
-use hoard_core::wire::{LogBatch, LogIngestResponse};
-
-/// Minimum level cloud will store. Entries below this are dropped silently.
-const CLOUD_MIN_RANK: u8 = 2; // INFO
+use crate::routes::logs::MAX_BATCH_ENTRIES;
+use hoard_core::wire::{ships_at, LogBatch, LogIngestResponse, CLOUD_MIN_RANK};
 
 pub async fn ingest(
     State(state): State<CloudState>,
@@ -50,8 +53,8 @@ pub async fn ingest(
     let mut accepted = 0usize;
     for entry in &batch.entries {
         let level = entry.level.trim().to_ascii_lowercase();
-        if level_rank(&level) < CLOUD_MIN_RANK {
-            continue; // defense in depth: never store below INFO in cloud
+        if !ships_at(entry, CLOUD_MIN_RANK) {
+            continue; // defense in depth: never store below WARN in cloud
         }
         let fields_json = entry.fields.as_ref().map(|v| v.to_string());
 

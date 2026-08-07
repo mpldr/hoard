@@ -25,6 +25,14 @@
 -- `devices` are tiny (one row per save / per device) so this is negligible.
 --
 -- Idempotent: setting REPLICA IDENTITY FULL when already FULL is a no-op.
+--
+-- Note for whoever reads 0020 next and is tempted to correct its now-wrong
+-- comment in place: don't. `sqlx::migrate!` records a SHA-384 of each applied
+-- migration file and refuses to run when one changes — comments included —
+-- so editing an applied migration doesn't just annotate history, it stops the
+-- server from booting with `VersionMismatch`. That exact edit was made and
+-- reverted on 2026-08-03; the correction lives here instead, in the migration
+-- that actually fixes the behaviour.
 
 alter table public.saves replica identity full;
 alter table public.devices replica identity full;

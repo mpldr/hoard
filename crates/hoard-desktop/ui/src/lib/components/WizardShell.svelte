@@ -8,7 +8,7 @@
    * navigation wiring.
    */
   import type { Snippet } from "svelte";
-  import { ArrowLeft } from "lucide-svelte";
+  import { ArrowLeft } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import Logo from "./Logo.svelte";
   import type { OnboardingStep } from "../stores/onboarding";

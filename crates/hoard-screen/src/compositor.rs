@@ -5,14 +5,26 @@
 //! with no GPU or window. The windowed runtime ([`crate::runtime`], behind the
 //! `runtime` feature) just hands this its surface buffer and presents it.
 //!
-//! Scaling is nearest-neighbour: cheap, and for a glanceable overlay the
-//! quality is fine. A GPU path (sampled textures) can replace this later
-//! without touching the scene/geometry model — that is the point of the seam.
+//! Scaling is bilinear by default. A panel can ask for nearest-neighbour
+//! instead (`smooth: false` on a scope): at high magnification the lens
+//! stretches a handful of pixels across the whole panel, and interpolating
+//! that turns it into coloured mush — hard pixel edges read better. A GPU path
+//! (sampled textures) can replace this later without touching the
+//! scene/geometry model — that is the point of the seam.
 
 use std::collections::HashMap;
 
-use crate::scene::{resolve_blit, Scene};
+use crate::scene::{resolve_blit, Panel, Scene, SourceRef};
 use crate::source::Frame;
+
+/// Whether this panel's pixels should be interpolated when scaled. Only the
+/// scope opts out today; everything else keeps the smooth path it always had.
+fn panel_smooth(panel: &Panel) -> bool {
+    match &panel.source {
+        SourceRef::Scope(spec) => spec.smooth,
+        _ => true,
+    }
+}
 
 /// Clear `out` (RGBA8, `out_w*out_h*4` bytes) to fully transparent, then draw
 /// every panel of `scene` back-to-front. `frames` holds each panel's latest
@@ -35,11 +47,18 @@ pub fn compose_into(
             continue;
         }
         let blit = resolve_blit(panel, frame.width, frame.height);
-        draw_blit(frame, &blit, out, out_w, out_h);
+        draw_blit(frame, &blit, out, out_w, out_h, panel_smooth(panel));
     }
 }
 
-fn draw_blit(frame: &Frame, blit: &crate::scene::Blit, out: &mut [u8], out_w: u32, out_h: u32) {
+fn draw_blit(
+    frame: &Frame,
+    blit: &crate::scene::Blit,
+    out: &mut [u8],
+    out_w: u32,
+    out_h: u32,
+    smooth: bool,
+) {
     let dst = blit.dst;
     // Destination pixel bounds, clipped to the surface.
     let x0 = dst.x.floor().max(0.0) as i64;
@@ -83,8 +102,16 @@ fn draw_blit(frame: &Frame, blit: &crate::scene::Blit, out: &mut [u8], out_w: u3
             let tx = ((sxf - ix0) * 256.0) as u32;
 
             // Exact hit (1:1 region or integer-aligned sample): take the texel
-            // directly, skipping three lookups and the blend.
-            let s = if tx == 0 && ty == 0 {
+            // directly, skipping three lookups and the blend. Nearest-neighbour
+            // takes the same shortcut on purpose — `sxf`/`syf` already sit in
+            // pixel-centre space, so rounding them picks the texel the
+            // destination pixel actually lands on.
+            let s = if !smooth {
+                frame.pixel(
+                    (sxf.round() as u32).min(sx_max as u32),
+                    (syf.round() as u32).min(sy_max as u32),
+                )
+            } else if tx == 0 && ty == 0 {
                 frame.pixel(x0s, y0s)
             } else {
                 let itx = 256 - tx;

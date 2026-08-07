@@ -68,7 +68,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: pnpm
           cache-dependency-path: crates/hoard-desktop/ui/pnpm-lock.yaml
 
@@ -109,10 +109,12 @@ jobs:
             libpipewire-0.3-dev \
             clang
 
-      # Both sidecars the bundle ships: the overlay (hoard-screen) and the sync
-      # service (hoardd). Without the second one the app installs without an
-      # engine — it's a thin client of the daemon since ADR 0021's Slice 4.
-      - name: Build sidecars (hoard-screen, hoardd)
+      # The three sidecars the bundle ships: the overlay (hoard-screen), the sync
+      # service (hoardd) and the terminal face (hoard). Without the second one
+      # the app installs without an engine — it's a thin client of the daemon
+      # since ADR 0021's Slice 4. The third is what makes installing the app
+      # install the whole of Hoard, at one version and in one pass.
+      - name: Build sidecars (hoard-screen, hoardd, hoard)
         shell: bash
         run: bash scripts/build-sidecar.sh
 

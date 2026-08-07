@@ -189,13 +189,20 @@ async fn verify_key(
     Ok(())
 }
 
-/// Reachability + writability probe through the trait only: stage a tiny file,
-/// put it under a throwaway key, confirm it's there, delete it.
+/// Reachability probe through the trait only: stage a file, put it under a
+/// throwaway key, read it back and compare the bytes, then delete it.
+///
+/// The read-back is deliberate. A put-only probe is green against an endpoint
+/// that stores mangled bytes (the `aws-chunked` case that made every blob
+/// written through some S3 gateways unreadable), which is exactly the answer an
+/// operator running `storage status` needs before trusting it with saves.
 async fn reachability(store: &Arc<dyn BlobStore>, data_dir: &Path) -> Result<()> {
     let tmp = data_dir.join("tmp");
     tokio::fs::create_dir_all(&tmp).await.ok();
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = hex::encode(Sha256::digest(&payload));
     let stage = tmp.join(format!("probe-{}", Uuid::new_v4()));
-    tokio::fs::write(&stage, b"ok")
+    tokio::fs::write(&stage, &payload)
         .await
         .context("stage probe file")?;
     let key = format!("_hoard_probe/{}", Uuid::new_v4());
@@ -204,10 +211,16 @@ async fn reachability(store: &Arc<dyn BlobStore>, data_dir: &Path) -> Result<()>
         .await
         .context("probe put")?;
     let present = store.exists(&key).await.context("probe head")?;
+    let verified = if present {
+        verify_key(store, &key, &expected, &tmp).await
+    } else {
+        Ok(())
+    };
     let _ = store.delete(&key).await;
     if !present {
         anyhow::bail!("probe object missing after write");
     }
+    verified.context("probe read-back: the endpoint did not return what was written")?;
     Ok(())
 }
 

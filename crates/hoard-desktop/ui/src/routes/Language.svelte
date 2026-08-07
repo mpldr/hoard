@@ -8,7 +8,7 @@
    * later — so we let the user continue with whatever is already active too.
    */
   import { push } from "svelte-spa-router";
-  import { ArrowRight } from "lucide-svelte";
+  import { ArrowRight } from "@lucide/svelte";
   import { fly } from "svelte/transition";
   import { _, locale } from "svelte-i18n";
   import Button from "../lib/components/Button.svelte";

@@ -665,7 +665,7 @@ pub fn validate_path_shape(local_path: &Path) -> Result<()> {
 /// Lo segundo evita dos watchers y dos historiales sobre los mismos bytes. El
 /// escaneo automático ya lo comprobaba por su cuenta, pero un alta manual —o
 /// la CLI— podían duplicar igual.
-fn validate_folder(local_path: &Path, except_save_id: Option<&str>) -> Result<()> {
+fn validate_folder(local_path: &Path, except_save_ids: &[&str]) -> Result<()> {
     validate_path_shape(local_path)?;
     if !local_path.exists() {
         // No existe todavía: se asume carpeta. Un save de fichero suelto
@@ -677,12 +677,7 @@ fn validate_folder(local_path: &Path, except_save_id: Option<&str>) -> Result<()
         anyhow::bail!("{} isn't a folder or a file.", local_path.display());
     }
     if let Ok((state, _)) = CliState::load_default() {
-        // `except_save_id` es el save que se está reapuntando: solaparse
-        // consigo mismo no es un conflicto.
-        if let Some((_, other)) = state.saves.iter().find(|(id, st)| {
-            Some(id.as_str()) != except_save_id
-                && crate::detection::paths_overlap(&st.local_path, local_path)
-        }) {
+        if let Some(other) = conflicting_save(&state, local_path, except_save_ids) {
             anyhow::bail!(
                 "'{}' already tracks {} — one folder, one game.",
                 other.game_slug,
@@ -691,6 +686,142 @@ fn validate_folder(local_path: &Path, except_save_id: Option<&str>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// El save —si lo hay— que ya cubre `local_path` y no es ninguno de los que se
+/// están reapuntando. Puro para poder testearlo: `validate_folder` es un
+/// envoltorio de IO (crea la carpeta, lee el state del disco) y esta decisión es
+/// la que se ha equivocado en producción.
+///
+/// `except_save_ids` son varios a propósito. Una adopción releva **dos**
+/// entradas a la vez: el `save_id` que trae la nube y el que esta máquina se
+/// mintó en local para el mismo (juego, etiqueta). Excluyendo sólo el primero,
+/// la entrada local choca contra sí misma y el juego queda encallado.
+/// La entrada que esta máquina ya tiene **para esta misma carpeta**, si la hay.
+///
+/// La identidad de un save rastreado es la carpeta, no el slug. El slug no es
+/// estable entre fuentes: el mismo juego sale `vrising` por el appid de Steam y
+/// `v-rising` por el catálogo, o `dispatch` y `dispatch-2025` según quién lo
+/// nombre. Buscando por slug, dos nombres del mismo juego se tratan como dos
+/// juegos y la regla de "una carpeta, un juego" los bloquea mutuamente — que es
+/// exactamente lo que le pasó a un usuario en ago-2026 con tres juegos a la vez.
+///
+/// Comparación exacta de carpeta (insensible a caja en Windows), **no**
+/// solapamiento: una carpeta anidada dentro de otra sí es el conflicto legítimo
+/// que la regla debe seguir denunciando.
+fn row_for_same_folder<'a>(state: &'a CliState, local_path: &Path) -> Option<&'a str> {
+    state
+        .saves
+        .iter()
+        .find(|(_, st)| same_folder(&st.local_path, local_path))
+        .map(|(id, _)| id.as_str())
+}
+
+/// Misma carpeta, con la caja de Windows en cuenta (`C:\Users` y `c:\users` son
+/// la misma). Espeja el criterio de [`crate::detection::paths_overlap`], que ya
+/// baja a minúsculas en Windows por la misma razón.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// El juego —distinto de `slug`— que ya reclama `path`, si lo hay. `None` = el
+/// override manual es legítimo.
+///
+/// Un override manual gana a la heurística **para siempre**: vive en
+/// `device.json`, sobrevive a desinstalar con "borrar datos", a borrar el estado
+/// de saves y a dejar de monitorizar el juego, y cada escaneo vuelve a proponer
+/// esa carpeta con confianza alta. Por eso apuntar un juego a la carpeta de otro
+/// no es un error recuperable: es veneno permanente y casi invisible. Pasó en
+/// ago-2026 —`horizon-forbidden-west` → `…\Saved Games\Surviving Mars
+/// Relaunched`— y dejó al juego dueño de esa carpeta sin poder rastrearla.
+///
+/// Dos árbitros, porque el veneno se puede cuajar antes de que nadie rastree
+/// nada: las filas ya rastreadas y el informe de detección en caché.
+pub fn manual_override_conflict(
+    state: &CliState,
+    report: Option<&DetectionReport>,
+    slug: &str,
+    path: &Path,
+) -> Option<String> {
+    if let Some((_, st)) = state.saves.iter().find(|(_, st)| {
+        st.game_slug != slug && crate::detection::paths_overlap(&st.local_path, path)
+    }) {
+        return Some(st.game_slug.clone());
+    }
+    report?
+        .games
+        .iter()
+        .find(|g| {
+            g.slug != slug
+                && g.found_paths
+                    .iter()
+                    .any(|p| crate::detection::paths_overlap(p, path))
+        })
+        .map(|g| g.slug.clone())
+}
+
+/// Filas locales que un alta deja obsoletas: las que cubren el mismo (juego,
+/// etiqueta) o **la misma carpeta** con un id distinto del que se va a insertar.
+///
+/// Existe porque en self-hosted el `save_id` lo pone el servidor, no el cliente.
+/// Si su fila para este (juego, etiqueta) ya no es la que esta máquina tenía
+/// mapeada —porque el servidor se reinstaló y repartió ids nuevos— insertar sin
+/// más deja DOS filas sobre la misma carpeta.
+fn superseded_rows(
+    state: &CliState,
+    slug: &str,
+    label: &str,
+    local_path: &Path,
+    keep_id: &str,
+) -> Vec<String> {
+    state
+        .saves
+        .iter()
+        .filter(|(id, st)| {
+            id.as_str() != keep_id
+                && ((st.game_slug == slug && st.label == label)
+                    || same_folder(&st.local_path, local_path))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Filas locales que el servidor no conoce, en self-hosted.
+///
+/// Ahí el `save_id` es del servidor: un id que no está en su lista no se puede
+/// subir (todo snapshot contra él es un 404) y la biblioteca —que pinta lo que
+/// lista el servidor— tampoco lo enseña, así que el usuario no puede ni verlo ni
+/// quitarlo. Pero sigue contando para «una carpeta, un juego», de modo que
+/// bloquea para siempre volver a dar de alta esa carpeta. Podarlas es la única
+/// salida sin tocar ficheros a mano.
+fn rows_unknown_to_server(state: &CliState, known: &HashSet<String>) -> Vec<String> {
+    let mut stale: Vec<String> = state
+        .saves
+        .keys()
+        .filter(|id| !known.contains(*id))
+        .cloned()
+        .collect();
+    stale.sort();
+    stale
+}
+
+fn conflicting_save<'a>(
+    state: &'a CliState,
+    local_path: &Path,
+    except_save_ids: &[&str],
+) -> Option<&'a SaveState> {
+    state
+        .saves
+        .iter()
+        .find(|(id, st)| {
+            !except_save_ids.contains(&id.as_str())
+                && crate::detection::paths_overlap(&st.local_path, local_path)
+        })
+        .map(|(_, st)| st)
 }
 
 /// Registra que el usuario quiere respaldar un juego/carpeta. Crea la fila en el
@@ -709,14 +840,22 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     // Re-añadir el MISMO (juego, etiqueta) es un flujo legítimo (re-track,
     // re-onboarding, re-alta por detección) y reusa la fila existente más
     // abajo; sólo tiene que fallar si la carpeta es de OTRO save.
+    //
+    // Y "el mismo juego" no se decide sólo por el slug: el mismo título sale
+    // `vrising` o `v-rising`, `dispatch` o `dispatch-2025`, según lo nombre el
+    // appid de Steam, el catálogo o el launcher. Si además de por (slug,
+    // etiqueta) se reconoce **la carpeta**, un re-alta bajo otro nombre reusa
+    // la fila en vez de estrellarse contra ella.
     let reusing = CliState::load_default().ok().and_then(|(state, _)| {
         state
             .saves
             .iter()
             .find(|(_, st)| st.game_slug == args.game_slug && st.label == label)
             .map(|(id, _)| id.clone())
+            .or_else(|| row_for_same_folder(&state, &local_path).map(str::to_string))
     });
-    validate_folder(&local_path, reusing.as_deref())?;
+    let except: Vec<&str> = reusing.iter().map(String::as_str).collect();
+    validate_folder(&local_path, &except)?;
 
     // Cloud no tiene `create_save` server-side: la fila se materializa en el
     // primer upload (UPSERT en (user_id, game_slug, label)). El cliente minta un
@@ -805,8 +944,24 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     };
 
     let (mut cli_state, path) = CliState::load_default()?;
+    // El alta self-hosted es un REEMPLAZO, no una suma. La fila la identifica
+    // la carpeta, y el id lo pone el servidor: si reparte uno nuevo para la
+    // misma carpeta —reinstalar el servidor rehace la base y con ella los ids—
+    // insertar sin podar deja dos filas sobre los mismos bytes. La vieja ya no
+    // existe en el servidor (todo lo que suba da 404), no sale en la biblioteca
+    // y aun así hace saltar «una carpeta, un juego» en cada intento posterior:
+    // el juego queda encallado sin ninguna salida por la UI. Le pasó a un
+    // self-hoster en ago-2026 con ~40 juegos a la vez tras rehacer su stack.
+    let new_id = save.id.to_string();
+    for stale in superseded_rows(&cli_state, &args.game_slug, &label, &local_path, &new_id) {
+        tracing::info!(
+            save_id = %stale, slug = %args.game_slug,
+            "dropping the local row this add supersedes"
+        );
+        cli_state.saves.remove(&stale);
+    }
     cli_state.saves.insert(
-        save.id.to_string(),
+        new_id,
         SaveState {
             local_path: local_path.clone(),
             game_slug: save.game_slug.to_string(),
@@ -864,9 +1019,48 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
     let local_path = PathBuf::from(&args.local_path);
     // Adoptar es reapuntar un save que ya existe en la nube: solaparse consigo
     // mismo no es un conflicto de "una carpeta, un juego".
-    validate_folder(&local_path, Some(args.save_id.as_str()))?;
+    //
+    // Y "consigo mismo" son DOS entradas, no una. Esta máquina pudo dar de alta
+    // el juego por su cuenta —detección, alta manual— mintándose un `save_id`
+    // local; la nube trae el suyo. Mismo juego, misma carpeta, ids distintos:
+    // excluyendo sólo el de la nube, la entrada local se bloquea a sí misma y el
+    // juego queda encallado para siempre. El escaneo automático falla en cada
+    // vuelta con «'furi' already tracks … — one folder, one game» (chocando
+    // contra sí mismo), el "+" manual falla igual, y reapuntar la carpeta desde
+    // la ficha también: no queda ni una vía en la UI para salir del estado.
+    // Y no basta con buscar por slug: el mismo juego llega con nombres distintos
+    // según la fuente (`vrising` por el appid de Steam, `v-rising` por el
+    // catálogo; `dispatch` y `dispatch-2025`). Lo que identifica a la fila que
+    // se está relevando es **la carpeta**, que es la unidad de la propia regla.
+    let superseded = CliState::load_default().ok().and_then(|(state, _)| {
+        state
+            .saves
+            .iter()
+            .find(|(id, st)| {
+                id.as_str() != args.save_id
+                    && st.game_slug == args.game_slug
+                    && st.label == args.label
+            })
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                row_for_same_folder(&state, &local_path)
+                    .filter(|id| *id != args.save_id)
+                    .map(str::to_string)
+            })
+    });
+    let except: Vec<&str> = std::iter::once(args.save_id.as_str())
+        .chain(superseded.iter().map(String::as_str))
+        .collect();
+    validate_folder(&local_path, &except)?;
 
     let (mut cli_state, path) = CliState::load_default()?;
+    // El relevo es un reemplazo, no una suma: dejar viva la entrada local
+    // dejaría dos watchers y dos historiales sobre los mismos bytes — justo lo
+    // que la regla de "una carpeta, un juego" existe para impedir— y el panel
+    // pintaría el juego dos veces, una de ellas sin versiones ni tamaño.
+    if let Some(old) = superseded.as_deref() {
+        cli_state.saves.remove(old);
+    }
     let preset = presets::builtin_preset_for(&args.game_slug).map(str::to_string);
     cli_state.saves.insert(
         args.save_id.clone(),
@@ -982,6 +1176,199 @@ fn prune_poisoned_rows(state: &mut CliState) -> Vec<String> {
     }
     poisoned.sort();
     poisoned
+}
+
+/// Qué hacer con una carpeta recién detectada en un alta **automática**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTrack {
+    /// Darla de alta ahora.
+    Track,
+    /// Todavía no: no hay ni un fichero dentro y el servidor tampoco tiene nada
+    /// de este juego, así que no hay nada que respaldar ni que restaurar.
+    SkipEmpty,
+}
+
+/// Decide si una carpeta detectada se da de alta sola.
+///
+/// Rastrear una carpeta vacía no respalda nada: el motor la mira, no encuentra
+/// bytes y avisa «nothing to back up and this save has never had a snapshot» en
+/// cada vuelta (72 veces en tres días en el log de un self-hoster, ago-2026,
+/// por carpetas de Goldberg que el juego nunca llegó a usar). No se pierde
+/// nada por esperar: el escaneo automático vuelve a pasar cada pocos minutos y
+/// la da de alta en cuanto el juego escriba su primer fichero — que es también
+/// el primer instante en el que había algo que guardar.
+///
+/// **La excepción que importa**: si el servidor ya tiene ese save (otra máquina
+/// lo subió), la carpeta vacía es justo el caso bueno —máquina nueva esperando
+/// una restauración— y se da de alta igual.
+///
+/// Ante la duda, dar de alta: un error de lectura, un permiso, un árbol
+/// gigantesco… cualquier cosa que impida contestar cuenta como "tiene
+/// contenido". Este filtro sólo puede quitar ruido, nunca vigilancia.
+pub fn auto_track_decision(path: &Path, has_server_row: bool) -> AutoTrack {
+    if has_server_row || dir_has_any_file(path) {
+        AutoTrack::Track
+    } else {
+        AutoTrack::SkipEmpty
+    }
+}
+
+/// ¿Hay al menos un fichero en el árbol? Recorrido acotado —se para en el
+/// primero— y **fail-open**: si no se puede contestar (permisos, un árbol más
+/// grande que los topes) devuelve `true`.
+fn dir_has_any_file(root: &Path) -> bool {
+    const MAX_ENTRIES: usize = 512;
+    const MAX_DEPTH: usize = 6;
+
+    if root.is_file() {
+        return true;
+    }
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return true; // no se puede mirar ⇒ no se decide en contra
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return true;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if depth < MAX_DEPTH {
+                        pending.push((entry.path(), depth + 1));
+                    } else {
+                        return true; // más hondo de lo que miramos
+                    }
+                }
+                Ok(_) => return true, // fichero (o symlink): hay contenido
+                Err(_) => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Una fila tal y como la lista el servidor, reducida a lo que decide la
+/// reconciliación. Existe para poder probar la decisión sin un servidor.
+#[derive(Debug, Clone)]
+pub struct ServerRow {
+    pub id: String,
+    pub game_slug: String,
+    pub label: String,
+}
+
+/// La decisión de [`reconcile_with_server`], sin IO: por cada fila local que el
+/// servidor no conoce, el id al que re-apuntarla — o `None` para tirarla.
+fn reconcile_plan(state: &CliState, server: &[ServerRow]) -> Vec<(String, Option<String>)> {
+    let known: HashSet<String> = server.iter().map(|r| r.id.clone()).collect();
+    let by_key: std::collections::HashMap<(&str, &str), &str> = server
+        .iter()
+        .map(|r| ((r.game_slug.as_str(), r.label.as_str()), r.id.as_str()))
+        .collect();
+    rows_unknown_to_server(state, &known)
+        .into_iter()
+        .filter_map(|id| {
+            let row = state.saves.get(&id)?;
+            let reissued = by_key
+                .get(&(row.game_slug.as_str(), row.label.as_str()))
+                .map(|s| s.to_string());
+            Some((id, reissued))
+        })
+        .collect()
+}
+
+/// Qué hizo [`reconcile_with_server`]. Sólo para el log: el estado ya está en
+/// disco cuando esto vuelve.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// Filas re-apuntadas al `save_id` que el servidor tiene ahora para ese
+    /// mismo (juego, etiqueta).
+    pub relinked: usize,
+    /// Filas tiradas: el servidor no sabe nada de ese juego.
+    pub dropped: usize,
+}
+
+impl Reconciliation {
+    pub fn changed(&self) -> bool {
+        self.relinked > 0 || self.dropped > 0
+    }
+}
+
+/// Cura el estado local contra lo que el servidor dice tener. **Self-hosted
+/// only**; en Cloud el `save_id` lo minta el cliente y no puede quedar huérfano
+/// así, y su duplicado ya lo poda `list_tracked` con el manifiesto.
+///
+/// Rehacer el servidor —perder la base, migrar el stack, empezar de cero— le
+/// reparte ids nuevos a los mismos juegos. Las filas locales se quedan
+/// apuntando a ids que ya no existen: cada subida devuelve 404 y se reintenta
+/// en bucle (1.353 intentos en tres días en el caso de ago-2026), el juego no
+/// se pinta en la biblioteca y encima bloquea su carpeta. Reconciliar al
+/// arrancar el motor significa que **actualizar la app repara la máquina sola**,
+/// sin que el usuario tenga que borrar nada a mano.
+///
+/// Re-apuntar y no borrar cuando se puede: si el servidor tiene una fila para
+/// el mismo (juego, etiqueta), la fila local se queda con su carpeta y sus
+/// ajustes y sólo cambia de id. Se reinician el cursor de versión y el
+/// `set_hash` porque son del servidor viejo: el nuevo empieza en cero, y con el
+/// `set_hash` puesto la primera subida se saltaría por "bytes sin cambios".
+pub async fn reconcile_with_server(client: &ApiClient) -> Result<Reconciliation> {
+    if client.is_cloud().await {
+        return Ok(Reconciliation::default());
+    }
+    let server = client.list_saves(None).await?;
+    let (mut state, path) = CliState::load_default()?;
+
+    let rows: Vec<ServerRow> = server
+        .iter()
+        .map(|s| ServerRow {
+            id: s.id.to_string(),
+            game_slug: s.game_slug.to_string(),
+            label: s.label.clone(),
+        })
+        .collect();
+
+    let mut out = Reconciliation::default();
+    for (id, reissued) in reconcile_plan(&state, &rows) {
+        let Some(row) = state.saves.get(&id).cloned() else {
+            continue;
+        };
+        let slug = row.game_slug.clone();
+        state.saves.remove(&id);
+        match reissued {
+            // El servidor tiene el mismo juego con otro id: se releva la fila.
+            // Si el id nuevo ya estaba mapeado (el gemelo del alta), esto
+            // sobreescribe una sola vez y la vieja desaparece igual.
+            Some(new_id) => {
+                state.saves.insert(
+                    new_id.clone(),
+                    SaveState {
+                        last_version_num: None,
+                        set_hash: None,
+                        ..row
+                    },
+                );
+                tracing::info!(
+                    old = %id, new = %new_id, slug = %slug,
+                    "state: re-linked a save the server re-issued"
+                );
+                out.relinked += 1;
+            }
+            None => {
+                tracing::info!(
+                    save_id = %id, slug = %slug,
+                    "state: dropped a save the server doesn't have"
+                );
+                out.dropped += 1;
+            }
+        }
+    }
+    if out.changed() {
+        state.save(&path)?;
+    }
+    Ok(out)
 }
 
 /// Lista los saves que Hoard rastrea para el usuario logueado. El server manda
@@ -1101,10 +1488,26 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
     // La poda por (slug,label) es cloud-only (el manifest es su árbitro), pero
     // la de filas envenenadas no necesita nube: su árbitro es el nombre y la
     // carpeta. Un self-hoster sufre el mismo churn de atribución.
-    let poisoned = prune_poisoned_rows(&mut cli_state);
-    if !poisoned.is_empty() {
+    let mut pruned = prune_poisoned_rows(&mut cli_state);
+    // Y la poda que el cloud hacía con su manifiesto, aquí con la lista del
+    // servidor: un id que no está en ella es papel mojado —no se puede subir
+    // (404), no se pinta— pero sigue bloqueando su carpeta. La biblioteca es el
+    // único sitio por el que esa fila puede desaparecer sola.
+    let known: HashSet<String> = saves.iter().map(|s| s.id.to_string()).collect();
+    let unknown = rows_unknown_to_server(&cli_state, &known);
+    if !unknown.is_empty() {
+        tracing::warn!(
+            count = unknown.len(),
+            "pruning tracked rows the server doesn't know about"
+        );
+    }
+    for id in &unknown {
+        cli_state.saves.remove(id);
+    }
+    pruned.extend(unknown);
+    if !pruned.is_empty() {
         cli_state.save(&state_path)?;
-        detached = poisoned;
+        detached = pruned;
     }
     let mut out = Vec::with_capacity(saves.len());
     for s in saves {
@@ -1209,8 +1612,12 @@ pub async fn rename_label(
 /// intactos. El frontend despega el save del agente vivo.
 pub fn untrack(save_id: &str) -> Result<()> {
     let (mut cli_state, path) = CliState::load_default()?;
-    cli_state.saves.remove(save_id);
+    let dropped = cli_state.saves.remove(save_id);
     cli_state.save(&path)?;
+    // Una desmentida: el pipeline propuso esta carpeta y el usuario la echó.
+    if let Some(save) = dropped {
+        crate::telemetry::untracked(&save.game_slug, &save.local_path);
+    }
     Ok(())
 }
 
@@ -1322,16 +1729,22 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
     if path_buf.as_os_str().is_empty() {
         anyhow::bail!("Path can't be empty.");
     }
-    validate_folder(&path_buf, Some(save_id))?;
+    validate_folder(&path_buf, &[save_id])?;
 
     let (mut cli_state, path) = CliState::load_default()?;
     let entry = cli_state
         .saves
         .get_mut(save_id)
         .context("That save isn't tracked on this machine.")?;
-    entry.local_path = path_buf;
+    let previous = std::mem::replace(&mut entry.local_path, path_buf);
     let snapshot = entry.clone();
     cli_state.save(&path)?;
+
+    // De dónde a dónde: la desmentida que más enseña, porque trae la respuesta
+    // buena además del fallo. Sólo cuenta si la ruta cambió de verdad.
+    if previous != snapshot.local_path {
+        crate::telemetry::repointed(&snapshot.game_slug, &previous, &snapshot.local_path);
+    }
 
     // Siempre despega; sólo reengancha si no está pausado.
     Ok(if snapshot.paused {
@@ -1347,8 +1760,10 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_excluded_paths, detected_paths_in, local_detection, prune_poisoned_rows,
-        resolve_processes, CachedDetection,
+        apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in,
+        local_detection, manual_override_conflict, prune_poisoned_rows, reconcile_plan,
+        resolve_processes, row_for_same_folder, rows_unknown_to_server, superseded_rows, AutoTrack,
+        CachedDetection, ServerRow,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
@@ -1369,6 +1784,384 @@ mod tests {
             set_hash: None,
             processes: Vec::new(),
         }
+    }
+
+    /// Un informe de detección con un solo juego en una sola carpeta.
+    fn report_with(slug: &str, path: &str) -> DetectionReport {
+        DetectionReport {
+            games: vec![DetectedGame {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                found_paths: vec![PathBuf::from(path)],
+                confidence: Confidence::High,
+                path_confidences: vec![Confidence::High],
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            }],
+            catalog_size: 0,
+            steam_apps_found: 0,
+            scanned_at_ms: 0,
+            stats: DetectionStats::default(),
+        }
+    }
+
+    /// El informe de ago-2026 (Furi, Windows + Steam Deck): la máquina ya tenía
+    /// el juego dado de alta con un id local y la nube traía el suyo. Adoptar
+    /// excluía sólo el id de la nube, así que la entrada local **chocaba contra
+    /// sí misma** y saltaba «'furi' already tracks … — one folder, one game».
+    /// El escaneo automático lo reintentaba en cada vuelta, el "+" manual daba
+    /// lo mismo y reapuntar la carpeta también: cero salidas por la UI.
+    #[test]
+    fn adopting_a_cloud_save_doesnt_collide_with_this_machines_own_row() {
+        let folder = r"C:\Users\angel\AppData\LocalLow\TheGameBakers\Furi";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("local-minted-id".into(), save_state("furi", folder));
+
+        // Excluyendo sólo el id de la nube: la fila local se interpone.
+        let blocked = conflicting_save(&state, &PathBuf::from(folder), &["cloud-id"]);
+        assert_eq!(
+            blocked.map(|s| s.game_slug.as_str()),
+            Some("furi"),
+            "reproduce el bug: sin relevar la fila local, choca consigo misma"
+        );
+
+        // Excluyendo ambas —lo que hace `adopt` ahora— la adopción pasa.
+        assert!(
+            conflicting_save(
+                &state,
+                &PathBuf::from(folder),
+                &["cloud-id", "local-minted-id"]
+            )
+            .is_none(),
+            "el mismo juego en la misma carpeta no es un conflicto consigo mismo"
+        );
+
+        // Y la regla que de verdad importa sigue en pie: OTRO juego sobre la
+        // misma carpeta se rechaza igual.
+        state
+            .saves
+            .insert("otro".into(), save_state("skyrim", folder));
+        assert_eq!(
+            conflicting_save(
+                &state,
+                &PathBuf::from(folder),
+                &["cloud-id", "local-minted-id"]
+            )
+            .map(|s| s.game_slug.as_str()),
+            Some("skyrim"),
+            "«una carpeta, un juego» sigue protegiendo contra juegos distintos"
+        );
+    }
+
+    /// El informe self-hosted de ago-2026: rehizo el servidor de cero y desde
+    /// entonces el escaneo fallaba para ~40 juegos con «ya la rastrea», siempre
+    /// contra el MISMO slug y la MISMA carpeta —o sea, contra su propio gemelo—.
+    /// El id lo pone el servidor y la base nueva repartió otros; el alta
+    /// insertaba el nuevo sin quitar el viejo.
+    #[test]
+    fn a_self_hosted_add_supersedes_the_row_it_replaces() {
+        let folder = r"D:\SteamUnlock\userdata\866681748\3768760\remote";
+        let mut state = CliState::default();
+        state.saves.insert(
+            "id-de-la-base-vieja".into(),
+            save_state("007-first-light", folder),
+        );
+
+        assert_eq!(
+            superseded_rows(
+                &state,
+                "007-first-light",
+                "main",
+                &PathBuf::from(folder),
+                "id-de-la-base-nueva"
+            ),
+            vec!["id-de-la-base-vieja".to_string()],
+            "la fila vieja se releva; si no, bloquea su propia carpeta para siempre"
+        );
+
+        // Y no se lleva por delante a nadie más: otro juego, otra carpeta.
+        state.saves.insert(
+            "otro".into(),
+            save_state("thymesia", r"C:\Users\angel\AppData\Roaming\FLT\1343240"),
+        );
+        let relevadas = superseded_rows(
+            &state,
+            "007-first-light",
+            "main",
+            &PathBuf::from(folder),
+            "id-de-la-base-nueva",
+        );
+        assert_eq!(relevadas, vec!["id-de-la-base-vieja".to_string()]);
+
+        // Re-alta idéntica (mismo id): no hay nada que relevar.
+        assert!(superseded_rows(
+            &state,
+            "007-first-light",
+            "main",
+            &PathBuf::from(folder),
+            "id-de-la-base-vieja"
+        )
+        .is_empty());
+    }
+
+    /// El caso de ago-2026 en la máquina del autor: `horizon-forbidden-west`
+    /// quedó apuntado a `…\Saved Games\Surviving Mars Relaunched` —la carpeta
+    /// madre de los saves de Surviving Mars—, así que Horizon vigilaba bytes
+    /// ajenos y Surviving Mars no podía rastrear los suyos. El override manual
+    /// no lo borra ni desinstalar con "borrar datos": vive en `device.json`.
+    #[test]
+    fn a_manual_override_cant_steal_another_games_folder() {
+        // Rutas POSIX aunque el caso real fuese en Windows: en un runner Linux
+        // una ruta con `\` es UN componente, así que el anidamiento —que es lo
+        // que se está probando— no existiría. La regla es la misma en ambos.
+        let madre = "/home/u/Saved Games/Surviving Mars Relaunched";
+        let hija = "/home/u/Saved Games/Surviving Mars Relaunched/76561197960271";
+        let state = CliState::default();
+        let report = report_with("surviving-mars-relaunched", hija);
+
+        assert_eq!(
+            manual_override_conflict(
+                &state,
+                Some(&report),
+                "horizon-forbidden-west",
+                &PathBuf::from(madre)
+            )
+            .as_deref(),
+            Some("surviving-mars-relaunched"),
+            "la carpeta madre contiene los saves de otro juego: no es de Horizon"
+        );
+
+        // Reapuntar el juego a SU propia carpeta sigue siendo legítimo —es para
+        // lo que existe el override— y una carpeta que no reclama nadie también.
+        assert!(manual_override_conflict(
+            &state,
+            Some(&report),
+            "surviving-mars-relaunched",
+            &PathBuf::from(madre)
+        )
+        .is_none());
+        assert!(manual_override_conflict(
+            &state,
+            Some(&report),
+            "horizon-forbidden-west",
+            &PathBuf::from("/home/u/Saved Games/Horizon Forbidden West")
+        )
+        .is_none());
+    }
+
+    /// El otro árbitro: una fila ya rastreada, sin necesidad de caché de
+    /// detección (recién borrada, primer arranque…).
+    #[test]
+    fn a_manual_override_respects_whats_already_tracked() {
+        let folder = "/home/u/Saved Games/Planet S/saves";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("id".into(), save_state("planet-s", folder));
+
+        assert_eq!(
+            manual_override_conflict(&state, None, "otro-juego", &PathBuf::from(folder)).as_deref(),
+            Some("planet-s")
+        );
+        assert!(
+            manual_override_conflict(&state, None, "planet-s", &PathBuf::from(folder)).is_none(),
+            "reapuntar el mismo juego no choca consigo mismo"
+        );
+    }
+
+    /// El alta automática espera a que haya algo que guardar. Los cuatro casos
+    /// que decide, sobre carpetas de verdad.
+    #[test]
+    fn empty_folders_wait_but_nothing_else_does() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. Vacía del todo: espera.
+        let vacia = tmp.path().join("magicka-2");
+        std::fs::create_dir_all(&vacia).unwrap();
+        assert_eq!(auto_track_decision(&vacia, false), AutoTrack::SkipEmpty);
+
+        // 2. Vacía pero el servidor ya tiene el juego: es una máquina nueva
+        //    esperando restaurar. Se da de alta igual — el caso que NO se puede
+        //    romper por quitar ruido.
+        assert_eq!(auto_track_decision(&vacia, true), AutoTrack::Track);
+
+        // 3. Con un fichero dentro: se da de alta.
+        let conmigo = tmp.path().join("celeste");
+        std::fs::create_dir_all(&conmigo).unwrap();
+        std::fs::write(conmigo.join("save0.celeste"), b"x").unwrap();
+        assert_eq!(auto_track_decision(&conmigo, false), AutoTrack::Track);
+
+        // 4. El fichero está en un subdirectorio —la forma real de Goldberg,
+        //    `<appid>/remote/…`—: cuenta igual.
+        let anidada = tmp.path().join("962130");
+        std::fs::create_dir_all(anidada.join("remote")).unwrap();
+        std::fs::write(anidada.join("remote/profile.dat"), b"x").unwrap();
+        assert_eq!(auto_track_decision(&anidada, false), AutoTrack::Track);
+
+        // 5. Sólo subcarpetas vacías: sigue sin haber nada que guardar.
+        let hueca = tmp.path().join("hueca");
+        std::fs::create_dir_all(hueca.join("remote")).unwrap();
+        assert_eq!(auto_track_decision(&hueca, false), AutoTrack::SkipEmpty);
+
+        // 6. Y lo que hace que esperar no sea perder: en cuanto el juego
+        //    escribe, el escaneo siguiente la da de alta. No se aplaza nada
+        //    durable, se re-decide cada vuelta.
+        std::fs::write(vacia.join("Player.sav"), b"x").unwrap();
+        assert_eq!(auto_track_decision(&vacia, false), AutoTrack::Track);
+    }
+
+    /// Ante la duda, dar de alta. Una carpeta que ni siquiera existe no se puede
+    /// leer, y ese `Err` no puede convertirse en "no la vigiles".
+    #[test]
+    fn an_unreadable_folder_is_never_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fantasma = tmp.path().join("no-existe");
+        assert_eq!(auto_track_decision(&fantasma, false), AutoTrack::Track);
+
+        // Un save de fichero suelto tampoco es una carpeta vacía.
+        let suelto = tmp.path().join("partida.sav");
+        std::fs::write(&suelto, b"x").unwrap();
+        assert_eq!(auto_track_decision(&suelto, false), AutoTrack::Track);
+    }
+
+    /// La reparación automática: al arrancar el motor —o sea, al actualizar—
+    /// las filas con ids que el servidor ya no conoce se re-apuntan a la fila
+    /// que ese servidor tenga hoy para el mismo (juego, etiqueta), y sólo se
+    /// tiran las que no tienen equivalente. El caso real: doctorase rehízo su
+    /// servidor y furi acabó con DOS ids muertos sobre la misma carpeta.
+    #[test]
+    fn a_reissued_server_row_relinks_instead_of_dropping() {
+        let furi = "/home/angel/AppData/LocalLow/TheGameBakers/Furi";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("furi-viejo".into(), save_state("furi", furi));
+        state
+            .saves
+            .insert("furi-gemelo".into(), save_state("furi", furi));
+        state
+            .saves
+            .insert("007-viejo".into(), save_state("007-first-light", "/d/007"));
+
+        let server = vec![ServerRow {
+            id: "furi-nuevo".into(),
+            game_slug: "furi".into(),
+            label: "main".into(),
+        }];
+
+        let plan = reconcile_plan(&state, &server);
+        assert_eq!(
+            plan,
+            vec![
+                ("007-viejo".to_string(), None),
+                ("furi-gemelo".to_string(), Some("furi-nuevo".to_string())),
+                ("furi-viejo".to_string(), Some("furi-nuevo".to_string())),
+            ],
+            "las dos filas de furi convergen en el id nuevo; 007 no existe en el servidor y se tira"
+        );
+
+        // Nada que hacer cuando el servidor conoce lo que hay.
+        let server = vec![ServerRow {
+            id: "furi-viejo".into(),
+            game_slug: "furi".into(),
+            label: "main".into(),
+        }];
+        let mut solo_furi = CliState::default();
+        solo_furi
+            .saves
+            .insert("furi-viejo".into(), save_state("furi", furi));
+        assert!(reconcile_plan(&solo_furi, &server).is_empty());
+    }
+
+    /// La salida sola: en self-hosted el servidor es el registro, así que una
+    /// fila con un id que él no conoce sólo puede dar 404 al subir, no se pinta
+    /// en la biblioteca —y aun así bloquea su carpeta—. Se poda al listar.
+    #[test]
+    fn rows_the_server_never_heard_of_are_pruned() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("viva".into(), save_state("thymesia", "/games/thymesia"));
+        state
+            .saves
+            .insert("fantasma".into(), save_state("furi", "/games/furi"));
+
+        let known: std::collections::HashSet<String> = ["viva".to_string()].into_iter().collect();
+        assert_eq!(
+            rows_unknown_to_server(&state, &known),
+            vec!["fantasma".to_string()]
+        );
+
+        // Servidor con todo: no se toca nada.
+        let known: std::collections::HashSet<String> = ["viva".to_string(), "fantasma".to_string()]
+            .into_iter()
+            .collect();
+        assert!(rows_unknown_to_server(&state, &known).is_empty());
+    }
+
+    /// Los otros dos del mismo informe, que el arreglo por slug NO cubría: el
+    /// mismo juego llega con nombres distintos según la fuente y la regla de
+    /// "una carpeta, un juego" los trataba como juegos distintos.
+    ///
+    ///   slug=dispatch  ↔ fila `dispatch-2025`  (…\Dispatch\Saved\SaveGames)
+    ///   slug=v-rising  ↔ fila `vrising`        (…\VRising\Saves)
+    ///
+    /// La identidad de un save rastreado es la carpeta, no cómo se llame.
+    #[test]
+    fn the_same_folder_is_the_same_save_however_the_slug_is_spelled() {
+        let dispatch = r"C:\Users\angel\AppData\Local\Dispatch\Saved\SaveGames";
+        let vrising = r"C:\Users\angel\AppData\LocalLow\Stunlock Studios\VRising\Saves";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("row-dispatch".into(), save_state("dispatch-2025", dispatch));
+        state
+            .saves
+            .insert("row-vrising".into(), save_state("vrising", vrising));
+
+        assert_eq!(
+            row_for_same_folder(&state, &PathBuf::from(dispatch)),
+            Some("row-dispatch"),
+            "la carpeta identifica la fila aunque el slug lleve el año"
+        );
+        assert_eq!(
+            row_for_same_folder(&state, &PathBuf::from(vrising)),
+            Some("row-vrising"),
+            "…y aunque el slug lleve o no el guion"
+        );
+
+        // Relevando esa fila, el alta bajo el nombre nuevo ya no choca.
+        assert!(
+            conflicting_save(&state, &PathBuf::from(dispatch), &["row-dispatch"]).is_none(),
+            "reusar la fila de la misma carpeta desbloquea el alta"
+        );
+
+        // Pero una carpeta ANIDADA sigue siendo el conflicto legítimo: ahí no
+        // hay una fila que reusar, hay dos ámbitos distintos y hay que avisar.
+        //
+        // Con ruta POSIX a propósito: `paths_overlap` compara por COMPONENTES, y
+        // en un runner Linux una ruta con backslashes es un único componente, así
+        // que dos rutas Windows nunca anidarían aquí. En producción no importa
+        // —esas rutas sólo existen en Windows, donde sí anidan— pero el test
+        // tiene que probar el anidamiento de verdad, no un artefacto del host.
+        let base = "/home/u/.local/share/Dispatch/Saved/SaveGames";
+        let mut posix = CliState::default();
+        posix
+            .saves
+            .insert("row-dispatch".into(), save_state("dispatch-2025", base));
+        let nested = PathBuf::from(format!("{base}/Slot1"));
+        assert!(
+            row_for_same_folder(&posix, &nested).is_none(),
+            "anidada no es la misma carpeta"
+        );
+        assert!(
+            conflicting_save(&posix, &nested, &[]).is_some(),
+            "y sigue denunciándose como solape"
+        );
     }
 
     #[test]

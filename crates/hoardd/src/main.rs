@@ -5,6 +5,17 @@
 //! de usuario en el boot, o lanzado por un cliente que no encontró ninguno
 //! ("spawn if absent", ver [`hoardd::client::Client::ensure_running`]).
 
+// Windows: sin consola en release. De las dos vías de arranque, la del cliente
+// ya lanza con `CREATE_NO_WINDOW` (ver `client::detach`), pero la del servicio
+// no puede: el Task Scheduler ejecuta el `.exe` con `InteractiveToken`, o sea
+// dentro de la sesión del usuario, y a un binario del subsistema "console"
+// Windows le asigna una consola. Resultado: una ventana negra con el log del
+// sync cada vez que inicias sesión. El subsistema "windows" la quita de raíz;
+// no se pierde diagnóstico porque `init_tracing` escribe además a fichero (y es
+// lo que lee `hoard sync logs`). En debug se conserva la consola, que es donde
+// sí quieres ver el daemon a mano — mismo criterio que `hoard-desktop`.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::Parser;
 use hoardd::endpoint::Endpoint;

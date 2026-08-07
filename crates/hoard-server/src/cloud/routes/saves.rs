@@ -217,8 +217,8 @@ pub async fn init_upload(
     //    commits, the cleanup cron deletes pending rows older than 1h).
     sqlx::query(
         r#"
-        INSERT INTO save_versions (save_id, version_num, size_bytes, sha256, r2_key, notes, parent_version, file_count)
-        VALUES ($1, $2, $3, '', $4, $5, $6, $7)
+        INSERT INTO save_versions (save_id, version_num, size_bytes, sha256, r2_key, notes, parent_version, file_count, device_name)
+        VALUES ($1, $2, $3, '', $4, $5, $6, $7, $8)
         "#,
     )
     .bind(&save_row.0)
@@ -228,6 +228,7 @@ pub async fn init_upload(
     .bind(body.notes.as_deref())
     .bind(parent_version)
     .bind(body.file_count.max(0))
+    .bind(body.device_name.as_deref())
     .execute(&state.pool)
     .await?;
 
@@ -701,8 +702,8 @@ pub async fn cas_init(
     sqlx::query(
         r#"
         INSERT INTO save_versions
-            (save_id, version_num, size_bytes, sha256, r2_key, notes, parent_version, file_count, content_addressed)
-        VALUES ($1, $2, $3, '', '', $4, $5, $6, TRUE)
+            (save_id, version_num, size_bytes, sha256, r2_key, notes, parent_version, file_count, content_addressed, device_name)
+        VALUES ($1, $2, $3, '', '', $4, $5, $6, TRUE, $7)
         "#,
     )
     .bind(&save_row.0)
@@ -711,6 +712,7 @@ pub async fn cas_init(
     .bind(body.notes.as_deref())
     .bind(parent_version)
     .bind(body.files.len() as i64)
+    .bind(body.device_name.as_deref())
     .execute(&mut *tx)
     .await?;
 
@@ -1316,6 +1318,10 @@ pub struct VersionEntry {
     pub file_count: i64,
     pub total_size_bytes: i64,
     pub is_pinned: bool,
+    /// Máquina de la que salió esta versión. `None` en todo lo subido antes de
+    /// que se guardara (y por clientes viejos): el historial se calla en vez de
+    /// inventarse un equipo.
+    pub device_name: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -1356,12 +1362,13 @@ pub async fn list_versions(
         Option<i64>,
         i64,
         bool,
+        Option<String>,
         time::OffsetDateTime,
         Option<time::OffsetDateTime>,
     );
     let rows: Vec<Row> = sqlx::query_as(
         r#"
-        SELECT version_num, size_bytes, parent_version, file_count, is_pinned, created_at, deleted_at
+        SELECT version_num, size_bytes, parent_version, file_count, is_pinned, device_name, created_at, deleted_at
           FROM save_versions
          WHERE save_id = $1
            AND sha256 <> ''
@@ -1377,16 +1384,19 @@ pub async fn list_versions(
     let out = rows
         .into_iter()
         .map(
-            |(version_num, size, parent, file_count, is_pinned, created, deleted)| VersionEntry {
-                id: version_num.to_string(),
-                save_id: save_id.clone(),
-                version_num,
-                parent_version: parent,
-                file_count,
-                total_size_bytes: size,
-                is_pinned,
-                created_at: created,
-                deleted_at: deleted,
+            |(version_num, size, parent, file_count, is_pinned, device_name, created, deleted)| {
+                VersionEntry {
+                    id: version_num.to_string(),
+                    save_id: save_id.clone(),
+                    version_num,
+                    parent_version: parent,
+                    file_count,
+                    total_size_bytes: size,
+                    is_pinned,
+                    device_name,
+                    created_at: created,
+                    deleted_at: deleted,
+                }
             },
         )
         .collect();

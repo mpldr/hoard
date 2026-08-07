@@ -6,13 +6,14 @@
    *
    * The two paid CTAs open the public marketing page with a `plan` query
    * param so the checkout can preselect Pro vs Pro+. Keeping the actual
-   * checkout out-of-app means we don't need to embed Lemon Squeezy here.
+   * checkout out-of-app means we don't need to embed Polar here.
    */
   import { _ } from "svelte-i18n";
-  import { Sparkles, Check } from "lucide-svelte";
+  import { Sparkles, Check } from "@lucide/svelte";
   import Modal from "./Modal.svelte";
   import Button from "./Button.svelte";
-  import { cloud, openUpgradePage } from "../stores/cloud";
+  import { push } from "svelte-spa-router";
+  import { cloud } from "../stores/cloud";
 
   type Props = {
     open: boolean;
@@ -26,9 +27,13 @@
 
   const currentPlan = $derived($cloud.account?.plan ?? null);
 
-  function pick(plan: "pro") {
-    void openUpgradePage(plan);
+  // El modal cierra y lleva a `/pro`, donde está la explicación completa y el
+  // botón de pago con su aviso. Antes saltaba directo al navegador desde un
+  // diálogo que el usuario no había ido a buscar (lo dispara un 402 del
+  // servidor), que es la forma más brusca de sacarlo de la aplicación.
+  function pick(_plan: "pro") {
     onClose();
+    push("/pro");
   }
 
   type PlanCard = {

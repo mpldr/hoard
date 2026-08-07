@@ -9,11 +9,13 @@
 //! account). `device_fp` is still recorded (and the aggregate sums over it), but
 //! for a 1:1 machine↔user server that's just the single device.
 //!
-//! - `POST` replaces a device's full breakdown of `(day, game, secs)` rows: the
-//!   client's local playtime is monotonic (only accrues), so each device is the
-//!   sole source of truth for its own rows. We wipe this `(user_id, device_fp)`'s
-//!   rows and re-insert the payload in one transaction; an empty payload clears
-//!   a device that no longer has anything to attribute for this account.
+//! - `POST` replaces a device's breakdown of `(day, game, secs)` rows, only as
+//!   wide as the client can vouch for — see the cloud route for the full story.
+//!   The short version: this used to wipe every row for the device on the
+//!   grounds that "the client's local playtime is monotonic", an invariant
+//!   nothing enforced and that a reinstall breaks. Now a payload clears only the
+//!   days it mentions, unless it sets `authoritative` (the agent does that only
+//!   when its store came off disk).
 //! - `GET` returns the device-merged aggregate in the same
 //!   `{ days, by_game, daily_by_game, total_secs }` shape the recap reads
 //!   locally. The synthetic `__other__` slug counts toward `days`/`total_secs`
@@ -45,6 +47,10 @@ pub struct PlaytimeUpload {
     /// Device fingerprint (the agent's logship identity). Scopes the rows so
     /// multiple machines accumulate independently instead of overwriting.
     pub device_fp: String,
+    /// The client vouches for this device's *whole* history. Defaults to
+    /// `false` so an older client gets the safe behaviour without an update.
+    #[serde(default)]
+    pub authoritative: bool,
     pub rows: Vec<PlaytimeRowIn>,
 }
 
@@ -104,18 +110,42 @@ pub async fn upload(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Full replace for this device: drop its current rows, then re-insert the
-    // payload. The client's local store is monotonic, so this never loses
-    // history; an empty payload correctly clears a device.
-    sqlx::query("DELETE FROM playtime WHERE user_id = ? AND device_fp = ?")
-        .bind(&user_id)
-        .bind(fp)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "playtime delete failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Clear before re-inserting, but only as wide as the client can vouch for.
+    // Day by day rather than one statement with an `IN (...)`: SQLite has no
+    // array binding, and a payload covers a handful of days inside a
+    // transaction that is already doing one INSERT per row.
+    if body.authoritative {
+        sqlx::query("DELETE FROM playtime WHERE user_id = ? AND device_fp = ?")
+            .bind(&user_id)
+            .bind(fp)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "playtime delete failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        let mut days: Vec<&str> = body
+            .rows
+            .iter()
+            .filter(|r| valid_day(&r.day))
+            .map(|r| r.day.as_str())
+            .collect();
+        days.sort_unstable();
+        days.dedup();
+        for day in days {
+            sqlx::query("DELETE FROM playtime WHERE user_id = ? AND device_fp = ? AND day = ?")
+                .bind(&user_id)
+                .bind(fp)
+                .bind(day)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "playtime delete failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+    }
 
     let mut accepted = 0usize;
     for row in &body.rows {

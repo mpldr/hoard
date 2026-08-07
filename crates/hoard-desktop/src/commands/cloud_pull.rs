@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::commands::supervisor;
+use crate::daemon::CloudPulse;
 
 /// Lock a mutex, recovering from poisoning instead of panicking.
 ///
@@ -201,6 +202,25 @@ struct CloudPullCompleted {
 struct QuotaReached {
     reset_in_seconds: u32,
     plan: String,
+}
+
+/// Publica el pulso del bucle **y lo recuerda**.
+///
+/// Los tres eventos de abajo son momentáneos: quien no estaba escuchando cuando
+/// pasaron no puede recuperarlos, y una ventana que nace más tarde —el HUD— se
+/// quedaría con el dot de la nube en "no se sabe" hasta la siguiente pasada.
+/// Anotarlo en el mismo gesto que se emite es lo que le deja leer el estado en
+/// vez de tener que escuchar (ver [`crate::daemon::UiSnapshot`]).
+fn note(app: &AppHandle, pulse: CloudPulse, retry_in: Option<u32>) {
+    app.state::<crate::state::AppState>()
+        .daemon
+        .note_cloud(pulse, retry_in);
+}
+
+/// El bucle no pudo hablar con la nube (DNS, TCP, TLS, 5xx, sin token).
+fn offline(app: &AppHandle) {
+    note(app, CloudPulse::Offline, None);
+    let _ = app.emit("agent://offline", ());
 }
 
 /// Cancel any in-flight poller and start a fresh one ticking every
@@ -370,7 +390,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         }
         Err(e) => {
             tracing::warn!(error = %e, "cloud-pull: couldn't get a token for the session");
-            let _ = app.emit("agent://offline", ());
+            offline(app);
             return;
         }
     };
@@ -393,7 +413,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "cloud-pull: network error");
-            let _ = app.emit("agent://offline", ());
+            offline(app);
             return;
         }
     };
@@ -411,7 +431,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
                     Ok(r) => resp = r,
                     Err(e) => {
                         tracing::debug!(error = %e, "cloud-pull: network error after refresh");
-                        let _ = app.emit("agent://offline", ());
+                        offline(app);
                         return;
                     }
                 }
@@ -431,7 +451,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
                     return;
                 }
                 tracing::warn!(error = %e, "cloud-pull: token refresh failed");
-                let _ = app.emit("agent://offline", ());
+                offline(app);
                 return;
             }
         }
@@ -446,6 +466,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(60);
         let plan = creds.plan.clone().unwrap_or_else(|| "free".to_string());
+        note(app, CloudPulse::Throttled, Some(retry_after));
         let _ = app.emit(
             "agent://quota-reached",
             QuotaReached {
@@ -457,7 +478,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
     }
     if !status.is_success() {
         tracing::warn!(status = %status, "cloud-pull: non-2xx response");
-        let _ = app.emit("agent://offline", ());
+        offline(app);
         return;
     }
 
@@ -514,6 +535,7 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
         (new_versions, new_bytes)
     };
 
+    note(app, CloudPulse::Online, None);
     let _ = app.emit(
         "agent://cloud-pull-completed",
         CloudPullCompleted {

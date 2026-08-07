@@ -1,0 +1,18 @@
+-- Which machine a version came from, so the history can say it.
+--
+-- The column existed on the self-hosted side from day one (`snapshots.
+-- device_name`) and the cloud upload body has always accepted `device_name`,
+-- but nothing on this side stored it: the INSERT simply left it out, and
+-- `save_versions.device_id` — the FK added with the table — was never written
+-- either. With one save synced across two PCs, "v77 · two hours ago" isn't
+-- enough to decide which copy to restore.
+--
+-- Stored as the name and not as a FK to `devices` on purpose. `device_id` is
+-- `ON DELETE SET NULL`, so removing a machine from the account would erase the
+-- provenance of every backup it ever made; and renaming it would rewrite
+-- history. What the timeline wants is who made this version *at the time*,
+-- which is a denormalised fact, not a live reference.
+--
+-- NULL = unknown: every pre-existing row, and any upload from a client older
+-- than this. The UI drops the suffix rather than inventing a machine.
+ALTER TABLE save_versions ADD COLUMN device_name TEXT;

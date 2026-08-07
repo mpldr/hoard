@@ -10,6 +10,26 @@
 
   let message = $state('');
   let error = $state<string | null>(null);
+  // The machine-readable reason under the headline. Kept separate so the
+  // friendly sentence stays friendly and the quotable detail still shows.
+  let errorDetail = $state<string | null>(null);
+
+  /**
+   * A denied or failed provider round-trip comes back as `error` +
+   * `error_description` — in the query on PKCE, in the fragment on implicit.
+   * We used to ignore both and print "we couldn't finish signing you in",
+   * which is how "you clicked Cancel on Google's consent screen" and "the
+   * provider is misconfigured" became the same dead end.
+   */
+  function providerError(): string | null {
+    const q = $page.url.searchParams;
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const code = q.get('error_code') ?? hash.get('error_code');
+    const kind = q.get('error') ?? hash.get('error');
+    const desc = q.get('error_description') ?? hash.get('error_description');
+    if (!kind && !desc && !code) return null;
+    return [code ?? kind, desc].filter(Boolean).join(' · ');
+  }
   // Once we've handed off to the desktop app we stop the spinner and show a
   // terminal success state. Setting `window.location.href = "hoard://…"` blocks
   // the page (the browser hands control to the OS handler), so a CSS spinner
@@ -70,6 +90,16 @@
   onMount(() => {
     message = $_('callback.signing_in');
 
+    // The provider said no before we even get to token exchange. Say what it
+    // said instead of guessing.
+    const denied = providerError();
+    if (denied) {
+      error = $_('callback.failed_provider');
+      errorDetail = denied;
+      message = '';
+      return;
+    }
+
     // Does THIS redirect carry a fresh auth payload? Magic-link / OAuth returns
     // land here either with `#access_token=…` (implicit) or `?code=…` (PKCE).
     const href = window.location.href;
@@ -79,10 +109,11 @@
     // hand its session to the app. The cached session is the right one.
     if (!hasFreshAuth) {
       (async () => {
-        const { data } = await supabase.auth.getSession();
+        const { data, error: sessErr } = await supabase.auth.getSession();
         if (data.session) done(data.session);
         else {
-          error = $_('callback.failed_generic');
+          error = $_('callback.failed_no_session');
+          errorDetail = sessErr?.message ?? null;
           message = '';
         }
       })();
@@ -107,7 +138,10 @@
       if (settled) return;
       settled = true;
       sub.subscription.unsubscribe();
-      error = $_('callback.failed_generic');
+      // The tokens were in the URL but `detectSessionInUrl` never fired
+      // SIGNED_IN. Naming the timeout separates it from "the provider said no"
+      // and from "there was nothing to sign in with".
+      error = $_('callback.failed_timeout');
       message = '';
     }, 8000);
   });
@@ -117,6 +151,9 @@
   {#if error}
     <h1 class="text-2xl font-semibold text-ink">{$_('callback.failed_title')}</h1>
     <p class="mt-2 text-sm text-ink-soft">{error}</p>
+    {#if errorDetail}
+      <p class="mt-2 max-w-full break-words font-mono text-xs text-ink-faint">{errorDetail}</p>
+    {/if}
     <a href="/login" class="mt-6 text-sm text-accent hover:underline">
       {$_('callback.back_to_signin')}
     </a>

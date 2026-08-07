@@ -17,11 +17,13 @@
   cards read as layered glass rather than flat filled boxes. The `tilt`
   action adds a 3D lean + cursor-following glow on hover.
 -->
-<div
-  class="tilt card-glass relative rounded-2xl border border-white/[0.09] bg-zinc-950/30 p-6
-         shadow-[0_1px_0_0_rgba(255,255,255,0.08)_inset,0_10px_40px_-12px_rgba(0,0,0,0.75)]
-         backdrop-blur-xl {extraClass}"
-  use:tilt
->
+<!--
+  El fondo, el filo, el radio y la sombra ya no se escriben aquí: los pone
+  `.panel` (app.css), la misma superficie que usa el resto de paneles. Antes
+  esta tarjeta tenía su propio `border-white/[0.09]` mientras el panel de
+  estadísticas del Panel usaba `border-white/[0.08]` y la barra lateral
+  `border-zinc-800/60`: tres filos distintos para la misma idea.
+-->
+<div class="tilt card-glass panel relative p-6 backdrop-blur-xl {extraClass}" use:tilt>
   {@render children()}
 </div>

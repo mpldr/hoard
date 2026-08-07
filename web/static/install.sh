@@ -3,15 +3,28 @@
 #
 #   curl -fsSL https://hoard.services/install.sh | sh
 #
-# Detects your OS/arch, downloads the matching `hoard` tarball from the latest
-# GitHub release, verifies its SHA-256, and installs the binary to
-# ~/.local/bin (no sudo). Overridable with env vars:
+# Detects your OS/arch, downloads the matching core tarball from the latest
+# GitHub release, verifies its SHA-256, and installs to ~/.local/bin (no sudo).
+#
+# It installs the CORE: `hoardd` (the sync engine, which runs as a background
+# service) and `hoard` (the terminal face). They ship and update together
+# always — `hoard` is a thin client of `hoardd` since 1.1.0, so either one on its
+# own is a program that cannot do anything.
+#
+# Then it hands off to `hoard install`, which decides whether this machine also
+# wants the desktop app and fetches it. A NAS or a server stops at the core; a
+# desktop or a Steam Deck gets the app too, in the same pass and at the same
+# version. That decision lives in Rust (`hoard_agent::install`) so the installer,
+# `hoard upgrade` and the in-app updater cannot drift apart.
+#
+# Overridable with env vars:
 #
 #   HOARD_VERSION=1.0.2            pin a version instead of "latest"
 #   HOARD_INSTALL_DIR=/opt/bin     install somewhere else
+#   HOARD_HEADLESS=1               core only, never the desktop app
+#   HOARD_WITH_DESKTOP=1           force the desktop app even if undetected
 #
-# The CLI is the same sync engine as the desktop app, headless. After install:
-#   hoard login && hoard sync start
+# After install:  hoard login && hoard sync start
 set -eu
 
 REPO="rleeon/hoard"
@@ -105,18 +118,28 @@ fi
 
 # ---- extract ---------------------------------------------------------------
 tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
-src="$tmp/hoard-${ver}-${platform}/hoard"
-[ -f "$src" ] || fail "the archive did not contain the expected 'hoard' binary."
+root="$tmp/hoard-${ver}-${platform}"
+# Both halves of the core, checked before anything is written. Installing one
+# without the other is what this whole layout exists to prevent: `hoard` with no
+# `hoardd` is a client with nothing to talk to, and it fails at the point of use
+# rather than here.
+for want in hoard hoardd; do
+  [ -f "$root/$want" ] || fail "the archive did not contain '$want' — refusing to install half of the core."
+done
 
 # ---- install ---------------------------------------------------------------
 dir="${HOARD_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$dir"
-if command -v install >/dev/null 2>&1; then
-  install -m 0755 "$src" "$dir/hoard"
-else
-  cp "$src" "$dir/hoard" && chmod 0755 "$dir/hoard"
-fi
-info "Installed ${BOLD}hoard ${ver}${RESET} → ${dir}/hoard"
+put() {
+  if command -v install >/dev/null 2>&1; then
+    install -m 0755 "$root/$1" "$dir/$1"
+  else
+    cp "$root/$1" "$dir/$1" && chmod 0755 "$dir/$1"
+  fi
+}
+put hoard
+put hoardd
+info "Installed ${BOLD}hoard ${ver}${RESET} (engine + CLI) → ${dir}"
 
 # ---- PATH check ------------------------------------------------------------
 on_path=no
@@ -142,6 +165,33 @@ if [ "$on_path" = no ]; then
   say "  Added it to ${BOLD}$rc${RESET}. Open a new terminal, or run:"
   say "    ${BOLD}$line${RESET}"
 fi
+
+# ---- the rest of Hoard -----------------------------------------------------
+# The core is in; `hoard install` takes it from here. It decides what else this
+# machine wants and fetches it at the SAME version, so the pieces never drift.
+# Everything below is best-effort on purpose: a failure here leaves a working
+# core behind, and the user can re-run `hoard install` once the cause is fixed.
+say ""
+# Both flags accumulate rather than overwrite, so setting HOARD_HEADLESS=1 and
+# HOARD_WITH_DESKTOP=1 together reaches `hoard install` as the contradiction it
+# is and clap rejects it (`conflicts_with`). Assigning instead of appending —
+# which this did — silently dropped --headless and pulled a desktop app onto a
+# machine that asked not to have one. install.ps1 has always accumulated; these
+# two must not disagree about what the same env vars mean.
+rest_args=""
+[ "${HOARD_HEADLESS:-}" = "1" ]     && rest_args="$rest_args --headless"
+[ "${HOARD_WITH_DESKTOP:-}" = "1" ] && rest_args="$rest_args --with-desktop"
+
+# stdin is the script itself inside `curl … | sh`, so anything that might prompt
+# has to be told it can't. `hoard install` picks a non-interactive delivery when
+# it sees this.
+# La versión va explícita aunque el binario recién puesto ya sea esa: deja el
+# contrato escrito, y si alguien reordena esto y se instala un `hoard` de otra
+# versión, falla en vez de mezclar piezas de dos releases.
+HOARD_NONINTERACTIVE=1 "$dir/hoard" install --version "$ver" $rest_args </dev/null || {
+  warn "the core is installed, but setting up the rest didn't finish."
+  say  "  Re-run it when you're ready:  ${BOLD}hoard install${RESET}"
+}
 
 say ""
 info "Done. Next steps:"

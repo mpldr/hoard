@@ -14,7 +14,7 @@
   import { onMount, onDestroy } from "svelte";
   import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
-  import { LogOut, ArrowUpRight, Mail, Download, Trash2, RefreshCw, ShieldCheck, AlertTriangle, CreditCard, HardDrive, Layers, Clock, FileArchive, Gauge } from "lucide-svelte";
+  import { LogOut, ArrowUpRight, Mail, Download, Trash2, RefreshCw, ShieldCheck, AlertTriangle, CreditCard, HardDrive, Layers, Clock, FileArchive, Gauge } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
   import Button from "../lib/components/Button.svelte";
@@ -31,7 +31,6 @@
     downloadCloudExport,
     deleteCloudAccount,
     openBillingPortal,
-    openUpgradePage,
     planLabel,
     type CloudExportStatus,
   } from "../lib/stores/cloud";
@@ -465,7 +464,7 @@
         </div>
         <div class="flex flex-col items-end gap-2">
           {#if account.plan === "free"}
-            <Button variant="primary" onclick={() => openUpgradePage()}>
+            <Button variant="primary" onclick={() => push("/pro")}>
               <ArrowUpRight size={14} />
               {$_("account.upgrade")}
             </Button>

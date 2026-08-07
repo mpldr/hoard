@@ -2,13 +2,25 @@
 #
 #   irm https://hoard.services/install.ps1 | iex
 #
-# Detects your architecture, downloads the matching `hoard` tarball from the
-# latest GitHub release, verifies its SHA-256, installs hoard.exe to
+# Detects your architecture, downloads the matching core tarball from the
+# latest GitHub release, verifies its SHA-256, installs to
 # %LOCALAPPDATA%\hoard\bin, and adds that folder to your user PATH.
 #
+# It installs the CORE: hoardd.exe (the sync engine, which runs as a background
+# service) and hoard.exe (the terminal face). They ship and update together
+# always - hoard is a thin client of hoardd since 1.1.0, so either one on its
+# own is a program that cannot do anything.
+#
+# Then it hands off to `hoard install`, which decides whether this machine also
+# wants the desktop app and fetches it at the same version. That decision lives
+# in Rust (hoard_agent::install) so this script, `hoard upgrade` and the in-app
+# updater cannot drift apart.
+#
 # Override with environment variables before running:
-#   $env:HOARD_VERSION     = '1.0.2'   # pin a version instead of "latest"
-#   $env:HOARD_INSTALL_DIR = 'C:\tools' # install somewhere else
+#   $env:HOARD_VERSION      = '1.0.2'   # pin a version instead of "latest"
+#   $env:HOARD_INSTALL_DIR  = 'C:\tools' # install somewhere else
+#   $env:HOARD_HEADLESS     = '1'       # core only, never the desktop app
+#   $env:HOARD_WITH_DESKTOP = '1'       # force the desktop app
 #
 # After install:  hoard login ; hoard sync start
 
@@ -110,8 +122,16 @@ try {
   # ---- extract -------------------------------------------------------------
   tar.exe -xzf $pkg -C $tmp
   if ($LASTEXITCODE -ne 0) { Die "failed to extract the archive." }
-  $src = Join-Path $tmp "hoard-$ver-$platform\hoard.exe"
-  if (-not (Test-Path $src)) { Die "the archive did not contain hoard.exe." }
+  $root = Join-Path $tmp "hoard-$ver-$platform"
+  # Both halves of the core, checked before anything is written. Installing one
+  # without the other is what this layout exists to prevent: hoard.exe with no
+  # hoardd.exe is a client with nothing to talk to, and it fails at the point of
+  # use rather than here.
+  foreach ($want in @('hoard.exe','hoardd.exe')) {
+    if (-not (Test-Path (Join-Path $root $want))) {
+      Die "the archive did not contain $want - refusing to install half of the core."
+    }
+  }
 
   # ---- install -------------------------------------------------------------
   $dir = $env:HOARD_INSTALL_DIR
@@ -119,8 +139,10 @@ try {
     $dir = Join-Path $env:LOCALAPPDATA 'hoard\bin'
   }
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
-  Copy-Item $src (Join-Path $dir 'hoard.exe') -Force
-  Info "Installed hoard $ver -> $dir\hoard.exe"
+  foreach ($bin in @('hoard.exe','hoardd.exe')) {
+    Copy-Item (Join-Path $root $bin) (Join-Path $dir $bin) -Force
+  }
+  Info "Installed hoard $ver (engine + CLI) -> $dir"
 
   # ---- PATH (user scope) ---------------------------------------------------
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -131,6 +153,21 @@ try {
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     $env:Path = "$env:Path;$dir"   # current session
     Warn "$dir was added to your user PATH. Open a new terminal for it to take effect everywhere."
+  }
+  # ---- the rest of Hoard ---------------------------------------------------
+  # The core is in; `hoard install` takes it from here. It decides what else
+  # this machine wants and fetches it at the SAME version, so the pieces never
+  # drift. Best-effort on purpose: a failure here leaves a working core behind,
+  # and the user can re-run `hoard install` once the cause is fixed.
+  Write-Host ""
+  $restArgs = @('install', '--version', $ver)
+  if ($env:HOARD_HEADLESS -eq '1')     { $restArgs += '--headless' }
+  if ($env:HOARD_WITH_DESKTOP -eq '1') { $restArgs += '--with-desktop' }
+  $env:HOARD_NONINTERACTIVE = '1'
+  & (Join-Path $dir 'hoard.exe') @restArgs
+  if ($LASTEXITCODE -ne 0) {
+    Warn "the core is installed, but setting up the rest didn't finish."
+    Write-Host "  Re-run it when you're ready:  hoard install"
   }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

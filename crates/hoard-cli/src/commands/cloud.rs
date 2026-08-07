@@ -149,6 +149,7 @@ pub async fn run(cmd: CloudCommand) -> Result<()> {
             let dev = hoard_agent::logship::device_identity();
             let body = PlaytimeUploadBody {
                 device_fp: dev.fingerprint,
+                authoritative: store.is_authoritative(),
                 rows: store.upload_rows(),
             };
             // Push best-effort; luego lee el agregado multi-equipo del server.

@@ -3,7 +3,8 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { session } from '$lib/stores/session';
-  import { api } from '$lib/api';
+  import { api, ApiError } from '$lib/api';
+  import { describeError } from '$lib/errors';
   import { PLANS } from '$lib/plans';
   import Button from '$lib/components/Button.svelte';
   import LogoMark from '$lib/components/LogoMark.svelte';
@@ -48,7 +49,18 @@
       // Hand off to Polar's hosted checkout.
       window.location.href = url;
     } catch (e) {
-      error = (e as Error).message;
+      // The banner stays friendly, but the real status has to go *somewhere* —
+      // without this a failed checkout is unreportable: the user sees one
+      // sentence and the server logs nothing when the request never got past
+      // auth.
+      console.error('[checkout]', e);
+      // An expired session is not an error to apologise for, it's a login.
+      // Come straight back here afterwards so the purchase intent survives.
+      if (e instanceof ApiError && e.status === 401) {
+        goto(`/login?next=${encodeURIComponent(selfUrl)}`);
+        return;
+      }
+      error = describeError(e, $_);
       busy = false;
     }
   }
@@ -113,7 +125,13 @@
       </div>
 
       {#if error}
-        <p class="mt-4 text-sm text-red-400">{$_('checkout.error')}</p>
+        <!-- Headline stays friendly; the concrete reason goes underneath. A
+             lone "try again in a moment" is what made a dead session, an
+             unconfigured product and an offline browser look identical. -->
+        <div class="mt-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-left">
+          <p class="text-sm text-red-400">{$_('checkout.error')}</p>
+          <p class="mt-1 break-words font-mono text-xs text-ink-faint">{error}</p>
+        </div>
       {/if}
 
       <div class="mt-6 flex items-center gap-3">

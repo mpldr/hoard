@@ -26,7 +26,7 @@
     MonitorPlay,
     Sparkles,
     Settings as SettingsIcon,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import Button from "./Button.svelte";
 

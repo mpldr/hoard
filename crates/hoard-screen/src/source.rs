@@ -63,6 +63,12 @@ pub trait Source: Send {
     /// that samples the *screen* (the scope/magnifier) tracks its panel as the
     /// user drags it. Most sources don't care — default is a no-op.
     fn set_viewport(&mut self, _rect: crate::scene::Rect, _monitor: u32) {}
+    /// Whether the overlay is in Editor mode. Fed by the engine when the mode
+    /// changes. A source that hides itself behind a binding (the scope) must
+    /// ignore that binding while the user is arranging panels — otherwise the
+    /// lens is invisible exactly when it needs to be dragged into place.
+    /// Default is a no-op; most sources don't care.
+    fn set_editing(&mut self, _editing: bool) {}
 }
 
 /// Animated test pattern: a moving diagonal gradient. Drives the entire

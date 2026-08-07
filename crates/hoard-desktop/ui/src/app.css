@@ -33,20 +33,6 @@
   font-style: normal;
   font-display: swap;
 }
-@font-face {
-  font-family: "Fraunces";
-  src: url("./fonts/fraunces.woff2") format("woff2");
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Fraunces";
-  src: url("./fonts/fraunces-italic.woff2") format("woff2");
-  font-weight: 100 900;
-  font-style: italic;
-  font-display: swap;
-}
 
 /* ---- Theme tokens ---------------------------------------------------- */
 /* Tailwind v4 reads --font-* / --color-* here to mint utilities. The
@@ -58,7 +44,10 @@
     "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono:
     "Geist Mono", ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  --font-serif: "Fraunces", ui-serif, Georgia, "Times New Roman", serif;
+  /* Sin webfont serif: el experimento de display serif se descartó (ver
+     `.font-display` más abajo) pero los `@font-face` seguían costando
+     149 KB de descarga en cada arranque sin que ninguna regla los usara. */
+  --font-serif: ui-serif, Georgia, "Times New Roman", serif;
 
   /* Obsidian surfaces — near-black with a sliver of emerald hue so the
      dark never reads as dead/plastic grey. */
@@ -69,6 +58,34 @@
   --color-border: oklch(1 0 0 / 8%);
   --color-accent: oklch(0.62 0.15 158); /* emerald, the gem */
   --color-accent-hover: oklch(0.72 0.16 160);
+
+  /* Rampa neutra repintada. Tailwind trae `zinc` gris puro; aquí es obsidiana
+     con croma bajísimo en el mismo tono (165) que `--color-bg`, y con pasos
+     perceptualmente regulares en oklch. Dos consecuencias: los fondos grandes
+     dejan de leerse como plástico gris sobre el negro, y los peldaños
+     intermedios (700/800) por fin se distinguen entre sí, que es lo que hacía
+     que bordes y superficies se confundieran.
+
+     Como cada componente usa utilidades crudas (`bg-zinc-900`, `text-zinc-400`),
+     repintar la rampa reviste toda la aplicación sin tocar el marcado — y el
+     tema Quartz la vuelve a repintar más abajo para el modo claro. */
+  --color-zinc-50: oklch(0.98 0.004 165);
+  --color-zinc-100: oklch(0.95 0.005 165);
+  --color-zinc-200: oklch(0.89 0.006 165);
+  --color-zinc-300: oklch(0.8 0.007 165);
+  --color-zinc-400: oklch(0.685 0.008 165);
+  --color-zinc-500: oklch(0.565 0.009 165);
+  --color-zinc-600: oklch(0.45 0.009 165);
+  --color-zinc-700: oklch(0.35 0.008 165);
+  --color-zinc-800: oklch(0.268 0.007 165);
+  --color-zinc-900: oklch(0.2 0.006 165);
+  --color-zinc-950: oklch(0.145 0.005 165);
+
+  /* Escala de radios. Antes convivían rounded-md/lg/xl/2xl sin criterio; estos
+     tres tienen un significado: control, panel y superficie flotante. */
+  --radius-control: 0.625rem;
+  --radius-panel: 1rem;
+  --radius-pop: 1.125rem;
 }
 
 html,
@@ -79,6 +96,24 @@ body,
 
 :root {
   color-scheme: dark;
+
+  /* ---- Elevación ---------------------------------------------------- */
+  /* Tres superficies y su filo. Fuera de `@theme` a propósito: son valores
+     compuestos (con alfa) que cada tema repinta, no colores que Tailwind deba
+     convertir en utilidades. Se consumen desde las clases `.panel` / `.pop` de
+     más abajo, o con `bg-[var(--surface-2)]` cuando hace falta a mano. */
+  --surface-1: oklch(0.185 0.006 165 / 62%);
+  --surface-2: oklch(0.225 0.007 165 / 72%);
+  --surface-3: oklch(0.255 0.008 165 / 88%);
+  --edge: oklch(1 0 0 / 9%);
+  --edge-strong: oklch(1 0 0 / 15%);
+  /* Filo superior: la línea de luz de un píxel que hace que un panel parezca
+     levantado y no pegado al fondo. */
+  --edge-top: inset 0 1px 0 0 oklch(1 0 0 / 8%);
+
+  --shadow-panel: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 32px -16px oklch(0 0 0 / 70%);
+  --shadow-raised: 0 2px 4px oklch(0 0 0 / 45%), 0 20px 48px -20px oklch(0 0 0 / 80%);
+  --shadow-pop: 0 4px 8px oklch(0 0 0 / 50%), 0 32px 64px -24px oklch(0 0 0 / 85%);
 }
 
 /* ---- Base atmosphere ------------------------------------------------- */
@@ -107,6 +142,39 @@ body::before {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
+/* La ventana del HUD es transparente: sin esto, el fondo negro del `body` (y
+   su capa de grano) taparía el juego con un rectángulo opaco en vez de dejar
+   ver lo de debajo. La pone `main.ts` al montar en esa ventana. */
+html.is-overlay,
+html.is-overlay body {
+  background: transparent !important;
+}
+html.is-overlay body::before {
+  display: none;
+}
+
+/* Las barras de desplazamiento las pinta el motor con el tema del sistema, y
+   en un tema GTK claro salen como una franja clara pegada al borde — sobre un
+   HUD translúcido eso se lee como una línea blanca. En esta ventana no hace
+   falta ninguna a nivel de página (el registro tiene su propio scroll), así que
+   fuera; y la del registro, oscura. */
+html.is-overlay,
+html.is-overlay body {
+  overflow: hidden;
+  scrollbar-width: none;
+}
+html.is-overlay ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+html.is-overlay ::-webkit-scrollbar-track {
+  background: transparent;
+}
+html.is-overlay ::-webkit-scrollbar-thumb {
+  background: oklch(1 0 0 / 18%);
+  border-radius: 9999px;
+}
+
 /* Keep app content above the grain layer. */
 #app {
   position: relative;
@@ -131,6 +199,44 @@ h2 {
 .tabular {
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
+}
+
+/* ---- Superficies ----------------------------------------------------- */
+/* Las tres clases que sustituyen a las combinaciones improvisadas de
+   `bg-zinc-9xx/xx + border-white/[0.0x] + rounded-xl + shadow-[…]`. Un
+   componente que quiera una superficie usa una de estas y hereda filo, sombra
+   y radio coherentes con el resto de la aplicación. Se puede seguir tiñendo
+   por encima con utilidades (`border-emerald-500/25`, por ejemplo) — el
+   sistema fija la forma, no el color. */
+@layer components {
+  .panel {
+    background-color: var(--surface-1);
+    border: 1px solid var(--edge);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--edge-top), var(--shadow-panel);
+  }
+  .panel-raised {
+    background-color: var(--surface-2);
+    border: 1px solid var(--edge);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--edge-top), var(--shadow-raised);
+  }
+  .pop {
+    background-color: var(--surface-3);
+    border: 1px solid var(--edge-strong);
+    border-radius: var(--radius-pop);
+    box-shadow: var(--edge-top), var(--shadow-pop);
+  }
+}
+
+/* Foco visible y coherente. Antes cada componente inventaba su anillo (o no
+   ponía ninguno); esto da uno solo, del color del acento, a cualquier cosa
+   enfocada por teclado. `:focus-visible` no dispara con el ratón, así que no
+   cambia nada al hacer clic. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: inherit;
 }
 
 /* ---- Native control legibility (webkit2gtk) ------------------------- */
@@ -166,6 +272,15 @@ html.is-linux .card-glass {
   -webkit-backdrop-filter: none;
 }
 
+/* Las superficies translúcidas tienen el mismo problema que el blur en
+   webkit2gtk cuando se apilan sobre otra capa translúcida: sin desenfoque el
+   alfa basta, pero conviene subirlo para que el negro no se cuele. */
+html.is-linux {
+  --surface-1: oklch(0.185 0.006 165 / 80%);
+  --surface-2: oklch(0.225 0.007 165 / 88%);
+  --surface-3: oklch(0.255 0.008 165 / 96%);
+}
+
 /* ---- Motion --------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -173,6 +288,16 @@ html.is-linux .card-glass {
   *::after {
     animation-duration: 0.001ms !important;
     transition-duration: 0.001ms !important;
+  }
+
+  /* Excepción: si el usuario eligió nivel de relieve a mano
+     (`data-motion-on`, que pone `stores/motion.ts` cuando la barra está por
+     encima de 0), `.tilt` conserva su suavizado. Aplanárselo no le da menos movimiento —los grados son los que
+     pidió—, sólo se lo da a saltos persiguiendo al ratón, que es lo contrario
+     de lo que busca quien activa el ajuste del sistema. Sin elección
+     Con la barra a 0 no hay nada que suavizar. */
+  :root[data-motion-on] .tilt {
+    transition-duration: 220ms !important;
   }
 }
 
@@ -220,6 +345,17 @@ html.is-linux .card-glass {
   --color-emerald-500: oklch(0.5 0.15 162);
   --color-emerald-600: oklch(0.48 0.15 162);
   --color-emerald-700: oklch(0.42 0.14 162);
+
+  /* Elevación en papel: pigmento blanco y sombras cortas, no alfa oscuro. */
+  --surface-1: oklch(1 0 0 / 62%);
+  --surface-2: oklch(1 0 0 / 82%);
+  --surface-3: oklch(1 0 0 / 96%);
+  --edge: oklch(0.2 0.012 95 / 11%);
+  --edge-strong: oklch(0.2 0.012 95 / 18%);
+  --edge-top: inset 0 1px 0 0 oklch(1 0 0 / 70%);
+  --shadow-panel: 0 1px 2px oklch(0.3 0.02 95 / 8%), 0 10px 28px -14px oklch(0.3 0.02 95 / 22%);
+  --shadow-raised: 0 2px 4px oklch(0.3 0.02 95 / 10%), 0 18px 40px -18px oklch(0.3 0.02 95 / 28%);
+  --shadow-pop: 0 4px 8px oklch(0.3 0.02 95 / 12%), 0 28px 56px -22px oklch(0.3 0.02 95 / 34%);
 }
 :root[data-theme="quartz"] body {
   background-color: oklch(0.975 0.005 95);
@@ -246,7 +382,17 @@ html.is-linux .card-glass {
 .tilt {
   transform: perspective(700px) rotateX(var(--tilt-rx, 0deg))
     rotateY(var(--tilt-ry, 0deg));
-  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  /* La transición incluye el color, no sólo el transform. `.tilt` se declara
+     después del `@import` de Tailwind, así que su `transition` gana a las
+     utilidades `transition` / `transition-colors` del marcado: cualquier
+     elemento que lleve las dos —los botones del rail, sin ir más lejos— se
+     quedaba sin suavizado de color y cambiaba de golpe. Enumerarlas aquí
+     devuelve ese suavizado sin tener que quitar `tilt` de nada. */
+  transition:
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
   will-change: transform;
 }
 .tilt::after {
@@ -264,8 +410,16 @@ html.is-linux .card-glass {
   );
 }
 .tilt:hover::after {
-  opacity: 0.18;
+  opacity: var(--tilt-glow-strength, 0.18);
 }
+
+/* La intensidad del relieve es un porcentaje continuo, así que
+   `--tilt-glow-strength` y `--glow-strength` las escribe `stores/motion.ts`
+   directamente sobre `<html>` — aquí sólo quedan los valores de reserva por si
+   el store no llegó a correr. Los grados los escala la propia acción. La
+   perspectiva del `transform` es deliberadamente fija: hacerla variar esconde
+   un segundo multiplicador (reduce el desplazamiento igual que recortar
+   grados) y las dos reducciones se multiplican. */
 
 /* Glow-only — same cursor-following glow as .tilt but WITHOUT the 3D
    rotation. Used by buttons and small interactive elements where a tilt
@@ -290,7 +444,7 @@ html.is-linux .card-glass {
   );
 }
 .glow:hover::after {
-  opacity: 1;
+  opacity: var(--glow-strength, 1);
 }
 
 /* Ripple — host clips the spawned span to the button's rounded corners. */
@@ -369,6 +523,43 @@ html.is-linux .card-glass {
   justify-content: center;
   padding-left: 0;
   padding-right: 0;
+}
+
+/* Barra de intensidad del relieve. La pista va de apagado al acento, así que
+   la propia barra enseña lo que se está regulando. Mismo tratamiento manual
+   que `.hue-slider`: los navegadores no dejan estilar un range sin
+   `appearance: none` y sus pseudo-elementos por motor. */
+.motion-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.5rem;
+  border-radius: 9999px;
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--surface-3),
+    color-mix(in oklch, var(--color-accent) 85%, transparent)
+  );
+  border: 1px solid var(--edge);
+}
+.motion-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.5rem;
+  width: 0.5rem;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  border: 2px solid oklch(1 0 0 / 0.85);
+  box-shadow: 0 1px 4px oklch(0 0 0 / 0.5);
+  cursor: grab;
+}
+.motion-slider::-moz-range-thumb {
+  height: 1.5rem;
+  width: 0.5rem;
+  border: 2px solid oklch(1 0 0 / 0.85);
+  border-radius: 9999px;
+  background: var(--color-accent);
+  cursor: grab;
 }
 
 /* Hue picker — the accent slider's track is a full hue wheel so the user sees

@@ -1,15 +1,30 @@
 //! `/v1/cloud/playtime` — cloud mirror of the agent's real-hours-played
 //! tracker, attributed per local day and per game, per device.
 //!
-//! - `POST` replaces a device's full breakdown of `(day, game, secs)` rows:
-//!   the client's local playtime is monotonic (it only ever accrues, never
-//!   prunes), so each device is the sole source of truth for its own rows. We
-//!   wipe this `(user_id, device_fp)`'s rows and re-insert the payload inside
-//!   one transaction. This lets a device that legitimately has *nothing* for an
-//!   account (e.g. after the per-account playtime partition, a second account
-//!   that never played here) push an empty set and have its stale rows cleared,
-//!   instead of them lingering forever under a grow-only upsert. `device_fp`
-//!   keeps two machines that played the same game on the same day independent.
+//! - `POST` replaces a device's breakdown of `(day, game, secs)` rows, scoped
+//!   by how much the client can actually vouch for. `device_fp` keeps two
+//!   machines that played the same game on the same day independent.
+//!
+//!   **How wide the replace goes is the client's call, and defaults to narrow.**
+//!   This used to wipe every row for `(user_id, device_fp)` unconditionally,
+//!   justified by "the client's local store is monotonic, so this never loses
+//!   history". Nothing enforced that invariant, and it stops holding the moment
+//!   the local store is gone — a reinstall, a wiped `AppData`, a fresh profile.
+//!   Then the client came back with an empty breakdown, this route believed it,
+//!   and the account's history was deleted server-side. That is exactly how a
+//!   user lost theirs (2026-08-07): the app was reinstalled at 03:19 and its
+//!   own routine push finished the job at 04:17.
+//!
+//!   So a payload now only clears the days it actually mentions, unless it sets
+//!   `authoritative` — which the agent does only when its store came off disk.
+//!   A client that lost its file says nothing about last month, so last month
+//!   survives; a client that still has its file can retract a day (a game
+//!   excluded from the count) and the retraction lands.
+//!
+//!   The old wide behaviour remains reachable for what it was for: a device
+//!   that legitimately has *nothing* for an account (after the per-account
+//!   playtime partition, a second account that never played here) pushes an
+//!   authoritative empty set and its stale rows go.
 //! - `GET` returns the device-merged aggregate in the same
 //!   `{ days, by_game, total_secs }` shape the recap reads locally, so the UI
 //!   can swap its source without reshaping. The synthetic `__other__` slug
@@ -39,6 +54,14 @@ pub struct PlaytimeUpload {
     /// Device fingerprint (the agent's logship identity). Scopes the rows so
     /// multiple machines accumulate independently instead of overwriting.
     pub device_fp: String,
+    /// The client vouches for this device's *whole* history, so anything it
+    /// doesn't send may be dropped.
+    ///
+    /// Defaults to `false`, and the default is the point: an older client — or
+    /// any client that can't tell a real zero from a lost file — gets the safe
+    /// behaviour without being updated first.
+    #[serde(default)]
+    pub authoritative: bool,
     pub rows: Vec<PlaytimeRowIn>,
 }
 
@@ -97,15 +120,40 @@ pub async fn upload(
 
     let mut tx = state.pool.begin().await?;
 
-    // Full replace for this device: drop its current rows, then re-insert the
-    // payload. The client's local store is monotonic, so this never loses
-    // history; an empty payload correctly clears a device that no longer has
-    // anything to attribute for this account.
-    sqlx::query("DELETE FROM playtime WHERE user_id = $1 AND device_fp = $2")
-        .bind(user.user_id)
-        .bind(fp)
-        .execute(&mut *tx)
-        .await?;
+    // Clear before re-inserting, but only as wide as the client can vouch for.
+    // A day the payload mentions is fully restated by it (so a retracted game
+    // disappears); a day it doesn't mention is none of this payload's business
+    // unless the client says it knows its whole past.
+    if body.authoritative {
+        sqlx::query("DELETE FROM playtime WHERE user_id = $1 AND device_fp = $2")
+            .bind(user.user_id)
+            .bind(fp)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let days: Vec<String> = {
+            let mut d: Vec<String> = body
+                .rows
+                .iter()
+                .filter(|r| valid_day(&r.day))
+                .map(|r| r.day.clone())
+                .collect();
+            d.sort_unstable();
+            d.dedup();
+            d
+        };
+        if !days.is_empty() {
+            sqlx::query(
+                "DELETE FROM playtime
+                  WHERE user_id = $1 AND device_fp = $2 AND day = ANY($3::date[])",
+            )
+            .bind(user.user_id)
+            .bind(fp)
+            .bind(&days)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
 
     let mut accepted = 0usize;
     for row in &body.rows {

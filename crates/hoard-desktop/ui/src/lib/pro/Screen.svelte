@@ -34,14 +34,104 @@
 
   // Parámetros del visor de francotirador (SourceRef::Scope): lente que
   // muestra aumentado lo que hay debajo del panel.
+  /** Botón o tecla que enciende el visor. Los botones van numerados como los
+   *  numera el navegador (`MouseEvent.button`: 0 izq, 1 rueda, 2 der, 3 atrás,
+   *  4 adelante) y las teclas por `KeyboardEvent.code`, que es lo que llega al
+   *  capturarlas — el overlay traduce a VK/keysym en su lado. */
+  export type ScBinding =
+    | { type: "mouse"; button: number }
+    | { type: "key"; code: string };
+
+  /** Cuándo se ve el visor: `toggle` alterna, `hold` sólo mientras se mantiene,
+   *  `timed` lo enciende `seconds` y se apaga solo. */
+  export type ScMode = "toggle" | "hold" | "timed";
+
+  /** A qué apunta la lente: lo que tiene debajo, el centro de la pantalla, o
+   *  un punto desplazado. Desacopla *dónde se ve* de *qué se ve*. */
+  export type ScAim =
+    | { kind: "under" }
+    | { kind: "center" }
+    | { kind: "offset"; dx: number; dy: number };
+
   export type Sc = {
     shape: "circle" | "square";
     zoom: number;
     border: boolean;
+    /** Suavizar los píxeles ampliados (bilineal) o dejarlos duros (vecino). */
+    smooth: boolean;
+    /** Cruz fina en el centro de la vista ampliada. */
+    reticle: boolean;
+    aim: ScAim;
+    activation: {
+      /** `null` = siempre visible (el comportamiento de siempre). */
+      binding: ScBinding | null;
+      mode: ScMode;
+      seconds: number;
+    };
   };
 
+  export const ZOOM_MIN = 1;
+  export const ZOOM_MAX = 20;
+
+  /**
+   * El deslizador de aumento NO es lineal, y no es un capricho: el aumento se
+   * percibe de forma multiplicativa (de ×1 a ×2 se nota tanto como de ×10 a
+   * ×20), así que un recorrido lineal de 1 a 20 dejaría todo el rango útil
+   * —de ×1 a ×4— apelotonado en el primer 16 % de la barra y sería imposible
+   * afinar ahí. Con la curva exponencial, un mismo tramo de barra siempre
+   * cambia el aumento en la misma *proporción*: la mitad de la barra cae en
+   * ×4,5 y el ×1,01 sigue siendo alcanzable.
+   */
+  const ZOOM_STEPS = 1000;
+
+  export function sliderToZoom(pos: number): number {
+    const t = Math.min(1, Math.max(0, pos / ZOOM_STEPS));
+    return Math.round(ZOOM_MAX ** t * 100) / 100;
+  }
+
+  export function zoomToSlider(zoom: number): number {
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom || ZOOM_MIN));
+    return Math.round((Math.log(z) / Math.log(ZOOM_MAX)) * ZOOM_STEPS);
+  }
+
+  /** ×1,01 · ×2,5 · ×12 — sin decimales que no aportan nada. */
+  export function zoomLabel(zoom: number): string {
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom || ZOOM_MIN));
+    const txt = z < 10 ? z.toFixed(2).replace(/\.?0+$/, "") : z.toFixed(0);
+    return `×${txt}`;
+  }
+
   export function defaultSc(): Sc {
-    return { shape: "circle", zoom: 2, border: true };
+    return {
+      shape: "circle",
+      zoom: 2,
+      border: true,
+      smooth: true,
+      reticle: false,
+      aim: { kind: "under" },
+      activation: { binding: null, mode: "toggle", seconds: 3 },
+    };
+  }
+
+  /** Nombre legible de un vínculo. Los botones del ratón se nombran, no se
+   *  numeran: "Ratón 4" dice bastante más que "botón 3". */
+  export function bindingLabel(b: ScBinding | null): string {
+    if (!b) return tr({ es: "Sin asignar", en: "Unassigned" });
+    if (b.type === "key") return b.code;
+    switch (b.button) {
+      case 0:
+        return tr({ es: "Clic izquierdo", en: "Left click" });
+      case 1:
+        return tr({ es: "Rueda", en: "Middle click" });
+      case 2:
+        return tr({ es: "Clic derecho", en: "Right click" });
+      case 3:
+        return tr({ es: "Ratón 4 (atrás)", en: "Mouse 4 (back)" });
+      case 4:
+        return tr({ es: "Ratón 5 (adelante)", en: "Mouse 5 (forward)" });
+      default:
+        return tr({ es: `Botón ${b.button}`, en: `Button ${b.button}` });
+    }
   }
 
   export type Panel = {
@@ -120,7 +210,7 @@
     Locate,
     ZoomIn,
     Layers,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { tr } from "./lib";
 
   type WinInfo = { id: string; title: string; app: string; protected: boolean };
@@ -218,6 +308,10 @@
                   shape: p.sc.shape,
                   zoom: p.sc.zoom,
                   border: p.sc.border,
+                  smooth: p.sc.smooth,
+                  reticle: p.sc.reticle,
+                  aim: p.sc.aim,
+                  activation: p.sc.activation,
                 }
               : { kind: "window", id: p.windowId },
         rect: { x: p.x, y: p.y, w: p.w, h: p.h },
@@ -324,6 +418,16 @@
               shape: src.shape ?? "circle",
               zoom: src.zoom ?? 2,
               border: src.border ?? true,
+              smooth: src.smooth ?? true,
+              reticle: src.reticle ?? false,
+              aim: src.aim ?? { kind: "under" },
+              // Un overlay antiguo no manda `activation`; sin este defecto el
+              // visor se quedaría sin objeto y el editor reventaría al leerlo.
+              activation: {
+                binding: src.activation?.binding ?? null,
+                mode: src.activation?.mode ?? "toggle",
+                seconds: src.activation?.seconds ?? 3,
+              },
             }
           : (prev?.sc ?? defaultSc()),
         x: p.rect.x,
@@ -480,6 +584,66 @@
     selectedId = id;
     pushScene();
   }
+
+  // ── Captura de vínculo del visor ──────────────────────────────────────
+  //
+  // "Pulsa el botón que quieras usar" y la app detecta cuál fue. Se escucha en
+  // captura (`capture: true`) y se corta la propagación: mientras se está
+  // asignando, el clic NO debe llegar al botón de debajo ni cerrar nada.
+  //
+  // El ratón se escucha en `pointerdown` en vez de `click` porque los botones
+  // laterales (4 y 5) no generan `click` en muchos navegadores, y son justo los
+  // que se quieren asignar. El navegador además los usa para atrás/adelante en
+  // el historial: `preventDefault` lo evita.
+  let bindingFor = $state<string | null>(null);
+
+  function startBindingCapture(panelId: string) {
+    bindingFor = panelId;
+  }
+
+  function commitBinding(b: ScBinding | null) {
+    const p = panels.find((q) => q.id === bindingFor);
+    bindingFor = null;
+    if (!p) return;
+    p.sc.activation.binding = b;
+    pushScene();
+  }
+
+  function onBindingPointer(e: PointerEvent) {
+    if (!bindingFor) return;
+    e.preventDefault();
+    e.stopPropagation();
+    commitBinding({ type: "mouse", button: e.button });
+  }
+
+  function onBindingKey(e: KeyboardEvent) {
+    if (!bindingFor) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // Escape cancela sin asignar; sería la tecla más fácil de asignar sin
+    // querer y la que menos sentido tiene para un visor.
+    if (e.code === "Escape") {
+      bindingFor = null;
+      return;
+    }
+    commitBinding({ type: "key", code: e.code });
+  }
+
+  $effect(() => {
+    if (!bindingFor) return;
+    window.addEventListener("pointerdown", onBindingPointer, true);
+    window.addEventListener("keydown", onBindingKey, true);
+    // `auxclick` es el que dispara el menú atrás/adelante en algunos navegadores.
+    const swallow = (e: Event) => e.preventDefault();
+    window.addEventListener("auxclick", swallow, true);
+    window.addEventListener("contextmenu", swallow, true);
+    return () => {
+      window.removeEventListener("pointerdown", onBindingPointer, true);
+      window.removeEventListener("keydown", onBindingKey, true);
+      window.removeEventListener("auxclick", swallow, true);
+      window.removeEventListener("contextmenu", swallow, true);
+    };
+  });
 
   function addScope() {
     const size = 360;
@@ -1294,22 +1458,234 @@
                 </button>
               </div>
               <label class="flex items-center gap-2 text-xs text-zinc-400">
-                <span class="w-16">{tr({ es: "Aumento", en: "Zoom" })}</span>
+                <span class="w-16 shrink-0">{tr({ es: "Aumento", en: "Zoom" })}</span>
                 <input
                   type="range"
-                  min="1"
-                  max="4"
-                  step="0.25"
-                  bind:value={s.sc.zoom}
-                  oninput={() => pushScene()}
+                  min="0"
+                  max={ZOOM_STEPS}
+                  step="1"
+                  value={zoomToSlider(s.sc.zoom)}
+                  oninput={(e) => {
+                    s.sc.zoom = sliderToZoom(+e.currentTarget.value);
+                    pushScene();
+                  }}
                   class="flex-1 accent-emerald-500"
+                  aria-label={tr({ es: "Aumento", en: "Zoom" })}
+                  aria-valuetext={zoomLabel(s.sc.zoom)}
                 />
-                <span class="w-10 text-right tabular-nums text-zinc-500">×{s.sc.zoom}</span>
+                <!-- Campo numérico además de la barra: con un rango tan amplio,
+                     clavar un ×1,01 o un ×12,5 arrastrando es una lotería. -->
+                <input
+                  type="number"
+                  min={ZOOM_MIN}
+                  max={ZOOM_MAX}
+                  step="0.01"
+                  value={s.sc.zoom}
+                  oninput={(e) => {
+                    const v = +e.currentTarget.value;
+                    if (!Number.isFinite(v)) return;
+                    s.sc.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, v));
+                    pushScene();
+                  }}
+                  class="w-16 shrink-0 rounded border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-right text-xs tabular-nums text-zinc-200 [appearance:textfield] focus:border-emerald-500/40 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                />
+                <span class="w-12 shrink-0 text-right tabular-nums text-zinc-500"
+                  >{zoomLabel(s.sc.zoom)}</span
+                >
               </label>
+
+              <!-- ── Nitidez y retícula ────────────────────────────────── -->
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  title={tr({
+                    es: "Con aumento alto, «Suave» difumina y «Nítido» deja los píxeles duros",
+                    en: "At high zoom, Smooth blurs and Sharp keeps hard pixel edges",
+                  })}
+                  onclick={() => {
+                    s.sc.smooth = !s.sc.smooth;
+                    pushScene();
+                  }}
+                  class="flex-1 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-700"
+                >
+                  {s.sc.smooth
+                    ? tr({ es: "Suave", en: "Smooth" })
+                    : tr({ es: "Nítido", en: "Sharp" })}
+                </button>
+                <button
+                  type="button"
+                  onclick={() => {
+                    s.sc.reticle = !s.sc.reticle;
+                    pushScene();
+                  }}
+                  class="flex-1 rounded border px-2 py-1 text-xs transition-colors {s.sc.reticle
+                    ? 'border-emerald-500/60 bg-emerald-600/20 text-emerald-300'
+                    : 'border-zinc-700 text-zinc-300 hover:bg-zinc-700'}"
+                >
+                  {tr({ es: "Retícula", en: "Reticle" })}
+                  <span class="tabular-nums">{s.sc.reticle ? "ON" : "OFF"}</span>
+                </button>
+              </div>
+
+              <!-- ── A qué apunta ──────────────────────────────────────── -->
+              <div class="flex items-center gap-2 text-xs text-zinc-400">
+                <span class="w-16 shrink-0">{tr({ es: "Apunta a", en: "Aims at" })}</span>
+                <div class="inline-flex flex-1 rounded-md border border-zinc-700 p-0.5">
+                  {#each [{ k: "under", es: "Debajo", en: "Under" }, { k: "center", es: "Centro", en: "Center" }, { k: "offset", es: "Desplazado", en: "Offset" }] as opt (opt.k)}
+                    <button
+                      type="button"
+                      onclick={() => {
+                        s.sc.aim =
+                          opt.k === "offset"
+                            ? { kind: "offset", dx: 0, dy: -200 }
+                            : { kind: opt.k as "under" | "center" };
+                        pushScene();
+                      }}
+                      class="flex-1 rounded py-1 text-[11px] leading-none transition-colors {s.sc.aim
+                        .kind === opt.k
+                        ? 'bg-emerald-600 text-white'
+                        : 'text-zinc-300 hover:bg-zinc-700'}"
+                      >{tr({ es: opt.es, en: opt.en })}</button
+                    >
+                  {/each}
+                </div>
+              </div>
+
+              {#if s.sc.aim.kind === "offset"}
+                <div class="flex items-center gap-2 text-xs text-zinc-400">
+                  <span class="w-16 shrink-0">{tr({ es: "Distancia", en: "Distance" })}</span>
+                  {#each [{ ax: "dx" as const, lbl: "X" }, { ax: "dy" as const, lbl: "Y" }] as f (f.ax)}
+                    <label class="flex flex-1 items-center gap-1">
+                      <span class="text-zinc-500">{f.lbl}</span>
+                      <input
+                        type="number"
+                        step="10"
+                        value={s.sc.aim.kind === "offset" ? s.sc.aim[f.ax] : 0}
+                        oninput={(e) => {
+                          const v = +e.currentTarget.value;
+                          if (s.sc.aim.kind !== "offset" || !Number.isFinite(v)) return;
+                          s.sc.aim = { ...s.sc.aim, [f.ax]: v };
+                          pushScene();
+                        }}
+                        class="w-full rounded border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-right tabular-nums text-zinc-200 [appearance:textfield] focus:border-emerald-500/40 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                      />
+                    </label>
+                  {/each}
+                </div>
+              {/if}
+
+              <p class="text-[11px] leading-relaxed text-zinc-500">
+                {s.sc.aim.kind === "under"
+                  ? tr({
+                      es: "Amplía lo que tiene justo debajo. Para ver el centro de la pantalla hay que ponerla encima… y entonces lo tapa.",
+                      en: "Magnifies whatever sits under it. To see the screen centre you have to put it there — and then it covers it.",
+                    })
+                  : s.sc.aim.kind === "center"
+                    ? tr({
+                        es: "Amplía el centro de la pantalla estés donde estés: deja la lente en una esquina y sigue viendo el punto de mira.",
+                        en: "Magnifies the screen centre wherever the lens sits: park it in a corner and still watch your crosshair.",
+                      })
+                    : tr({
+                        es: "Amplía un punto desplazado respecto a la lente. Y negativa sube; X positiva va a la derecha.",
+                        en: "Magnifies a point offset from the lens. Negative Y is up; positive X is right.",
+                      })}
+              </p>
+
+              <!-- ── Activación ────────────────────────────────────────── -->
+              <div class="mt-1 space-y-2 border-t border-zinc-700/60 pt-2">
+                <div class="flex items-center gap-2 text-xs text-zinc-400">
+                  <span class="w-16 shrink-0">{tr({ es: "Botón", en: "Button" })}</span>
+                  <button
+                    type="button"
+                    onclick={() => startBindingCapture(s.id)}
+                    class="flex-1 rounded border px-2 py-1 text-left text-xs transition-colors {bindingFor ===
+                    s.id
+                      ? 'animate-pulse border-emerald-500 bg-emerald-600/20 text-emerald-200'
+                      : 'border-zinc-700 text-zinc-200 hover:bg-zinc-700'}"
+                  >
+                    {bindingFor === s.id
+                      ? tr({
+                          es: "Pulsa un botón o tecla… (Esc cancela)",
+                          en: "Press a button or key… (Esc cancels)",
+                        })
+                      : bindingLabel(s.sc.activation.binding)}
+                  </button>
+                  {#if s.sc.activation.binding && bindingFor !== s.id}
+                    <button
+                      type="button"
+                      title={tr({ es: "Quitar el vínculo", en: "Clear binding" })}
+                      onclick={() => {
+                        s.sc.activation.binding = null;
+                        pushScene();
+                      }}
+                      class="shrink-0 rounded border border-zinc-700 px-2 py-1 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100"
+                      >×</button
+                    >
+                  {/if}
+                </div>
+
+                {#if s.sc.activation.binding}
+                  <div class="flex items-center gap-2 text-xs text-zinc-400">
+                    <span class="w-16 shrink-0">{tr({ es: "Modo", en: "Mode" })}</span>
+                    <div class="inline-flex flex-1 rounded-md border border-zinc-700 p-0.5">
+                      {#each [{ m: "toggle" as ScMode, es: "Alternar", en: "Toggle" }, { m: "hold" as ScMode, es: "Mantener", en: "Hold" }, { m: "timed" as ScMode, es: "Segundos", en: "Timed" }] as opt (opt.m)}
+                        <button
+                          type="button"
+                          onclick={() => {
+                            s.sc.activation.mode = opt.m;
+                            pushScene();
+                          }}
+                          class="flex-1 rounded py-1 text-[11px] leading-none transition-colors {s.sc
+                            .activation.mode === opt.m
+                            ? 'bg-emerald-600 text-white'
+                            : 'text-zinc-300 hover:bg-zinc-700'}"
+                          >{tr({ es: opt.es, en: opt.en })}</button
+                        >
+                      {/each}
+                    </div>
+                  </div>
+
+                  {#if s.sc.activation.mode === "timed"}
+                    <label class="flex items-center gap-2 text-xs text-zinc-400">
+                      <span class="w-16 shrink-0">{tr({ es: "Duración", en: "Duration" })}</span>
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="15"
+                        step="0.5"
+                        bind:value={s.sc.activation.seconds}
+                        oninput={() => pushScene()}
+                        class="flex-1 accent-emerald-500"
+                      />
+                      <span class="w-10 text-right tabular-nums text-zinc-500"
+                        >{s.sc.activation.seconds}s</span
+                      >
+                    </label>
+                  {/if}
+
+                  <p class="text-[11px] leading-relaxed text-zinc-500">
+                    {s.sc.activation.mode === "toggle"
+                      ? tr({
+                          es: "Una pulsación lo enciende y la siguiente lo apaga.",
+                          en: "One press shows it, the next hides it.",
+                        })
+                      : s.sc.activation.mode === "hold"
+                        ? tr({
+                            es: "Sólo se ve mientras mantienes el botón pulsado.",
+                            en: "Only visible while you hold the button down.",
+                          })
+                        : tr({
+                            es: "Una pulsación lo enciende y se apaga solo; volver a pulsar reinicia la cuenta.",
+                            en: "One press shows it until the time runs out; pressing again restarts the countdown.",
+                          })}
+                  </p>
+                {/if}
+              </div>
+
               <p class="text-[11px] text-zinc-500">
                 {tr({
-                  es: "Lente que aumenta lo que hay debajo (como una mira de francotirador). Arrástrala y redimensiónala; los clics pasan al juego. La mirilla se dibuja encima sin aumentar. Mientras haya un visor, el overlay no sale en grabaciones/OBS.",
-                  en: "Lens that magnifies what's underneath (sniper-style). Drag and resize it; clicks pass to the game. The crosshair draws on top unmagnified. While a scope exists, the overlay is hidden from recordings/OBS.",
+                  es: "Lente que aumenta lo que hay debajo (como una mira de francotirador). Arrástrala y redimensiónala; los clics pasan al juego. La mirilla se dibuja encima sin aumentar. Mientras haya un visor, el overlay no sale en grabaciones/OBS. Sin botón asignado se ve siempre; en el editor se ve igualmente para poder colocarlo.",
+                  en: "Lens that magnifies what's underneath (sniper-style). Drag and resize it; clicks pass to the game. The crosshair draws on top unmagnified. While a scope exists, the overlay is hidden from recordings/OBS. With no button bound it's always on; in the editor it stays visible so you can position it.",
                 })}
               </p>
             {:else}

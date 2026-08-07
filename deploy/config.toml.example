@@ -49,10 +49,12 @@ upload_timeout_secs = 600
 # backend = "local"
 
 # External S3-compatible object storage (MinIO, Backblaze B2, Cloudflare R2,
-# Garage, Wasabi, or `rclone serve s3` fronting Mega/Dropbox/Drive). Only read
-# when backend = "s3". The server stays mandatory: it keeps the SQLite index,
-# auth and deduplication — the bucket only holds opaque zstd blob/chunk bytes
-# and is NOT restorable on its own without the server's database.
+# Garage, Wasabi, or an `rclone serve s3` bridge in front of a consumer drive
+# — OneDrive, Mega, Google Drive, Dropbox…; see SELF-HOST_GUIDE.md, that path
+# has real trade-offs). Only read when backend = "s3". The server stays
+# mandatory: it keeps the SQLite index, auth and deduplication — the bucket
+# only holds opaque zstd blob/chunk bytes and is NOT restorable on its own
+# without the server's database.
 # [storage.s3]
 # endpoint = "http://127.0.0.1:9000"        # MinIO example
 # bucket = "hoard"

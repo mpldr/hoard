@@ -130,6 +130,39 @@ export const i18nSettled: Promise<void> = (async () => {
   }
 })();
 
+/** Lectura en vuelo, para que una ráfaga de eventos colapse en una sola. */
+let syncing: Promise<void> | null = null;
+
+/**
+ * Relee el idioma guardado y lo aplica si se ha quedado atrás.
+ *
+ * Hace falta porque [`setLocale`] cambia el idioma **de la ventana que lo
+ * llama** y persiste a prefs, pero no avisa a nadie: cada ventana tiene su
+ * propio contexto JS y, por tanto, su propio store de svelte-i18n. La ventana
+ * principal es la única que pasa por Ajustes, así que una segunda ventana que
+ * sobreviva al cambio se queda con el idioma con el que montó — y el HUD del
+ * juego sobrevive siempre, porque cerrarlo lo **esconde**, no lo destruye.
+ *
+ * Llamarlo al volver a enseñarse es la mitad barata del arreglo: una lectura de
+ * prefs por apertura, sin eventos nuevos que emitir ni oír, y sin poder
+ * disparar nada. Si prefs no se puede leer, o no hay idioma elegido, se queda
+ * el que hubiera: no hay nada mejor que adivinar.
+ */
+export function syncPersistedLocale(): Promise<void> {
+  if (syncing) return syncing;
+  syncing = (async () => {
+    try {
+      const prefs = await getPrefs();
+      await applyPersisted(pickSupported(prefs.language ?? null));
+    } catch {
+      /* best-effort */
+    } finally {
+      syncing = null;
+    }
+  })();
+  return syncing;
+}
+
 /** Update the active locale and persist it to prefs so the next launch
  *  remembers the choice. */
 export async function setLocale(code: string): Promise<void> {

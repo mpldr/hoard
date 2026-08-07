@@ -158,6 +158,7 @@ unsafe fn run_inner(engine: &mut Engine) -> Result<(), String> {
         }
 
         if mode == Mode::View {
+            engine.set_editing(mode == Mode::Editor);
             engine.tick();
             engine.render(&mut buf, sw as u32, sh as u32);
             present(view, rep, bitmap_data, &buf, sw, sh);

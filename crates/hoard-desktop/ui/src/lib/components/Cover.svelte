@@ -21,7 +21,7 @@
    *   460×215 header, and cropping that to a poster throws ~70% of it away.
    */
   import { _ } from "svelte-i18n";
-  import { Pencil, RotateCcw } from "lucide-svelte";
+  import { Pencil, RotateCcw } from "@lucide/svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     coverUrl,

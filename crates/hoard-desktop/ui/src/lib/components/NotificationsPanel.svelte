@@ -11,7 +11,7 @@
    */
   import { _ } from "svelte-i18n";
   import { fly } from "svelte/transition";
-  import { Bell, X, ExternalLink, ShieldAlert, Info, BellOff } from "lucide-svelte";
+  import { Bell, X, ExternalLink, ShieldAlert, Info, BellOff } from "@lucide/svelte";
 
   import {
     notifications,

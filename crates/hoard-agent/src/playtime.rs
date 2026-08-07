@@ -88,6 +88,20 @@ pub struct PlaytimeStore {
     dirty: bool,
     #[serde(skip)]
     last_flush_ms: u64,
+
+    /// Sólo memoria: este store **se leyó de un fichero que existía**.
+    ///
+    /// Distingue "este equipo no ha jugado a nada" de "este equipo no sabe lo
+    /// que ha jugado". Parecen lo mismo —los dos son un store vacío— y no lo
+    /// son: el segundo pasa cuando el fichero no está, y entonces las horas
+    /// están en otro sitio (o ya no están), no es que sean cero.
+    ///
+    /// La diferencia importa porque el servidor **reemplaza** las filas de este
+    /// dispositivo con lo que le mandemos. Subir un vacío sin saber si es un
+    /// vacío de verdad es cómo se pierde un historial: ver
+    /// [`Self::is_authoritative`].
+    #[serde(skip)]
+    from_disk: bool,
 }
 
 /// Forma serializable que el comando `list_playtime` devuelve a la UI.
@@ -182,11 +196,43 @@ impl PlaytimeStore {
 
     /// Carga el store; un fichero ausente o corrupto produce uno vacío (las
     /// horas son acumulables de nuevo, no son críticas).
+    ///
+    /// Ese vacío queda marcado como **no** autoritativo — ver [`Self::from_disk`].
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<Self>(&text) {
+                Ok(mut store) => {
+                    store.from_disk = true;
+                    store
+                }
+                Err(e) => {
+                    // Un JSON roto no es "cero horas": es un historial que no
+                    // sabemos leer. Se sigue con un store vacío para poder
+                    // acumular, pero sin derecho a borrar nada en el servidor.
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "playtime: store ilegible; se sigue sin él, pero no se declarará autoritativo"
+                    );
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// ¿Puede este store hablar por el pasado de este equipo?
+    ///
+    /// Sólo si salió de un fichero que existía y se pudo leer. Un store recién
+    /// nacido —instalación limpia, `AppData` borrado, cuenta nueva— no sabe
+    /// nada de los días anteriores, así que el servidor **no** debe tomarse su
+    /// silencio como "esos días no existieron".
+    ///
+    /// Esto es la mitad cliente del arreglo; la otra mitad está en la ruta
+    /// `/v1/playtime`, que sin esta bandera sólo borra los días que el envío
+    /// menciona.
+    pub fn is_authoritative(&self) -> bool {
+        self.from_disk
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

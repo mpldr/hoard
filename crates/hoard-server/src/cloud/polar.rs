@@ -1,7 +1,16 @@
-//! Polar webhooks (Merchant of Record, alternative to Lemon Squeezy).
+//! Polar webhooks — the billing provider. Polar is the Merchant of Record
+//! and settles through Stripe underneath, so "the Stripe fee" and "the
+//! Polar fee" are the same line item.
 //!
-//! Polar signs with the Standard Webhooks scheme, not Lemon Squeezy's hex
-//! `X-Signature`. Three headers travel with each delivery:
+//! Historical note: billing started on Lemon Squeezy and the schema still
+//! carries its fingerprints (`subscriptions`, the 0015 variant→product
+//! rename). Lemon Squeezy is **not used** — there is no LS code path, no LS
+//! config field, and nothing reads the `HOARD__CLOUD__LEMONSQUEEZY__*`
+//! secrets. Treat any surviving mention as dead history, not a second
+//! provider to keep working.
+//!
+//! Polar signs with the Standard Webhooks scheme, not the hex `X-Signature`
+//! Lemon Squeezy used. Three headers travel with each delivery:
 //! `webhook-id`, `webhook-timestamp`, `webhook-signature`. The signed
 //! content is `"{id}.{timestamp}.{raw_body}"`, HMAC-SHA256, base64-encoded,
 //! and the signature header carries one or more space-separated
@@ -13,8 +22,8 @@
 //! raw secret string bytes verbatim — so we key directly on
 //! `secret.as_bytes()` (the whole `polar_whs_...` string), no decoding.
 //!
-//! Events map onto the same `subscriptions` table + `profiles.plan` cascade
-//! as Lemon Squeezy; both providers coexist.
+//! Events map onto the `subscriptions` table + `profiles.plan` cascade the
+//! schema inherited from the Lemon Squeezy era.
 
 use crate::cloud::errors::CloudError;
 use crate::cloud::state::CloudState;
@@ -522,6 +531,16 @@ mod tests {
 
     #[test]
     fn product_resolution() {
+        // Real UUIDs copied from the production config, so don't read them as
+        // a source of truth — `deploy/config.cloud.toml.example` is that, and
+        // it has already moved on. The yearly one here
+        // (77d81015-7c9d-4009-b2a6-e0c0a0901899) is RETIRED: it was created in
+        // Polar with recurring_interval=month, so it billed €19.99 monthly
+        // under a "Pro anual" label. It was replaced by
+        // ee6d9395-cc3a-4b0c-96a5-4a008292ffc6 and archived. The monthly one
+        // is still live. Nothing here needs updating when products change —
+        // this test is about `resolve_product`'s lookup, and any two distinct
+        // strings would do.
         let products = vec![
             PolarProduct {
                 product_id: "4404a328-9289-4077-b25b-162ecd1d6ed3".into(),
@@ -530,6 +549,7 @@ mod tests {
                 storage_gb: Some(25),
             },
             PolarProduct {
+                // Retired — see the note above.
                 product_id: "77d81015-7c9d-4009-b2a6-e0c0a0901899".into(),
                 plan: "pro".into(),
                 interval: "year".into(),

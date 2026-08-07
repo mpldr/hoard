@@ -7,7 +7,7 @@
    * after their `duration`.
    */
   import { fly } from "svelte/transition";
-  import { CheckCircle2, AlertCircle, Info, X } from "lucide-svelte";
+  import { CheckCircle2, AlertCircle, Info, X } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import { toasts, dismissToast, type Toast } from "../stores/toasts";
 

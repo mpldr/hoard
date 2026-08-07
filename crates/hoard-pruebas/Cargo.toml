@@ -1,0 +1,34 @@
+[package]
+name = "hoard-pruebas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hoard-pruebas"
+path = "src/main.rs"
+
+[dependencies]
+# El banco mide el motor de verdad, así que lo llama directamente: nada de
+# reimplementar backup/restore aquí o mediríamos otra cosa.
+hoard-agent = { path = "../hoard-agent" }
+hoard-core = { path = "../hoard-core" }
+# El escenario largo (`soak`) habla con el servicio por su propio socket.
+hoardd = { path = "../hoardd" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+futures = { workspace = true }
+# Cloud no crea el save server-side: el id lo minta el cliente.
+uuid = { workspace = true }
+toml = { workspace = true }

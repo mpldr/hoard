@@ -3,7 +3,8 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { session, startSessionTracking } from '$lib/stores/session';
-  import { api } from '$lib/api';
+  import { api, ApiError } from '$lib/api';
+  import { describeError } from '$lib/errors';
   import Button from '$lib/components/Button.svelte';
   import LogoMark from '$lib/components/LogoMark.svelte';
 
@@ -51,8 +52,14 @@
       hostname = res.hostname;
       phase = 'approved';
     } catch (e) {
-      const msg = (e as Error).message;
-      errorMsg = msg === 'not_found' ? $_('link.err_not_found') : $_('link.err_generic');
+      // Match the server's stable `code`, not the message — that now reads
+      // "/v1/cloud/device/approve failed: 404 …" and would never compare equal.
+      // Anything we don't have dedicated copy for shows its real reason rather
+      // than a shrug.
+      errorMsg =
+        e instanceof ApiError && e.code === 'not_found'
+          ? $_('link.err_not_found')
+          : describeError(e, $_);
       phase = 'error';
     }
   }

@@ -402,6 +402,20 @@ pub async fn set_manual_path(
     let path_buf = validate_override_path(&path)?;
 
     let (mut cli_state, state_path) = CliState::load_default().map_err(|e| e.to_string())?;
+    // Apuntar un juego a la carpeta de OTRO no se puede deshacer solo: el
+    // override vive en `device.json` y sobrevive a todo lo que el usuario sabe
+    // borrar. Se rechaza aquí, con el nombre del juego que ya la reclama.
+    let cached = state.detection_cache.last.lock().unwrap().clone();
+    if let Some(owner) = hoard_agent::library::manual_override_conflict(
+        &cli_state,
+        cached.as_ref().map(|c| &c.report),
+        &slug,
+        &path_buf,
+    ) {
+        return Err(format!(
+            "That folder is '{owner}'s, not {slug}'s — one folder, one game. Pick the folder this game writes to."
+        ));
+    }
     cli_state.set_manual_path(&slug, path_buf);
     cli_state.save(&state_path).map_err(|e| e.to_string())?;
 

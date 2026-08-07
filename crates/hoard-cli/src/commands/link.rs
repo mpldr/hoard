@@ -239,7 +239,14 @@ pub async fn borrow_cloud_token(rejected: Option<String>) -> Result<Option<Cloud
         return Ok(None);
     };
     match ask(&mut client, Request::CloudToken { rejected }).await {
-        Ok(Payload::CloudToken(token)) => Ok(Some(token)),
+        Ok(Payload::CloudToken(token)) => {
+            // Igual que en el desktop: el enviador de logs lee de este hueco.
+            hoard_agent::credentials::set_lent_cloud(Some(hoard_agent::credentials::CloudLease {
+                url: token.server_url.clone(),
+                token: token.access_token.clone(),
+            }));
+            Ok(Some(token))
+        }
         Ok(other) => anyhow::bail!("unexpected answer to cloud_token: {other:?}"),
         Err(err) => {
             if matches!(

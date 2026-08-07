@@ -14,7 +14,7 @@
    * cadence (typically a 30s interval calling `refreshQuota` from the
    * auth store).
    */
-  import { HardDrive } from "lucide-svelte";
+  import { HardDrive } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import type { UserInfo } from "../api";
   import CountUp from "./CountUp.svelte";

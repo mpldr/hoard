@@ -68,6 +68,10 @@ x11rb = { version = "0.13", optional = true, features = [
     "composite",
     "shape",
     "damage",
+    # XInput2: `XIQueryPointer` es lo único que reporta los botones laterales
+    # del ratón (8/9). El protocolo core sólo tiene Button1..Button5, así que
+    # sin esta extensión no se puede vincular el visor a un botón del pulgar.
+    "xinput",
 ] }
 libc = { version = "0.2", optional = true }
 # Wayland capture stack (feature = "wayland").

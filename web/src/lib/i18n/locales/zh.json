@@ -164,6 +164,8 @@
   "account.storage_label": "存储",
   "account.devices_label": "设备",
   "account.no_devices": "尚未关联任何设备。从桌面应用登录后会显示在这里。",
+  "account.devices_error": "无法加载你的设备。",
+  "account.action_error": "操作未能完成。",
   "account.confirm_unlink": "解除此设备的关联？",
   "account.export_requested": "导出已加入队列。准备好后我们会发邮件通知你。",
   "account.confirm_delete_intro": "这将删除你的账户和每一个快照。请在下一个框中输入 DELETE 以确认。",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "需要其他版本或架构？所有构建都在",
   "callback.signing_in": "正在登录…",
   "callback.failed_title": "登录失败",
-  "callback.failed_generic": "我们无法完成登录。请重试。",
+  "callback.failed_provider": "登录服务商拒绝了该请求。",
+  "callback.failed_no_session": "此链接中没有可完成的登录。",
+  "callback.failed_timeout": "登录未能及时完成。",
   "callback.back_to_signin": "返回登录",
   "callback.desktop_return": "已登录！请回到 Hoard 应用——这个标签页可以关闭了。",
   "callback.desktop_reopen": "没有打开？点这里重新打开 Hoard。",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "加载中…",
   "common.error": "出了点问题。",
+  "err.unreachable": "无法连接 Hoard API。请检查网络后重试。",
+  "err.session_expired": "登录状态已过期，请重新登录以继续。",
+  "err.http": "服务器返回了错误（{status}）。",
   "common.retry": "重试",
   "common.cancel": "取消",
   "common.confirm": "确认",
@@ -345,6 +352,5 @@
   "link.approve_hint": "只批准你自己在自己的设备上发起的代码。",
   "link.approved": "设备已批准。",
   "link.approved_hint": "回到那台机器：它正在登录。",
-  "link.err_not_found": "该代码无效或已过期。请在你的设备上重新开始。",
-  "link.err_generic": "无法批准该设备。请重试。"
+  "link.err_not_found": "该代码无效或已过期。请在你的设备上重新开始。"
 }

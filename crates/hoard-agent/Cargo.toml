@@ -28,6 +28,7 @@ directories = { workspace = true }
 async-compression = { workspace = true }
 tokio-tar = { workspace = true }
 tokio-util = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 sha2 = { workspace = true }
@@ -62,6 +63,13 @@ keyring = { version = "3", default-features = false, features = [
     "crypto-rust",
 ] }
 
+# Verificador minisign (Ed25519). Un instalador bajado de internet se ejecuta
+# con privilegios, así que no se aplica ninguno sin firma válida de CI (ADR
+# 0017). Estaba sólo en el desktop; baja aquí porque desde la unificación la
+# terminal instala la app igual que la app se actualiza a sí misma, y la
+# comprobación tiene que ser la misma en los dos caminos.
+minisign-verify = "0.2"
+
 # Windows-only registry access for `pathexpand` (OneDrive-aware Known Folder
 # lookups via User Shell Folders) and `steam` (Steam's install path from
 # `Valve\Steam\SteamPath`, so non-default install drives are found). Kept
@@ -73,8 +81,25 @@ keyring = { version = "3", default-features = false, features = [
 # binary so Windows hosts without a system sqlite still work (sqlite is
 # not part of the standard Windows install). Single consumer + cfg-gated,
 # so it also stays out of `[workspace.dependencies]`.
+
+# `geteuid` en `install/`: parte de decidir si podemos elevar privilegios sin
+# quedarnos esperando a un humano que dentro de `curl … | sh` no existe. Ya está
+# en el árbol de dependencias (tokio lo arrastra en unix), así que no añade
+# compilación; único consumidor y cfg-gated, de ahí que no vaya al workspace.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# `SendMessageTimeoutW` para difundir `WM_SETTINGCHANGE` tras tocar el PATH del
+# usuario en `install::ensure_cli_reachable`. Sin esa difusión el cambio queda
+# escrito pero invisible: Explorer conserva su bloque de entorno en caché y toda
+# terminal que lance hereda el viejo, así que `hoard` no existiría hasta cerrar
+# sesión. Comprobado contra la máquina Windows del usuario.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]

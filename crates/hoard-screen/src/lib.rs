@@ -35,6 +35,7 @@ pub mod capture;
 pub mod compositor;
 pub mod crosshair;
 pub mod engine;
+pub mod input;
 pub mod ipc;
 pub mod mode;
 pub mod monitors;

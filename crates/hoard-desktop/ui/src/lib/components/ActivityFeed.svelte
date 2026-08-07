@@ -11,6 +11,7 @@
    * cheap CSS overflow cutoff.
    */
   import { _ } from "svelte-i18n";
+  import { feedRelativeTime, feedSummary } from "../utils/feedText";
   import { fly } from "svelte/transition";
   import {
     Eye,
@@ -30,7 +31,7 @@
     Lock,
     LockOpen,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
 
   import { activityFeed, type FeedEntry } from "../stores/live";
   import * as api from "../api";
@@ -105,110 +106,8 @@
     storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
   };
 
-  function relativeTime(at: number): string {
-    const seconds = Math.round((Date.now() - at) / 1000);
-    if (seconds < 5) return $_("activity.time_just_now");
-    if (seconds < 60)
-      return $_("activity.time_seconds_ago", { values: { count: seconds } });
-    const minutes = Math.round(seconds / 60);
-    if (minutes < 60)
-      return $_("activity.time_minutes_ago", { values: { count: minutes } });
-    const hours = Math.round(minutes / 60);
-    return $_("activity.time_hours_ago", { values: { count: hours } });
-  }
-
-  function summary(e: FeedEntry): string {
-    const name = e.game_slug ?? e.save_id?.slice(0, 8) ?? "—";
-    switch (e.kind) {
-      case "watcher_armed":
-        return $_("activity.watcher_armed", { values: { name } });
-      case "game_started":
-        return $_("activity.game_started", { values: { name } });
-      case "game_stopped":
-        return $_("activity.game_stopped", { values: { name } });
-      case "throttled":
-        return $_("activity.throttled", { values: { name } });
-      case "upload_started":
-        return $_("activity.upload_started", { values: { name } });
-      case "upload_completed":
-        return $_("activity.upload_completed", {
-          values: {
-            name,
-            version: e.version ?? 0,
-            size: formatBytes(e.bytes ?? 0),
-          },
-        });
-      case "upload_failed":
-        return $_("activity.upload_failed", {
-          values: { name, error: e.error ?? "" },
-        });
-      case "bandwidth_throttled":
-        return $_("activity.bandwidth_throttled", {
-          values: { name, seconds: e.retry_in ?? 60 },
-        });
-      case "auto_restored":
-        return $_("activity.auto_restored", {
-          values: { name, version: e.version ?? 0 },
-        });
-      case "cloud_pull":
-        return $_("activity.cloud_pull", {
-          values: {
-            count: e.new_versions ?? 0,
-            size: formatBytes(e.bytes ?? 0),
-          },
-        });
-      case "quota_reached":
-        return $_("activity.quota_reached", {
-          values: { plan: e.plan ?? "free", seconds: e.retry_in ?? 60 },
-        });
-      case "offline":
-        return $_("activity.offline");
-      case "online":
-        return $_("activity.online");
-      case "backup_too_large":
-        return $_("activity.backup_too_large", {
-          values: {
-            name,
-            size: formatBytes(e.bytes ?? 0),
-            limit: formatBytes(e.limit_bytes ?? 0),
-          },
-        });
-      case "backup_trimmed":
-        return $_("activity.backup_trimmed", {
-          values: {
-            name,
-            count: e.count ?? 0,
-            size: formatBytes(e.bytes ?? 0),
-          },
-        });
-      case "auto_restore_failed":
-        return $_("activity.auto_restore_failed", {
-          values: { name, error: e.error ?? "" },
-        });
-      case "auto_restore_stuck":
-        return $_("activity.auto_restore_stuck", {
-          values: { name, count: e.failures ?? 0, error: e.error ?? "" },
-        });
-      case "auto_restore_recovered":
-        return $_("activity.auto_restore_recovered", { values: { name } });
-      case "storage_purging":
-        return $_("activity.storage_purging");
-      case "storage_full":
-        return $_("activity.storage_full");
-      case "gate_locked":
-        return $_("activity.gate_locked", {
-          values: {
-            reason: $_(e.reason_key ?? "activity.gate_reason_fetch_failed"),
-          },
-        });
-      case "gate_unlocked":
-        return $_("activity.gate_unlocked", {
-          values: {
-            reason: $_(e.reason_key ?? "activity.gate_reason_pro"),
-          },
-        });
-    }
-  }
+  const relativeTime = (at: number) => feedRelativeTime(at, $_);
+  const summary = (e: FeedEntry) => feedSummary(e, $_);
 
   async function hidePanel() {
     try {

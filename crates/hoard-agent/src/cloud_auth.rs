@@ -645,6 +645,10 @@ pub fn store_tokens_unlocked(tokens: &Tokens, server_url: &str) -> Result<()> {
 /// `Request::ForgetSession` y, si no hay servicio, [`forget_tokens_unlocked`].
 pub fn clear_session() -> Result<()> {
     let _ = keyring_delete();
+    // Y el hueco del enviador de logs: es una copia en memoria del JWT, así que
+    // un logout que no lo vacíe deja enviando con la sesión que se acaba de
+    // cerrar.
+    crate::credentials::set_lent_cloud(None);
     let path = session_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("borrando {}", path.display()))?;
@@ -660,6 +664,11 @@ pub fn clear_session() -> Result<()> {
 /// con un par que ya no vale. Lo pisa el siguiente login, y mientras tanto no
 /// autoriza nada — un refresh token huérfano no es una sesión.
 pub fn forget_tokens_unlocked() -> Result<()> {
+    // El hueco del enviador de logs, igual que en [`clear_session`]: es una
+    // copia en memoria del JWT, y el fichero borrado no la vacía. Los dos
+    // caminos de logout tienen que hacerlo o `hoard logout` sin servicio dejaría
+    // el proceso enviando con la sesión recién cerrada.
+    crate::credentials::set_lent_cloud(None);
     let path = session_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("borrando {}", path.display()))?;

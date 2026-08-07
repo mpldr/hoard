@@ -416,6 +416,21 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
     // `resolve_owned`: el camino que rota. Es del servicio y de nadie más — los
     // clientes usan `resolve_borrowed` con el token que les prestamos.
     let active = hoard_agent::session::resolve_owned().await?;
+    // Antes de hidratar nada: curar el estado contra el servidor. Es el único
+    // punto por el que pasa toda máquina —arranque, login, actualización (el
+    // instalador reinicia el servicio)— así que actualizar la app repara sola a
+    // quien tenga filas apuntando a ids que su servidor ya no conoce. Un fallo
+    // aquí no puede impedir arrancar: sin red el motor sigue teniendo trabajo
+    // local que hacer.
+    match library::reconcile_with_server(&active.client).await {
+        Ok(r) if r.changed() => tracing::info!(
+            relinked = r.relinked,
+            dropped = r.dropped,
+            "hoardd: reconciled tracked saves with the server"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "hoardd: couldn't reconcile with the server"),
+    }
     let (state, _path) = CliState::load_default()?;
     // Sin saves rastreados el motor arranca igual (a diferencia de `hoard sync`,
     // que es un comando y puede abortar): un servicio residente tiene que estar

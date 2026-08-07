@@ -158,13 +158,18 @@ impl AgentStatus {
 
 /// Una fila del journal camino de la UI.
 #[derive(Debug, Clone, Serialize)]
-struct BacklogRow {
+pub struct BacklogRow {
+    /// Identidad de la fila dentro de esta ejecución del daemon. La ventana
+    /// principal no la necesita —va cosiendo el feed evento a evento— pero
+    /// cualquier superficie que **relea** la instantánea entera sí: sin una clave
+    /// estable, cada relectura sería una lista nueva para Svelte.
+    pub seq: u64,
     /// Cuándo pasó, en ms de época. Va incluido porque **la hora importa** al
     /// reproducir: un `game_started` de hace dos horas tiene que pintar dos
     /// horas de sesión, no arrancar el contador de cero. Es la última ocurrencia
     /// (`last_at`), que en una fila colapsada es la que sigue siendo cierta.
-    at: i64,
-    event: AgentEvent,
+    pub at: i64,
+    pub event: AgentEvent,
 }
 
 /// Backlog del journal, tal como lo recibe la UI.
@@ -180,10 +185,63 @@ struct BacklogPayload {
 impl From<hoard_core::ipc::JournalEntry> for BacklogRow {
     fn from(entry: hoard_core::ipc::JournalEntry) -> Self {
         Self {
+            seq: entry.seq,
             at: entry.last_at.unix_timestamp() * 1000,
             event: entry.event,
         }
     }
+}
+
+/// Cuántas filas del journal se guardan aquí para quien llegue tarde.
+///
+/// El anillo del daemon tiene 1024; éste es sólo el espejo local de lo que ya se
+/// relevó, y quien lo lee recorta a `MAX_FEED_ENTRIES` (80). Ciento veinte dejan
+/// margen para las filas que no son de feed sin que la instantánea engorde el
+/// puente del webview, que se cruza entero en cada lectura.
+const JOURNAL_MIRROR: usize = 120;
+
+/// Estado del bucle de nube tal como lo ve la UI. Es el mismo vocabulario que
+/// `CloudStatus` en `stores/live.ts`: quien lo pinta no traduce nada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudPulse {
+    /// Todavía no ha terminado ninguna pasada.
+    #[default]
+    Unknown,
+    Online,
+    Offline,
+    Throttled,
+}
+
+/// Lo que la UI sabe **ahora mismo**, sin preguntarle a nadie.
+///
+/// Existe para las superficies que sólo leen. La ventana principal construye su
+/// estado escuchando: enciende el relevo, recibe el backlog una vez y va
+/// cosiendo los eventos que llegan. Una ventana que nace después —el HUD— no
+/// puede hacer eso: el backlog ya se emitió, [`attach`] es idempotente y
+/// [`emit_status`] sólo habla cuando algo cambia, así que escuchar le daría un
+/// panel en blanco y una cabecera en rojo con el servicio vivo.
+///
+/// Así que no escucha: lee esto. Es una copia de lo que este proceso ya tenía en
+/// memoria —cero E/S, cero red, cero peticiones al servicio— y por eso abrir el
+/// HUD no puede arrancar, despertar ni alterar nada.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiSnapshot {
+    pub status: AgentStatus,
+    /// Lo que el servicio dice de cada partida vigilada: si el juego está
+    /// corriendo y cuándo le toca la próxima copia.
+    ///
+    /// Va aparte del journal a propósito. Quién está jugando y qué copia viene
+    /// son **estado**, no historia: reconstruirlos replicando eventos obliga a
+    /// guardar el `game_started` para siempre, y el día que se caiga del anillo
+    /// el HUD dirá que nadie juega con el juego delante. El servicio ya lleva la
+    /// cuenta; esto la copia.
+    pub slots: Vec<AgentSlotStatus>,
+    /// En orden cronológico, lo más viejo primero (como el backlog).
+    pub rows: Vec<BacklogRow>,
+    pub cloud: CloudPulse,
+    /// Segundos hasta que se levante el freno, cuando `cloud == Throttled`.
+    pub cloud_retry_in: Option<u32>,
 }
 
 /// Cursor del journal dentro de **una** ejecución del daemon.
@@ -212,6 +270,17 @@ pub struct DaemonLink {
     /// bucle sigue creyendo que ya publicó "arriba" y la UI se queda en parado
     /// hasta que el motor cambie de estado por su cuenta.
     last_status: Mutex<Option<AgentStatus>>,
+    /// Espejo de las últimas filas relevadas, para quien llegue tarde
+    /// ([`UiSnapshot`]). Se escribe en el mismo gesto que se emiten: lo que hay
+    /// aquí es exactamente lo que la ventana principal recibió, ni más ni menos.
+    journal: Mutex<std::collections::VecDeque<BacklogRow>>,
+    /// Últimos slots que reportó el servicio, del mismo `Status` del que sale
+    /// [`Self::last_status`].
+    slots: Mutex<Vec<AgentSlotStatus>>,
+    /// Último pulso del bucle de nube, que vive en `commands::cloud_pull` y
+    /// emite por su cuenta. Mismo motivo que el journal: sus eventos son
+    /// momentáneos y quien no estaba escuchando no puede recuperarlos.
+    cloud: Mutex<(CloudPulse, Option<u32>)>,
 }
 
 impl DaemonLink {
@@ -304,7 +373,18 @@ impl DaemonLink {
     /// token revocado server-side pero aún "fresco" volvería una y otra vez.
     pub async fn cloud_token(&self, rejected: Option<String>) -> Result<CloudToken> {
         match self.request(Request::CloudToken { rejected }).await? {
-            Payload::CloudToken(token) => Ok(token),
+            Payload::CloudToken(token) => {
+                // De paso se lo dejamos puesto al enviador de logs, que corre en
+                // su propio hilo y no puede pedir nada por IPC. Este es el único
+                // sitio del desktop por donde entra un token Cloud fresco.
+                hoard_agent::credentials::set_lent_cloud(Some(
+                    hoard_agent::credentials::CloudLease {
+                        url: token.server_url.clone(),
+                        token: token.access_token.clone(),
+                    },
+                ));
+                Ok(token)
+            }
             other => Err(anyhow!("unexpected answer to cloud_token: {other:?}")),
         }
     }
@@ -392,6 +472,54 @@ impl DaemonLink {
             seq,
         });
     }
+
+    /// Guarda una fila ya relevada. `resync` la trata como lo que dice ser: no
+    /// hay continuidad que respetar, así que lo de antes se tira en vez de
+    /// coserse con lo nuevo — igual que hacen los stores.
+    fn remember(&self, rows: &[BacklogRow], resync: bool) {
+        let mut journal = self.journal.lock().unwrap();
+        if resync {
+            journal.clear();
+        }
+        for row in rows {
+            journal.push_back(row.clone());
+        }
+        while journal.len() > JOURNAL_MIRROR {
+            journal.pop_front();
+        }
+    }
+
+    /// Anota el pulso del bucle de nube. Lo llama `commands::cloud_pull` en el
+    /// mismo gesto en que emite, para que el espejo no pueda contar otra cosa
+    /// que lo que oyó la ventana principal.
+    pub fn note_cloud(&self, pulse: CloudPulse, retry_in: Option<u32>) {
+        *self.cloud.lock().unwrap() = (pulse, retry_in);
+    }
+
+    /// Anota los slots del último `Status`. Con la lista vacía cuando no hay
+    /// servicio: no saber es un dato, y fingir que los últimos que vimos siguen
+    /// vigentes sería pintar «jugando» sobre un motor que ya no mira nada.
+    fn note_slots(&self, slots: &[AgentSlotStatus]) {
+        *self.slots.lock().unwrap() = slots.to_vec();
+    }
+
+    /// Todo lo que este proceso sabe, copiado. Sin E/S y sin tocar el servicio:
+    /// ver [`UiSnapshot`].
+    pub fn snapshot(&self) -> UiSnapshot {
+        let (cloud, cloud_retry_in) = *self.cloud.lock().unwrap();
+        UiSnapshot {
+            status: self
+                .last_status
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(AgentStatus::down),
+            slots: self.slots.lock().unwrap().clone(),
+            rows: self.journal.lock().unwrap().iter().cloned().collect(),
+            cloud,
+            cloud_retry_in,
+        }
+    }
 }
 
 /// Empieza a relevar los eventos del servicio a la UI. Lo llama el store cuando
@@ -442,6 +570,7 @@ async fn pump(app: AppHandle) -> Finished {
         }
         // La UI no puede quedarse creyendo que el motor sigue: si perdimos el
         // socket, no sabemos nada de él.
+        app.state::<AppState>().daemon.note_slots(&[]);
         emit_status(&app, &AgentStatus::down());
         tokio::time::sleep(reconnect_delay()).await;
     }
@@ -504,7 +633,13 @@ async fn pump_once(app: &AppHandle) -> Result<()> {
         match push {
             Push::Event(entry) => {
                 state.daemon.set_cursor(&epoch, entry.seq);
-                emit_event(app, &entry.event);
+                // Guardar y emitir en el mismo gesto, como hace el journal del
+                // daemon: si se separan, un día uno de los dos se olvida y la
+                // superficie que lee la instantánea se queda contando una
+                // historia distinta de la que oyó la ventana principal.
+                let row = BacklogRow::from(entry);
+                state.daemon.remember(std::slice::from_ref(&row), false);
+                emit_event(app, &row.event);
             }
             // Nos hemos retrasado y el canal descartó filas. El daemon lo
             // confiesa en vez de dejar el hueco invisible; nosotros volvemos a
@@ -550,6 +685,7 @@ async fn status_loop(app: AppHandle) -> Finished {
         match state.daemon.status().await {
             Ok(status) => {
                 announce_slots(&app, &status.slots, &mut armed);
+                state.daemon.note_slots(&status.slots);
                 let now = AgentStatus::from_daemon(&status);
                 if !now.running {
                     tracing::debug!(
@@ -563,6 +699,7 @@ async fn status_loop(app: AppHandle) -> Finished {
             // creer que sigue: el icono no puede quedarse en verde por inercia.
             Err(err) => {
                 tracing::debug!(error = %format!("{err:#}"), "desktop: couldn't read the service status");
+                state.daemon.note_slots(&[]);
                 emit_status(&app, &AgentStatus::down());
             }
         }
@@ -629,6 +766,9 @@ struct WatcherArmed {
 }
 
 fn emit_backlog(app: &AppHandle, rows: Vec<BacklogRow>, resync: bool) {
+    // El espejo se escribe **antes** del early-return y aunque no haya filas: un
+    // `resync` sin nada que traer sigue siendo la orden de tirar lo de antes.
+    app.state::<AppState>().daemon.remember(&rows, resync);
     if rows.is_empty() && !resync {
         return;
     }

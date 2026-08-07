@@ -17,7 +17,7 @@
    * component so none of this touches the detection flow in Library.svelte.
    */
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, Plus, X, Gamepad2, Cpu } from "lucide-svelte";
+  import { FolderOpen, Plus, X, Gamepad2, Cpu } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Modal from "./Modal.svelte";

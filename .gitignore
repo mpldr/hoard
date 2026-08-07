@@ -59,6 +59,11 @@ crates/hoard-desktop/ui/.vite/
 crates/hoard-desktop/binaries/
 crates/hoard-desktop/hoard-screen-*
 crates/hoard-desktop/hoardd-*
+# …y la CLI, que también viaja como sidecar desde la instalación unificada.
+# Faltaba: `hoard-<triple>` no casa con ninguno de los dos patrones de arriba y
+# se quedaba sin ignorar, a un `git add -A` de meter 10 MB de binario en el repo.
+crates/hoard-desktop/hoard-x86_64-*
+crates/hoard-desktop/hoard-aarch64-*
 
 # This project uses pnpm — npm/yarn lockfiles dropped in by accident
 # (e.g. running `npm install` against the same package.json) shouldn't
@@ -85,8 +90,16 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 
 # Dashboard de métricas admin (usa service_role). Solo local, nunca al repo.
 /tools/admin-dashboard.html
+/tools/serve-dashboard.sh
 # Su migración/RPC (admin_metrics con mi uid). Se aplica a mano en prod.
 /crates/hoard-server/migrations/postgres/0030_admin_metrics.sql
+# La v2 de esa misma RPC lleva el uid empotrado igual que la 0030, así que se
+# ignora por lo mismo y se aplica a mano. Ojo: `sqlx::migrate!` empotra la
+# carpeta en tiempo de compilación y aborta el arranque con `VersionMissing`
+# si la base tiene aplicada una versión que el binario no trae — por eso el
+# server cloud se construye desde este árbol (deploy/fly/Dockerfile), donde
+# los dos ficheros sí están en disco, y no desde un clon limpio del repo.
+/crates/hoard-server/migrations/postgres/0039_admin_metrics_v2.sql
 
 # Visión del rediseño del CLI. Doc de trabajo local.
 /HOARD-CLI.local.md
@@ -105,3 +118,15 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 /deploy/.env.discord-bot
 /deploy/scripts/discord-status-bot.py
 /deploy/systemd/hoard-discord-bot.service
+
+# Telemetría de detección: idea a futuro y por qué. Nota de trabajo local.
+/TELEMETRIA.local.md
+
+# Plan de SEO/GEO: dónde colocarse para que un LLM recupere Hoard. Nota local.
+/6-8-seo.local.md
+
+# El config del stack de Docker es del usuario, no del repo: versionarlo hacía
+# que un `git pull` le pisara su configuración (y con ella el `data_dir`), que
+# fue como un self-hoster perdió de vista su base en ago-2026. La guía ya dice
+# `cp deploy/config.toml.example deploy/docker/config/config.toml`.
+deploy/docker/config/config.toml

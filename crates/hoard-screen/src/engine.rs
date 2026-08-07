@@ -133,6 +133,14 @@ impl Engine {
         changed
     }
 
+    /// Tell every live source whether the overlay is in Editor mode. Cheap
+    /// enough to call on every mode change; sources that don't care no-op.
+    pub fn set_editing(&mut self, editing: bool) {
+        for src in self.sources.values_mut() {
+            src.set_editing(editing);
+        }
+    }
+
     /// Composite the current frames into `out` (RGBA8, `w*h*4` bytes).
     pub fn render(&self, out: &mut [u8], w: u32, h: u32) {
         compose_into(&self.scene, &self.frames, out, w, h);

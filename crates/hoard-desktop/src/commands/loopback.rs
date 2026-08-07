@@ -86,7 +86,21 @@ pub async fn start(app: AppHandle, state: String) -> Result<u16> {
                                 let _ = w.set_focus();
                             }
                             crate::capture_deep_link(&app, url, true);
-                            break;
+                            // Deliberately NOT `break`. `cloud_login_url` keeps
+                            // handing this same port out for the whole
+                            // LISTEN_TIMEOUT window while the attempt is
+                            // pending, so a one-shot listener left every retry
+                            // inside that window aimed at a closed socket —
+                            // the browser got ERR_CONNECTION_REFUSED and the
+                            // user had to wait out the 5 minutes. Capturing a
+                            // callback is not the same as *completing* a login:
+                            // an interrupted handoff, a failed `/v1/me`, or the
+                            // user going back to pick a different account all
+                            // land here with the attempt still live. Keep
+                            // serving until it's retired or the deadline hits.
+                            if !attempt_pending(&app, &expected_state) {
+                                break;
+                            }
                         }
                         // A stray request (favicon probe, etc.) — keep waiting.
                         Ok(None) => continue,
@@ -101,6 +115,16 @@ pub async fn start(app: AppHandle, state: String) -> Result<u16> {
     });
 
     Ok(port)
+}
+
+/// Is this listener's attempt still the one `cloud_login_url` advertises?
+/// `cloud_complete_login` clears `pending_login` once a login actually lands,
+/// so `false` means nobody is being sent to this port any more and the task can
+/// free it instead of idling to the deadline.
+fn attempt_pending(app: &AppHandle, nonce: &str) -> bool {
+    let state = app.state::<crate::state::AppState>();
+    let pending = state.pending_login.lock().unwrap();
+    pending.as_ref().is_some_and(|p| p.nonce == nonce)
 }
 
 /// Read one HTTP request; if it's the OAuth callback *with a matching `state`*,

@@ -346,9 +346,41 @@ impl Client {
     }
 }
 
-/// Ruta del binario del daemon: el override, si no el hermano del ejecutable
-/// actual (como se empaqueta), si no el `PATH`.
+/// Ruta del binario del daemon, por orden de autoridad: el override, **el que
+/// ejecuta el servicio instalado**, el hermano del ejecutable actual (como se
+/// empaqueta) y por último el `PATH`.
+///
+/// El segundo escalón es el que se añadió al unificar la instalación, y no es
+/// una preferencia: con la app y el instalador de terminal conviviendo puede
+/// haber dos `hoardd` en el disco (`/usr/bin` del paquete, `~/.local/bin` del
+/// tarball), y "hermano, si no PATH" hacía que el binario elegido dependiera de
+/// **quién** preguntara — la app levantaría el suyo y la terminal el suyo. Sólo
+/// hay un daemon por usuario, así que sólo puede haber una respuesta: la que ya
+/// tomó el gestor de servicios. Es la misma clase de fallo que el
+/// `hoard-server` viejo del `PATH` eclipsando al bueno, resuelta de raíz en vez
+/// de a base de limpiar binarios a mano.
 pub fn daemon_binary() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os(DAEMON_BIN_ENV).filter(|v| !v.is_empty()) {
+        return std::path::PathBuf::from(path);
+    }
+    if let Some(path) = crate::autostart::installed_exec_start() {
+        if path.is_file() {
+            return path;
+        }
+    }
+    own_daemon_binary()
+}
+
+/// El daemon **de esta instalación**: el override, el hermano de este
+/// ejecutable, y si no el `PATH`. Deliberadamente ciego al servicio instalado.
+///
+/// Es lo que [`crate::autostart`] pone en el `ExecStart`, y por eso no puede
+/// mirar la unidad: la unidad es lo que estamos declarando. Si mirara, una
+/// actualización que moviera el binario reescribiría la unidad con la ruta
+/// **vieja** que ella misma acaba de leer, y el servicio seguiría arrancando el
+/// binario anterior para siempre. Los clientes usan [`daemon_binary`], que sí
+/// consulta la unidad; quien la declara usa ésta.
+pub fn own_daemon_binary() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os(DAEMON_BIN_ENV).filter(|v| !v.is_empty()) {
         return std::path::PathBuf::from(path);
     }
@@ -376,9 +408,22 @@ fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     detach(&mut command);
-    command
-        .spawn()
-        .with_context(|| format!("starting the daemon ({})", binary.display()))?;
+    command.spawn().map_err(|e| {
+        // `NotFound` aquí no es "falló el arranque", es "no está el motor". Se
+        // dice con esas palabras: éste es el mensaje que ve quien abre la app o
+        // escribe `hoard track`, y sin la pista el síntoma es indistinguible de
+        // un fallo de permisos o de un daemon que arrancó y murió.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "the sync engine ({}) isn't there. `hoard` is a thin client of `hoardd` and the \
+                 two ship together — reinstall the core (https://hoard.services/install.sh) or \
+                 drop `hoardd` beside `hoard`.",
+                binary.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("starting the daemon ({})", binary.display()))
+        }
+    })?;
     Ok(())
 }
 

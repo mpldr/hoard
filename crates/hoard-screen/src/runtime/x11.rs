@@ -261,6 +261,11 @@ pub fn run(mut engine: Engine) -> Result<(), String> {
                 overlay_shape(&conn, window, sw, sh, &scene)?;
                 shape_dirty = false;
             }
+            // El visor puede estar vinculado a un botón y esconderse solo; en el editor
+            // tiene que verse igualmente para poder colocarlo. Se avisa antes de cada
+            // tick: es poner un bool en un puñado de fuentes, no compensa llevar la
+            // cuenta de si cambió.
+            engine.set_editing(mode == Mode::Editor);
             engine.tick();
             engine.render(&mut buf, sw as u32, sh as u32);
             rgba_to_bgrx(&buf, &mut bgrx);

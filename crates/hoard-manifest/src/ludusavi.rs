@@ -85,8 +85,9 @@ const TITLES_OVERRIDE_REL: &str = "hoard/ludusavi-titles.json";
 /// save path. Names processes and appids; never used to detect a save.
 const TITLES_ZST: &[u8] = include_bytes!("../data/ludusavi-titles.json.zst");
 
-static CATALOG: OnceLock<Vec<LudusaviEntry>> = OnceLock::new();
-static TITLES: OnceLock<Vec<TitleEntry>> = OnceLock::new();
+/// Los dos ficheros de datos, atados a la misma generación. Ver
+/// [`manifest_data`] para por qué no son dos `OnceLock` sueltos.
+static MANIFEST_DATA: OnceLock<(Vec<LudusaviEntry>, Vec<TitleEntry>)> = OnceLock::new();
 
 /// One game from the Ludusavi catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,21 +322,55 @@ fn load_runtime_override() -> Option<Vec<LudusaviEntry>> {
 /// embedded JSON. The choice is sticky for the lifetime of the process —
 /// updates take effect on the next launch.
 pub fn catalog() -> &'static [LudusaviEntry] {
-    CATALOG
-        .get_or_init(|| {
-            if let Some(override_) = load_runtime_override() {
-                return override_;
-            }
-            // The embedded blob was emitted by our own generator; a decode
-            // failure is a build-time invariant violation, not user-facing.
-            let json = zstd::decode_all(CATALOG_ZST)
-                .unwrap_or_else(|e| panic!("embedded ludusavi catalog must decompress: {e}"));
-            serde_json::from_slice(&json).unwrap_or_else(|e| {
-                tracing::error!("embedded Ludusavi catalog parse failed: {e}");
-                panic!("embedded ludusavi-catalog.json must parse: {e}");
-            })
+    &manifest_data().0
+}
+
+/// Catálogo y títulos **a la vez**, de la misma generación de datos.
+///
+/// Eran dos `OnceLock` sueltos, y ahí había un estado mixto real: cada uno se
+/// resuelve la primera vez que alguien lo toca, y entre esos dos momentos el
+/// fichero de override puede aparecer (lo escribe [`save_runtime_override`] con
+/// el proceso vivo) o cambiar el `XDG_CACHE_HOME` que lo localiza. El resultado
+/// era un catálogo de una generación con los títulos de otra, y con él unos
+/// índices que dicen cosas que ninguna de las dos dice: un `mars.exe` que en el
+/// catálogo viejo reclaman dos juegos y en los títulos nuevos sólo uno pasa a
+/// resolver a ese uno, y un save acaba bautizado con el nombre de otro juego.
+///
+/// Resolverlos en el mismo `get_or_init` los ata a un único instante. El
+/// override sigue entrando en el proceso siguiente, que es el contrato de
+/// arriba; lo que ya no puede es entrar a medias.
+fn manifest_data() -> &'static (Vec<LudusaviEntry>, Vec<TitleEntry>) {
+    MANIFEST_DATA.get_or_init(|| (load_catalog(), load_titles()))
+}
+
+fn load_catalog() -> Vec<LudusaviEntry> {
+    if let Some(override_) = load_runtime_override() {
+        return override_;
+    }
+    // The embedded blob was emitted by our own generator; a decode
+    // failure is a build-time invariant violation, not user-facing.
+    let json = zstd::decode_all(CATALOG_ZST)
+        .unwrap_or_else(|e| panic!("embedded ludusavi catalog must decompress: {e}"));
+    serde_json::from_slice(&json).unwrap_or_else(|e| {
+        tracing::error!("embedded Ludusavi catalog parse failed: {e}");
+        panic!("embedded ludusavi-catalog.json must parse: {e}");
+    })
+}
+
+fn load_titles() -> Vec<TitleEntry> {
+    if let Some(override_) = load_titles_override() {
+        return override_;
+    }
+    // Softer failure than the catalog: without the title index we
+    // fall back to naming things after the process, which is worse
+    // but not broken.
+    zstd::decode_all(TITLES_ZST)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .unwrap_or_else(|| {
+            tracing::error!("embedded Ludusavi title index unreadable");
+            Vec::new()
         })
-        .as_slice()
 }
 
 /// Number of games in the (currently-loaded) catalog. Useful for progress
@@ -346,23 +381,7 @@ pub fn catalog_size() -> usize {
 
 /// The title-only index: manifest games with a name but no save path.
 pub fn titles() -> &'static [TitleEntry] {
-    TITLES
-        .get_or_init(|| {
-            if let Some(override_) = load_titles_override() {
-                return override_;
-            }
-            // Softer failure than the catalog: without the title index we
-            // fall back to naming things after the process, which is worse
-            // but not broken.
-            zstd::decode_all(TITLES_ZST)
-                .ok()
-                .and_then(|json| serde_json::from_slice(&json).ok())
-                .unwrap_or_else(|| {
-                    tracing::error!("embedded Ludusavi title index unreadable");
-                    Vec::new()
-                })
-        })
-        .as_slice()
+    &manifest_data().1
 }
 
 /// Lazily-built lookup tables over [`catalog`] and [`titles`].
@@ -384,6 +403,11 @@ struct Indexes {
     exe_to_title: HashMap<&'static str, &'static str>,
     /// Steam appid → display name, across catalog and titles.
     app_id_to_title: HashMap<u64, &'static str>,
+    /// Canonical name → display name, across catalog **and** titles. El gemelo
+    /// de [`Indexes::by_canon`] para *nombrar*: un juego sin ruta de guardado no
+    /// está en el catálogo, así que `by_canon` no lo encuentra y una carpeta que
+    /// se llama como él acababa siendo un juego fantasma con nombre crudo.
+    canon_to_title: HashMap<String, &'static str>,
 }
 
 static INDEXES: OnceLock<Indexes> = OnceLock::new();
@@ -470,6 +494,21 @@ fn indexes() -> &'static Indexes {
             }
         }
 
+        // Y el nombre canónico, con la misma regla: primero el catálogo, y las
+        // entradas sólo-título rellenan los huecos que aquél no cubre.
+        let mut canon_to_title: HashMap<String, &'static str> =
+            HashMap::with_capacity(cat.len() + tit.len());
+        for (name, canon) in cat
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .chain(tit.iter().map(|t| t.display_name.as_str()))
+            .map(|name| (name, hoard_core::ids::canon_token(name)))
+        {
+            if canon.len() >= hoard_core::ids::MIN_IDENTITY_TOKEN_LEN {
+                canon_to_title.entry(canon).or_insert(name);
+            }
+        }
+
         Indexes {
             by_app_id,
             by_slug,
@@ -478,6 +517,7 @@ fn indexes() -> &'static Indexes {
             exe_to_slug,
             exe_to_title,
             app_id_to_title,
+            canon_to_title,
         }
     })
 }
@@ -494,6 +534,23 @@ pub fn find_by_canon_name(name: &str) -> Option<&'static LudusaviEntry> {
         return None;
     }
     indexes().by_canon.get(&canon).map(|i| &catalog()[*i])
+}
+
+/// Display name for a **folder-ish** name, from the catalog or the title-only
+/// index. Wider que [`find_by_canon_name`]: también nombra juegos que no
+/// podemos rastrear.
+///
+/// Es la que hay que usar para *nombrar* una carpeta. `find_by_canon_name`
+/// devuelve una entrada del catálogo —con sus rutas— y por eso sólo ve juegos
+/// con ruta de guardado; una carpeta llamada como un juego sin ruta (una
+/// edición nueva, un juego online) se quedaba sin título y acababa en la
+/// biblioteca con el nombre crudo del proceso o del directorio.
+pub fn title_for_canon_name(name: &str) -> Option<&'static str> {
+    let canon = hoard_core::ids::canon_token(name);
+    if canon.len() < hoard_core::ids::MIN_IDENTITY_TOKEN_LEN {
+        return None;
+    }
+    indexes().canon_to_title.get(&canon).copied()
 }
 
 /// Look up a catalog entry by its Lutris slug (the prefix directory name

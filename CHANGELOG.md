@@ -7,6 +7,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-08-07
+
+### Added
+- **Every version now tells you which machine it came from.** The history of a
+  save listed a date and a size and left you to guess whether that snapshot was
+  the desktop's or the laptop's — which is the one thing you actually want to
+  know before restoring one. Each version now carries the name of the machine
+  that made it, and the history shows it.
+- **A heads-up display over the game.** Alt+H brings up a panel on top of
+  whatever you are playing, in the shape of the Steam overlay, showing what the
+  sync engine is doing right now: what it backed up, when, and whether anything
+  is waiting. It reads the engine and nothing more — there is no button on it
+  that can touch your saves — and Alt+H puts it away again.
+- **The Hoard Screen scope can be bound to a mouse or keyboard button.** The
+  magnifier used to live in the overlay's own controls; you can now put it on a
+  button and choose how it behaves — press to toggle, hold while you aim, or
+  show it for a fixed moment. Extra mouse buttons work as bindings too.
+- **Scanning a folder you point at yourself.** Telling Hoard "the saves are in
+  here" now means exactly that: it looks inside the folder you chose and offers
+  what it finds, without applying the size and name rules it uses when guessing
+  on its own — those rules exist for scanning your whole disk unattended, and
+  they were throwing away folders you had explicitly pointed at. The three
+  slightly different ways of adding a save by hand are now one dialog.
+- **One install, whatever your machine is.** Hoard now installs and updates as
+  a set of components rather than as "the app" or "the CLI": the installer works
+  out which pieces your machine wants and puts them all in at the same version,
+  in one pass. A NAS or a server stops at the engine and the terminal; a desktop
+  or a Steam Deck gets the app as well. Upgrades move everything together, so
+  the pieces can't drift apart, and the app now ships the terminal command with
+  it instead of leaving it as a separate download.
+- **Saves sync in game mode on SteamOS, Bazzite and CachyOS.** The sync engine
+  is now installed in its own right instead of riding inside the app bundle, so
+  it can start with your session on systems where the app has to be an AppImage
+  — which is every immutable/atomic image, the Steam Deck included. Nothing to
+  keep open and nothing to launch: install once from the desktop and game mode
+  syncs on its own.
+
+### Changed
+- **A pass over the app's surfaces.** Behaviour on hover and focus, the
+  contrast of the greys, the depth of panels and cards, and how versions are
+  laid out in history all got a revision, with a control for how pronounced the
+  relief is. Covers and the Library frames stayed as they were.
+
+### Fixed
+- **A save that the game rotated mid-upload could be stored corrupt.** Many
+  games write a new save by renaming the old one out of the way, and if that
+  happened between Hoard reading a file and finishing sending it, what reached
+  the server was half of one file and half of another — a version that looked
+  fine in the list and could not be restored. Hoard now checks what it actually
+  sent, byte for byte, and aborts the whole snapshot if a file moved underneath
+  it, so a bad version is never committed. The next backup picks up the new
+  contents normally. **If you have used Hoard on a game that rotates saves,
+  this is the fix to update for.**
+- **"Hoard already tracks this folder" on a folder it did not track.** A save's
+  identity was tied to a name derived from the game's title, and that name is
+  not stable — the same game could be `vrising` on one machine and `v-rising`
+  on another, or gain a year in the catalogue. Two different folders could
+  collide on it and Hoard would refuse to add the second, with the only way out
+  being to untrack and re-add. Identity is now the folder itself, which is what
+  it always meant.
+- **Restoring into an empty folder could loop.** If the folder a save lives in
+  was empty — a fresh machine, a game reinstalled — the restore bypassed the
+  check that decides whether there is anything to do, and a restore that wrote
+  nothing still reported success, so it started again immediately. One account
+  moved 10.6 GB this way. Both halves are fixed: the empty folder no longer
+  skips the check, and a restore that writes nothing is a failure.
+- **Hoard could be pointed at a folder no backup should ever cover.** Nothing
+  stopped you from tracking a Wine prefix root, a `Documents`, or a home
+  directory — a mistake that turns the next backup into an attempt to upload
+  everything you own. Those roots are now refused, the Windows rules apply
+  inside Proton prefixes as well as outside, and the check sits on the path the
+  backup actually takes rather than only in the dialog.
+- **Self-hosted: rebuilding your server left invisible duplicate rows.** A
+  rebuilt server hands out new identifiers, and re-adding a save created a
+  second row while the old one stayed behind — not shown anywhere, still
+  holding a claim on the folder, and answering 404 for every sync. The stale
+  rows are now dropped when the library is listed.
+- **Self-hosted: an update could leave the server unable to find its own
+  database.** The Docker stack shipped a `config.toml` in the repository, so a
+  `git pull` overwrote yours — including `data_dir`, which is where your saves
+  and your database are. A server that starts against an empty database where
+  a populated one is expected now refuses to run and says so, and the config
+  file is no longer versioned. Copy `deploy/config.toml.example` once, as the
+  self-host guide says, and updates stop touching it.
+- **404s from guessing what kind of server was on the other end.** When the
+  check that asks a server what it is could not reach it, the client assumed
+  self-hosted and spoke the wrong dialect to a Hoard Cloud server, which
+  answered 404 to everything. An unreachable server and a self-hosted one are
+  now two different answers, and the client waits for a real one.
+- **Windows: a black console window at every sign-in.** The sync service was
+  built as a console program, so Windows opened a terminal for it when the
+  scheduled task started it with your session. It is a windowless program now.
+- **Detection got a broad overhaul.** Eighteen changes to how Hoard works out
+  where a game keeps its saves — following a game's launch command through
+  wrappers to the process that actually runs, resolving base-folder references,
+  handling saves that are a single loose file rather than a folder, and more.
+  The bundled catalogue also went from 7.3 MB to 1.7 MB.
+- **Server: a stuck compression job retried every five minutes, forever.** Six
+  stored objects had been failing to compress since July with no terminal
+  state, so the sweep picked them up again on every pass. Attempts are now
+  counted and capped.
+- **Server: rate-limit responses are readable from a browser again.** The
+  limiter sat outside the layer that adds the cross-origin headers, so its 429
+  never carried them and the web only ever saw "network error" — precisely when
+  knowing the real status matters. The order is now the other way round, and
+  the preflight no longer counts against your quota.
+- **Diagnostic reports were never actually being sent.** Hoard has had a
+  diagnostics channel since 1.0, on by default, and it has never delivered a
+  single line: it looked for your session in the wrong place, so on a Hoard
+  Cloud machine it found nothing and gave up, every time. It works now, and the
+  reports carry what makes a bug findable — including where detection got a
+  game's save folder wrong and how you fixed it, which until now only reached us
+  when somebody wrote in on Discord. Two things changed alongside it: paths are
+  stripped of your username before they leave your machine (`C:\Users\<user>\…`
+  is what arrives), and the Settings toggle now says what is actually sent
+  instead of promising "anonymous pings" that never leave out paths or game
+  names. It is still one switch, still on by default, and turning it off still
+  stops the stream within seconds.
+- **Self-hosting on OneDrive, Mega, Google Drive or Dropbox actually works
+  now.** The guide has pointed at `rclone serve s3` as the way to keep saves on
+  a cloud drive you already pay for, without ever explaining how to set it up —
+  and worse, going that route quietly stored every save wrong. The uploads were
+  being framed in a way that AWS, R2 and MinIO unwrap and the rclone bridge does
+  not, so what landed in your drive was not what was sent, and you'd only find
+  out the day you needed a restore. The server now speaks the plainest version
+  of the protocol, checks at startup that the storage it was given returns
+  exactly the bytes it wrote (and refuses to start if not), and the self-host
+  guide has a step-by-step section for each provider, including what the
+  trade-offs are.
+- **A backup to remote storage no longer holds up everyone else's.** While one
+  save was uploading to an S3 bucket or a cloud drive, the rest of the server's
+  writes queued behind it and started failing outright if it took more than a
+  few seconds — which, on a consumer drive, it does. Uploads now happen outside
+  the database lock.
+- **Restoring from remote storage stopped needing a copy of the whole save on
+  the server's disk.** A restore staged every file of the snapshot locally
+  before sending any of it, so a 10 GB library needed 10 GB free on the server.
+  It now streams a piece at a time (a few MB), and a download that gets cut
+  short is reported as an error instead of quietly producing a short file.
+- **The terminal install could not sync at all.** Since 1.1.0 `hoard` has been a
+  thin client of the sync service, but the published tarball only ever contained
+  `hoard` — never the `hoardd` engine it talks to. Installing from the terminal
+  produced a command that could not start or reach a service, which is exactly
+  what the headless install is for. The tarball now carries both halves, and CI
+  refuses to publish one without the other.
+- **Which engine ran no longer depends on who started it.** With the app and the
+  terminal install both present, the running engine could be either copy
+  depending on `PATH` order and which client woke it. The installed service is
+  now the single authority on that, and clients follow it.
+- **In-app updates on SteamOS, Bazzite and other atomic systems.** The updater
+  offered an `.rpm` on any machine with `rpm` present, including images whose
+  `/usr` is read-only — so the download succeeded and the install could not
+  possibly apply. It now picks the format the machine can actually install, the
+  same way the terminal installer does.
+
 ## [1.1.1] — 2026-08-02
 
 ### Added

@@ -16,7 +16,7 @@
   import { get } from "svelte/store";
   import { _ } from "svelte-i18n";
   import ProGate from "./ProGate.svelte";
-  import { openUpgradePage } from "../stores/cloud";
+  import { push } from "svelte-spa-router";
   import { tourActive } from "../stores/tour";
   import {
     entitlements,
@@ -74,7 +74,7 @@
       >
         <span>{$_("pro.trial_days_left", { values: { n: days } })}</span>
         <button
-          onclick={() => openUpgradePage("pro")}
+          onclick={() => push(`/pro?feature=${feature}`)}
           class="font-medium underline decoration-emerald-500/50 underline-offset-2 transition-colors hover:text-emerald-200"
         >
           {$_("pro.upgrade")}

@@ -91,7 +91,7 @@ aws-smithy-runtime-api = { version = "1", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 hmac = { version = "0.12", optional = true }
 # Polar webhooks use Standard Webhooks: base64-encoded HMAC-SHA256 over
-# `id.timestamp.body`, unlike Lemon Squeezy's hex signature.
+# `id.timestamp.body`.
 base64 = { version = "0.22", optional = true }
 # Account-export ZIP writer. Entries are `Stored` (game saves are already
 # compressed) so this is just the container format.

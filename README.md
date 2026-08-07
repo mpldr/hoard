@@ -70,7 +70,7 @@ Works in all -- except phone, you can install in:
 | Linux (Fedora / openSUSE) | the `.rpm` asset on the release page | ✅ |
 | Linux (any distro) | `Hoard_<version>_amd64.AppImage` | ✅ |
 | macOS (Apple Silicon only) | `Hoard_<version>_aarch64.dmg` -- I dont have a macOS to try it | ⚠️ |
-| SteamOS/Brazzite/CachyOS gamemode | With [Hoard-CLI](https://hoard.services/cli) | ✅ |
+| SteamOS/Bazzite/CachyOS game mode | `curl -fsSL https://hoard.services/install.sh \| sh` | ✅ |
 
 
 >**Please note:** I'm currently unable to build and test on Mac and steamOS.
@@ -79,10 +79,21 @@ Works in all -- except phone, you can install in:
 produce it. On an Intel Mac, self-host the server or build the desktop app
 from source below; nothing about the app itself is Apple-Silicon-only.
 
-# Hoard-CLI
+# One installer, whatever your machine is
+
+Hoard is an engine (`hoardd`) plus two faces: the terminal (`hoard`) and the
+app. The installer works out which ones your machine wants and puts them all in
+at the same version — a NAS or a server stops at the engine and the terminal, a
+desktop or a Steam Deck gets the app too, in the same pass. Upgrades move
+everything together, so the pieces can't drift apart.
+
+In game mode there is nothing to keep open: the engine runs as a background
+service that starts with your session, so your saves sync with no window and no
+terminal.
 
 Prefer the terminal, or running on a headless box (NAS / server / Steam Deck)?
-The `Hoard-CLI` ships as a standalone binary no GUI deps.
+Add `--headless` and it never fetches the app. Everything ships as standalone
+binaries with no GUI deps.
 Download it in [cli latest release](https://hoard.services/cli):
 
 ![Hoard cli photo](web/static/CLI.png)

@@ -2811,15 +2811,20 @@ fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
     {
-        if let Some(entry) = ludusavi::find_by_canon_name(dir) {
-            return entry.display_name.clone();
+        // `title_for_canon_name` y no `find_by_canon_name`: aquí sólo se busca
+        // un NOMBRE, y el catálogo únicamente lleva juegos con ruta de guardado.
+        // Una edición que el manifiesto sólo conoce por su título —"Surviving
+        // Mars: Relaunched"— no está en él, así que buscarla ahí devolvía nada y
+        // el save acababa llamándose "Mars", por el ejecutable.
+        if let Some(title) = ludusavi::title_for_canon_name(dir) {
+            return title.to_string();
         }
     }
     // 3. El primer ancestro con nombre propio del save, si es un juego del
-    //    catálogo. `…/Saved Games/Surviving Mars Relaunched/<steamid>` lo es.
+    //    manifiesto. `…/Saved Games/Surviving Mars Relaunched/<steamid>` lo es.
     let ancestor = meaningful_ancestor(path);
-    if let Some(entry) = ancestor.and_then(ludusavi::find_by_canon_name) {
-        return entry.display_name.clone();
+    if let Some(title) = ancestor.and_then(ludusavi::title_for_canon_name) {
+        return title.to_string();
     }
     // 4. El mismo ancestro, pero con el título del catálogo como PREFIJO: la
     //    carpeta lleva un calificador que el catálogo no tiene (`Surviving Mars
@@ -4222,8 +4227,30 @@ mod tests {
             "mars.exe lo reclama más de un juego; no debe resolver"
         );
         let name = attribute_game_name(&save, &store);
-        assert_eq!(name, "Surviving Mars: Relaunched");
+        assert_eq!(name, "Surviving Mars: Relaunched", "{}", catalog_source());
         assert_eq!(ludusavi::slugify(&name), "surviving-mars-relaunched");
+    }
+
+    /// Contra qué datos se está midiendo, para el mensaje de un test que casa
+    /// títulos concretos del manifiesto.
+    ///
+    /// Estos tests afirman cosas sobre datos que vienen de fuera, y el catálogo
+    /// que se carga **no es siempre el que trae el binario**: si la app ha
+    /// refrescado el manifiesto, mandan los ficheros de `~/.cache/hoard/`.
+    /// Entonces esto falla en local y pasa en CI, y sin la nota parece cosa de
+    /// brujas. El fallo es de verdad —arriba movieron el juego y el nombrado se
+    /// degrada con él—, pero hay que saber con qué se está comparando.
+    ///
+    /// Sólo informa del tamaño cargado: mirar si el fichero de override existe
+    /// **ahora** miente, porque otro test puede tener `XDG_CACHE_HOME` apuntando
+    /// a su tempdir en este instante, y el catálogo ya está cargado desde antes.
+    fn catalog_source() -> String {
+        format!(
+            "catálogo cargado: {} juegos. Si esto falla en local y pasa en CI, la app refrescó \
+             el manifiesto en ~/.cache/hoard y esos datos mandan; para medir como CI: \
+             XDG_CACHE_HOME=$(mktemp -d) cargo test",
+            ludusavi::catalog_size()
+        )
     }
 
     /// Y con la carpeta del save opaca, la del ejecutable basta.
@@ -4240,7 +4267,9 @@ mod tests {
         );
         assert_eq!(
             attribute_game_name(&save, &store),
-            "Surviving Mars: Relaunched"
+            "Surviving Mars: Relaunched",
+            "{}",
+            catalog_source()
         );
     }
 

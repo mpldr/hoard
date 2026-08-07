@@ -7,18 +7,80 @@ import type { AccountProfile, BillingCycle, DeviceRow, PlanId, UsageEvent } from
  * Rust server exposes. Replacing the backend means changing this file.
  */
 
-async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+/**
+ * A non-2xx response, carrying everything a caller needs to say something
+ * true: `status` to branch on (401 → the session died, send them back to
+ * login), `code` (the server's stable machine code) to match on without
+ * string-sniffing a message, and `detail` (the server's own sentence) as the
+ * concrete reason a user can quote in a bug report.
+ *
+ * `status === 0` is the special case for "the request never reached the
+ * server" — DNS, CORS, offline. It reads very differently to a user than a
+ * 500, and conflating the two is how "the checkout is broken" and "your wifi
+ * dropped" ended up as the same sentence.
+ *
+ * Every method below throws this on failure. They used to fail three
+ * different ways — a flat `Error` whose message was the only clue, a
+ * swallowed failure that returned `[]`, or no status check at all — so
+ * "unlinking that device failed" and "you have no devices" rendered
+ * identically, and a failed account deletion still signed you out and sent
+ * you home as though it had worked.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly detail: string,
+    readonly code: string = ''
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
+ * Authenticated fetch that fails loudly. Returns the `Response` only on 2xx;
+ * every other outcome throws an [`ApiError`] carrying the server's own
+ * `{error, code}` body (see `hoard-server/src/cloud/errors.rs`).
+ */
+async function request(path: string, init: RequestInit = {}): Promise<Response> {
   const token = await auth.getAccessToken();
   const headers = new Headers(init.headers);
   if (token) headers.set('Authorization', `Bearer ${token}`);
   headers.set('Accept', 'application/json');
-  return fetch(`${config.api.baseUrl}${path}`, { ...init, headers });
+
+  let res: Response;
+  try {
+    res = await fetch(`${config.api.baseUrl}${path}`, { ...init, headers });
+  } catch (e) {
+    const msg = (e as Error).message;
+    throw new ApiError(`${path}: ${msg}`, 0, msg, 'unreachable');
+  }
+  if (res.ok) return res;
+
+  // Errors come back as `{error, code}`. Anything else — a proxy's HTML 502,
+  // an empty body — still yields its raw text rather than nothing at all.
+  const body = await res.text().catch(() => '');
+  let detail = body;
+  let code = '';
+  try {
+    const j = JSON.parse(body) as { error?: string; code?: string };
+    if (typeof j.error === 'string') detail = j.error;
+    if (typeof j.code === 'string') code = j.code;
+  } catch {
+    /* not JSON: keep the raw body, it's still better than nothing */
+  }
+  throw new ApiError(
+    `${path} failed: ${res.status}${detail ? ` ${detail}` : ''}`,
+    res.status,
+    detail,
+    code
+  );
 }
 
 export const api = {
   async me(): Promise<AccountProfile> {
-    const res = await authedFetch('/v1/me');
-    if (!res.ok) throw new Error(`me failed: ${res.status}`);
+    const res = await request('/v1/me');
     const j = await res.json();
     // Field names map 1:1 onto the server's `Me` wire shape (see
     // hoard-server/src/cloud/routes/me.rs). They are NOT `plan_renews_at` /
@@ -47,22 +109,17 @@ export const api = {
    */
   async createCheckout(plan: Exclude<PlanId, 'free'>, cycle: BillingCycle): Promise<string> {
     const interval = cycle === 'yearly' ? 'year' : 'month';
-    const res = await authedFetch('/v1/cloud/checkout', {
+    const res = await request('/v1/cloud/checkout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ plan, interval })
     });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`checkout failed: ${res.status} ${detail}`);
-    }
     const j = await res.json();
     return j.url as string;
   },
 
   async devices(): Promise<DeviceRow[]> {
-    const res = await authedFetch('/v1/devices');
-    if (!res.ok) return [];
+    const res = await request('/v1/devices');
     const j = await res.json();
     return (j.devices ?? []).map((d: Record<string, unknown>) => ({
       id: d.id as string,
@@ -74,33 +131,28 @@ export const api = {
   },
 
   async unlinkDevice(id: string): Promise<void> {
-    await authedFetch(`/v1/devices/${id}`, { method: 'DELETE' });
+    await request(`/v1/devices/${id}`, { method: 'DELETE' });
   },
 
   /**
    * Approve a headless CLI's device-pairing request. The phone is signed in;
    * the server mints a fresh session for *this* user and hands it to the
-   * waiting CLI. `code` is the short user_code shown by `hoard login`. Throws
-   * with the server's error `code` ("not_found" for a wrong/expired code) so
-   * the page can localize the message.
+   * waiting CLI. `code` is the short user_code shown by `hoard login`. A
+   * wrong or expired code comes back as `ApiError` with `code === 'not_found'`,
+   * which the page localizes.
    */
   async approveDevice(code: string): Promise<{ hostname: string | null }> {
-    const res = await authedFetch('/v1/cloud/device/approve', {
+    const res = await request('/v1/cloud/device/approve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ user_code: code })
     });
-    if (!res.ok) {
-      const detail = await res.json().catch(() => ({}) as Record<string, unknown>);
-      throw new Error((detail?.code as string) ?? `approve failed: ${res.status}`);
-    }
     const j = await res.json();
     return { hostname: (j.hostname as string) ?? null };
   },
 
   async usageEvents(limit = 20): Promise<UsageEvent[]> {
-    const res = await authedFetch(`/v1/usage?limit=${limit}`);
-    if (!res.ok) return [];
+    const res = await request(`/v1/usage?limit=${limit}`);
     const j = await res.json();
     return j.events ?? [];
   },
@@ -110,6 +162,8 @@ export const api = {
     status: 'ok' | 'degraded' | null;
     version: string | null;
   }> {
+    // Deliberately NOT `request`: this one's job is to *report* reachability,
+    // so an outage is its expected result, not an exception.
     try {
       const res = await fetch(`${config.api.baseUrl}/v1/health`);
       // The server answered but with an error code: it's up but not well.
@@ -124,10 +178,10 @@ export const api = {
   },
 
   async requestAccountExport(): Promise<void> {
-    await authedFetch('/v1/me/export', { method: 'POST' });
+    await request('/v1/me/export', { method: 'POST' });
   },
 
   async deleteAccount(): Promise<void> {
-    await authedFetch('/v1/me', { method: 'DELETE' });
+    await request('/v1/me', { method: 'DELETE' });
   }
 };

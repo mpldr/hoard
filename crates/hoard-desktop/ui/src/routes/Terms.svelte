@@ -7,7 +7,7 @@
    */
   import { push } from "svelte-spa-router";
   import { fly } from "svelte/transition";
-  import { ExternalLink } from "lucide-svelte";
+  import { ExternalLink } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
   import Button from "../lib/components/Button.svelte";
   import WizardShell from "../lib/components/WizardShell.svelte";
@@ -51,7 +51,7 @@
       <button
         type="button"
         onclick={() => openExternal(TERMS_URL)}
-        class="inline-flex items-center gap-2 text-sm text-emerald-400 hover:text-emerald-300 focus:outline-none"
+        class="inline-flex items-center gap-2 text-sm text-emerald-400 hover:text-emerald-300"
       >
         <ExternalLink size={14} />
         {$_("onboarding.terms_link_terms")}
@@ -59,7 +59,7 @@
       <button
         type="button"
         onclick={() => openExternal(PRIVACY_URL)}
-        class="inline-flex items-center gap-2 text-sm text-emerald-400 hover:text-emerald-300 focus:outline-none"
+        class="inline-flex items-center gap-2 text-sm text-emerald-400 hover:text-emerald-300"
       >
         <ExternalLink size={14} />
         {$_("onboarding.terms_link_privacy")}

@@ -164,6 +164,8 @@
   "account.storage_label": "Spazio",
   "account.devices_label": "Dispositivi",
   "account.no_devices": "Ancora nessun dispositivo collegato. Accedi dall'app desktop e comparirà qui.",
+  "account.devices_error": "Non è stato possibile caricare i tuoi dispositivi.",
+  "account.action_error": "L'operazione non è andata a buon fine.",
   "account.confirm_unlink": "Scollegare questo dispositivo?",
   "account.export_requested": "Export in coda. Ti invieremo un'e-mail quando è pronto.",
   "account.confirm_delete_intro": "Questo elimina il tuo account e ogni snapshot. Nella casella successiva, digita DELETE per confermare.",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "Cerchi un'altra versione o architettura? Tutte le build sono su",
   "callback.signing_in": "Accesso in corso…",
   "callback.failed_title": "Accesso non riuscito",
-  "callback.failed_generic": "Non siamo riusciti a completare l'accesso. Riprova.",
+  "callback.failed_provider": "Il tuo provider di accesso ha rifiutato la richiesta.",
+  "callback.failed_no_session": "Questo link non conteneva nessun accesso da completare.",
+  "callback.failed_timeout": "L'accesso non si è concluso in tempo.",
   "callback.back_to_signin": "Torna all'accesso",
   "callback.desktop_return": "Accesso effettuato! Torna all'app Hoard — puoi chiudere questa scheda.",
   "callback.desktop_reopen": "Non si è aperta? Clicca qui per riaprire Hoard.",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "Caricamento…",
   "common.error": "Qualcosa è andato storto.",
+  "err.unreachable": "Non è stato possibile raggiungere l'API di Hoard. Controlla la connessione e riprova.",
+  "err.session_expired": "La sessione è scaduta. Accedi di nuovo per continuare.",
+  "err.http": "Il server ha risposto con un errore ({status}).",
   "common.retry": "Riprova",
   "common.cancel": "Annulla",
   "common.confirm": "Conferma",
@@ -345,6 +352,5 @@
   "link.approve_hint": "Approva solo un codice che hai avviato tu su un dispositivo tuo.",
   "link.approved": "Dispositivo approvato.",
   "link.approved_hint": "Torna a quella macchina: sta effettuando l'accesso.",
-  "link.err_not_found": "Codice non valido o scaduto. Ricomincia dal tuo dispositivo.",
-  "link.err_generic": "Impossibile approvare il dispositivo. Riprova."
+  "link.err_not_found": "Codice non valido o scaduto. Ricomincia dal tuo dispositivo."
 }

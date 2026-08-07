@@ -3599,6 +3599,40 @@ async fn run_backup_with_retry(
                         }
                     }
                 }
+                // Raíz imposible (perfil entero, prefijo de Proton completo):
+                // no es un fallo transitorio y reintentarlo no lo arregla, así
+                // que se asienta sin marcar rojo ni re-armar el backoff. Se
+                // grita con la ruta y el motivo delante, que es lo único que
+                // permite al usuario entender por qué su juego no sube: la
+                // guarda estructural ya existía, pero sólo corría al dar de
+                // alta, y una fila envenenada de antes no volvía a pasar por
+                // ella. Reportado ago-2026 (Steam Deck subiendo el `pfx`).
+                if let Some(unsafe_src) = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<crate::backup::UnsafeSource>())
+                {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        path = %unsafe_src.path.display(),
+                        reason = %unsafe_src.reason,
+                        "agent: refusing to back up this save — the tracked folder can't be a \
+                         game's save folder; re-point it at the folder inside"
+                    );
+                    crate::telemetry::rejected_root(
+                        &save.game_slug,
+                        &unsafe_src.path,
+                        &unsafe_src.reason,
+                    );
+                    let _ = done_tx.try_send(BackupDone {
+                        save_id: save.save_id.clone(),
+                        new_set_hash: None,
+                        committed: false,
+                        version_num: None,
+                        landed: false,
+                    });
+                    return;
+                }
                 // Empty source (no regular files to upload): not a failure.
                 // Pushing an empty snapshot would clobber the last good server
                 // copy, so we skip exactly like the up-front empty-folder guard.
@@ -3622,6 +3656,9 @@ async fn run_backup_with_retry(
                             "agent: nothing to back up and this save has never had a snapshot — \
                              the tracked folder is probably not where the game saves"
                         );
+                        // El aviso de arriba es para el humano que abre el log
+                        // de su máquina; éste es el que se puede contar.
+                        crate::telemetry::no_snapshots(&save.game_slug, &save.local_path);
                     } else {
                         tracing::info!(
                             save_id = %save.save_id,
@@ -3672,6 +3709,34 @@ async fn run_backup_with_retry(
                     });
                     return;
                 }
+                // 404 al subir: el servidor no conoce este `save_id`. Reintentar
+                // no lo va a resucitar —lo repara `library::reconcile_with_server`
+                // al arrancar el motor, re-apuntando la fila al id que el
+                // servidor tenga ahora— así que se asienta como los otros
+                // terminales. Sin este corte, una base rehecha deja al motor
+                // reintentando cada 600 s para siempre: 1.353 subidas fallidas
+                // en tres días en el caso de ago-2026.
+                let gone = e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<crate::api::ApiError>(),
+                        Some(crate::api::ApiError::NotFound)
+                    )
+                });
+                if gone {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        "agent: backup abandoned — the server doesn't know this save; it'll be re-linked on the next engine start"
+                    );
+                    let _ = done_tx.try_send(BackupDone {
+                        save_id: save.save_id.clone(),
+                        new_set_hash: None,
+                        committed: false,
+                        version_num: None,
+                        landed: false,
+                    });
+                    return;
+                }
                 // Per-save size cap (413 `save_too_large`): the upload can never
                 // succeed as-is, so retrying just burns the budget and spams the
                 // feed. Emit a dedicated, actionable event and settle (clear
@@ -3685,13 +3750,20 @@ async fn run_backup_with_retry(
                         _ => None,
                     });
                 if let Some(detail) = too_large {
+                    // El 413 no siempre es el tope de un plan: un self-hoster lo
+                    // recibe de su proxy (nginx trae 1 MB de `client_max_body_size`
+                    // por defecto) y ahí no hay plan ninguno. Se dice lo que se
+                    // sabe —`human()` ya distingue los dos casos— en vez de
+                    // afirmar un tope de plan de 0 bytes, que fue justo lo que
+                    // apareció en el log de un self-hoster en ago-2026.
                     tracing::warn!(
                         save_id = %save.save_id,
                         game_slug = %save.game_slug,
                         plan = %detail.plan,
                         limit_bytes = detail.limit_bytes,
                         actual_bytes = detail.actual_bytes,
-                        "agent: backup rejected — save exceeds the plan's per-save size cap"
+                        detail = %detail.human(),
+                        "agent: backup rejected — the server refused the upload as too large"
                     );
                     let _ = done_tx.try_send(BackupDone {
                         save_id: save.save_id.clone(),

@@ -10,7 +10,7 @@
    * non-functional while frozen.
    */
   import { _ } from "svelte-i18n";
-  import { AlertTriangle } from "lucide-svelte";
+  import { AlertTriangle } from "@lucide/svelte";
   import Button from "./Button.svelte";
   import { cloud, reactivateCloudAccount, logoutCloud } from "../stores/cloud";
   import { toastError } from "../stores/toasts";

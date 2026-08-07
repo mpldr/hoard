@@ -8,7 +8,7 @@
    * surfacing every step's input/output. The Tauri command is read-only —
    * nothing here writes to the detection cache or `state.json`.
    */
-  import { ArrowLeft, Search } from "lucide-svelte";
+  import { ArrowLeft, Search } from "@lucide/svelte";
   import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
 

@@ -169,6 +169,10 @@ impl S3Store {
             access_key_id: cfg.access_key_id.clone(),
             secret_access_key: cfg.secret_access_key.clone(),
             force_path_style: cfg.force_path_style,
+            // A self-hoster's endpoint can be anything from MinIO to an rclone
+            // bridge in front of a consumer drive, so speak the plainest S3
+            // possible here (see `S3::connect`).
+            compat: true,
         })
         .await?;
         Ok(Self {
@@ -185,19 +189,55 @@ impl S3Store {
         }
     }
 
-    /// Fail-fast reachability/writability check: PUT then DELETE a tiny probe
-    /// object. Run once at startup so a misconfigured bucket surfaces before
-    /// the first user upload rather than as a 500 mid-sync.
+    /// Fail-fast check, run once at startup: store a probe object *the same way
+    /// a blob is stored* (streaming PUT from a file on disk), read it back and
+    /// compare the bytes, then delete it.
+    ///
+    /// The round-trip is the point. A write-only probe passes on an endpoint
+    /// that mangles streaming bodies — the historical failure here was
+    /// `aws-chunked` framing being stored verbatim by `rclone serve s3`, which
+    /// corrupts every blob while the server logs nothing. Comparing bytes turns
+    /// that into a refusal to boot. Reading also proves the credentials can GET,
+    /// not just PUT, which restore needs.
     pub async fn probe(&self) -> Result<()> {
         let key = self.full_key(".hoard_write_probe");
-        self.inner
-            .put_object(&key, b"ok".to_vec())
+        // Big enough to cross the SDK's in-memory/streaming body split and to
+        // survive nothing but an exact round-trip; small enough to be free.
+        let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let staged = std::env::temp_dir().join(format!("hoard-s3-probe-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&staged, &payload)
             .await
-            .context("probe write failed")?;
+            .with_context(|| format!("probe: staging {}", staged.display()))?;
+
+        let result = self.probe_roundtrip(&key, &staged, &payload).await;
+        let _ = tokio::fs::remove_file(&staged).await;
+        // Leaving the probe object behind on a failed run is harmless; deleting
+        // it on the way out keeps the bucket clean when it worked.
+        let _ = self.inner.delete(&key).await;
+        result
+    }
+
+    async fn probe_roundtrip(&self, key: &str, staged: &Path, expected: &[u8]) -> Result<()> {
         self.inner
-            .delete(&key)
+            .put_file(key, staged)
             .await
-            .context("probe delete failed")?;
+            .context("probe write failed (check endpoint, bucket, credentials)")?;
+        let got = self
+            .inner
+            .get_object(key)
+            .await
+            .context("probe read-back failed (the credentials can write but not read?)")?;
+        if got != expected {
+            anyhow::bail!(
+                "probe read-back returned different bytes than were written \
+                 ({} bytes out, {} back). This endpoint is not storing uploads \
+                 verbatim — blobs written to it would be silently corrupt. If it \
+                 sits behind a proxy, check that the proxy isn't rewriting request \
+                 bodies.",
+                expected.len(),
+                got.len()
+            );
+        }
         Ok(())
     }
 }
@@ -277,6 +317,51 @@ pub async fn build_store(cfg: &crate::config::Config) -> Result<Arc<dyn BlobStor
     build_backend(cfg, cfg.storage.backend).await
 }
 
+/// Startup guard (self-host): datos en disco pero **base vacía**.
+///
+/// El inverso de [`sanity_check`], y el que muerde de verdad. Si el `data_dir`
+/// tiene contenido de un despliegue anterior pero la base no tiene ni un
+/// usuario, la base se ha perdido: casi siempre un `docker compose` sin volumen
+/// persistente para `/var/lib/hoard`, o un `down -v`. El servidor arrancaba tan
+/// contento —migraciones "aplicadas" sobre una base recién creada— y el
+/// operador se enteraba cuando su cliente no podía loguear, con los snapshots
+/// intactos al lado. Reportado en ago-2026: un self-hoster actualizó, perdió
+/// usuarios y clientes, y tuvo que recrearlo todo a mano.
+///
+/// Arrancar así no es recuperable desde el cliente: los `save_id` que guarda
+/// cada máquina ya no existen aquí, y sus subidas responden 404 para siempre.
+/// Mejor negarse a servir y decirlo.
+pub async fn guard_against_lost_database(
+    pool: &sqlx::SqlitePool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(pool)
+        .await?;
+    if users > 0 {
+        return Ok(());
+    }
+    // Sin usuarios: ¿hay rastro de un despliegue anterior en disco? `blobs/` y
+    // `chunks/` son del almacén local; `snapshots/` es del layout legacy.
+    let leftovers = ["blobs", "chunks", "snapshots"]
+        .iter()
+        .filter(|d| std::fs::read_dir(data_dir.join(d)).is_ok_and(|mut r| r.next().is_some()))
+        .count();
+    if leftovers == 0 {
+        // Instalación nueva de verdad: nada que proteger.
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to start: the database has no users, but {} holds data from a previous \
+         deployment. The database was lost, not the storage — almost always a container \
+         recreated without a persistent volume for the data directory (or a `docker compose \
+         down -v`). Starting anyway would look healthy while every client gets 404s for save \
+         ids this database has never seen. Restore the database file, or move the leftover \
+         data aside if you really mean to start fresh.",
+        data_dir.display()
+    )
+}
+
 /// Startup guard (self-host): if the DB references content-addressed objects
 /// but the active store holds none of a random sample, the operator almost
 /// certainly flipped `[storage] backend` without running the migration. Fail
@@ -336,6 +421,49 @@ pub async fn sanity_check(pool: &sqlx::SqlitePool, store: &Arc<dyn BlobStore>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mem_pool() -> sqlx::SqlitePool {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .pragma("foreign_keys", "ON");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// El caso que se llevó por delante el despliegue de un self-hoster: base
+    /// recién creada (cero usuarios) junto a un `data_dir` lleno del despliegue
+    /// anterior. Arrancar así se ve sano y deja 404 eternos a todos sus
+    /// clientes, así que el arranque tiene que negarse.
+    #[tokio::test]
+    async fn refuses_to_boot_with_an_empty_database_next_to_leftover_data() {
+        let pool = mem_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Instalación nueva de verdad: sin usuarios y sin datos. Debe pasar —
+        // un falso positivo aquí rompería CADA primer arranque.
+        guard_against_lost_database(&pool, tmp.path())
+            .await
+            .expect("una instalación nueva tiene que arrancar");
+
+        // Ahora con restos de blobs y sin usuarios: la base se perdió.
+        std::fs::create_dir_all(tmp.path().join("blobs/user-1/ab")).unwrap();
+        std::fs::write(tmp.path().join("blobs/user-1/ab/abcd"), b"x").unwrap();
+        let err = guard_against_lost_database(&pool, tmp.path())
+            .await
+            .expect_err("base vacía + datos en disco tiene que abortar");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no users") && msg.contains("previous deployment"),
+            "el mensaje debe nombrar el problema: {msg}"
+        );
+    }
 
     #[test]
     fn key_scheme_matches_disk_layout() {

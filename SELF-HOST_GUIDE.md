@@ -39,14 +39,46 @@ Upgrade later with `sudo hoard-server upgrade`: it swaps the binary
 atomically and prints the `systemctl restart` step (it won't restart the
 service itself, so an in-flight sync isn't killed).
 
+### Behind a reverse proxy
+
+`hoard-server` has no TLS, so most people put nginx, Caddy or a Cloudflare
+tunnel in front of it. **Two proxy defaults will break syncing** and the
+symptoms don't look like proxy problems:
+
+- **Upload body size.** nginx allows 1 MB by default, and every save bigger
+  than that gets a `413` before it ever reaches Hoard. The app can only report
+  what it's told, so the backup shows up as rejected for size.
+- **Timeouts.** A big restore or upload that runs past `proxy_read_timeout`
+  (60 s by default) is cut off mid-transfer and surfaces as a `502` with an
+  HTML body — HTML that Hoard never emits.
+
+nginx:
+
+```nginx
+client_max_body_size 4G;
+proxy_read_timeout   600s;
+proxy_send_timeout   600s;
+proxy_request_buffering off;   # stream uploads instead of spooling to disk
+```
+
+Caddy needs neither (no body cap, and it streams by default). A Cloudflare
+proxied hostname caps request bodies at 100 MB on the free plan regardless of
+your own config — if any of your saves are bigger, use a tunnel to a hostname
+that isn't proxied, or connect over your LAN/VPN.
+
 ## External storage (S3-compatible)
 
 By default the server keeps every blob on local disk under `data_dir`. You can
 instead point it at any **S3-compatible** bucket — MinIO, Backblaze B2,
-Cloudflare R2, Garage, Wasabi, or `rclone serve s3` fronting Mega / Dropbox /
-Google Drive — by adding a `[storage.s3]` block. Nothing else changes: the
-client never talks to the bucket, there are no presigned URLs, and the upgrade
-is zero-config for existing installs (omit the block and you stay on disk).
+Cloudflare R2, Garage, Wasabi — by adding a `[storage.s3]` block. Consumer
+drives that don't speak S3 at all (OneDrive, Mega, Google Drive, Dropbox,
+pCloud, Proton Drive…) work through an `rclone serve s3` bridge; that's a
+[section of its own](#consumer-cloud-drives-onedrive-mega-drive-dropbox-)
+because it has real trade-offs.
+
+Nothing else changes: the client never talks to the bucket, there are no
+presigned URLs, and the upgrade is zero-config for existing installs (omit the
+block and you stay on disk).
 
 Important: **the server is still required.** It owns the SQLite index, the auth
 tokens and the deduplication — the bucket only holds opaque zstd blob/chunk
@@ -81,34 +113,182 @@ secret_access_key = "change-me-please"
 force_path_style = true          # MinIO / Garage / rclone require this
 ```
 
-On boot the server writes and deletes a probe object; a bad endpoint, bucket or
-credential fails fast with a clear message instead of erroring mid-sync.
+On boot the server writes a probe object, reads it back, compares the bytes and
+deletes it. A bad endpoint, bucket or credential — or one that doesn't store
+what it was sent — fails fast with a clear message instead of erroring
+mid-sync, or worse, corrupting quietly.
 
-### rclone serve s3 (Mega / Dropbox / Drive, …)
+### Consumer cloud drives (OneDrive, Mega, Drive, Dropbox, …)
 
-There is no native Mega/Dropbox/Drive integration — the server speaks S3 only.
-`rclone serve s3` bridges the gap: it exposes an S3 endpoint backed by any of
-rclone's ~70 remotes.
+There is no native OneDrive/Mega/Drive/Dropbox integration and there won't be:
+the server speaks S3 and nothing else. What bridges the gap is **`rclone serve
+s3`**, a small process you run next to the server that presents an S3 endpoint
+on localhost and forwards every object to any of rclone's ~70 remotes. Hoard
+sees a bucket; your drive sees a folder full of files.
+
+Read the [trade-offs](#is-this-a-good-idea) before you commit to it. If you
+have a real object store available (a €5 B2 bucket, a MinIO on your NAS), use
+that instead — this path exists because "I already pay for 1 TB of OneDrive"
+is a perfectly good reason.
+
+#### 1. Install rclone and connect your drive
 
 ```sh
-# assuming you've already `rclone config`d a remote called `mega:`
-rclone serve s3 mega:hoard \
-  --auth-key hoardkey,hoardsecret \
-  --addr 127.0.0.1:9100
+sudo -v ; curl https://rclone.org/install.sh | sudo bash
+sudo -u hoard -H rclone config          # run it as the user the server runs as
 ```
 
+`rclone config` is an interactive wizard: `n` for a new remote, name it
+`drive`, pick your provider from the list, accept the defaults, and say **no**
+to "Use auto config" if the server is headless — it prints a URL you open on
+your laptop, and you paste the token back. Provider-specific notes:
+
+| Provider | `rclone config` type | Notes |
+|---|---|---|
+| OneDrive | `onedrive` | Choose `OneDrive Personal or Business`; the wizard then lists your drives. |
+| Mega | `mega` | User + password, no OAuth dance. Enable 2FA-free app access. |
+| Google Drive | `drive` | Ask for a full-access scope (`1`), otherwise the server can't delete during GC. |
+| Dropbox | `dropbox` | Default scopes are fine. |
+| pCloud / Proton / Koofr / … | see `rclone config` | Anything in [rclone's list](https://rclone.org/overview/) works the same way. |
+
+Verify the remote and create the folder that will act as the bucket:
+
+```sh
+sudo -u hoard -H rclone lsd drive:            # should list your drive's folders
+sudo -u hoard -H rclone mkdir drive:hoard     # this folder *is* the bucket
+```
+
+#### 2. Run the bridge as a service
+
+`rclone serve s3` must be up before the server and stay up; run it under
+systemd, not in a terminal. `/etc/systemd/system/rclone-hoard-s3.service`:
+
+```ini
+[Unit]
+Description=rclone S3 bridge for Hoard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hoard
+Group=hoard
+ExecStart=/usr/bin/rclone serve s3 drive:hoard \
+  --addr 127.0.0.1:9100 \
+  --auth-key hoardkey,CHANGE-ME-please \
+  --force-path-style \
+  --vfs-cache-mode writes \
+  --vfs-cache-max-size 4G \
+  --cache-dir /var/lib/hoard/rclone-cache \
+  --log-level NOTICE
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo mkdir -p /var/lib/hoard/rclone-cache && sudo chown hoard: /var/lib/hoard/rclone-cache
+sudo systemctl enable --now rclone-hoard-s3
+sudo systemctl status rclone-hoard-s3
+```
+
+What the flags are doing, since each one is load-bearing:
+
+- `--addr 127.0.0.1:9100` — **loopback only**. The bridge has no TLS and one
+  static key pair; it must not be reachable from the network.
+- `--auth-key id,secret` — invent both, they're only shared with the server. If
+  you omit the flag rclone allows *anonymous* access to your drive. Don't.
+- `--force-path-style` — the addressing Hoard uses (it's rclone's default too,
+  spelled out here so a config edit can't silently flip it).
+- `--vfs-cache-mode writes` + `--vfs-cache-max-size` — stage uploads on local
+  disk and push them to the drive in the background. Without it every upload
+  runs at your drive's write speed with the server waiting on it. The trade-off
+  is honest: a blob is "stored" from Hoard's point of view when rclone has it,
+  so a machine that dies with a full cache loses whatever hadn't been pushed
+  yet. Drop the two flags if you'd rather be slow than sorry.
+
+Also make the server wait for the bridge — add to
+`/etc/systemd/system/hoard-server.service.d/rclone.conf`:
+
+```ini
+[Unit]
+After=rclone-hoard-s3.service
+Wants=rclone-hoard-s3.service
+```
+
+#### 3. Point Hoard at it
+
 ```toml
+[storage]
+data_dir = "/var/lib/hoard"     # still holds the DB, tmp staging and the cache
+backend  = "s3"
+
 [storage.s3]
 endpoint = "http://127.0.0.1:9100"
-bucket = "hoard"                 # a path inside the rclone remote
+bucket = "hoard"                 # the folder you created inside the remote
+region = ""
 access_key_id = "hoardkey"
-secret_access_key = "hoardsecret"
+secret_access_key = "CHANGE-ME-please"
 force_path_style = true
 ```
 
-Object-storage backends behind a cloud drive are slower and rate-limited; keep
-them on the same host/LAN as the server and expect restores to stream at the
-remote's pace.
+#### 4. Check it before you trust it with saves
+
+```sh
+sudo -u hoard hoard-admin --config /etc/hoard/config.toml storage status
+```
+
+The last line must read `Reachability : ok (write+read+delete probe passed)`.
+That probe writes an object, **reads it back and compares the bytes**, then
+deletes it — a bridge that mangles uploads fails here instead of months later
+at restore. The server runs the same probe at boot and refuses to start if it
+fails, so a red status is not something to work around.
+
+Then do a real round-trip: back up a save from the app, delete it locally,
+restore it. And once you have a few versions stored:
+
+```sh
+sudo -u hoard hoard-admin --config /etc/hoard/config.toml storage verify --all
+```
+
+which re-downloads every object and checks it still hashes to its key.
+
+#### Is this a good idea?
+
+Sometimes. What you're getting is a drive with no object-storage semantics
+pretending to be one, so:
+
+- **Slow, and rate-limited.** Every blob is a file operation against a consumer
+  API. OneDrive throttles, Drive caps uploads around 750 GB/day, Mega meters
+  bandwidth. A first backup of a large library takes hours; restores stream at
+  whatever the drive gives you. Keep the bridge on the same machine as the
+  server — LAN, never WAN.
+- **`rclone serve s3` is marked experimental by rclone itself.** It has been
+  stable enough in practice, but that's the ground you're standing on.
+- **Your drive alone is not a backup of your saves.** The folder holds opaque
+  zstd blobs named by hash; the mapping from saves and versions to those bytes
+  lives only in the server's SQLite DB. Copy `data_dir/hoard.db` somewhere
+  safe on a schedule (`sqlite3 hoard.db ".backup /path/hoard.db.bak"` is
+  consistent against a running server) or the blobs are unreadable bytes.
+- **You still need local disk.** The DB, upload staging and the rclone cache
+  all live under `data_dir`. Restores spool one blob (or one 4 MiB chunk of a
+  large file) at a time, so scratch space stays small — but it isn't zero.
+- **Don't let a desktop sync client near that folder.** The OneDrive/Dropbox
+  app syncing the same directory the bridge writes to is how you get partial
+  files and conflict copies. Give the bridge its own folder and leave it alone.
+
+What you get in exchange: the server stops growing, and its disk holds a
+database instead of every version of every save.
+
+#### Any other S3 endpoint
+
+The same `[storage.s3]` block points at anything that speaks S3. Hoard talks a
+deliberately plain dialect — no flexible checksums, no `aws-chunked` bodies, no
+presigned URLs, and one plain PUT per object (files above 128 MB are split into
+chunks before they reach the backend, so multipart never comes up in practice)
+— which is why older MinIO builds, Backblaze B2, Ceph RGW, Garage, SeaweedFS
+and friends work without special-casing.
 
 ### Migrating between storage backends
 

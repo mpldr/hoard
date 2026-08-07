@@ -5,6 +5,7 @@ pub mod cloud;
 pub mod config;
 pub mod daemon;
 pub mod games;
+pub mod install;
 pub mod launch;
 pub mod link;
 pub mod restore;

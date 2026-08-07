@@ -8,8 +8,14 @@
 #     HOARD__CLOUD__SUPABASE_JWKS_URL=... \
 #     HOARD__CLOUD__R2__ACCESS_KEY_ID=... \
 #     HOARD__CLOUD__R2__SECRET_ACCESS_KEY=... \
-#     HOARD__CLOUD__LEMONSQUEEZY__WEBHOOK_SECRET=... \
-#     HOARD__CLOUD__LEMONSQUEEZY__API_KEY=...
+#     HOARD__CLOUD__POLAR__WEBHOOK_SECRET=... \
+#     HOARD__CLOUD__POLAR__ACCESS_TOKEN=...
+#
+# Billing is Polar (Merchant of Record, Stripe underneath) and nothing else.
+# The deployed app still carries three `HOARD__CLOUD__LEMONSQUEEZY__*`
+# secrets from the pre-Polar era; no config field reads them, so they are
+# inert credentials sitting in the deployment — `fly secrets unset` them and
+# revoke the key on the LS side.
 #   fly deploy --dockerfile deploy/fly/Dockerfile
 
 app = "hoard-server"
@@ -62,9 +68,10 @@ kill_timeout = "10s"
   cpus = 1
   memory_mb = 512
 
-# Autoscaling: 1-3 machines. Fly's "auto_stop" idles to zero on quiet hours;
-# `min_machines_running = 1` keeps one warm so the first user request after
-# a quiet patch doesn't pay the cold-start cost.
+# Rolling deploys across the app's machines. Note this says nothing about
+# how many stay up — that's `min_machines_running` above, which is 0. An
+# earlier version of this comment claimed one machine is kept warm; it is
+# not, and believing it hid a machine that sat started for 16 days.
 [deploy]
   strategy = "rolling"
   max_unavailable = 0.3

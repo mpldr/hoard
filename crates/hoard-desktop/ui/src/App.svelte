@@ -1,5 +1,9 @@
 <script lang="ts">
-  import Router, { push, replace, location } from "svelte-spa-router";
+  // svelte-spa-router 5 retiró los stores `location`/`querystring`/`params` y
+  // los sustituyó por el objeto `router`, que es estado con runas: leer
+  // `router.location` dentro de un `$derived`/`$effect`/markup ya es reactivo,
+  // sin `$` de suscripción.
+  import Router, { push, replace, router } from "svelte-spa-router";
   import { onMount, onDestroy } from "svelte";
   import { fly } from "svelte/transition";
   import {
@@ -19,7 +23,7 @@
     Lock,
     Bell,
     Eye,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   // Las rutas se cargan bajo demanda. Importarlas de forma estática metía las
@@ -45,6 +49,7 @@
   const loadAccount = () => import("./routes/Account.svelte");
   const loadHoardScreen = () => import("./routes/HoardScreen.svelte");
   const loadHoardWrapped = () => import("./routes/HoardWrapped.svelte");
+  const loadPro = () => import("./routes/Pro.svelte");
 
   /** Azúcar para no repetir el `loadingComponent` en cada ruta. */
   const lazy = (asyncComponent: () => Promise<unknown>) =>
@@ -81,7 +86,6 @@ import { tilt } from "./lib/actions/tilt";
     hydrateCloud,
     initCloudDeepLink,
     initCloudSessionWatch,
-    openUpgradePage,
     planLabel,
   } from "./lib/stores/cloud";
   import {
@@ -90,6 +94,7 @@ import { tilt } from "./lib/actions/tilt";
   } from "./lib/stores/automatic";
   import { toastInfo, toastSuccess } from "./lib/stores/toasts";
   import { prefs, hydratePrefs } from "./lib/stores/prefs";
+  import { initGameOverlay } from "./lib/stores/gameOverlay";
   import { hydrateCardSizes } from "./lib/stores/cardSizes.svelte";
   import {
     entitlements,
@@ -139,6 +144,9 @@ import { tilt } from "./lib/actions/tilt";
     // themselves are reachable so an unlocked user lands on the empty state).
     "/hoard-screen": lazy(loadHoardScreen),
     "/hoard-wrapped": lazy(loadHoardWrapped),
+    // Destino de todo candado. Vive dentro de la aplicación a propósito:
+    // antes estos botones abrían el navegador en la página de precios.
+    "/pro": lazy(loadPro),
   };
 
   let booted = $state(false);
@@ -196,12 +204,12 @@ import { tilt } from "./lib/actions/tilt";
   );
   $effect(() => {
     const sig = tourSig;
-    const loc = $location;
+    const loc = router.location;
     if (!booted || !sig || sig === lastSigChecked) return;
     // El tour es "post-onboarding": no lo arranques mientras el wizard sigue en
     // pantalla (la sesión ya existe desde el paso `token`, pero aún falta elegir
     // el modo en `done`). Espera a que `finish()` navegue a una ruta de app; al
-    // depender de `$location`, este efecto vuelve a evaluarse tras esa navegación.
+    // depender de `router.location`, este efecto vuelve a evaluarse tras esa navegación.
     if (loc.startsWith("/onboarding")) return;
     lastSigChecked = sig;
     void loadTourSeen().then((seen) => {
@@ -259,7 +267,7 @@ import { tilt } from "./lib/actions/tilt";
   // same WAAPI surface as the tour — no library, no remount — so route state
   // (scroll, focus, onMount fetches) survives.
   $effect(() => {
-    $location;
+    router.location;
     if (!booted || showTour) return;
     const reduce = window.matchMedia?.(
       "(prefers-reduced-motion: reduce)",
@@ -460,6 +468,12 @@ import { tilt } from "./lib/actions/tilt";
       toastInfo($_("account.session_expired"));
       if (!$auth.user) replace("/onboarding/language");
     });
+
+    // Atajo global del HUD sobre el juego (Alt+H de fábrica). Se registra
+    // desde la ventana principal porque sigue viva aunque esté en la bandeja,
+    // que es justo cuando hace falta: con el juego delante no hay ventana a la
+    // que volver.
+    initGameOverlay();
 
     // Register the Tauri listeners exactly once for the lifetime of this
     // app instance. Modo Automático's detect/track/sweep work runs entirely in
@@ -667,12 +681,14 @@ import { tilt } from "./lib/actions/tilt";
   // Click on a locked premium item. A signed-in cloud user is sent to the
   // pricing page to upgrade; a self-hosted / signed-out user is sent to
   // /account to sign in to Hoard Cloud first (no plan to upgrade yet).
-  function openPremiumUpsell() {
-    if ($cloud.account) {
-      void openUpgradePage("pro");
-    } else {
-      push("/account");
-    }
+  // Un elemento con candado lleva SIEMPRE a la pantalla `/pro`, tenga sesión
+  // o no: allí se explica qué es Pro y, si hace falta entrar primero o queda
+  // una prueba sin estrenar, se ofrece eso antes que el pago. Antes esto
+  // abría `hoard.services/pricing` en el navegador del sistema en cuanto
+  // había sesión — pulsar un elemento del menú te echaba de la aplicación.
+  // `feature` sólo sirve para que la pantalla nombre lo que ibas a abrir.
+  function openPremiumUpsell(feature: FeatureKey) {
+    push(`/pro?feature=${feature}`);
   }
 
   // First entry is the account button: "Iniciar sesión" with no cloud
@@ -719,9 +735,10 @@ import { tilt } from "./lib/actions/tilt";
     "/account",
     "/hoard-screen",
     "/hoard-wrapped",
+    "/pro",
   ];
   const isAppRoute = $derived(
-    APP_ROUTE_PREFIXES.some((p) => $location.startsWith(p)),
+    APP_ROUTE_PREFIXES.some((p) => router.location.startsWith(p)),
   );
 
   // First letter for the avatar fallback when the cloud account has no
@@ -809,7 +826,7 @@ import { tilt } from "./lib/actions/tilt";
       <!-- Shared button markup for top-level links and indented group
            children, so the two render paths can't drift apart. -->
 {#snippet navLink(item: NavLink, indented: boolean)}
-        {@const active = $location === item.route}
+        {@const active = router.location === item.route}
           <button
             type="button"
             data-tour-route={item.route}
@@ -831,7 +848,7 @@ import { tilt } from "./lib/actions/tilt";
           {#if entry.kind === "link"}
             {@render navLink(entry, false)}
           {:else if entry.kind === "feature"}
-            {@const active = $location === entry.route}
+            {@const active = router.location === entry.route}
             <!-- The per-feature server entitlement decides; `PRO_DEV_UNLOCK` is
                  the owner's local test override, never set in public builds.
                  `trial_available` stays navigable: the trial only starts when
@@ -870,7 +887,7 @@ import { tilt } from "./lib/actions/tilt";
                 title={$cloud.account
                   ? $_("nav.locked_pro")
                   : $_("nav.locked_signin")}
-                onclick={openPremiumUpsell}
+                onclick={() => openPremiumUpsell(entry.feature)}
                 class="group flex w-full items-center gap-3 rounded-md border-l-2 border-transparent px-3 py-2 text-sm text-zinc-500 transition-colors duration-150 hover:bg-zinc-800/40 hover:text-zinc-300"
               >
                 <entry.icon size={18} class="opacity-70" />
@@ -882,7 +899,7 @@ import { tilt } from "./lib/actions/tilt";
             <!-- A child on the active route forces the group open even if the
                  user had collapsed it, so the highlight is never hidden. -->
             {@const childActive = entry.children.some(
-              (c) => $location === c.route,
+              (c) => router.location === c.route,
             )}
             {@const open = savesOpen || childActive}
             <button
@@ -963,7 +980,7 @@ import { tilt } from "./lib/actions/tilt";
               {#if $cloud.account.plan === "free"}
                 <button
                   type="button"
-                  onclick={() => openUpgradePage("pro")}
+                  onclick={() => push("/pro")}
                   class="flex shrink-0 items-center gap-1 rounded-md bg-gradient-to-r from-emerald-400 to-teal-400 px-2.5 py-2 text-[11px] font-semibold text-emerald-950 shadow-sm shadow-emerald-500/30 transition-all hover:from-emerald-300 hover:to-teal-300 hover:shadow-emerald-500/50"
                   title={$_("sidebar.upgrade_tooltip")}
                 >

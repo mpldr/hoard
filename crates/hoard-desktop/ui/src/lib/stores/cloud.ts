@@ -337,7 +337,7 @@ export async function reactivateCloudAccount(): Promise<CloudAccount> {
 
 /** Open the public pricing page in the browser, where the checkout buttons
  *  live. There is no `/upgrade` route on the site (it 404'd); `/pricing` is
- *  the page that links to the Lemon Squeezy hosted checkout. The optional
+ *  the page that links to the Polar hosted checkout. The optional
  *  `plan` is kept for future deep-linking but `/pricing` ignores it today. */
 export async function openUpgradePage(plan?: "pro"): Promise<void> {
   const base = "https://hoard.services";
@@ -346,7 +346,7 @@ export async function openUpgradePage(plan?: "pro"): Promise<void> {
 }
 
 /** Open the web account page, which exposes the customer portal link
- *  (Lemon Squeezy). The old `/billing` route didn't exist. */
+ *  (Polar). The old `/billing` route didn't exist. */
 export async function openBillingPortal(): Promise<void> {
   const base = "https://hoard.services";
   await openExternal(`${base}/account`);

@@ -41,6 +41,25 @@ pub struct EmptySource {
     pub path: PathBuf,
 }
 
+/// La carpeta rastreada no puede ser la de un juego: un perfil entero, una raíz
+/// de sistema, un prefijo de Wine/Proton completo.
+///
+/// Existe porque la guarda estructural sólo corría **al dar de alta** (alta
+/// manual, adopción, re-apuntar). Una fila envenenada de antes de que la guarda
+/// existiera —o de una vía de alta que se olvidó de validar— no volvía a pasar
+/// por ahí nunca, y seguía subiendo. Reportado en ago-2026: una Steam Deck
+/// subiendo `steamapps/compatdata/423230/pfx`, el prefijo entero, 308 MB, para
+/// una partida de unos KB.
+///
+/// Se comprueba en el camino del backup, antes de tocar el disco, para que
+/// cubra a la vez lo viejo y cualquier alta futura que no valide.
+#[derive(Debug, thiserror::Error)]
+#[error("refusing to back up {path}: {reason}. Pick the game's own save folder inside it.")]
+pub struct UnsafeSource {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// One file enumerated from the source directory.
 #[derive(Debug, Clone)]
 pub struct UploadFile {
@@ -397,11 +416,35 @@ where
     let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
     let file_count = files.len();
 
+    // Elegir protocolo exige SABER cuál habla el servidor, no suponerlo.
+    // `is_cloud()` colapsa "self-hosted" y "la sonda de `/v1/health` falló" en
+    // el mismo `false` — cómodo para un adorno de UI, veneno aquí: con la sonda
+    // caída se toma la rama self-hosted y se sube contra
+    // `/v1/saves/:id/snapshots`, que en cloud **no existe**. El usuario ve
+    // «uploading snapshot: not found (404)» y se va a buscar un save borrado
+    // que está perfectamente. Reportado ago-2026, y el disparador es de lo más
+    // corriente: la máquina de Fly se apaga por inactividad y la sonda pilla el
+    // arranque en frío.
+    //
+    // Sin sonda resuelta no se elige: se falla como lo que es —el servidor no
+    // está localizable— y el backoff de siempre lo reintenta.
+    //
+    // Las dos llamadas hacen falta y no son redundantes: `server_mode()` es
+    // quien **sondea y cachea** (su propio `None` es igual de ambiguo, porque
+    // se traga el error), y `probed_is_cloud()` es quien luego da la respuesta
+    // honesta — sólo devuelve `Some` si hubo una sonda con éxito.
+    let _ = client.server_mode().await;
+    let Some(is_cloud) = client.probed_is_cloud() else {
+        bail!(
+            "can't tell which protocol this server speaks yet (the /v1/health probe hasn't \
+             succeeded). Not guessing: uploading with the wrong one fails as a misleading 404."
+        );
+    };
     // Hoard Cloud (api.hoard.services) speaks a different protocol: the
     // self-hosted `/v1/saves/:id/snapshots` multipart endpoint doesn't exist
     // there. Pack the save into a single tar.zst, declare the upload, PUT the
     // bytes straight to R2 via a presigned URL, then commit.
-    if client.is_cloud().await {
+    if is_cloud {
         return upload_directory_cloud(
             client,
             save_id,
@@ -428,6 +471,13 @@ where
     // (another device advanced this save since we last synced).
     if let Some(b) = base_version {
         form = form.text("base_version", b.to_string());
+    }
+    // Quién sube. La columna existe desde el primer día y el server la guarda y
+    // la devuelve; lo que faltaba era que alguien la rellenara, así que el
+    // historial no podía distinguir dos máquinas sincronizando la misma
+    // partida.
+    if let Some(device) = crate::logship::device_name() {
+        form = form.text("device_name", device);
     }
     progress(0, total_bytes);
 
@@ -613,7 +663,7 @@ where
                 save_id: save_id.to_string(),
                 game_slug: game_slug.to_string(),
                 label: Some(label.to_string()),
-                device_name: None,
+                device_name: crate::logship::device_name(),
                 notes: None,
                 backup_only: false,
                 base_version,
@@ -720,11 +770,29 @@ where
         let progress = &progress;
         put_futs.push(
             async move {
-                let body = file_to_body(&f.absolute_path).await?;
+                let file = tokio::fs::File::open(&f.absolute_path)
+                    .await
+                    .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                let (stream, sent) = hashing_stream(file);
                 client
-                    .put_presigned(&blob.upload, body, f.size_bytes)
+                    .put_presigned(
+                        &blob.upload,
+                        reqwest::Body::wrap_stream(stream),
+                        f.size_bytes,
+                    )
                     .await
                     .with_context(|| format!("uploading {}", f.relative_path))?;
+                // El objeto ya está en el bucket, pero **sin commit no existe
+                // para nadie**: la fila de `cloud_blobs` se crea al confirmar la
+                // versión, y el dedup del servidor mira esa tabla, no el bucket.
+                // Así que abortar aquí deja el objeto huérfano (lo barre el GC) y
+                // el intento siguiente lo vuelve a pedir y lo sobreescribe con el
+                // contenido bueno. Lo que no puede pasar —y es lo que pasaba— es
+                // que se confirme una versión que apunta a bytes que no son.
+                {
+                    let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
+                    verify_sent(&f.relative_path, &blob.sha256, f.size_bytes, &sent)?;
+                }
                 let done = uploaded.fetch_add(f.size_bytes, Ordering::Relaxed) + f.size_bytes;
                 progress(done, denom);
                 Ok::<_, anyhow::Error>(())
@@ -768,7 +836,7 @@ where
         save_id: SaveId::parse(&commit.save_id).ok(),
         version_num: commit.version_num,
         parent_version: base_version,
-        device_name: None,
+        device_name: crate::logship::device_name(),
         notes: None,
         file_count: file_count as i64,
         total_size_bytes: total_bytes as i64,
@@ -801,7 +869,7 @@ fn landed_snapshot(
         save_id: SaveId::parse(save_id).ok(),
         version_num: head.version_num,
         parent_version: None,
-        device_name: None,
+        device_name: crate::logship::device_name(),
         notes: None,
         file_count: file_count as i64,
         total_size_bytes: total_bytes as i64,
@@ -839,12 +907,70 @@ pub(crate) async fn hash_file(path: &Path) -> Result<String> {
 }
 
 /// Wrap a file as a streaming reqwest body for the presigned PUT.
-async fn file_to_body(path: &Path) -> Result<reqwest::Body> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening {}", path.display()))?;
-    let stream = tokio_util::io::ReaderStream::new(file);
-    Ok(reqwest::Body::wrap_stream(stream))
+/// Lo que de verdad salió por el socket en un PUT.
+#[derive(Default)]
+pub(crate) struct Sent {
+    digest: Sha256,
+    len: u64,
+}
+
+impl Sent {
+    fn sha256(&self) -> String {
+        hex::encode(self.digest.clone().finalize())
+    }
+}
+
+/// El fichero como stream, hasheando **lo que se manda** en vez de confiar en
+/// lo que se leyó antes.
+///
+/// El hash y el PUT son dos lecturas distintas del mismo fichero, y entre las
+/// dos el juego puede haber rotado el save (`save` → `save.bak`, y un `save`
+/// nuevo en su sitio: es el patrón normal de autoguardado). Cuando eso pasa, al
+/// bucket se suben los bytes NUEVOS bajo el sha de los VIEJOS: un blob cuyo
+/// contenido no es el que su nombre promete. Restaurarlo devuelve otra partida
+/// —o basura—, y nada en el camino se queja. Es la única corrupción silenciosa
+/// que hemos encontrado (ago-2026, ~1,7% de la población en riesgo).
+///
+/// Hasheando el propio stream, después del PUT se puede comprobar. Ver
+/// [`verify_sent`] para qué se hace con el veredicto.
+fn hashing_stream(
+    file: tokio::fs::File,
+) -> (
+    impl futures::Stream<Item = std::io::Result<bytes::Bytes>>,
+    std::sync::Arc<std::sync::Mutex<Sent>>,
+) {
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Sent::default()));
+    let tap = sent.clone();
+    let stream = tokio_util::io::ReaderStream::new(file).inspect_ok(move |chunk| {
+        if let Ok(mut s) = tap.lock() {
+            s.digest.update(chunk);
+            s.len += chunk.len() as u64;
+        }
+    });
+    (stream, sent)
+}
+
+/// ¿Lo que salió es lo que se declaró? Puro para poder probarlo sin red.
+///
+/// No basta con el tamaño: una rotación puede dejar un fichero del mismo largo.
+/// Manda el sha; el tamaño se comprueba también porque un desajuste ahí
+/// significa además que el `content-length` del PUT mintió.
+fn verify_sent(
+    relative_path: &str,
+    declared_sha: &str,
+    declared_len: u64,
+    sent: &Sent,
+) -> Result<()> {
+    let actual = sent.sha256();
+    if actual == declared_sha && sent.len == declared_len {
+        return Ok(());
+    }
+    bail!(
+        "{relative_path} changed while it was being uploaded \
+         (declared {declared_sha} / {declared_len} B, sent {actual} / {} B). \
+         Nothing is committed; the next backup will pick up the new contents.",
+        sent.len
+    )
 }
 
 /// Skip-aware wrapper around [`upload_directory`] (ADR 0019).
@@ -876,11 +1002,30 @@ where
     F: Fn(u64, u64) + Send + Sync,
     G: FnOnce(),
 {
+    // Antes de tocar el disco: una raíz imposible no se recorre. Recorrer un
+    // prefijo de Proton entero para descubrir que no había que subirlo cuesta
+    // justo lo que se quiere evitar.
+    if let Some(reason) = crate::junkdirs::dangerous_sync_root(source) {
+        return Err(UnsafeSource {
+            path: source.to_path_buf(),
+            reason,
+        }
+        .into());
+    }
     let canonical = source
         .canonicalize()
         .with_context(|| format!("source path does not exist: {}", source.display()))?;
     if !canonical.is_dir() && !canonical.is_file() {
         bail!("source must be a folder or a file: {}", canonical.display());
+    }
+    // Y otra vez sobre la ruta resuelta: un enlace simbólico inocente puede
+    // apuntar al perfil entero, y lo que se recorre es el destino.
+    if let Some(reason) = crate::junkdirs::dangerous_sync_root(&canonical) {
+        return Err(UnsafeSource {
+            path: canonical,
+            reason,
+        }
+        .into());
     }
     let files = walk_source(&canonical)?;
     if files.is_empty() {
@@ -998,6 +1143,76 @@ mod tests {
             size_bytes: size,
             modified: Some(UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs)),
         }
+    }
+
+    /// El stream que alimenta el PUT tiene que hashear **lo que manda**, no lo
+    /// que se leyó antes. Se comprueba contra `hash_file`, que es el hash que se
+    /// declara en el manifiesto: si los dos coinciden sobre el mismo fichero, la
+    /// comprobación posterior no puede dar falsos positivos.
+    #[tokio::test]
+    async fn the_upload_stream_hashes_exactly_what_it_sends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("save.dat");
+        // Más de un chunk de `ReaderStream` (8 KiB) para que el digest tenga que
+        // acumular de verdad.
+        let bytes: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let (stream, sent) = hashing_stream(file);
+        let drained: u64 = stream
+            .fold(0u64, |acc, chunk| async move {
+                acc + chunk.unwrap().len() as u64
+            })
+            .await;
+
+        // El hash del fichero se pide ANTES de coger el candado: sostenerlo a
+        // través de un `await` es lo que denuncia `clippy::await_holding_lock`,
+        // y la CI corre clippy con `-D warnings` sobre `--all-targets`.
+        let want = hash_file(&path).await.unwrap();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(drained, bytes.len() as u64);
+        assert_eq!(sent.len, bytes.len() as u64);
+        assert_eq!(sent.sha256(), want);
+        assert!(verify_sent("save.dat", &sent.sha256(), sent.len, &sent).is_ok());
+    }
+
+    /// La rotación, que es el caso real: se declara el sha del `save` viejo y
+    /// por el socket salen los bytes del nuevo. Antes de esto se confirmaba la
+    /// versión igual y el blob quedaba mintiendo sobre su contenido.
+    #[tokio::test]
+    async fn a_file_rotated_mid_upload_is_caught() {
+        let tmp = tempfile::tempdir().unwrap();
+        let viejo = tmp.path().join("viejo.dat");
+        let nuevo = tmp.path().join("nuevo.dat");
+        std::fs::write(&viejo, b"partida de ayer").unwrap();
+        // Mismo tamaño a propósito: el largo no basta como árbitro.
+        std::fs::write(&nuevo, b"partida de HOY!").unwrap();
+        let sha_viejo = hash_file(&viejo).await.unwrap();
+        let len = std::fs::metadata(&viejo).unwrap().len();
+        assert_ne!(sha_viejo, hash_file(&nuevo).await.unwrap());
+
+        // Se sube lo que hay ahora (el fichero rotado) bajo el sha declarado.
+        let file = tokio::fs::File::open(&nuevo).await.unwrap();
+        let (stream, sent) = hashing_stream(file);
+        stream.for_each(|_| async {}).await;
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len, len, "misma longitud: sólo el sha lo delata");
+        let err = verify_sent("save.dat", &sha_viejo, len, &sent).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed while it was being uploaded"),
+            "{err}"
+        );
+
+        // Y un tamaño distinto también se caza (fichero truncado a media subida).
+        let corto = Sent {
+            digest: Sha256::new(),
+            len: 3,
+        };
+        assert!(verify_sent("save.dat", &corto.sha256(), len, &corto).is_err());
     }
 
     #[test]
@@ -1148,6 +1363,77 @@ mod tests {
     /// plantillas que apuntan a un fichero. El snapshot sale con la misma
     /// forma que el de una carpeta con un fichero dentro, así que firma,
     /// dedup y restore siguen funcionando sin cambios.
+    /// La guarda del camino del backup: una raíz imposible se rechaza **antes**
+    /// de recorrer nada. Es el caso de la Steam Deck de ago-2026 — el save
+    /// apuntaba al prefijo de Proton entero (308 MB) y la guarda estructural
+    /// sólo corría al dar de alta, así que esa fila no volvía a pasar por ella.
+    ///
+    /// Se comprueba con una carpeta REAL y poblada: si el rechazo dependiera de
+    /// que la ruta no exista o esté vacía, este test pasaría por el motivo
+    /// equivocado.
+    #[tokio::test]
+    async fn a_whole_proton_prefix_is_refused_before_walking_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // …/compatdata/423230/pfx con contenido dentro, como el real.
+        let save_dir = tmp.path().join(
+            "steamapps/compatdata/423230/pfx/drive_c/users/steamuser/AppData/LocalLow/TheGameBakers/Furi",
+        );
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::fs::write(save_dir.join("algo.dat"), b"x").unwrap();
+        let prefix_root = tmp.path().join("steamapps/compatdata/423230/pfx");
+
+        let client = crate::api::ApiClient::new("http://127.0.0.1:1", "t").unwrap();
+        let err = upload_directory_checked(
+            &client,
+            "save-1",
+            "furi",
+            "main",
+            &prefix_root,
+            None,
+            None,
+            None,
+            |_, _| {},
+            || {},
+        )
+        .await
+        .expect_err("un prefijo entero no puede subirse");
+
+        let unsafe_src = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<UnsafeSource>())
+            .expect("debe ser UnsafeSource, no un error de red ni de walk");
+        assert!(
+            unsafe_src.reason.to_lowercase().contains("prefix"),
+            "el motivo debe nombrar el prefijo: {}",
+            unsafe_src.reason
+        );
+
+        // Y la carpeta buena DENTRO del prefijo no se rechaza aquí: fallará más
+        // adelante por no poder hablar con el servidor, que es otra cosa. Ojo
+        // al elegirla: `…/users/steamuser` NO vale como control, porque es un
+        // perfil entero y la guarda lo rechaza con toda la razón (las reglas de
+        // Windows se reusan dentro del prefijo). Tiene que ser la carpeta del
+        // juego de verdad.
+        let err = upload_directory_checked(
+            &client,
+            "save-1",
+            "furi",
+            "main",
+            &save_dir,
+            None,
+            None,
+            None,
+            |_, _| {},
+            || {},
+        )
+        .await
+        .expect_err("sin servidor, falla igual");
+        assert!(
+            !err.chain().any(|c| c.is::<UnsafeSource>()),
+            "la carpeta de dentro no puede rechazarse por forma: {err:#}"
+        );
+    }
+
     #[test]
     fn a_single_file_save_walks_to_one_entry_named_after_it() {
         let tmp = tempfile::tempdir().unwrap();

@@ -20,7 +20,7 @@
 import { derived, writable, type Writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type { AgentEvent } from "../api";
+import type { AgentEvent, CloudPulse, JournalRow } from "../api";
 
 /** Coarse local state. `armed` when at least one watcher slot is alive
  *  (any `watcher-armed` event seen in the session); `offline` until the
@@ -166,138 +166,142 @@ function pushEntry(
  *  Rust side on `agent://backlog`. */
 type BacklogRow = { at: number; event: AgentEvent };
 
+/** The feed row an engine event maps to, or `null` when it isn't feed material.
+ *
+ *  One mapping, two callers: the backlog replay below and {@link adoptJournal}.
+ *  They used to be one `switch` each, which is how two surfaces drift into
+ *  telling slightly different stories about the same event. The pair that only
+ *  exists as a *live* alias (`agent://throttled`) is deliberately absent —
+ *  "queued, waiting" is a momentary state, not history worth resurrecting. */
+function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
+  switch (p.type) {
+    case "game_started":
+      return { kind: "game_started", save_id: p.save_id, game_slug: p.game_slug };
+    case "game_stopped":
+      return { kind: "game_stopped", save_id: p.save_id, game_slug: p.game_slug };
+    case "backup_started":
+      return {
+        kind: "upload_started",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+      };
+    case "backup_success":
+      return {
+        kind: "upload_completed",
+        save_id: p.save_id,
+        version: p.version_num,
+        bytes: p.total_bytes,
+      };
+    case "backup_failed":
+      return {
+        kind: "upload_failed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        error: p.error,
+      };
+    case "backup_throttled":
+      return {
+        kind: "bandwidth_throttled",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        retry_in: p.retry_after_secs,
+      };
+    case "save_auto_restored":
+      return {
+        kind: "auto_restored",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        version: p.version_num,
+        bytes: p.bytes_extracted,
+      };
+    case "backup_too_large":
+      return {
+        kind: "backup_too_large",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        bytes: p.actual_bytes,
+        limit_bytes: p.limit_bytes,
+      };
+    case "backup_trimmed":
+      return {
+        kind: "backup_trimmed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.omitted_files,
+        bytes: p.omitted_bytes,
+      };
+    case "save_auto_restore_failed":
+      return {
+        kind: "auto_restore_failed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        error: p.error,
+      };
+    case "save_auto_restore_stuck":
+      return {
+        kind: "auto_restore_stuck",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        failures: p.failures,
+        error: p.error,
+      };
+    case "save_auto_restore_recovered":
+      return {
+        kind: "auto_restore_recovered",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+      };
+    default:
+      return null;
+  }
+}
+
 /** Rebuild feed rows from what the service journalled while nobody was
- *  listening — the app was closed, or we reconnected. Same mapping as the live
- *  listeners below; the pair that only exists as a *live* alias
- *  (`agent://throttled`) is deliberately left out, since "queued, waiting" is a
- *  momentary state and not history worth resurrecting.
+ *  listening — the app was closed, or we reconnected.
  *
  *  The feed is **not** cleared on `resync`: rows only ever arrive newer than
  *  our cursor, and it also holds rows from other sources (cloud pulls, gate
  *  flips) that a wipe would throw away. */
-function applyBacklogRow({ at, event: p }: BacklogRow) {
-  switch (p.type) {
-    case "game_started":
-      pushEntry(
-        { kind: "game_started", save_id: p.save_id, game_slug: p.game_slug },
-        at,
-      );
-      break;
-    case "game_stopped":
-      pushEntry(
-        { kind: "game_stopped", save_id: p.save_id, game_slug: p.game_slug },
-        at,
-      );
-      break;
-    case "backup_started":
-      pushEntry(
-        { kind: "upload_started", save_id: p.save_id, game_slug: p.game_slug },
-        at,
-      );
-      break;
-    case "backup_success":
-      pushEntry(
-        {
-          kind: "upload_completed",
-          save_id: p.save_id,
-          version: p.version_num,
-          bytes: p.total_bytes,
-        },
-        at,
-      );
-      break;
-    case "backup_failed":
-      pushEntry(
-        {
-          kind: "upload_failed",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          error: p.error,
-        },
-        at,
-      );
-      break;
-    case "backup_throttled":
-      pushEntry(
-        {
-          kind: "bandwidth_throttled",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          retry_in: p.retry_after_secs,
-        },
-        at,
-      );
-      break;
-    case "save_auto_restored":
-      pushEntry(
-        {
-          kind: "auto_restored",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          version: p.version_num,
-          bytes: p.bytes_extracted,
-        },
-        at,
-      );
-      break;
-    case "backup_too_large":
-      pushEntry(
-        {
-          kind: "backup_too_large",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          bytes: p.actual_bytes,
-          limit_bytes: p.limit_bytes,
-        },
-        at,
-      );
-      break;
-    case "backup_trimmed":
-      pushEntry(
-        {
-          kind: "backup_trimmed",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          count: p.omitted_files,
-          bytes: p.omitted_bytes,
-        },
-        at,
-      );
-      break;
-    case "save_auto_restore_failed":
-      pushEntry(
-        {
-          kind: "auto_restore_failed",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          error: p.error,
-        },
-        at,
-      );
-      break;
-    case "save_auto_restore_stuck":
-      pushEntry(
-        {
-          kind: "auto_restore_stuck",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-          failures: p.failures,
-          error: p.error,
-        },
-        at,
-      );
-      break;
-    case "save_auto_restore_recovered":
-      pushEntry(
-        {
-          kind: "auto_restore_recovered",
-          save_id: p.save_id,
-          game_slug: p.game_slug,
-        },
-        at,
-      );
-      break;
+function applyBacklogRow({ at, event }: BacklogRow) {
+  const row = feedRowFor(event);
+  if (row) pushEntry(row, at);
+}
+
+/** Replace the feed with a journal snapshot, wholesale.
+ *
+ *  This is the read-only path, for a surface that doesn't subscribe at all: it
+ *  asks Rust what the journal says and paints that. Replacing rather than
+ *  merging is the whole point — there is no cursor to keep, no gap to reason
+ *  about and no way to double-count a row, because the snapshot *is* the state.
+ *
+ *  `seq` becomes the row id, so re-reading the same journal yields the same
+ *  keys and Svelte reuses the DOM instead of rebuilding the list under the
+ *  user's eyes. */
+export function adoptJournal(rows: JournalRow[]): void {
+  const feed: FeedEntry[] = [];
+  // Newest first, like the live path prepends.
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const { seq, at, event } = rows[i];
+    const row = feedRowFor(event);
+    if (row) feed.push({ id: seq, at, ...row });
   }
+  if (feed.length > MAX_FEED_ENTRIES) feed.length = MAX_FEED_ENTRIES;
+  activityFeed.set(feed);
+}
+
+/** Adopt the cloud-loop state from a snapshot. Same reason as
+ *  {@link adoptJournal}: `agent://cloud-pull-completed` and friends are
+ *  momentary, so a window that wasn't listening when the last poll landed can
+ *  only learn the answer by asking. */
+export function adoptCloud(status: CloudPulse, retryIn: number | null): void {
+  cloudLoop.set({
+    status,
+    // El snapshot trae el estado, no *cuándo* fue: poner `Date.now()` aquí
+    // diría "acabo de comprobarlo" cada vez que alguien abre el HUD, que es
+    // justo la clase de mentira que este panel existe para no contar.
+    last_ok_at: null,
+    retry_in: retryIn,
+  });
 }
 
 /** Type for the `agent://watcher-armed` payload. Mirrors the Rust struct. */

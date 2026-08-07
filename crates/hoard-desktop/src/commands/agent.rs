@@ -173,6 +173,28 @@ pub async fn detach_agent_events(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Lo que este proceso ya sabe, copiado tal cual: estado del motor, las últimas
+/// filas del journal y el pulso de la nube.
+///
+/// **No enciende nada.** Ni `attach`, ni `start_agent`, ni una petición al
+/// servicio: es leer tres mutex en memoria. Ésa es toda la gracia — lo pide una
+/// superficie que sólo mira (el HUD del Alt+H), y abrir una ventana para mirar no
+/// puede tener efectos.
+///
+/// Existe porque el otro camino, escuchar, no le sirve a quien llega tarde: el
+/// backlog se emite una sola vez al arrancar la app, [`attach_agent_events`] es
+/// idempotente y `emit_status` sólo habla cuando algo cambia. Una ventana creada
+/// después de todo eso puede tener los oyentes perfectamente puestos y no recibir
+/// jamás una línea.
+///
+/// Síncrono a propósito: sin `async` no hay dónde meter un `await` al servicio,
+/// así que la garantía de "esto sólo lee" la sostiene el tipo y no la buena fe
+/// de quien lo edite mañana.
+#[tauri::command]
+pub fn agent_snapshot(state: State<'_, AppState>) -> daemon::UiSnapshot {
+    state.daemon.snapshot()
+}
+
 /// Fuerza un backup ya, saltándose el debounce.
 #[tauri::command]
 pub async fn backup_now(save_id: String, state: State<'_, AppState>) -> Result<(), String> {

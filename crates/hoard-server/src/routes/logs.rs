@@ -26,17 +26,12 @@ pub const MAX_BATCH_BYTES: usize = 256 * 1024;
 // `hoard_core::wire` (ADR 0021 C.6). Este par era drift real: el cliente
 // declaraba `target` y `ts` obligatorios y el server los tenía `Option`.
 
-/// Rank a level string for filtering. Unknown levels rank as INFO so they're
-/// never silently dropped by the cloud filter.
-pub fn level_rank(level: &str) -> u8 {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "trace" => 0,
-        "debug" => 1,
-        "warn" => 3,
-        "error" => 4,
-        _ => 2, // "info" and anything unrecognised
-    }
-}
+// El orden de niveles y la regla de qué se guarda viven en `hoard_core::wire`
+// (`level_rank` / `ships_at` / `CLOUD_MIN_RANK`), compartidos con el cliente:
+// estaban escritos tres veces —aquí, en el namespace cloud y en el enviador del
+// agente— y una regla duplicada es una fuga en silencio esperando su turno. Si
+// el cliente filtra a un nivel y el server a otro, o se manda lo que el server
+// tira o se tira lo que el cliente manda, y nadie se entera.
 
 pub async fn ingest(
     Extension(user): Extension<AuthUser>,
@@ -87,19 +82,5 @@ pub async fn ingest(
     Ok((StatusCode::OK, Json(LogIngestResponse { accepted })))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::level_rank;
-
-    #[test]
-    fn cloud_info_filter() {
-        // Cloud keeps INFO and above, drops TRACE/DEBUG. (CLOUD_MIN_RANK == 2)
-        assert!(level_rank("trace") < 2);
-        assert!(level_rank("debug") < 2);
-        assert!(level_rank("info") >= 2);
-        assert!(level_rank("WARN") >= 2);
-        assert!(level_rank("error") >= 2);
-        // Unknown levels are never silently dropped (treated as INFO).
-        assert!(level_rank("notice") >= 2);
-    }
-}
+// La matriz de la regla se testea una sola vez, donde vive: `hoard_core::wire`
+// (`one_rule_decides_what_travels_and_what_is_stored`).

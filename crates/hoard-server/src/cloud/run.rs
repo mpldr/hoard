@@ -343,12 +343,20 @@ pub async fn run(cfg: Config) -> Result<()> {
         .merge(public)
         .merge(authed_always)
         .merge(authed)
-        .with_state(state.clone())
-        .layer(cors);
+        .with_state(state.clone());
 
     // Per-IP rate limiting. SmartIpKeyExtractor keys off X-Forwarded-For
     // (Fly/CDN set it), falling back to the connection peer — which the
     // `into_make_service_with_connect_info` below provides.
+    //
+    // **Por dentro de CORS, no por fuera.** Las capas se aplican de dentro
+    // hacia fuera, así que con el limitador el último, sus 429 salían sin
+    // cabeceras CORS: cortocircuita antes de llegar a la capa que las pone. El
+    // navegador no puede leer una respuesta así, ni siquiera su código —la web
+    // sólo ve "error de red"—, de modo que cualquier 429 era indiagnosticable
+    // desde el cliente justo cuando más falta hace saberlo. Con CORS fuera, el
+    // preflight lo contesta CORS (y deja de contar contra el cupo, que también
+    // es lo correcto) y el 429 llega legible.
     if let Some(rl) = crate::ratelimit::layer(&cfg.server.rate_limit) {
         info!(
             per_second = cfg.server.rate_limit.per_second,
@@ -357,6 +365,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         );
         app = app.layer(rl);
     }
+    let app = app.layer(cors);
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     info!(%addr, "cloud mode listening");
@@ -395,7 +404,7 @@ async fn cloud_health(State(state): State<CloudState>) -> axum::Json<HealthBody>
         status: if db_ok { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION"),
         mode: "cloud",
-        log_min_level: "info",
+        log_min_level: "warn",
     })
 }
 
@@ -404,7 +413,8 @@ struct HealthBody {
     status: &'static str,
     version: &'static str,
     mode: &'static str,
-    /// Minimum log level cloud accepts for client-log ingest — INFO. The
-    /// client reads this on connect and filters at source.
+    /// Minimum log level cloud accepts for client-log ingest — WARN. The
+    /// client reads this on connect and filters at source. Las desmentidas de
+    /// detección (`TELEMETRY_TARGET`) van exentas en los dos lados.
     log_min_level: &'static str,
 }

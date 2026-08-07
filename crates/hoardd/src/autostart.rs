@@ -35,7 +35,7 @@
 //! que haya y esperan a que suelte el socket: es la forma de que el dueño del
 //! proceso pase a ser el gestor de servicios de verdad.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -68,12 +68,28 @@ pub struct Installed {
     pub path: Option<PathBuf>,
 }
 
-/// El binario que la unidad ejecuta: el `hoardd` que viaja junto a quien la
-/// instala (el bundle del desktop lo empaqueta como `externalBin`), y si no, el
-/// del `PATH`. Mismo criterio que "spawn if absent", para que las dos vías de
-/// arranque no puedan acabar ejecutando binarios distintos.
+/// El binario que la unidad ejecuta: el `hoardd` de **esta** instalación — el
+/// que viaja junto a quien la declara (el bundle del desktop lo empaqueta como
+/// `externalBin`, el tarball lo pone junto a `hoard`), y si no, el del `PATH`.
+///
+/// Ciego a propósito a la unidad que ya hubiera: ver
+/// [`crate::client::own_daemon_binary`]. Quien pregunta "¿cuál es el daemon de
+/// esta máquina?" usa [`crate::client::daemon_binary`], que empieza justo por lo
+/// que aquí se escribe.
 pub fn service_binary() -> PathBuf {
-    crate::client::daemon_binary()
+    crate::client::own_daemon_binary()
+}
+
+/// El `hoardd` que ejecuta el servicio ya instalado, leído de la propia
+/// definición del gestor de servicios. `None` si no hay servicio instalado o no
+/// se pudo leer.
+///
+/// Es el árbitro de "qué binario es el daemon de esta máquina" cuando hay más
+/// de un candidato en el disco, que es lo normal desde que la app y el
+/// instalador de terminal instalan Hoard entero cada uno: sólo hay un daemon por
+/// usuario, y el que manda es el que ya arranca el sistema.
+pub fn installed_exec_start() -> Option<PathBuf> {
+    platform::exec_start()
 }
 
 /// Instala la unidad y **arranca el servicio ahora**. Idempotente.
@@ -93,6 +109,15 @@ pub async fn install() -> Result<Installed> {
 /// llama el desktop en cada arranque (igual que reafirma su propio autostart),
 /// donde parar el sync para reinstalarlo sería absurdo.
 pub async fn ensure_installed() -> Result<Installed> {
+    // Declarar la unidad sin comprobar que el motor está es la forma más cara de
+    // fallar. `own_daemon_binary` cae a un nombre pelado cuando no encuentra el
+    // hermano, así que el `ExecStart` sale como `"hoardd"` a secas, systemd lo
+    // acepta, lo habilita, lo arranca y muere con `203/EXEC` — y lo único que ve
+    // el usuario es «Unable to locate executable 'hoardd'» en el journal, sin
+    // una sola pista de que lo que falta es media instalación. Pasó de verdad:
+    // los tarballs de la CLI desde la 1.1.0 no llevaban `hoardd`, así que todo
+    // el que instaló por `curl | sh` acabó aquí.
+    ensure_daemon_present()?;
     let (installed, changed) = platform::declare()?;
     // Con la definición intacta y el servicio ya instalado no hay nada que
     // hacer: esto lo llama el desktop en cada arranque, y dos subprocesos por
@@ -101,6 +126,34 @@ pub async fn ensure_installed() -> Result<Installed> {
         platform::enable().await?;
     }
     Ok(installed)
+}
+
+/// El binario que va a ir al `ExecStart` tiene que existir *antes* de escribir
+/// la unidad. Acepta una ruta absoluta que sea un fichero, o un nombre pelado
+/// que el `PATH` resuelva — el mismo criterio que aplicará el gestor de
+/// servicios al arrancarlo. Cualquier otra cosa es una instalación a medias, y
+/// se dice con esas palabras en vez de dejar que lo diga systemd en un journal
+/// que nadie está mirando.
+fn ensure_daemon_present() -> Result<()> {
+    let exe = crate::client::own_daemon_binary();
+    if exe.is_file() {
+        return Ok(());
+    }
+    // Nombre pelado (el fallback de `own_daemon_binary`): que decida el `PATH`,
+    // igual que hará el gestor de servicios.
+    if exe.parent().is_none_or(|p| p.as_os_str().is_empty())
+        && std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(&exe).is_file()))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the sync engine ({}) isn't installed next to this binary or on your PATH, so the \
+         service would be declared pointing at something that doesn't exist.\n\
+         `hoard` is a thin client of `hoardd` and the two ship together — reinstall the core \
+         (https://hoard.services/install.sh) or drop `hoardd` beside `hoard`.",
+        exe.display()
+    )
 }
 
 /// Quita el arranque automático y para el servicio del gestor. **No** manda
@@ -268,6 +321,19 @@ mod platform {
         )
     }
 
+    /// El `ExecStart` de la unidad instalada. La unidad la escribimos nosotros
+    /// ([`unit_text`]), así que basta con leer la línea y quitarle las comillas
+    /// que le pusimos.
+    pub fn exec_start() -> Option<PathBuf> {
+        let text = std::fs::read_to_string(unit_path().ok()?).ok()?;
+        let raw = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ExecStart="))?
+            .trim();
+        let unquoted = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"'));
+        Some(PathBuf::from(unquoted.unwrap_or(raw)))
+    }
+
     /// Escribe la unidad si hace falta. El `bool` dice si cambió, para que
     /// reafirmarla en cada arranque del desktop no cueste dos subprocesos.
     pub fn declare() -> Result<(Installed, bool)> {
@@ -276,16 +342,22 @@ mod platform {
         // Dentro de un AppImage el binario vive en un punto de montaje efímero
         // (`/tmp/.mount_XXXX/...`) que desaparece al cerrar la app: una unidad
         // apuntando ahí arrancaría en el siguiente login contra una ruta que ya
-        // no existe. Es la clase de fallo que sólo se ve semanas después, así
-        // que se dice ahora y en voz alta. El sync sigue funcionando — la app
-        // levanta el servicio al abrirse ("spawn if absent") —; lo que no hay es
-        // arranque sin abrirla.
-        if std::env::var_os("APPIMAGE").is_some() {
+        // no existe.
+        //
+        // Esto **dejó de ser un callejón sin salida** al volver el motor un
+        // componente instalable por derecho propio: si hay un `hoardd` fuera del
+        // montaje —el que pone el instalador de terminal, que es lo que ocurre
+        // en SteamOS y en cualquier imagen atómica, donde el AppImage es la única
+        // vía para la app— la unidad apunta a ése y el sync arranca en boot con
+        // toda normalidad. El AppImage se queda de cara gráfica, que es lo suyo.
+        // Sólo se aborta cuando el único `hoardd` del disco es el de dentro.
+        if std::env::var_os("APPIMAGE").is_some() && is_inside_appimage(&exe) {
             anyhow::bail!(
-                "an AppImage has no stable path for the service ({} lives in a temporary \
+                "this AppImage has no stable path for the service ({} lives in a temporary \
                  mount), so it can't start at login. The sync still runs whenever Hoard is \
-                 open; for login start use the .deb/.rpm package, or install the CLI and run \
-                 `hoard sync start`.",
+                 open. To start it at login, install the core with \
+                 `curl -fsSL https://hoard.services/install.sh | sh` — it puts `hoardd` \
+                 somewhere stable and this AppImage will use it.",
                 exe.display()
             );
         }
@@ -348,6 +420,26 @@ mod platform {
 
     pub async fn installed() -> bool {
         unit_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// ¿Está `exe` dentro del montaje efímero de **este** AppImage?
+    ///
+    /// Se compara contra `$APPDIR` (lo exporta el runtime del AppImage) y, como
+    /// respaldo, contra el prefijo que usa ese runtime al montar. La distinción
+    /// importa: un `hoardd` en `~/.local/bin` sobrevive al cierre de la app y es
+    /// una ruta perfectamente válida para la unidad, aunque quien la esté
+    /// declarando sea un AppImage.
+    pub fn is_inside_appimage(exe: &Path) -> bool {
+        if let Some(appdir) = std::env::var_os("APPDIR").map(PathBuf::from) {
+            if exe.starts_with(&appdir) {
+                return true;
+            }
+        }
+        // Ojo con `Path::starts_with`: compara **componentes**, y el montaje real
+        // se llama `.mount_Hoard1a2b`, así que contra `/tmp/.mount_` nunca casa.
+        // El prefijo hay que mirarlo sobre el nombre del componente.
+        exe.components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with(".mount_"))
     }
 }
 
@@ -463,6 +555,18 @@ mod platform {
     pub async fn installed() -> bool {
         plist_path().map(|p| p.exists()).unwrap_or(false)
     }
+
+    /// El ejecutable del LaunchAgent: el primer `<string>` de
+    /// `ProgramArguments`. El plist lo escribimos nosotros ([`plist_text`]), así
+    /// que no hace falta un parser de plists para leer lo que pusimos.
+    pub fn exec_start() -> Option<PathBuf> {
+        let text = std::fs::read_to_string(plist_path().ok()?).ok()?;
+        let after_key = text.split("<key>ProgramArguments</key>").nth(1)?;
+        let open = after_key.find("<string>")? + "<string>".len();
+        let rest = &after_key[open..];
+        let close = rest.find("</string>")?;
+        Some(PathBuf::from(rest[..close].trim()))
+    }
 }
 
 // =======================================================================
@@ -479,6 +583,41 @@ mod platform {
         run_quiet("schtasks", &["/Query", "/TN", UNIT])
             .await
             .unwrap_or(false)
+    }
+
+    /// Dónde anotamos qué ejecutable quedó en la tarea.
+    ///
+    /// Las otras dos plataformas guardan su definición en un fichero que
+    /// podemos leer; el Task Scheduler la guarda en su propia base, y sacarla de
+    /// ahí es un `schtasks /Query /XML` — un subproceso, y esto lo llama
+    /// [`super::installed_exec_start`] desde caminos síncronos que resuelven la
+    /// ruta del daemon a menudo. Así que se anota al registrarla y se lee de
+    /// aquí, que cuesta una lectura de fichero.
+    fn recorded_exec_path() -> Option<PathBuf> {
+        Some(
+            hoard_agent::config::CliConfig::project_dirs()
+                .ok()?
+                .config_dir()
+                .join("service-exec.txt"),
+        )
+    }
+
+    pub fn exec_start() -> Option<PathBuf> {
+        let recorded = std::fs::read_to_string(recorded_exec_path()?).ok()?;
+        let trimmed = recorded.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+
+    /// Anota el ejecutable de la tarea. Best-effort: si no se puede escribir, la
+    /// resolución del daemon cae al hermano/`PATH` de siempre.
+    fn record_exec(exe: &Path) {
+        let Some(path) = recorded_exec_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, exe.to_string_lossy().as_bytes());
     }
 
     /// La cuenta del que llama, como `DOMINIO\usuario`: a eso se acotan el
@@ -542,6 +681,7 @@ mod platform {
                  (right-click → \"Run as administrator\")."
             );
         }
+        record_exec(&exe);
         Ok(())
     }
 
@@ -561,6 +701,11 @@ mod platform {
         let _ = run_quiet("schtasks", &["/End", "/TN", UNIT]).await;
         if !run_quiet("schtasks", &["/Delete", "/TN", UNIT, "/F"]).await? {
             anyhow::bail!("`schtasks /Delete /TN {UNIT}` failed");
+        }
+        // Sin tarea no hay ejecutable anotado: dejarlo mentiría a
+        // `daemon_binary`, que lo trata como la respuesta con más autoridad.
+        if let Some(path) = recorded_exec_path() {
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }
@@ -593,6 +738,9 @@ mod platform {
     }
     pub async fn installed() -> bool {
         false
+    }
+    pub fn exec_start() -> Option<PathBuf> {
+        None
     }
 }
 
@@ -761,11 +909,43 @@ mod tests {
         assert_eq!(String::from_utf16(&units).unwrap(), "<a>ñ</a>");
     }
 
-    /// La unidad ejecuta el mismo binario que "spawn if absent" lanzaría: dos
-    /// vías de arranque que resolvieran binarios distintos serían dos versiones
-    /// del servicio según quién lo arrancara.
+    /// La unidad declara el daemon **de esta instalación**, no el que hubiera
+    /// declarado otra. Si mirase la unidad instalada, una actualización que
+    /// moviera el binario la reescribiría con la ruta vieja que acaba de leer y
+    /// el servicio arrancaría el binario anterior para siempre.
     #[test]
-    fn the_unit_and_spawn_if_absent_agree_on_the_binary() {
-        assert_eq!(service_binary(), crate::client::daemon_binary());
+    fn the_unit_declares_this_installations_daemon() {
+        assert_eq!(service_binary(), crate::client::own_daemon_binary());
+    }
+
+    /// Y un cliente pregunta por el daemon **de la máquina**, que empieza justo
+    /// por lo que la unidad dice. Son dos preguntas distintas —de ahí dos
+    /// funciones—; lo que no puede pasar es que un cliente levante un `hoardd`
+    /// distinto del que el sistema ya arranca.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_exec_start_we_write_is_the_one_we_read_back() {
+        let unit = platform::unit_text("/opt/hoard/hoardd");
+        let parsed = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ExecStart="))
+            .map(|raw| raw.trim().trim_matches('"'))
+            .map(PathBuf::from);
+        assert_eq!(parsed, Some(PathBuf::from("/opt/hoard/hoardd")));
+    }
+
+    /// Un `hoardd` fuera del montaje del AppImage es una ruta perfectamente
+    /// estable, y es lo que permite que en SteamOS la app vaya en AppImage y el
+    /// sync arranque igualmente en boot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_daemon_inside_the_mount_blocks_login_start() {
+        assert!(platform::is_inside_appimage(Path::new(
+            "/tmp/.mount_Hoard1a2b/usr/bin/hoardd"
+        )));
+        assert!(!platform::is_inside_appimage(Path::new(
+            "/home/ada/.local/bin/hoardd"
+        )));
+        assert!(!platform::is_inside_appimage(Path::new("/usr/bin/hoardd")));
     }
 }

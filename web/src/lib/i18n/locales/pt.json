@@ -164,6 +164,8 @@
   "account.storage_label": "Armazenamento",
   "account.devices_label": "Dispositivos",
   "account.no_devices": "Ainda sem dispositivos associados. Entra a partir da app de desktop e aparecerá aqui.",
+  "account.devices_error": "Não foi possível carregar os teus dispositivos.",
+  "account.action_error": "A ação não foi concluída.",
   "account.confirm_unlink": "Desassociar este dispositivo?",
   "account.export_requested": "Exportação na fila. Enviamos-te um e-mail quando estiver pronta.",
   "account.confirm_delete_intro": "Isto elimina a tua conta e cada snapshot. Na caixa seguinte, escreve DELETE para confirmar.",
@@ -232,7 +234,9 @@
   "cli.all_releases_note": "Procura outra versão ou arquitetura? Todas as builds estão no",
   "callback.signing_in": "A iniciar sessão…",
   "callback.failed_title": "Falha ao iniciar sessão",
-  "callback.failed_generic": "Não conseguimos concluir o início de sessão. Tenta de novo.",
+  "callback.failed_provider": "O teu fornecedor de início de sessão recusou o pedido.",
+  "callback.failed_no_session": "Esta ligação não trazia nenhum início de sessão para concluir.",
+  "callback.failed_timeout": "O início de sessão não terminou a tempo.",
   "callback.back_to_signin": "Voltar ao início de sessão",
   "callback.desktop_return": "Sessão iniciada! Volta à app Hoard — podes fechar este separador.",
   "callback.desktop_reopen": "Não abriu? Clica aqui para reabrir o Hoard.",
@@ -304,6 +308,9 @@
   "footer.copyright": "© {year} Hoard · Raimundo León Oliva · AGPL-3.0",
   "common.loading": "A carregar…",
   "common.error": "Algo correu mal.",
+  "err.unreachable": "Não foi possível contactar a API do Hoard. Verifica a ligação e tenta de novo.",
+  "err.session_expired": "A tua sessão expirou. Inicia sessão novamente para continuar.",
+  "err.http": "O servidor respondeu com um erro ({status}).",
   "common.retry": "Tentar de novo",
   "common.cancel": "Cancelar",
   "common.confirm": "Confirmar",
@@ -345,6 +352,5 @@
   "link.approve_hint": "Aprove apenas um código que você mesmo iniciou num dispositivo seu.",
   "link.approved": "Dispositivo aprovado.",
   "link.approved_hint": "Volte àquela máquina: já está a iniciar sessão.",
-  "link.err_not_found": "Esse código é inválido ou expirou. Comece de novo no seu dispositivo.",
-  "link.err_generic": "Não foi possível aprovar o dispositivo. Tente novamente."
+  "link.err_not_found": "Esse código é inválido ou expirou. Comece de novo no seu dispositivo."
 }

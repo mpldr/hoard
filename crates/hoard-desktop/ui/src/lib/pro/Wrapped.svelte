@@ -41,7 +41,7 @@
     Sparkles,
     Camera,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { tr, fmtBytes } from "./lib";
 
   // --- identity ----------------------------------------------------------
@@ -551,7 +551,16 @@
   </div>
 
   <!-- activity calendar -->
-  <div class="mt-4 rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4">
+  <!-- Lleva `tilt` como los otros dos paneles: los tres son la misma clase de
+       tarjeta y sólo el primero lo tenía, así que al pasar el ratón por el
+       Wrapped uno respondía y los otros dos no. `relative` es para el
+       resplandor (`.tilt::after` va con `position:absolute; inset:0`); no
+       cambia el contexto de los `absolute` de dentro, que ya cuelgan de sus
+       propios contenedores `relative`. -->
+  <div
+    class="tilt relative mt-4 rounded-2xl border border-white/[0.08] bg-zinc-900/60 p-4"
+    use:tilt
+  >
     <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
       <div>
         <h2 class="text-sm font-semibold text-zinc-100">
@@ -700,7 +709,8 @@
   <!-- day detail — opens when a calendar square is clicked -->
   {#if dayDetail}
     <div
-      class="mt-4 overflow-hidden rounded-2xl border border-emerald-400/20 bg-zinc-900/60 shadow-[0_8px_30px_-12px_rgba(16,185,129,0.25)]"
+      class="tilt relative mt-4 overflow-hidden rounded-2xl border border-emerald-400/20 bg-zinc-900/60 shadow-[0_8px_30px_-12px_rgba(16,185,129,0.25)]"
+      use:tilt
     >
       <!-- header band -->
       <div
@@ -801,10 +811,14 @@
 
   <!-- Cierre de la página: la barra de la cámara. Abre la tarjeta
        compartible — el mismo resumen, en una imagen que se puede enseñar. -->
+  <!-- Es el tercer bloque a ancho completo de la página, así que responde como
+       los otros dos aunque sea un botón: sin esto, pasar el ratón por el recap
+       inclinaba las dos tarjetas de arriba y aquí no ocurría nada. -->
   <button
     type="button"
     onclick={() => (showCard = !showCard)}
-    class="group mt-4 flex w-full items-center justify-center gap-2.5 rounded-2xl border px-4 py-3.5 transition {showCard
+    use:tilt
+    class="tilt relative group mt-4 flex w-full items-center justify-center gap-2.5 rounded-2xl border px-4 py-3.5 transition {showCard
       ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200'
       : 'border-white/[0.08] bg-zinc-900/60 text-zinc-300 hover:border-emerald-400/30 hover:bg-emerald-500/[0.06] hover:text-emerald-200'}"
     aria-expanded={showCard}

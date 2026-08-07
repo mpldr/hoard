@@ -192,6 +192,55 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 /// sigue funcionando por "spawn if absent" (la app levanta el servicio al
 /// abrirse); lo que se pierde es arrancar sin abrir la ventana, y eso queda
 /// dicho en el log.
+/// Anota esta instalación en el manifiesto y deja la terminal a mano.
+///
+/// Las dos mitades de "instalar la app instala Hoard entero", y las dos tienen
+/// que correr **aquí** y no en el instalador: quien baja el `.deb` de la web
+/// nunca pasa por `hoard install`, así que si esto no lo hiciera la app, esa
+/// máquina quedaría sin manifiesto (y su primer `upgrade` no sabría qué
+/// actualiza) y con la terminal dentro del bundle, presente pero inescribible.
+///
+/// En segundo plano y best-effort: ninguna de las dos puede retrasar ni tumbar
+/// el arranque de la ventana.
+pub(crate) fn register_installation() {
+    tauri::async_runtime::spawn(async move {
+        match hoard_agent::install::Manifest::reconcile() {
+            Ok(m) => tracing::info!(
+                components = m
+                    .components
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                delivery = m.delivery.map(|d| d.as_str()).unwrap_or("-"),
+                "install manifest reconciled"
+            ),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "couldn't reconcile the install manifest")
+            }
+        }
+        use hoard_agent::install::CliReach;
+        match hoard_agent::install::ensure_cli_reachable() {
+            Ok(CliReach::AddedToPath(dir)) => tracing::info!(
+                dir = %dir.display(),
+                "added the bundled `hoard` command to the user PATH (needs a new terminal)"
+            ),
+            Ok(CliReach::Linked(path)) => {
+                tracing::info!(path = %path.display(), "linked the bundled `hoard` command")
+            }
+            Ok(CliReach::AlreadyReachable) | Ok(CliReach::NotBundled) => {}
+            // El caso esperado del AppImage: su copia desaparecería al cerrar la
+            // app, así que ahí la terminal la pone el instalador del núcleo.
+            Ok(CliReach::Unreachable(why)) => {
+                tracing::info!(reason = %why, "the bundled `hoard` command stays out of PATH")
+            }
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "couldn't make `hoard` reachable")
+            }
+        }
+    });
+}
+
 pub(crate) fn sync_service_autostart(enabled: bool) {
     tauri::async_runtime::spawn(async move {
         let outcome = if enabled {

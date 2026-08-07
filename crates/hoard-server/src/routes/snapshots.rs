@@ -450,8 +450,118 @@ pub async fn create(
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "storage quota exceeded"));
     }
 
+    // ── Placement pass: bytes first, database second ────────────────────────
+    //
+    // Every physical write happens here, *before* the transaction opens. It
+    // used to be interleaved with the inserts, which meant the SQLite write
+    // lock was held for the whole upload to the storage backend — a rename on
+    // the local backend (microseconds), but a full network PUT per object on
+    // S3, and minutes when that S3 endpoint is an rclone bridge to a consumer
+    // drive. Every other writer on the server would sit behind it and start
+    // failing on the 5 s `busy_timeout`. Doing it out here keeps the
+    // transaction to what it should be: a few inserts.
+    //
+    // Safe to reorder because these objects are content-addressed: a key holds
+    // one immutable byte sequence, so writing it before the DB knows about it
+    // is at worst an orphan (which the rollback below removes), never a wrong
+    // value. `new_blobs` / `new_chunks` already say exactly which shas are
+    // missing for this user, so nothing already stored is rewritten.
+    let store = state.store.clone();
+    // What we physically placed this request, so it can be rolled back if the
+    // transaction never commits.
+    struct Placed {
+        key: String,
+        sha: String,
+        chunk: bool,
+    }
+    let mut created_blobs: Vec<Placed> = Vec::new();
+    // Within-request dedup: a sha appearing in several files is placed once.
+    let mut placed_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut placed_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let rollback_blobs = {
+        let store = store.clone();
+        let pool = state.pool.clone();
+        let user_id = user_id.clone();
+        move |placed: &[Placed]| {
+            let keys: Vec<(String, String, bool)> = placed
+                .iter()
+                .map(|p| (p.key.clone(), p.sha.clone(), p.chunk))
+                .collect();
+            let (store, pool, user_id) = (store.clone(), pool.clone(), user_id.clone());
+            tokio::spawn(async move {
+                for (key, sha, is_chunk) in keys {
+                    // Only drop bytes nothing references. Between our placement
+                    // and this rollback another request may have committed a
+                    // snapshot pointing at the same content-addressed key —
+                    // deleting it then would break *their* save. On a DB error
+                    // assume referenced: an orphan costs space, a wrong delete
+                    // costs data.
+                    let referenced = if is_chunk {
+                        chunk_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                    } else {
+                        blob_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                    };
+                    if !referenced {
+                        let _ = store.delete(&key).await;
+                    }
+                }
+            });
+        }
+    };
+
+    for (i, (rel_path, _size, sha)) in files.iter().enumerate() {
+        if let Some(plan) = chunk_plans.get(&i) {
+            let src = tmp_root.join(rel_path);
+            for c in plan.iter() {
+                if !new_chunks.contains(&c.sha256) || !placed_chunks.insert(c.sha256.clone()) {
+                    continue;
+                }
+                // We can't rename a byte range, so extract the chunk to a
+                // staging file under tmp/ first, then hand it to the backend
+                // (same-filesystem rename for local, upload for S3).
+                let key = crate::store::chunk_key(&user_id, &c.sha256);
+                let stage = tmp_root.join("_stage").join(&c.sha256);
+                if crate::chunking::place_chunk(&src, c.offset, c.len, &stage)
+                    .await
+                    .is_err()
+                    || store.put_from_file(&key, &stage).await.is_err()
+                {
+                    warn!(sha = %c.sha256, "chunk placement failed");
+                    rollback_blobs(&created_blobs);
+                    cleanup_tmp();
+                    return Err(internal());
+                }
+                created_blobs.push(Placed {
+                    key,
+                    sha: c.sha256.clone(),
+                    chunk: true,
+                });
+            }
+            // tmp source is left for cleanup_tmp; chunks were copied out.
+            continue;
+        }
+
+        if !new_blobs.contains(sha) || !placed_blobs.insert(sha.clone()) {
+            continue;
+        }
+        let key = crate::store::blob_key(&user_id, sha);
+        let src = tmp_root.join(rel_path);
+        if store.put_from_file(&key, &src).await.is_err() {
+            warn!(sha = %sha, "blob placement failed");
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            return Err(internal());
+        }
+        created_blobs.push(Placed {
+            key,
+            sha: sha.clone(),
+            chunk: false,
+        });
+    }
+
     let snapshot_id = Uuid::new_v4().to_string();
     let mut tx = state.pool.begin().await.map_err(|_| {
+        rollback_blobs(&created_blobs);
         cleanup_tmp();
         internal()
     })?;
@@ -461,6 +571,7 @@ pub async fn create(
         .await
         .map(|r| r.latest_version_num)
         .map_err(|_| {
+            rollback_blobs(&created_blobs);
             cleanup_tmp();
             internal()
         })?;
@@ -471,6 +582,7 @@ pub async fn create(
     // (keep-both) instead of silently overwriting the other line.
     if let Some(base) = base_version {
         if base != head {
+            rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err((
                 StatusCode::CONFLICT,
@@ -505,30 +617,14 @@ pub async fn create(
     .execute(&mut *tx)
     .await
     .map_err(|_| {
+        rollback_blobs(&created_blobs);
         cleanup_tmp();
         internal()
     })?;
 
-    // Storage-backend keys we physically placed this request, so we can roll
-    // them back (delete from the store) if the transaction fails to commit.
-    let store = state.store.clone();
-    let mut created_blobs: Vec<String> = Vec::new();
-    // Within-request dedup: a sha appearing in several files is placed once.
-    let mut placed_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut placed_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let rollback_blobs = {
-        let store = store.clone();
-        move |keys: &[String]| {
-            let keys: Vec<String> = keys.to_vec();
-            let store = store.clone();
-            tokio::spawn(async move {
-                for k in keys {
-                    let _ = store.delete(&k).await;
-                }
-            });
-        }
-    };
-
+    // From here the transaction only writes rows — the bytes are already in the
+    // store (see the placement pass above), so nothing below can block on the
+    // network while holding SQLite's single write lock.
     for (i, (rel_path, size, sha)) in files.iter().enumerate() {
         let file_id = Uuid::new_v4().to_string();
         if sqlx::query!(
@@ -552,10 +648,10 @@ pub async fn create(
         // ── Chunked file (ADR 0019, Fase 4) ─────────────────────────────
         // A large file has no whole-file blob: its bytes live as
         // content-defined chunks listed in order by snapshot_file_chunks.
-        // Each chunk is refcounted and placed on disk exactly like a blob,
-        // so dedup, GC and quota treat chunks and blobs uniformly.
+        // Each chunk is refcounted exactly like a blob, so dedup, GC and quota
+        // treat chunks and blobs uniformly. The bytes went to the store in the
+        // placement pass; this only records them.
         if let Some(plan) = chunk_plans.get(&i) {
-            let src = tmp_root.join(rel_path);
             for (ordinal, c) in plan.iter().enumerate() {
                 let ord = ordinal as i64;
                 let csize = c.len as i64;
@@ -590,25 +686,6 @@ pub async fn create(
                     cleanup_tmp();
                     return Err(internal());
                 }
-                // Place a chunk that's genuinely new (not already stored) once.
-                // We can't rename a byte range, so extract it to a staging file
-                // under tmp/ first, then hand it to the storage backend (a
-                // same-filesystem rename for local, an upload for S3).
-                if new_chunks.contains(&c.sha256) && placed_chunks.insert(c.sha256.clone()) {
-                    let key = crate::store::chunk_key(&user_id, &c.sha256);
-                    let stage = tmp_root.join("_stage").join(&c.sha256);
-                    if crate::chunking::place_chunk(&src, c.offset, c.len, &stage)
-                        .await
-                        .is_err()
-                        || store.put_from_file(&key, &stage).await.is_err()
-                    {
-                        warn!(sha = %c.sha256, "chunk placement failed");
-                        rollback_blobs(&created_blobs);
-                        cleanup_tmp();
-                        return Err(internal());
-                    }
-                    created_blobs.push(key);
-                }
             }
             // tmp source is left for cleanup_tmp; chunks were copied out.
             continue;
@@ -630,21 +707,6 @@ pub async fn create(
             rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err(internal());
-        }
-
-        // Place the bytes exactly once via the storage backend. `put_from_file`
-        // keeps the local fast path (same-filesystem rename from tmp/) and
-        // streams to the bucket on S3.
-        if new_blobs.contains(sha) && placed_blobs.insert(sha.clone()) {
-            let key = crate::store::blob_key(&user_id, sha);
-            let src = tmp_root.join(rel_path);
-            if store.put_from_file(&key, &src).await.is_err() {
-                warn!(sha = %sha, "blob placement failed");
-                rollback_blobs(&created_blobs);
-                cleanup_tmp();
-                return Err(internal());
-            }
-            created_blobs.push(key);
         }
     }
 
@@ -1049,8 +1111,10 @@ pub async fn download(
         let zstd = ZstdEncoder::new(writer);
         let mut tar = tokio_tar::Builder::new(zstd);
 
-        // Spool files created for a remote backend; removed after the tar is
-        // built (or on error). Local refs have cleanup=false and never land here.
+        // Spool files created for a remote backend, for the entry being written
+        // right now — they're dropped as soon as that entry is in the tar (see
+        // the end of the loop), so peak scratch space is one file, not the whole
+        // snapshot. Local refs have cleanup=false and never land here.
         let mut spooled: Vec<PathBuf> = Vec::new();
 
         // Resolve a storage key to a readable local path (spooling if remote),
@@ -1088,12 +1152,32 @@ pub async fn download(
                     // Concatenate the chunk files into one tar entry. Each chunk
                     // is ≤ MAX_CHUNK (a few MiB), so streaming them one at a time
                     // never buffers the whole file in RAM.
-                    let mut paths: Vec<PathBuf> = Vec::with_capacity(keys.len());
-                    for k in keys {
-                        paths.push(resolve!(k));
-                    }
-                    let stream = futures::stream::iter(paths)
-                        .then(|p| async move { tokio::fs::read(&p).await.map(bytes::Bytes::from) })
+                    //
+                    // Each chunk is also fetched *as the tar consumes it* and its
+                    // spool file dropped right after, instead of spooling the
+                    // file's chunks up front: on a remote backend a 10 GB save
+                    // then needs one chunk of scratch space, not 10 GB. On the
+                    // local backend `local_ref` hands back the real chunk path
+                    // and nothing is copied or deleted.
+                    let stream = futures::stream::iter(keys.clone())
+                        .then({
+                            let store = store.clone();
+                            let spool_dir = spool_dir.clone();
+                            move |k| {
+                                let (store, spool_dir) = (store.clone(), spool_dir.clone());
+                                async move {
+                                    let r = store
+                                        .local_ref(&k, &spool_dir)
+                                        .await
+                                        .map_err(std::io::Error::other)?;
+                                    let bytes = tokio::fs::read(&r.path).await;
+                                    if r.cleanup {
+                                        let _ = tokio::fs::remove_file(&r.path).await;
+                                    }
+                                    bytes.map(bytes::Bytes::from)
+                                }
+                            }
+                        })
                         .boxed();
                     let reader = tokio_util::io::StreamReader::new(stream);
                     let mut header = tokio_tar::Header::new_gnu();
@@ -1112,6 +1196,13 @@ pub async fn download(
                 }
                 let _ = tokio::fs::remove_dir_all(&spool_dir).await;
                 return;
+            }
+
+            // The entry is fully written, so its spooled bytes are dead weight.
+            // Freeing them here is what keeps a remote backend from demanding
+            // free local disk the size of the entire snapshot to restore it.
+            for p in spooled.drain(..) {
+                let _ = tokio::fs::remove_file(&p).await;
             }
         }
 

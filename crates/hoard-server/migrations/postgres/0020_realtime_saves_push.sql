@@ -17,12 +17,10 @@
 -- the repo the source of truth and is safe to (re)apply: every statement is
 -- guarded so running it against a project that already has these does nothing.
 --
--- Replica identity: originally left at the default (primary key), reasoning the
--- client never reads column values out of the Realtime payload. THAT WAS WRONG
--- and silently broke push entirely — Realtime replays each change through RLS as
--- the subscribing user, and the `user_id = auth.uid()` policy needs `user_id` in
--- the change record, which DEFAULT (PK-only) omits. Fixed in
--- `0037_realtime_replica_identity_full` (REPLICA IDENTITY FULL on saves+devices).
+-- Replica identity is left at the default (primary key). The client only needs
+-- "a row in saves changed, go pull" — it never reads column values out of the
+-- Realtime payload — so the PK in the change is sufficient and there is no need
+-- to widen replica identity to FULL.
 --
 -- Postgres/Supabase only: the self-hosted server (SQLite) has no Realtime and
 -- gets its own push path via the `/v1/events` SSE endpoint instead.

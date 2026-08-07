@@ -10,6 +10,7 @@
   import { auth } from '$lib/auth';
   import { billing } from '$lib/billing';
   import { api } from '$lib/api';
+  import { describeError } from '$lib/errors';
   import { session } from '$lib/stores/session';
   import { PLANS, formatBytes, formatPlanQuota, daysUntil } from '$lib/plans';
   import type { AccountProfile, DeviceRow } from '$lib/types';
@@ -19,6 +20,12 @@
   let devices = $state<DeviceRow[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  // The device list failing is not the same as the profile failing — the page
+  // still renders, so its failure gets its own line inside that card.
+  let devicesError = $state<string | null>(null);
+  // Whatever the last button press failed with. Shown next to the danger zone,
+  // because "nothing happened" is the worst possible answer there.
+  let actionError = $state<string | null>(null);
 
   async function load() {
     if (!$session) return;
@@ -32,11 +39,20 @@
         // No invented data: if the API is unreachable we say so instead of
         // rendering a fake free-plan profile.
         profile = null;
-        error = (p.reason as Error)?.message ?? 'unreachable';
+        error = describeError(p.reason, $_);
       }
-      devices = d.status === 'fulfilled' ? d.value : [];
+      if (d.status === 'fulfilled') {
+        devices = d.value;
+        devicesError = null;
+      } else {
+        // An empty list and a failed list are not the same thing. Rendering
+        // "no devices linked" for a 500 is how a user concludes their machines
+        // got silently unlinked.
+        devices = [];
+        devicesError = describeError(d.reason, $_);
+      }
     } catch (e) {
-      error = (e as Error).message;
+      error = describeError(e, $_);
     } finally {
       loading = false;
     }
@@ -65,13 +81,25 @@
 
   async function unlink(id: string) {
     if (!confirm($_('account.confirm_unlink'))) return;
-    await api.unlinkDevice(id);
-    devices = devices.filter((d) => d.id !== id);
+    actionError = null;
+    try {
+      await api.unlinkDevice(id);
+      devices = devices.filter((d) => d.id !== id);
+    } catch (e) {
+      // The row stays: the device is still linked, and dropping it here would
+      // claim otherwise until the next reload put it back.
+      actionError = describeError(e, $_);
+    }
   }
 
   async function exportAll() {
-    await api.requestAccountExport();
-    alert($_('account.export_requested'));
+    actionError = null;
+    try {
+      await api.requestAccountExport();
+      alert($_('account.export_requested'));
+    } catch (e) {
+      actionError = describeError(e, $_);
+    }
   }
 
   async function deleteAccount() {
@@ -79,7 +107,16 @@
     if (!ok) return;
     const c = prompt($_('account.confirm_delete_type'));
     if (c !== 'DELETE') return;
-    await api.deleteAccount();
+    actionError = null;
+    try {
+      await api.deleteAccount();
+    } catch (e) {
+      // Signing out and redirecting on a failed DELETE is indistinguishable
+      // from success — the user walks away believing their account is gone
+      // while it is very much still there. Stop and say what happened.
+      actionError = describeError(e, $_);
+      return;
+    }
     await auth.signOut();
     goto($localeHref('/'));
   }
@@ -210,7 +247,10 @@
     </Card>
 
     <Card title={$_('account.devices_section')}>
-      {#if devices.length === 0}
+      {#if devicesError}
+        <p class="text-sm text-red-400">{$_('account.devices_error')}</p>
+        <p class="mt-1 break-words font-mono text-xs text-ink-faint">{devicesError}</p>
+      {:else if devices.length === 0}
         <p class="text-sm text-ink-faint">{$_('account.no_devices')}</p>
       {:else}
         <ul class="divide-y divide-line">
@@ -259,6 +299,12 @@
             {$_('account.delete_cta')}
           </Button>
         </div>
+        {#if actionError}
+          <div class="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2">
+            <p class="text-sm text-red-400">{$_('account.action_error')}</p>
+            <p class="mt-1 break-words font-mono text-xs text-ink-faint">{actionError}</p>
+          </div>
+        {/if}
       </div>
     </Card>
   {/if}

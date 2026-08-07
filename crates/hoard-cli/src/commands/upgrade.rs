@@ -1,16 +1,27 @@
-//! `hoard upgrade`: pull the newest CLI in place. It first asks GitHub what the
-//! latest release is; if this binary is already current it says so and stops —
-//! no download, no installer. Only when there's a newer version (or the user
-//! pins one with `--version`) does it re-run the official one-liner installer
-//! (`install.sh` / `install.ps1`), which already detects OS+arch, verifies the
-//! release checksum and drops the binary where this one lives.
+//! `hoard upgrade`: sube **todo lo instalado** a la última release, junto.
 //!
-//! We deliberately don't overwrite our own running executable ourselves: the
-//! installer targets the standard install dir (`~/.local/bin`,
-//! `%LOCALAPPDATA%\hoard\bin`) and the new binary takes over on the next run.
+//! No actualiza "el CLI": actualiza los componentes que el manifiesto
+//! (`hoard_agent::install::Manifest`) dice que hay en esta máquina, todos a la
+//! misma versión. Es la misma operación que `hoard install`, mirada desde
+//! después: allí se decide qué toca, aquí se releva lo que ya estaba.
+//!
+//! ## Por qué mira el manifiesto antes de tocar nada
+//!
+//! El instalador de terminal deja el núcleo en un directorio del usuario
+//! (`~/.local/bin`); un paquete nativo lo deja dentro del bundle de la app
+//! (`/usr/bin`). Re-ejecutar el instalador a ciegas en el segundo caso no
+//! actualiza nada: **instala un segundo núcleo** en el home que eclipsa al del
+//! paquete según el orden del `PATH`, y a partir de ahí qué versión corre
+//! depende de quién arranque el proceso. Es el mismo fallo que el `hoard-server`
+//! viejo del `PATH`, y por eso aquí se pregunta primero de quién es cada pieza.
+//!
+//! No sobrescribimos nuestro propio ejecutable en marcha: el instalador escribe
+//! en el directorio estándar y el binario nuevo toma el relevo a la siguiente
+//! invocación.
 
 use anyhow::{bail, Result};
 
+use hoard_agent::install::{Component, Manifest};
 use hoard_agent::update;
 
 /// Canonical installer host (same one printed by `install.sh`).
@@ -33,7 +44,7 @@ pub async fn run(version: Option<String>) -> Result<()> {
     match update::fetch_latest().await {
         Some(latest) if update::is_newer(&latest, current) => {
             println!("new version available: {latest}\n");
-            install(None).await
+            install(Some(&latest)).await
         }
         Some(latest) => {
             println!("already up to date (latest is {latest}).");
@@ -51,9 +62,31 @@ pub async fn run(version: Option<String>) -> Result<()> {
     }
 }
 
-/// Re-run the platform installer. `version` pins `HOARD_VERSION`; `None`
-/// installs whatever the release marks as latest.
+/// Releva todos los componentes instalados a `version`.
+///
+/// El pin deja de ser opcional en la práctica aunque la firma lo permita: si el
+/// núcleo se resolviera contra "latest" y la app contra un número concreto,
+/// bastaría con que se publicara una release entre las dos descargas para dejar
+/// la máquina con piezas de versiones distintas. Un solo número para todo.
 async fn install(version: Option<&str>) -> Result<()> {
+    let manifest = Manifest::load_or_observe()?;
+
+    // El núcleo dentro del bundle de la app lo releva el instalador de la app,
+    // no el nuestro. Correr el instalador de terminal aquí no actualizaría el
+    // que corre: pondría otro al lado.
+    if manifest.core_from_bundle {
+        println!(
+            "this core ships inside the desktop app ({}), so the app's own \
+             installer owns it.",
+            manifest
+                .core_dir
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("?"))
+                .display()
+        );
+        return upgrade_desktop_only(&manifest, version).await;
+    }
+
     println!("running the official installer from {BASE}…\n");
 
     let status = match installer_command(version).status() {
@@ -73,12 +106,44 @@ async fn install(version: Option<&str>) -> Result<()> {
         );
     }
 
-    println!("\n✓ upgraded. Run `hoard --version` to confirm.");
+    println!("\n✓ core upgraded.");
 
     // Reload the resident daemon so it picks up the new binary. No-op (and no
     // noise) unless the sync service is actually installed here.
     crate::commands::service::reload_after_upgrade().await;
+
+    // El instalador termina llamando a `hoard install`, que releva la app si la
+    // hay — así que llegados aquí ya está todo a la misma versión y sólo queda
+    // decirlo.
+    if manifest.has(Component::Desktop) {
+        println!("✓ desktop app upgraded alongside it.");
+    }
+    println!("Run `hoard --version` to confirm.");
     Ok(())
+}
+
+/// El caso en que el núcleo no es nuestro: se releva la app, y su bundle trae el
+/// núcleo nuevo consigo.
+async fn upgrade_desktop_only(manifest: &Manifest, version: Option<&str>) -> Result<()> {
+    let Some(delivery) = manifest.delivery else {
+        bail!(
+            "nothing here is ours to upgrade — this install is managed by your \
+             package manager. Update it with that."
+        );
+    };
+    if !delivery.is_ours() {
+        bail!(
+            "this install is managed by your package manager ({}). Update it with that.",
+            delivery.as_str()
+        );
+    }
+    let target = match version {
+        Some(v) => v.trim_start_matches('v').to_string(),
+        None => update::fetch_latest().await.ok_or_else(|| {
+            anyhow::anyhow!("couldn't reach GitHub to resolve the latest version")
+        })?,
+    };
+    crate::commands::install::run(crate::commands::install::Want::Detect, Some(target)).await
 }
 
 #[cfg(unix)]

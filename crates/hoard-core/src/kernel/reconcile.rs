@@ -412,7 +412,23 @@ fn ingest_op_result(
             fingerprint,
             wrote,
         } => {
-            next.restore_failures = RestoreFailures::default();
+            // Un restore puede volver `Ok` sin haber movido nada: se baja el
+            // snapshot, se difunde contra la carpeta y el diff decide que no hay
+            // que escribir. Si además la carpeta sigue vacía, el disparador que
+            // lo trajo —`local_empty`, que puentea a propósito la puerta de
+            // versión— sigue siendo cierto en el tick siguiente y volvemos a
+            // bajar el mismo snapshot. Para siempre, y al precio completo de la
+            // descarga: un cliente se comió así 3.752 bajadas y 10,6 GB entre el
+            // 2026-07-27 y el 08-03 sin escribir un byte en disco.
+            //
+            // La escalada de fallos es lo único capaz de frenar eso, así que un
+            // "éxito" que no progresa no puede limpiarla. `!wrote` y carpeta
+            // vacía es la única combinación inequívoca: si se escribió algo,
+            // hubo progreso aunque la observación llegue tarde.
+            let restore_stalled = matches!(op, Some(Op::Restore)) && !wrote && obs.local_empty;
+            if !restore_stalled {
+                next.restore_failures = RestoreFailures::default();
+            }
             if version.is_some() {
                 next.known_version = version;
             }
@@ -463,6 +479,17 @@ fn ingest_op_result(
                     }
                     next.pull_pending = false;
                     next.deferred_notified = false;
+                    // Bajada que no progresó: escala por la misma escalera que un
+                    // fallo (60 s → 5 min → 15 min → 60 min). No es un error —el
+                    // servidor respondió— pero repetirlo cada tick tampoco es
+                    // sincronizar, y la carpeta vacía volverá a pedirlo igual.
+                    // Una versión cloud nueva resetea la escalada por
+                    // `clear_restore_backoff_on_new_version`, así que un pull
+                    // legítimo posterior no queda castigado.
+                    if restore_stalled {
+                        let delay = record_failure(&mut next.restore_failures, obs.cloud_version);
+                        next.next_restore_at = Some(now + Duration::seconds(delay));
+                    }
                 }
                 None => {}
             }
@@ -799,6 +826,73 @@ mod tests {
             acts(&d7),
             vec![&Action::Restore],
             "el veto se levanta a los 6 s, no a los 90"
+        );
+    }
+
+    /// Regresión: un restore que vuelve `Ok` sin escribir y deja la carpeta
+    /// vacía NO es progreso. `local_empty` puentea la puerta de versión a
+    /// propósito, así que sin frenar aquí el tick siguiente vuelve a pedir el
+    /// mismo snapshot y el par (bajar, no escribir) se repite eternamente al
+    /// precio completo de la descarga — 3.752 bajadas / 10,6 GB en producción
+    /// entre 2026-07-27 y 08-03.
+    #[test]
+    fn restore_ok_sin_escribir_y_carpeta_vacia_no_reintenta_de_inmediato() {
+        let state = State {
+            known_version: Some(2),
+            in_flight: Some(Op::Restore),
+            ..base_state()
+        };
+        // La op vuelve OK, sin escribir, y la carpeta sigue vacía.
+        let obs = Observation {
+            local_empty: true,
+            cloud_version: Some(2),
+            op_result: Some(OpResult::Ok {
+                version: Some(2),
+                fingerprint: None,
+                wrote: false,
+            }),
+            ..quiet_obs()
+        };
+        let (n1, d1) = reconcile(&state, &obs, world(0));
+        assert!(
+            !acts(&d1).contains(&&Action::Restore),
+            "no puede relanzar el restore en el mismo tick: {d1:?}"
+        );
+        assert_eq!(
+            n1.restore_failures.consecutive, 1,
+            "el 'éxito' que no progresa cuenta como intento, no limpia la escalada"
+        );
+        assert!(n1.next_restore_at.is_some(), "queda un backoff armado");
+
+        // Tick siguiente con la carpeta aún vacía: retenido por el cooldown, no
+        // otra descarga.
+        let obs2 = Observation {
+            local_empty: true,
+            cloud_version: Some(2),
+            ..quiet_obs()
+        };
+        let (_n2, d2) = reconcile(&n1, &obs2, world(1));
+        assert!(
+            !acts(&d2).contains(&&Action::Restore),
+            "sigue frenado mientras dura el backoff: {d2:?}"
+        );
+
+        // Y un restore que SÍ escribe limpia la escalada: el freno es sólo para
+        // el que no progresa.
+        let obs_ok = Observation {
+            local_empty: false,
+            cloud_version: Some(2),
+            op_result: Some(OpResult::Ok {
+                version: Some(2),
+                fingerprint: None,
+                wrote: true,
+            }),
+            ..quiet_obs()
+        };
+        let (n3, _d3) = reconcile(&state, &obs_ok, world(0));
+        assert_eq!(
+            n3.restore_failures.consecutive, 0,
+            "un restore con escritura real sí es progreso"
         );
     }
 

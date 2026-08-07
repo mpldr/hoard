@@ -44,6 +44,28 @@ enum Cmd {
         #[arg(long)]
         target: Option<PathBuf>,
     },
+    /// Re-read every cloud blob and check that its bytes hash to its name.
+    ///
+    /// The forensic half of the rotation-corruption fix: the client can no
+    /// longer upload a blob whose contents don't match its sha256, but the
+    /// ones committed before that fix are indistinguishable from healthy ones
+    /// until someone restores them. Reads and records a verdict; never
+    /// deletes. Cloud (Postgres + R2) only.
+    #[cfg(feature = "cloud")]
+    VerifyBlobs {
+        /// Stop after N blobs. Default: every blob that has no verdict yet.
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Re-check blobs that already have a verdict.
+        #[arg(long)]
+        recheck: bool,
+        /// Objects downloaded in parallel.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Report without writing verdicts to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +80,29 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&args.config)?;
 
     init_logging(&cfg);
+
+    #[cfg(feature = "cloud")]
+    if let Some(Cmd::VerifyBlobs {
+        limit,
+        recheck,
+        concurrency,
+        dry_run,
+    }) = args.cmd
+    {
+        let opts = hoard_server::cloud::verify::Options {
+            limit,
+            recheck,
+            concurrency: concurrency.max(1),
+            dry_run,
+        };
+        let report = hoard_server::cloud::verify::run(&cfg, opts).await?;
+        hoard_server::cloud::verify::print_report(&report, dry_run);
+        // Salida distinta de cero si hay daño: así un cron lo nota.
+        if !report.damaged.is_empty() {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -112,6 +157,11 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
     // references objects the active store doesn't have, refuse to boot with a
     // pointer to `hoard-admin storage migrate` (ADR 0020, phase 2).
     hoard_server::store::sanity_check(&pool, &store).await?;
+
+    // Y el inverso, que es el que pierde datos: almacén con contenido de un
+    // despliegue anterior y base sin un solo usuario. Arrancar así se ve sano y
+    // deja a cada cliente con `save_id` que aquí ya no existen — 404 eternos.
+    hoard_server::store::guard_against_lost_database(&pool, &cfg.storage.data_dir).await?;
 
     let state = Arc::new(health::ServerState {
         pool: pool.clone(),

@@ -23,7 +23,7 @@
    * the tracked-list refresh, and this modal shouldn't fork that.
    */
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, Radar, Link, Search, Gamepad2 } from "lucide-svelte";
+  import { FolderOpen, Radar, Link, Search, Gamepad2 } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Modal from "./Modal.svelte";

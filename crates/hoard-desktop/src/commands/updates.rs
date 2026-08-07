@@ -60,11 +60,10 @@ struct GhRelease {
     assets: Vec<GhAsset>,
 }
 
-#[derive(serde::Deserialize, Clone)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
+/// Los ficheros de la release los describe `hoard_agent::install::fetch`: es el
+/// mismo JSON de GitHub que lee la terminal, y tener dos structs para él es como
+/// acaban divergiendo dos updaters que deberían hacer lo mismo.
+use hoard_agent::install::fetch::Asset as GhAsset;
 
 /// `/v1/health` shape (mirrors `crates/hoard-server/src/routes/health.rs`).
 #[derive(serde::Deserialize)]
@@ -76,15 +75,11 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GH_RELEASES_URL: &str = "https://api.github.com/repos/rleeon/hoard/releases/latest";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// minisign public key for Hoard release artifacts — the same key the server's
-/// `hoard-server upgrade` embeds (see `crates/hoard-server/src/upgrade.rs` and
-/// ADR 0017). The matching secret lives only in CI; embedding the public half
-/// pins trust to the release pipeline, so a compromise of the GitHub *account*
-/// (re-uploading a malicious installer) can't produce one this updater will run
-/// as root. Keep in lockstep with the server constant.
-const MINISIGN_PUBKEY: &str = "RWSeOL1nHXZI9oa+WOdrc6yVasLPeBurvGWnERo4tN9F+YIQn7ipx3eO";
-
-/// Result of checking a freshly-downloaded installer against [`MINISIGN_PUBKEY`].
+/// Resultado de comprobar el instalador recién bajado contra la clave de release.
+///
+/// La clave y la verificación viven ahora en `hoard_agent::install::fetch`, una
+/// sola vez: dos copias de una clave de confianza son dos sitios donde rotarla,
+/// y uno donde olvidarse.
 enum SigCheck {
     /// A `<asset>.minisig` was present and its signature matched the bytes.
     Verified,
@@ -339,11 +334,9 @@ pub async fn apply_desktop_update(
 
     // Download into memory first so the signature is checked BEFORE the bytes
     // ever hit disk or an installer.
-    let bytes = download_bytes(&asset.browser_download_url)
-        .await
-        .map_err(|e| {
-            AppError::new("updates.error.title", "updates.error.download_failed").with_detail(e)
-        })?;
+    let bytes = download_bytes(&asset.url).await.map_err(|e| {
+        AppError::new("updates.error.title", "updates.error.download_failed").with_detail(e)
+    })?;
 
     // Gate the privileged auto-install behind a minisign check against the
     // embedded release key — the same guarantee the server's `upgrade` gives.
@@ -478,56 +471,19 @@ fn sanitize_exe_path(exe: std::path::PathBuf) -> std::path::PathBuf {
     exe
 }
 
-/// Installer preference on Windows, best first. The order is load-bearing —
-/// see the note in [`pick_asset`] — and lives out here so a test can check it
-/// on any host (the `pick_asset` branches are `cfg`-gated, and CI doesn't
-/// build this crate on Windows at all).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const WINDOWS_PREFERENCE: &[&str] = &["-setup.exe", ".exe", ".msi"];
-
-/// First asset whose filename ends with one of `suffixes`, in the order given
-/// — not the order the release happens to list them in.
-fn first_by_suffix<'a>(assets: &'a [GhAsset], suffixes: &[&str]) -> Option<&'a GhAsset> {
-    suffixes
-        .iter()
-        .find_map(|suffix| assets.iter().find(|a| a.name.ends_with(suffix)))
-}
-
-/// Pick the right asset for the current OS/arch. We match on filename suffix
-/// because Tauri's bundle namer doesn't expose a stable scheme we can predict.
+/// El fichero de la release que le toca a esta máquina.
+///
+/// La elección ya no se hace aquí. `hoard_agent::install` mira la máquina
+/// —gestor de paquetes disponible, raíz de sólo lectura, si se puede elevar sin
+/// bloquearse— y de ahí sale la vía; `fetch::asset_for` traduce esa vía a un
+/// fichero. Antes esto decidía por su cuenta mirando sólo la distro, y por eso
+/// en una imagen atómica (SteamOS, Bazzite) ofrecía un `.rpm` que no hay forma
+/// de aplicar: `rpm` está en el `PATH`, pero `/usr` es de sólo lectura. Ahora
+/// esas máquinas reciben el AppImage, igual que por la terminal.
 fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
-    #[cfg(target_os = "linux")]
-    {
-        // Pick the package format that matches the running distro. On an
-        // rpm-based system (Fedora/RHEL/openSUSE) prefer .rpm; everywhere else
-        // prefer .deb (Ubuntu/Debian, what we test against). Fall back to the
-        // other package format, then to the portable .AppImage.
-        let (primary, secondary): (&str, &str) = if linux_prefers_rpm() {
-            (".rpm", ".deb")
-        } else {
-            (".deb", ".rpm")
-        };
-        first_by_suffix(assets, &[primary, secondary, ".AppImage"])
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // NSIS (`-setup.exe`) first, MSI only as a fallback — the reverse of
-        // what this did until 1.1.0, and the order matters now that `hoardd`
-        // outlives the window (ADR 0021). An installer has to overwrite
-        // `hoardd.exe` while the daemon is holding it open, and only the NSIS
-        // bundle carries the hook that stops it first (`installer-hooks.nsh`,
-        // `NSIS_HOOK_PREINSTALL`). Through the MSI that hook never runs:
-        // Windows Installer just hits the locked file and falls back to its
-        // "files in use" prompt, which can't close a windowless background
-        // process — so the update fails and the app comes back up without its
-        // daemon. NSIS also installs per-user (`installMode: currentUser`),
-        // so the in-app update doesn't stop for a UAC prompt.
-        first_by_suffix(assets, WINDOWS_PREFERENCE)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        first_by_suffix(assets, &[".dmg"])
-    }
+    let probe = hoard_agent::install::Probe::read();
+    let delivery = hoard_agent::install::resolve_delivery(&probe);
+    hoard_agent::install::fetch::asset_for(delivery, assets)
 }
 
 async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -549,22 +505,22 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-/// Download `<asset>.minisig` from the release and verify it against the
-/// downloaded installer `bytes` using the embedded [`MINISIGN_PUBKEY`].
+/// Comprueba el instalador recién bajado contra la clave de release.
 ///
-/// - `Ok(Verified)`  — signature present and valid; safe to auto-install.
-/// - `Ok(Unsigned)`  — no signature asset in the release (caller falls back to
-///   a manual download instead of running the binary as root).
-/// - `Err(detail)`   — a signature WAS present but did not verify, or the
-///   signature couldn't be fetched/parsed. The caller aborts and discards the
-///   download: this is the tampered-artifact case.
+/// - `Ok(Verified)`  — firma presente y válida; se puede auto-instalar.
+/// - `Ok(Unsigned)`  — la release no publica firma para este fichero (quien
+///   llama se queda en descarga manual en vez de ejecutar nada como root).
+/// - `Err(detalle)`  — había firma y NO casa, o no se pudo leer. Se aborta y se
+///   descarta la descarga: éste es el caso de artefacto manipulado.
+///
+/// La criptografía y la clave son las de `install::fetch`, compartidas con la
+/// terminal. Lo que se queda aquí es la tolerancia al caso `Unsigned`, que es
+/// una decisión de este updater y no de la verificación.
 async fn verify_installer_signature(
     assets: &[GhAsset],
     asset_name: &str,
     bytes: &[u8],
 ) -> Result<SigCheck, String> {
-    use minisign_verify::{PublicKey, Signature};
-
     let sig_name = format!("{asset_name}.minisig");
     let Some(sig_asset) = assets.iter().find(|a| a.name == sig_name) else {
         return Ok(SigCheck::Unsigned);
@@ -576,7 +532,7 @@ async fn verify_installer_signature(
         .build()
         .map_err(|e| e.to_string())?;
     let sig_text = client
-        .get(&sig_asset.browser_download_url)
+        .get(&sig_asset.url)
         .send()
         .await
         .map_err(|e| format!("downloading signature: {e}"))?
@@ -586,54 +542,9 @@ async fn verify_installer_signature(
         .await
         .map_err(|e| format!("reading signature: {e}"))?;
 
-    let pubkey = PublicKey::from_base64(MINISIGN_PUBKEY)
-        .map_err(|e| format!("embedded minisign key is invalid: {e}"))?;
-    let signature = Signature::decode(&sig_text).map_err(|e| format!("malformed .minisig: {e}"))?;
-    pubkey
-        .verify(bytes, &signature, false)
-        .map_err(|e| format!("signature does NOT match the Hoard release key: {e}"))?;
-    Ok(SigCheck::Verified)
-}
-
-/// True on rpm-based distros (Fedora/RHEL/openSUSE). We check for the `rpm`
-/// binary while `dpkg` is absent, plus `/etc/os-release` ID hints, so a Debian
-/// box that happens to have `rpm` installed still gets `.deb`.
-#[cfg(target_os = "linux")]
-fn linux_prefers_rpm() -> bool {
-    fn on_path(bin: &str) -> bool {
-        std::env::var_os("PATH")
-            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-            .unwrap_or(false)
-    }
-    if on_path("dpkg") {
-        return false;
-    }
-    if let Ok(os) = std::fs::read_to_string("/etc/os-release") {
-        let rpm_ids = [
-            "fedora",
-            "rhel",
-            "centos",
-            "opensuse",
-            "suse",
-            "rocky",
-            "almalinux",
-        ];
-        for line in os.lines() {
-            if let Some(v) = line
-                .strip_prefix("ID=")
-                .or_else(|| line.strip_prefix("ID_LIKE="))
-            {
-                let v = v.trim_matches('"');
-                if rpm_ids
-                    .iter()
-                    .any(|id| v.split_whitespace().any(|w| w == *id))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    on_path("rpm")
+    hoard_agent::install::fetch::verify(bytes, &sig_text)
+        .map_err(|e| format!("{e:#}"))
+        .map(|()| SigCheck::Verified)
 }
 
 #[cfg(target_os = "linux")]
@@ -969,22 +880,26 @@ pub async fn trigger_server_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hoard_agent::install::fetch::asset_for;
+    use hoard_agent::install::Delivery;
 
     fn assets(names: &[&str]) -> Vec<GhAsset> {
         names
             .iter()
             .map(|n| GhAsset {
                 name: (*n).to_string(),
-                browser_download_url: format!("https://example.invalid/{n}"),
+                url: format!("https://example.invalid/{n}"),
             })
             .collect()
     }
 
+    /// El release publica los dos y el `.msi` va PRIMERO en la lista, así que
+    /// el orden no puede salir del release: sólo el bundle NSIS trae el hook que
+    /// para `hoardd` antes de pisar su `.exe`. La preferencia vive ahora en
+    /// `install::fetch`, pero el updater es quien se rompe si cambia, así que la
+    /// aserción se queda aquí.
     #[test]
     fn windows_update_takes_the_nsis_installer_not_the_msi() {
-        // El release publica los dos, y el .msi va PRIMERO en la lista de
-        // assets, así que el orden no puede salir del release: sólo el bundle
-        // NSIS trae el hook que para `hoardd` antes de pisar su .exe.
         let rel = assets(&[
             "Hoard_1.1.0_x64_en-US.msi",
             "Hoard_1.1.0_x64_en-US.msi.sha256",
@@ -992,7 +907,7 @@ mod tests {
             "Hoard_1.1.0_x64-setup.exe.sha256",
         ]);
         assert_eq!(
-            first_by_suffix(&rel, WINDOWS_PREFERENCE).map(|a| a.name.as_str()),
+            asset_for(Delivery::Nsis, &rel).map(|a| a.name.as_str()),
             Some("Hoard_1.1.0_x64-setup.exe")
         );
     }
@@ -1001,23 +916,32 @@ mod tests {
     fn windows_falls_back_to_the_msi_when_theres_no_nsis() {
         let rel = assets(&["Hoard_1.1.0_x64_en-US.msi"]);
         assert_eq!(
-            first_by_suffix(&rel, WINDOWS_PREFERENCE).map(|a| a.name.as_str()),
+            asset_for(Delivery::Nsis, &rel).map(|a| a.name.as_str()),
             Some("Hoard_1.1.0_x64_en-US.msi")
         );
     }
 
+    /// Cada vía coge su fichero y sólo el suyo. Antes esto se resolvía por una
+    /// lista de sufijos con fallback en cascada (`.deb` → `.rpm` → AppImage),
+    /// que es lo que hacía que una máquina de raíz inmutable acabara con un
+    /// paquete inaplicable: ahora la vía la decide la máquina antes de llegar
+    /// aquí, y aquí no hay cascada que la contradiga.
     #[test]
-    fn suffix_order_beats_release_order() {
-        let rel = assets(&["b.rpm", "a.deb"]);
+    fn each_delivery_takes_its_own_file_and_no_other() {
+        let rel = assets(&["b.rpm", "a.deb", "c.AppImage"]);
         assert_eq!(
-            first_by_suffix(&rel, &[".deb", ".rpm"]).map(|a| a.name.as_str()),
+            asset_for(Delivery::Deb, &rel).map(|a| a.name.as_str()),
             Some("a.deb")
         );
         assert_eq!(
-            first_by_suffix(&rel, &[".rpm", ".deb"]).map(|a| a.name.as_str()),
+            asset_for(Delivery::Rpm, &rel).map(|a| a.name.as_str()),
             Some("b.rpm")
         );
-        assert!(first_by_suffix(&rel, &[".dmg"]).is_none());
+        assert_eq!(
+            asset_for(Delivery::AppImage, &rel).map(|a| a.name.as_str()),
+            Some("c.AppImage")
+        );
+        assert!(asset_for(Delivery::Dmg, &rel).is_none());
     }
 
     #[test]

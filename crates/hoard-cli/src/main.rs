@@ -17,7 +17,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Upgrade the CLI to the latest release (re-runs the official installer)
+    /// Install (or repair) every Hoard component this machine wants
+    Install {
+        /// Core only — never the desktop app, even where one would fit
+        #[arg(long, conflicts_with = "with_desktop")]
+        headless: bool,
+        /// Install the desktop app too, even if this machine looks headless
+        #[arg(long)]
+        with_desktop: bool,
+        /// Pin a specific version instead of this binary's (e.g. `1.0.4`)
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Upgrade every installed component to the latest release, together
     Upgrade {
         /// Pin a specific version instead of the latest (e.g. `1.0.4`)
         #[arg(long)]
@@ -255,6 +267,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
         return commands::banner::show(true).await;
     };
     match command {
+        Commands::Install {
+            headless,
+            with_desktop,
+            version,
+        } => {
+            let want = match (headless, with_desktop) {
+                (true, _) => commands::install::Want::Headless,
+                (_, true) => commands::install::Want::Desktop,
+                _ => commands::install::Want::Detect,
+            };
+            commands::install::run(want, version).await
+        }
         Commands::Upgrade { version } => commands::upgrade::run(version).await,
         Commands::Desktop { args } => commands::launch::run("hoard-desktop", &args),
         Commands::Server { args } => commands::launch::run("hoard-server", &args),
@@ -396,9 +420,12 @@ async fn list_snapshots(
         println!("(no snapshots)");
         return Ok(());
     }
+    // La máquina va en la tabla por lo mismo que en la ventana: con una partida
+    // sincronizada en dos equipos, la fecha no dice cuál de las dos copias es.
+    // Las versiones anteriores a que el server lo guardara salen con "—".
     println!(
-        "{:>5}  {:>5}  {:>10}  {:<25}  STATE",
-        "VER", "FILES", "SIZE", "CREATED"
+        "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  STATE",
+        "VER", "FILES", "SIZE", "CREATED", "DEVICE"
     );
     for s in snaps {
         let state_label = if s.deleted_at.is_some() {
@@ -409,11 +436,12 @@ async fn list_snapshots(
             "active"
         };
         println!(
-            "{:>5}  {:>5}  {:>10}  {:<25}  {}",
+            "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  {}",
             s.version_num,
             s.file_count,
             fmt_bytes(s.total_size_bytes as u64),
             s.created_at,
+            s.device_name.as_deref().unwrap_or("—"),
             state_label
         );
     }

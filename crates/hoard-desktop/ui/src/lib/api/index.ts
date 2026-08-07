@@ -596,6 +596,43 @@ export function detachAgentEvents(): Promise<void> {
   return invoke<void>("detach_agent_events");
 }
 
+/** One row of the sync service's journal, as this process relayed it.
+ *  `seq` identifies the row within a run of the daemon — a stable key for any
+ *  surface that re-reads the whole snapshot instead of stitching events. */
+export type JournalRow = { seq: number; at: number; event: AgentEvent };
+
+/** Cloud-loop state. Same vocabulary as `CloudStatus` in `stores/live.ts`. */
+export type CloudPulse = "unknown" | "online" | "offline" | "throttled";
+
+/** Everything this process already knows, copied. See {@link agentSnapshot}. */
+export type UiSnapshot = {
+  status: AgentStatus;
+  /** What the service says about each watched save: is the game running, and
+   *  when is its next backup due. Kept apart from the journal on purpose —
+   *  those are *state*, and rebuilding state by replaying events means keeping
+   *  the `game_started` row forever or lying about who's playing. */
+  slots: AgentSlotStatus[];
+  /** Oldest first, like the backlog. */
+  rows: JournalRow[];
+  cloud: CloudPulse;
+  cloud_retry_in: number | null;
+};
+
+/** Read the current state instead of subscribing to it.
+ *
+ *  Subscribing only works for whoever was there at boot: the backlog is emitted
+ *  once, `attachAgentEvents` is idempotent, and the daemon status is only
+ *  re-emitted when it changes. A window created later — the in-game HUD — can
+ *  have every listener correctly registered and still never receive a line.
+ *
+ *  So it reads. The call touches nothing but three in-memory mutexes on the Rust
+ *  side: no I/O, no network, no request to the service, and above all nothing
+ *  that could *start* anything. Opening a window to look at the state must not
+ *  change it. */
+export function agentSnapshot(): Promise<UiSnapshot> {
+  return invoke<UiSnapshot>("agent_snapshot");
+}
+
 /** Force a backup right now, bypassing debounce. */
 export function backupNow(save_id: string): Promise<void> {
   return invoke<void>("backup_now", { saveId: save_id });
@@ -809,6 +846,10 @@ export type SnapshotEntry = {
   file_count: number;
   total_size_bytes: number;
   is_pinned: boolean;
+  /** Which machine this version came from. `null` for anything uploaded before
+   *  the server started recording it — the timeline drops the suffix rather
+   *  than naming a PC it doesn't know. */
+  device_name: string | null;
   created_at: string;
   deleted_at: string | null;
 };

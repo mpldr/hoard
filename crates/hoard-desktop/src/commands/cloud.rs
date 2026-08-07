@@ -1081,6 +1081,7 @@ pub async fn cloud_sync_playtime(
     let dev = hoard_agent::logship::device_identity();
     let body = PlaytimeUploadBody {
         device_fp: dev.fingerprint,
+        authoritative: store.is_authoritative(),
         rows: store.upload_rows(),
     };
 

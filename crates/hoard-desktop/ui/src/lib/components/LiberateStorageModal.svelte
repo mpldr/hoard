@@ -14,12 +14,12 @@
    *                       reversible by reactivating after upgrading.
    */
   import { _ } from "svelte-i18n";
+  import { push } from "svelte-spa-router";
   import Modal from "./Modal.svelte";
-  import { Crown, Download, Archive } from "lucide-svelte";
+  import { Crown, Download, Archive } from "@lucide/svelte";
   import {
     storageGamesCloud,
     archiveSaveCloud,
-    openUpgradePage,
     type StorageGame,
   } from "../stores/cloud";
   import { toastError, toastSuccess } from "../stores/toasts";
@@ -123,8 +123,12 @@
     }
   }
 
+  // A la pantalla Pro, no al navegador. Este diálogo salta cuando la cuota se
+  // llena —o sea, en mitad de otra cosa—, así que abrir una pestaña encima es
+  // el peor momento posible para hacerlo.
   function goPro() {
-    void openUpgradePage();
+    onClose();
+    push("/pro");
   }
 </script>
 

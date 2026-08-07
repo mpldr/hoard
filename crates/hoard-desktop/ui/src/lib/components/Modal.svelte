@@ -11,7 +11,7 @@
    */
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
-  import { X } from "lucide-svelte";
+  import { X } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   type Props = {
@@ -63,10 +63,12 @@
       aria-modal="true"
       aria-labelledby="modal-title"
       tabindex="-1"
-      class="mx-4 max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900 shadow-xl"
+      class="pop mx-4 max-h-[85vh] w-full max-w-lg overflow-y-auto"
       onclick={(e) => e.stopPropagation()}
     >
-      <header class="flex items-start justify-between gap-4 border-b border-zinc-800 px-5 py-4">
+      <header
+        class="flex items-start justify-between gap-4 border-b border-[var(--edge)] px-5 py-4"
+      >
         <div class="min-w-0">
           <h2 id="modal-title" class="text-base font-semibold tracking-tight text-zinc-100">
             {title}
@@ -93,7 +95,7 @@
 
       {#if footer}
         <footer
-          class="flex items-center justify-end gap-2 border-t border-zinc-800 px-5 py-3"
+          class="flex items-center justify-end gap-2 border-t border-[var(--edge)] px-5 py-3"
         >
           {@render footer()}
         </footer>

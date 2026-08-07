@@ -15,7 +15,7 @@
    */
   import { onMount } from "svelte";
   import { _ } from "svelte-i18n";
-  import { Loader2 } from "lucide-svelte";
+  import { Loader2 } from "@lucide/svelte";
   import Modal from "./Modal.svelte";
   import {
     applyDesktopUpdate,

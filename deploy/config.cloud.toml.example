@@ -121,8 +121,15 @@ product_id = "4404a328-9289-4077-b25b-162ecd1d6ed3"
 plan = "pro"
 interval = "month"
 
+# The `interval` here is OUR label; the actual billing period lives on the
+# Polar product and Polar will not let you change it after creation. The first
+# yearly product (77d81015-7c9d-4009-b2a6-e0c0a0901899) was created with
+# recurring_interval=month, so "Pro anual" billed €19.99 EVERY MONTH while
+# /pricing advertised two months free. Nobody bought it; it's replaced below
+# and archived in Polar. When you add a product, check its recurring_interval
+# in the API — the product *name* proves nothing.
 [[cloud.polar.products]]
-product_id = "77d81015-7c9d-4009-b2a6-e0c0a0901899"
+product_id = "ee6d9395-cc3a-4b0c-96a5-4a008292ffc6"
 plan = "pro"
 interval = "year"
 

@@ -27,7 +27,7 @@
     Pencil,
     PlayCircle,
     UploadCloud,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "./Button.svelte";
@@ -269,7 +269,7 @@
 </script>
 
 <div
-  class="tilt group relative flex flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-zinc-900/40 shadow-[0_1px_0_0_rgba(255,255,255,0.03)_inset] transition-all duration-200 hover:-translate-y-1 hover:border-white/[0.14] hover:shadow-[0_16px_40px_-12px_rgba(0,0,0,0.8)]"
+  class="tilt panel group relative flex flex-col overflow-hidden transition-[background-color,border-color,box-shadow] duration-200 hover:border-[var(--edge-strong)] hover:shadow-[var(--edge-top),var(--shadow-raised)]"
   use:tilt
 >
   <!-- Esquina de arrastre, la misma de la biblioteca: a lo ancho manda el

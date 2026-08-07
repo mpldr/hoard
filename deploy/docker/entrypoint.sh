@@ -18,7 +18,14 @@ if [ ! -f "$CFG" ]; then
       exit 1
     }
   else
-    echo "entrypoint: missing $CFG and no example available" >&2
+    # El compose monta ./config en /etc/hoard, así que ese mount TAPA el
+    # ejemplo que trae la imagen: si la carpeta va vacía no hay ni config ni
+    # ejemplo. Se dice el comando exacto en vez de "no example available".
+    echo "entrypoint: no config at $CFG (the ./config mount hides the image's example)." >&2
+    echo "entrypoint: from the repo root, run:" >&2
+    echo "entrypoint:   mkdir -p deploy/docker/config" >&2
+    echo "entrypoint:   cp deploy/config.toml.example deploy/docker/config/config.toml" >&2
+    echo "entrypoint: edit it (public_url at least), then 'docker compose up -d' again." >&2
     exit 1
   fi
 fi

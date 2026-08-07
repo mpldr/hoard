@@ -33,7 +33,7 @@
     X,
     PauseCircle,
     Cloud,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
@@ -375,7 +375,10 @@
     const game = folderTargetGame;
     folderTargetGame = null;
     if (!game) return;
-    await persistManualPath(game, chosen);
+    // Si el override se rechaza —la carpeta es de otro juego— rastrear igual
+    // sería quedarse con la mitad mala del trato: el juego vigilando bytes
+    // ajenos y el dueño real sin poder rastrear los suyos.
+    if (!(await persistManualPath(game, chosen))) return;
     await trackWithPath(game, chosen);
   }
 
@@ -392,7 +395,10 @@
    *  re-scan doesn't revert to the heuristic guess. The detection cache
    *  refresh happens server-side; we just update our local `report.games`
    *  so the source badge flips to "manual" without a roundtrip. */
-  async function persistManualPath(game: DetectedGame, chosen: string) {
+  async function persistManualPath(
+    game: DetectedGame,
+    chosen: string,
+  ): Promise<boolean> {
     try {
       await api.setManualPath(game.slug, chosen);
       if (report) {
@@ -415,12 +421,14 @@
           values: { name: game.display_name },
         }),
       );
+      return true;
     } catch (e) {
-      // Persistence failed but the user already picked a folder — surface
-      // the error so they know the override won't survive a re-scan, then
-      // let `trackWithPath` continue so this session's tracking still
-      // works.
+      // Antes se seguía adelante «para que al menos esta sesión funcione». Ya
+      // no: el motivo más probable del rechazo es que esa carpeta sea de otro
+      // juego, y ahí seguir es justo lo que hay que evitar. El error se
+      // enseña y el llamante decide (no rastrea).
       toastError(typeof e === "string" ? e : (e as Error).message);
+      return false;
     }
   }
 
@@ -1031,9 +1039,9 @@
           {@const pending = entry.game ? untrackedPaths(entry.game) : []}
           {@const expanded = expandedPaths.has(entry.slug)}
           <div
-            class="tilt group relative flex flex-col overflow-hidden rounded-xl border bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:bg-zinc-900/50 {isTracked
+            class="tilt panel group relative flex flex-col overflow-hidden transition-[background-color,border-color,box-shadow] duration-150 hover:bg-[var(--surface-2)] {isTracked
               ? 'border-emerald-500/25 hover:border-emerald-500/40'
-              : 'border-white/[0.08] hover:border-white/[0.12]'}"
+              : 'hover:border-[var(--edge-strong)]'}"
             use:tilt
           >
             <CardResizeHandle section="detected" />

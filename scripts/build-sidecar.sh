@@ -3,15 +3,19 @@
 # the desktop src-tauri root as Tauri `externalBin`s, named with the host target
 # triple (+ `.exe` on Windows) exactly as Tauri's bundler expects.
 #
-# Two of them:
+# Three of them:
 #   - `hoard-screen` — the in-game overlay (Pro layer).
 #   - `hoardd`       — the local sync service that owns the engine (ADR 0021).
 #                      The desktop is a thin client of it and starts it when it's
 #                      absent, so a bundle without `hoardd` is an app that can't
 #                      sync at all.
+#   - `hoard`        — the terminal face. It rides along so that installing the
+#                      app installs the whole of Hoard: same version, same pass,
+#                      no second download. Which copy ends up on PATH is decided
+#                      by `hoard_agent::install`, not by whoever wrote last.
 #
-# `bundle.externalBin` in tauri.conf.json lists both, which means every desktop
-# bundle needs them present first — run this before `tauri build`. The compiled
+# `bundle.externalBin` in tauri.conf.json lists all three, which means every
+# desktop bundle needs them present first — run before `tauri build`. The compiled
 # artifacts are gitignored (only the sources under `crates/` are tracked). Run
 # once per matrix OS in CI, or locally before a desktop build.
 #
@@ -65,3 +69,10 @@ place hoard-screen
 echo "Building hoardd sidecar ($triple)"
 cargo build --manifest-path "$HOARD/Cargo.toml" --release -p hoardd
 place hoardd
+
+# La cara de terminal. Va en el bundle para que instalar la app instale Hoard
+# entero y no "la app, y el CLI aparte si te enteras" — el mismo trato que el
+# instalador de terminal le da a la app.
+echo "Building hoard CLI sidecar ($triple)"
+cargo build --manifest-path "$HOARD/Cargo.toml" --release -p hoard-cli
+place hoard

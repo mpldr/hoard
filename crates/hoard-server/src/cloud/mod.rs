@@ -38,5 +38,6 @@ pub mod routes;
 pub mod run;
 pub mod state;
 pub mod supabase_admin;
+pub mod verify;
 
 pub use run::run;

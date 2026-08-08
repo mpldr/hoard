@@ -52,9 +52,11 @@ export type CloudAccount = {
   /** RFC3339 — populated only when the user has scheduled a cancellation. */
   cancel_at: string | null;
   /** Storage pressure: `"ok"` (green), `"purging"` (orange — old versions are
-   *  being auto-deleted to free room) or `"full"` (red — at the hard limit,
-   *  sync stopped). Absent on older servers → treat as `"ok"`. */
-  storage_status?: "ok" | "purging" | "full";
+   *  being auto-deleted to free room), `"full"` (red — at the hard limit, sync
+   *  stopped) or `"grace"` (blue — a downgrade is scheduled; the account still
+   *  has its old, larger limit and **nothing is being deleted** until
+   *  `storage_limit_change_at`). Absent on older servers → treat as `"ok"`. */
+  storage_status?: "ok" | "purging" | "full" | "grace";
   /** Set while a storage downgrade is scheduled but not yet applied: the limit
    *  the account will drop to (bytes). During this grace window the user keeps
    *  the larger limit and nothing is purged. `null`/absent = no pending change. */
@@ -250,6 +252,15 @@ export type StorageGame = {
   purge_after: string | null;
 };
 
+/** Blobs shared by two or more live saves, keyed by the exact set sharing
+ *  them. Their bytes belong to no single game's `freeable_bytes`, so they only
+ *  come back once every save in `save_ids` is archived — the "same folder
+ *  tracked twice" case. */
+export type SharedGroup = {
+  save_ids: string[];
+  bytes: number;
+};
+
 /** Per-game freeable footprint + quota figures for the "free space" dialog. */
 export type StorageGames = {
   plan: string;
@@ -258,6 +269,7 @@ export type StorageGames = {
   /** Bytes the live footprint is over the limit (0 if within). */
   over_bytes: number;
   games: StorageGame[];
+  shared_groups?: SharedGroup[];
 };
 
 export type ArchiveResult = {

@@ -212,6 +212,10 @@ impl Journal {
 ///   colapso lo hace idempotente si el shell lo re-emite.
 /// - `BackupThrottled` — esperas por la ventana de banda del server. Reposo con
 ///   motivo; sólo cambia de fila si cambia el `retry_after_secs`.
+/// - `BackupQuotaFull` — la cuenta está llena. Cada save lo descubre por su
+///   cuenta y el park lo re-emite cada hora: son N informes del mismo hecho,
+///   no N incidencias. Colapsa por cifras, así que la fila se refresca cuando
+///   el usuario libera algo y sigue sin llegar.
 /// - `HeavyProcessDetected` — el mismo proceso pesado visto otra vez no es un
 ///   descubrimiento nuevo.
 ///
@@ -222,6 +226,20 @@ impl Journal {
 /// las acciones (`Backup*` de verdad, `SaveAutoRestored`,
 /// `SaveConflictsBackedUp`) tampoco: son el historial.
 pub fn collapse_key(event: &AgentEvent) -> Option<String> {
+    // `BackupQuotaFull` es el único que colapsa **entre saves distintos**: el
+    // hecho es de la cuenta, no del save, así que veinte juegos chocando contra
+    // el mismo muro son una fila, no veinte. Por eso su clave se construye a
+    // mano en vez de serializar el evento entero (que incluiría el `save_id` y
+    // los volvería a separar).
+    if let AgentEvent::BackupQuotaFull {
+        plan,
+        used_bytes,
+        limit_bytes,
+        ..
+    } = event
+    {
+        return Some(format!("quota_full:{plan}:{used_bytes}:{limit_bytes}"));
+    }
     let restful = matches!(
         event,
         AgentEvent::RestoreDeferred { .. }

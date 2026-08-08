@@ -113,6 +113,25 @@ pub enum AgentEvent {
         limit_bytes: u64,
         actual_bytes: u64,
     },
+    /// The *account* is out of storage (402 `quota_exceeded`), so this upload —
+    /// and every other one — will keep failing until the user frees space or
+    /// upgrades. Its own event rather than a `BackupFailed` for two reasons:
+    /// nothing about this save is wrong (a red "factorio falló" blames the
+    /// wrong thing, and the raw 402 JSON was what actually reached the feed in
+    /// ago-2026), and it's account-wide, so the UI collapses every save's
+    /// report into one actionable banner that opens "liberar espacio".
+    ///
+    /// The save keeps its pending changes and re-arms on a long park — the
+    /// bytes are still only on disk, so the slot must stay vetoed from restores
+    /// until they land.
+    BackupQuotaFull {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        plan: String,
+        used_bytes: u64,
+        limit_bytes: u64,
+    },
     /// The save was bigger than the plan's per-save cap, so the agent uploaded
     /// only the newest files that fit and dropped the oldest (generic recency
     /// trim — no per-game knowledge). The backup **succeeded** (a

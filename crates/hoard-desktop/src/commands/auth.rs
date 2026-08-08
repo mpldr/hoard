@@ -363,6 +363,7 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
             }
             ApiError::Network(e) => network_message(e),
             ApiError::TooLarge(detail) => detail.human(),
+            ApiError::QuotaExceeded(detail) => detail.human(),
             ApiError::RateLimited {
                 retry_after_seconds,
                 ..

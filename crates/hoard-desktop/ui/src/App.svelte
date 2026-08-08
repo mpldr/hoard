@@ -87,7 +87,14 @@ import { tilt } from "./lib/actions/tilt";
     initCloudDeepLink,
     initCloudSessionWatch,
     planLabel,
+    refreshCloud,
+    exportAllCloudData,
   } from "./lib/stores/cloud";
+  import {
+    liberateOpen,
+    closeLiberate,
+  } from "./lib/stores/liberate";
+  import LiberateStorageModal from "./lib/components/LiberateStorageModal.svelte";
   import {
     automaticState,
     initAutomaticListener,
@@ -526,6 +533,22 @@ import { tilt } from "./lib/actions/tilt";
     disposeUpdatePoller = null;
     void unsubscribeLive();
   });
+
+  /**
+   * "Descargar saves" from the liberate dialog: kick off the account export
+   * and send the user to Account, which owns the progress + download UI. The
+   * dialog stays open — grabbing a copy first and *then* archiving is the whole
+   * point of that button, so closing it would undo the user's train of thought.
+   */
+  async function handleLiberateDownload() {
+    try {
+      await exportAllCloudData();
+      toastInfo($_("account.export_started"));
+      push("/account");
+    } catch (e) {
+      showError(e);
+    }
+  }
 
   async function toggleActivityFeed() {
     const visible = !($prefs?.live_activity_visible ?? true);
@@ -1155,6 +1178,16 @@ import { tilt } from "./lib/actions/tilt";
 />
 
 <ErrorDialog error={$errorDialog} onClose={dismissError} />
+
+<!-- "Liberar espacio" lives at the shell level, not inside Account: it's needed
+     the moment an upload bounces off a full account, and that happens while the
+     user is on Library, Dashboard or nowhere at all. -->
+<LiberateStorageModal
+  open={$liberateOpen}
+  onClose={closeLiberate}
+  onDownload={handleLiberateDownload}
+  onDone={() => void refreshCloud()}
+/>
 
 {#if isAppRoute && ($prefs?.live_activity_visible ?? true)}
   <ActivityFeed onClose={() => toggleActivityFeed()} />

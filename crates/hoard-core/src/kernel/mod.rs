@@ -123,6 +123,14 @@ pub enum OpResult {
     /// (contar un throttle como "stuck" era justo el bug del spam). Simétrico
     /// backup/restore.
     Throttled { retry_after_secs: u32 },
+    /// 402: la **cuenta** no tiene sitio. A diferencia del 429 no hay ventana
+    /// que espere sola: hasta que el usuario libere o suba de plan, cualquier
+    /// subida choca igual. Aparca la subida en un reposo largo
+    /// ([`reconcile::QUOTA_FULL_BACKOFF_SECS`]) conservando `has_pending` —los
+    /// bytes siguen sólo en disco, y limpiarlo dejaría que un restore los
+    /// pisara— y **no** toca el contador de fallos: la cuenta llena no es un
+    /// save roto.
+    QuotaFull,
     /// Cualquier otro error (red, sha, permisos, timeout), tras agotar los
     /// reintentos internos del ejecutor. Su efecto depende de la op en vuelo: en
     /// una **bajada** escala el contador de fallos por versión cloud y el

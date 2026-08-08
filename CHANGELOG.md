@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dropping from Pro to Free deleted your history without warning.** The
+  grace window that was supposed to give you a month before a smaller plan takes
+  effect never ran on the one downgrade that matters: the code worked out "how
+  much room do you have today" using the plan you were moving *to*, so a Pro→Free
+  drop looked like it changed nothing, the limit collapsed the same second, and
+  the auto-purge started deleting old versions immediately. The window is now
+  real — your old limit is frozen in place until the date, nothing is purged
+  meanwhile, and the app counts down to it.
+- **A full account failed one upload at a time, forever.** Hitting the storage
+  limit surfaced as a raw server error per game (the JSON body, verbatim, in the
+  activity panel) and every save kept retrying against a wall only you can move.
+  It's now a state of its own: uploads park for an hour, the panel says what's
+  happening in one line instead of once per game, and the row carries the button
+  that opens "free up space" — which used to be buried in Account, three screens
+  from wherever you were when it happened.
+- **"Free up space" couldn't see space shared between two games.** When the same
+  folder ends up tracked twice (it happens: the slug can change under you), both
+  copies point at the same stored bytes, which belong exclusively to neither — so
+  both reported "0 bytes to free" and archiving either one freed nothing. Those
+  bytes are now counted and the pair is flagged as the duplicate it is. On the
+  account that turned this up it was 1.25 GB: 60% of a Free plan, invisible.
+- **"Free up space" picked your games for you.** It archived the heaviest ones
+  until the numbers worked. Now it proposes that as a starting point and lets you
+  tick what actually goes, with a live meter showing where your account lands —
+  and it says so plainly when archiving everything still wouldn't be enough.
+
 ## [1.1.2] — 2026-08-07
 
 ### Added

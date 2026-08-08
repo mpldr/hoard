@@ -37,6 +37,14 @@ pub enum ApiError {
     /// a red "falló".
     #[error("game is archived on the server")]
     Archived,
+    /// HTTP 402 with `code:"quota_exceeded"` — the account's total stored bytes
+    /// are at (or over) the plan limit. Unlike a 413 there is nothing to trim
+    /// and nothing to wait for: **every** upload will fail identically until the
+    /// user frees space or upgrades, so the caller must park the whole cloud leg
+    /// instead of retrying per save. Carries the server's figures so the UI can
+    /// say how far over the line the account is.
+    #[error("{}", .0.human())]
+    QuotaExceeded(QuotaExceeded),
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -68,6 +76,47 @@ pub struct SaveTooLarge {
     pub actual_bytes: u64,
     #[serde(default)]
     pub upgrade_url: Option<String>,
+}
+
+/// Structured body of a Hoard Cloud `quota_exceeded` 402. Same defaulting
+/// discipline as [`SaveTooLarge`]: a body we can't parse still yields a usable
+/// error.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QuotaExceeded {
+    #[serde(default)]
+    pub plan: String,
+    #[serde(default)]
+    pub used_bytes: u64,
+    #[serde(default)]
+    pub limit_bytes: u64,
+    #[serde(default)]
+    pub requested_bytes: u64,
+    #[serde(default)]
+    pub upgrade_url: Option<String>,
+}
+
+impl QuotaExceeded {
+    /// Bytes the account is over its limit by. `0` when the figures are absent
+    /// or the account is exactly at the line.
+    pub fn over_bytes(&self) -> u64 {
+        self.used_bytes.saturating_sub(self.limit_bytes)
+    }
+
+    pub fn human(&self) -> String {
+        if self.limit_bytes == 0 {
+            return "storage quota exceeded (402)".into();
+        }
+        format!(
+            "storage full: {} of {} used on the {} plan — free space or upgrade",
+            fmt_bytes(self.used_bytes),
+            fmt_bytes(self.limit_bytes),
+            if self.plan.is_empty() {
+                "current"
+            } else {
+                &self.plan
+            },
+        )
+    }
 }
 
 impl SaveTooLarge {
@@ -131,6 +180,13 @@ impl ApiError {
                 }
             }
             StatusCode::NOT_FOUND => ApiError::NotFound,
+            // Cloud-only. Self-hosted never issues a 402, so an unparseable body
+            // here is still safest treated as "the account is full".
+            StatusCode::PAYMENT_REQUIRED if extract_code(&body).as_deref() == Some("quota_exceeded") => {
+                ApiError::QuotaExceeded(
+                    serde_json::from_str::<QuotaExceeded>(&body).unwrap_or_default(),
+                )
+            }
             StatusCode::PAYLOAD_TOO_LARGE => {
                 ApiError::TooLarge(serde_json::from_str::<SaveTooLarge>(&body).unwrap_or_default())
             }

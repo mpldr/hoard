@@ -27,6 +27,7 @@
     WifiOff,
     Scissors,
     Trash2,
+    HardDrive,
     AlertTriangle,
     Lock,
     LockOpen,
@@ -34,6 +35,7 @@
   } from "@lucide/svelte";
 
   import { activityFeed, type FeedEntry } from "../stores/live";
+  import { openLiberate } from "../stores/liberate";
   import * as api from "../api";
   import { formatBytes } from "../utils/format";
 
@@ -55,12 +57,14 @@
     offline: WifiOff,
     online: CheckCircle2,
     backup_too_large: XCircle,
+    backup_quota_full: HardDrive,
     backup_trimmed: Scissors,
     auto_restore_failed: XCircle,
     auto_restore_stuck: AlertTriangle,
     auto_restore_recovered: CheckCircle2,
     storage_purging: Trash2,
     storage_full: AlertTriangle,
+    storage_grace: Clock,
     gate_locked: Lock,
     gate_unlocked: LockOpen,
   } as const;
@@ -80,12 +84,14 @@
     offline: "text-rose-400",
     online: "text-emerald-400",
     backup_too_large: "text-rose-400",
+    backup_quota_full: "text-rose-400",
     backup_trimmed: "text-amber-300",
     auto_restore_failed: "text-rose-400",
     auto_restore_stuck: "text-amber-400",
     auto_restore_recovered: "text-emerald-400",
     storage_purging: "text-amber-400",
     storage_full: "text-rose-400",
+    storage_grace: "text-sky-300",
     gate_locked: "text-rose-400",
     gate_unlocked: "text-emerald-400",
   } as const;
@@ -102,9 +108,18 @@
     auto_restore_stuck:
       "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_full: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    backup_quota_full:
+      "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     backup_trimmed: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
+    storage_grace: "my-1 rounded-md border border-sky-500/60 bg-sky-500/10",
   };
+
+  /** Rows whose problem the user can actually do something about from here. */
+  const ACTIONABLE = new Set<FeedEntry["kind"]>([
+    "backup_quota_full",
+    "storage_full",
+  ]);
 
   const relativeTime = (at: number) => feedRelativeTime(at, $_);
   const summary = (e: FeedEntry) => feedSummary(e, $_);
@@ -173,7 +188,21 @@
             <Icon size={14} />
           </span>
           <div class="min-w-0 flex-1 text-xs leading-snug">
-            <p class="truncate text-zinc-200">{summary(entry)}</p>
+            <p class="text-zinc-200 {ACTIONABLE.has(entry.kind) ? '' : 'truncate'}">
+              {summary(entry)}
+            </p>
+            <!-- Storage rows carry the way out. A feed that only *reports* a
+                 full account leaves the user hunting through Settings for the
+                 escape hatch at the worst possible moment. -->
+            {#if ACTIONABLE.has(entry.kind)}
+              <button
+                type="button"
+                class="mt-1 rounded-md border border-rose-500/50 bg-rose-500/10 px-2 py-1 text-[11px] font-medium text-rose-200 transition-colors hover:bg-rose-500/20"
+                onclick={openLiberate}
+              >
+                {$_("liberate.cta")}
+              </button>
+            {/if}
             <p class="text-[10px] text-zinc-500">
               {_tickRef >= 0 ? relativeTime(entry.at) : ""}
             </p>

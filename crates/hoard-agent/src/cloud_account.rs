@@ -167,6 +167,19 @@ pub struct StorageGames {
     /// Bytes por encima del límite (0 si dentro).
     pub over_bytes: u64,
     pub games: Vec<StorageGame>,
+    /// Blobs que comparten dos o más partidas vivas, agrupados por el conjunto
+    /// exacto que los comparte. Esos bytes no son exclusivos de ninguna, así que
+    /// no salen en ningún `freeable_bytes`: sólo vuelven si se archivan **todas**
+    /// las del grupo. El caso típico es la misma carpeta trackeada dos veces.
+    #[serde(default)]
+    pub shared_groups: Vec<SharedGroup>,
+}
+
+/// Un grupo de blobs compartidos y lo que pesan. Espeja `SharedGroup` del server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedGroup {
+    pub save_ids: Vec<String>,
+    pub bytes: i64,
 }
 
 /// Resultado de archivar. Espeja `ArchiveOut` del server.

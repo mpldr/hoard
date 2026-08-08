@@ -58,6 +58,13 @@ pub const STUCK_AFTER: u32 = 3;
 /// (ADR 0021 D.8.2).
 pub const BACKUP_FAILURE_BACKOFF_SECS: i64 = 10 * 60;
 
+/// Reposo tras un 402 (cuenta llena). Mucho más largo que el de un fallo
+/// normal: liberar espacio es una acción humana —archivar juegos, subir a
+/// Pro—, no una racha de red que se cura sola en diez minutos. Con veinte
+/// saves en la biblioteca, el backoff de fallo normal serían ~120 POST a la
+/// hora que ya sabemos que van a devolver 402.
+pub const QUOTA_FULL_BACKOFF_SECS: i64 = 60 * 60;
+
 /// Cadencia fija del poll airbag a `/v1/cloud/sync`. **Fuente de verdad del
 /// número**: `hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS` la re-exporta, para
 /// que el umbral de obsolescencia de abajo se derive de la cadencia real en vez
@@ -511,6 +518,15 @@ fn ingest_op_result(
             }
             decisions.push(Decision::Act(Action::Throttle { until }));
         }
+        // 402: la cuenta está llena. Sólo frena subidas —una bajada no consume
+        // cuota, así que un restore pendiente debe seguir su camino— y deja
+        // `has_pending` intacto para que el slot siga vetado del pull mientras
+        // los cambios estén sólo en disco.
+        OpResult::QuotaFull => {
+            if matches!(op, Some(Op::Backup)) {
+                next.next_backup_at = Some(now + Duration::seconds(QUOTA_FULL_BACKOFF_SECS));
+            }
+        }
         // Otro error, según la op:
         // - subida: agotó su presupuesto de reintentos internos → se re-arma en
         //   el backoff largo y **conserva** `has_pending` (los cambios nunca
@@ -747,6 +763,49 @@ mod tests {
                 Some(Action::Throttle { .. })
             ),
             "backup también emite Throttle: {bds:?}"
+        );
+    }
+
+    /// Cuenta llena (402): aparca la subida una hora, conserva `has_pending`
+    /// (los bytes siguen sólo en disco) y no cuenta como fallo del save. Y no
+    /// toca el lado restore: bajar no consume cuota.
+    #[test]
+    fn quota_full_parks_the_upload_without_blaming_the_save() {
+        let state = State {
+            in_flight: Some(Op::Backup),
+            has_pending: true,
+            ..base_state()
+        };
+        let obs = Observation {
+            op_result: Some(OpResult::QuotaFull),
+            ..quiet_obs()
+        };
+        let (next, _ds) = reconcile(&state, &obs, world(0));
+        let until = next.next_backup_at.expect("la subida queda aparcada");
+        assert_eq!(
+            (until - at(0)).whole_seconds(),
+            QUOTA_FULL_BACKOFF_SECS,
+            "el park del 402 es el largo, no el de un fallo cualquiera"
+        );
+        assert!(next.has_pending, "los cambios locales siguen sin versión");
+        assert!(next.next_restore_at.is_none(), "sin tocar el lado restore");
+        assert_eq!(
+            next.restore_failures,
+            RestoreFailures::default(),
+            "una cuenta llena NO es un save roto"
+        );
+
+        // Antes del deadline no se reintenta; cruzado, la subida vuelve a salir.
+        let obs_quiet = quiet_obs();
+        let (_m, ds_mid) = reconcile(&next, &obs_quiet, world(QUOTA_FULL_BACKOFF_SECS / 2));
+        assert!(
+            !acts(&ds_mid).contains(&&Action::Backup),
+            "dentro del park no se reintenta: {ds_mid:?}"
+        );
+        let (_p, ds_past) = reconcile(&next, &obs_quiet, world(QUOTA_FULL_BACKOFF_SECS + 1));
+        assert!(
+            acts(&ds_past).contains(&&Action::Backup),
+            "pasada la hora vuelve a intentarlo: {ds_past:?}"
         );
     }
 

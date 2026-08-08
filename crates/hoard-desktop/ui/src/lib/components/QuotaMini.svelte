@@ -54,7 +54,7 @@
         limit: u.storage_quota_bytes,
         capped: !u.is_local_server && u.storage_quota_bytes > 0,
         // Self-hosted UserInfo carries no pressure signal → always "ok".
-        status: "ok" as "ok" | "purging" | "full",
+        status: "ok" as "ok" | "purging" | "full" | "grace",
       };
     }
     const acc = $cloud.account;
@@ -72,7 +72,7 @@
       used: 0,
       limit: 0,
       capped: false,
-      status: "ok" as "ok" | "purging" | "full",
+      status: "ok" as "ok" | "purging" | "full" | "grace",
     };
   });
 
@@ -88,19 +88,28 @@
   // once the server is actually purging old versions to make room, red only
   // when it's full and rejecting uploads. Below that it stays emerald however
   // high the bar climbs — a plan at 85% that isn't purging anything is fine.
+  //
+  // `grace` is sky: a downgrade is scheduled, so the figures are still those of
+  // the old, larger limit and nothing is being deleted — but the rail is the
+  // one surface visible from every screen, so it's where a shrink that hasn't
+  // happened yet should be noticeable. Account has the date.
   const barClass = $derived(
     src.status === "full"
       ? "bg-red-500"
       : src.status === "purging"
         ? "bg-amber-400"
-        : "bg-emerald-500",
+        : src.status === "grace"
+          ? "bg-sky-500"
+          : "bg-emerald-500",
   );
   const pctClass = $derived(
     src.status === "full"
       ? "text-red-400"
       : src.status === "purging"
         ? "text-amber-400"
-        : "text-zinc-300",
+        : src.status === "grace"
+          ? "text-sky-300"
+          : "text-zinc-300",
   );
 </script>
 

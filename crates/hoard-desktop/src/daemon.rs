@@ -796,6 +796,7 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::BackupFailed { .. } => "agent://backup-failed",
         AgentEvent::BackupThrottled { .. } => "agent://backup-throttled",
         AgentEvent::BackupTooLarge { .. } => "agent://backup-too-large",
+        AgentEvent::BackupQuotaFull { .. } => "agent://backup-quota-full",
         AgentEvent::BackupTrimmed { .. } => "agent://backup-trimmed",
         AgentEvent::SaveAutoRestored { .. } => "agent://save-auto-restored",
         AgentEvent::SaveAutoRestoreFailed { .. } => "agent://save-auto-restore-failed",

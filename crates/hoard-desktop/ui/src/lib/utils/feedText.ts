@@ -94,6 +94,13 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
           limit: formatBytes(e.limit_bytes ?? 0),
         },
       });
+    case "backup_quota_full":
+      return $_("activity.backup_quota_full", {
+        values: {
+          used: formatBytes(e.bytes ?? 0),
+          limit: formatBytes(e.limit_bytes ?? 0),
+        },
+      });
     case "backup_trimmed":
       return $_("activity.backup_trimmed", {
         values: {
@@ -116,6 +123,8 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
       return $_("activity.storage_purging");
     case "storage_full":
       return $_("activity.storage_full");
+    case "storage_grace":
+      return $_("activity.storage_grace");
     case "gate_locked":
       return $_("activity.gate_locked", {
         values: {

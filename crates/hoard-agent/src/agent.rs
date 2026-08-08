@@ -390,6 +390,13 @@ enum AgentCommand {
     /// on [`kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS`] — the recovery path
     /// that doesn't depend on a new fs event.
     RetryBackupAfterFailure(String),
+    /// Internal: the upload hit a 402 — the whole account is out of storage.
+    /// Same wedge-avoidance contract as `RetryBackupAfterFailure` (no
+    /// `BackupDone`, `has_pending` survives), but fed to the reductor as
+    /// [`kernel::OpResult::QuotaFull`] so it parks on the long
+    /// [`kernel::reconcile::QUOTA_FULL_BACKOFF_SECS`] instead of retrying every
+    /// ten minutes against a wall that only a human can move.
+    ParkBackupQuotaFull(String),
     /// Latest known cloud version per save id, as last seen by the `cloud_pull`
     /// poller's manifest. The poller already fetches the full manifest once per
     /// tick, so it hands the map to the agent and the reconciliation sweep can
@@ -1690,6 +1697,25 @@ async fn run_agent(
                                 save_id = %id,
                                 backoff_secs = kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS,
                                 "agent: backup retries exhausted — re-arming on the long backoff"
+                            );
+                        }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads,
+                        );
+                    }
+                    Some(AgentCommand::ParkBackupQuotaFull(id)) => {
+                        // Cuenta llena (402). Igual que el caso de arriba es una
+                        // entrada del reductor, pero con su propia disposición:
+                        // aparca la subida una hora, conserva `has_pending` y no
+                        // cuenta como fallo del save — no lo es.
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.next_scheduled_backup_at = None;
+                            slot.pending_op_result = Some(kernel::OpResult::QuotaFull);
+                            tracing::info!(
+                                save_id = %id,
+                                backoff_secs = kernel::reconcile::QUOTA_FULL_BACKOFF_SECS,
+                                "agent: cloud storage full — parking the upload until space is freed"
                             );
                         }
                         reconcile_all(
@@ -3781,6 +3807,45 @@ async fn run_backup_with_retry(
                             limit_bytes: detail.limit_bytes,
                             actual_bytes: detail.actual_bytes,
                         })
+                        .await;
+                    return;
+                }
+                // Account out of storage (402 `quota_exceeded`): nothing about
+                // this save is wrong and nothing will change by retrying — the
+                // next attempt, and every other save's, hits the same wall until
+                // a human frees space or upgrades. Park it for an hour and say
+                // so once, account-wide. Deliberately **no** `BackupDone`: the
+                // bytes are still only on disk, so `has_pending` must survive
+                // (same contract as the exhausted-retries path below).
+                let quota = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<crate::api::ApiError>())
+                    .and_then(|api_err| match api_err {
+                        crate::api::ApiError::QuotaExceeded(d) => Some(d.clone()),
+                        _ => None,
+                    });
+                if let Some(detail) = quota {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        plan = %detail.plan,
+                        used_bytes = detail.used_bytes,
+                        limit_bytes = detail.limit_bytes,
+                        over_bytes = detail.over_bytes(),
+                        "agent: backup parked — the cloud account is out of storage"
+                    );
+                    let _ = events_tx
+                        .send(AgentEvent::BackupQuotaFull {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            plan: detail.plan.clone(),
+                            used_bytes: detail.used_bytes,
+                            limit_bytes: detail.limit_bytes,
+                        })
+                        .await;
+                    let _ = cmd_tx
+                        .send(AgentCommand::ParkBackupQuotaFull(save.save_id.clone()))
                         .await;
                     return;
                 }

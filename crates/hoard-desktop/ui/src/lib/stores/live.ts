@@ -55,6 +55,10 @@ export type FeedEntry = {
     // Per-save plan-limit outcomes — surfaced here (not as toasts) so the
     // reconciliation sweep doesn't spam a popup per save on every launch.
     | "backup_too_large"
+    // The account ran out of storage. Account-wide, not per-save: the engine
+    // collapses every save's report into one row (see `journal::collapse_key`)
+    // and the row carries the action that opens "liberar espacio".
+    | "backup_quota_full"
     | "backup_trimmed"
     | "auto_restore_failed"
     // Auto-restore has failed repeatedly on the same cloud version. Distinct
@@ -66,6 +70,10 @@ export type FeedEntry = {
     // `storage_status` (`purging` → amber, `full` → red).
     | "storage_purging"
     | "storage_full"
+    // A storage downgrade is scheduled: the account keeps its old limit and
+    // nothing is deleted until the date. The row exists so the countdown is
+    // seen *before* the shrink, which is the whole point of the window.
+    | "storage_grace"
     // Pro-gate (Hoard-Screen) transitions — pushed from the entitlements store
     // when the gate visibly flips between locked and unlocked, with the cause
     // in `reason_key` (an i18n key). Lets the user see WHY the candado
@@ -220,6 +228,15 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         save_id: p.save_id,
         game_slug: p.game_slug,
         bytes: p.actual_bytes,
+        limit_bytes: p.limit_bytes,
+      };
+    case "backup_quota_full":
+      return {
+        kind: "backup_quota_full",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        plan: p.plan,
+        bytes: p.used_bytes,
         limit_bytes: p.limit_bytes,
       };
     case "backup_trimmed":
@@ -518,6 +535,21 @@ export async function subscribeLive() {
   );
 
   unlisteners.push(
+    await listen<AgentEvent>("agent://backup-quota-full", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_quota_full") return;
+      pushEntry({
+        kind: "backup_quota_full",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        plan: p.plan,
+        bytes: p.used_bytes,
+        limit_bytes: p.limit_bytes,
+      });
+    }),
+  );
+
+  unlisteners.push(
     await listen<AgentEvent>("agent://backup-trimmed", (e) => {
       const p = e.payload;
       if (p.type !== "backup_trimmed") return;
@@ -584,6 +616,7 @@ export function noteStorageStatus(status: string | undefined | null) {
   lastStorageStatus = s;
   if (s === "purging") pushEntry({ kind: "storage_purging" });
   else if (s === "full") pushEntry({ kind: "storage_full" });
+  else if (s === "grace") pushEntry({ kind: "storage_grace" });
 }
 
 /** Last gate state we pushed a feed row for, so a re-pull that reports the

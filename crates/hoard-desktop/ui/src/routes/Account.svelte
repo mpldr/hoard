@@ -19,7 +19,7 @@
   import Card from "../lib/components/Card.svelte";
   import Button from "../lib/components/Button.svelte";
   import Modal from "../lib/components/Modal.svelte";
-  import LiberateStorageModal from "../lib/components/LiberateStorageModal.svelte";
+  import { openLiberate } from "../lib/stores/liberate";
   import {
     cloud,
     hydrateCloud,
@@ -43,7 +43,6 @@
   >(null);
   let confirmDeleteOpen = $state(false);
   let deleteConfirmation = $state("");
-  let liberateOpen = $state(false);
 
   // Latest export job + a poll while it's building. The worker is async, so the
   // download link appears here (and by email) once the ZIP is ready.
@@ -232,15 +231,20 @@
     // to the raw % only for older servers that don't send `storage_status`.
     const status = a.storage_status ?? "ok";
     const color =
-      status === "full" || pct >= 100
-        ? "bg-rose-500"
-        : status === "purging"
-          ? "bg-amber-500"
-          : pct >= 90
-            ? "bg-rose-500"
-            : pct >= 75
-              ? "bg-amber-500"
-              : "bg-emerald-500";
+      // Sky first: inside a downgrade window the account is *fine* — it still
+      // has its old limit and nothing is being deleted. Painting it red or
+      // amber would announce a problem that hasn't happened yet.
+      status === "grace"
+        ? "bg-sky-500"
+        : status === "full" || pct >= 100
+          ? "bg-rose-500"
+          : status === "purging"
+            ? "bg-amber-500"
+            : pct >= 90
+              ? "bg-rose-500"
+              : pct >= 75
+                ? "bg-amber-500"
+                : "bg-emerald-500";
     return {
       usedLabel: formatBytes(a.storage_used_bytes),
       capLabel: formatBytes(a.storage_limit_bytes),
@@ -528,7 +532,7 @@
           {:else if storageView.status === "full"}
             <p class="mt-1.5 text-xs text-rose-400">{$_("account.storage_full")}</p>
             <div class="mt-2">
-              <Button onclick={() => (liberateOpen = true)}>
+              <Button onclick={openLiberate}>
                 <HardDrive size={14} />
                 {$_("liberate.cta")}
               </Button>
@@ -736,11 +740,5 @@
   {/snippet}
 </Modal>
 
-<LiberateStorageModal
-  open={liberateOpen}
-  onClose={() => (liberateOpen = false)}
-  onDownload={handleExport}
-  onDone={() => {
-    void refreshCloud();
-  }}
-/>
+<!-- El diálogo lo monta `App.svelte` a nivel de shell (hace falta desde
+     cualquier pantalla, no sólo desde aquí); esta página sólo lo abre. -->

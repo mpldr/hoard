@@ -519,6 +519,16 @@ export type AgentEvent =
       actual_bytes: number;
     }
   | {
+      /** Account-wide: the plan's storage is full, so no save can upload. */
+      type: "backup_quota_full";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      plan: string;
+      used_bytes: number;
+      limit_bytes: number;
+    }
+  | {
       type: "backup_trimmed";
       save_id: string;
       game_slug: string;

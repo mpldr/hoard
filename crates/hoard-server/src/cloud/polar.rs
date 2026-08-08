@@ -328,7 +328,35 @@ pub async fn handle(
         return CloudError::Db(e).into_response();
     }
 
+    // Order matters in both branches: `settle_storage_limit` reads the *old*
+    // plan off the profile row to know how much room the user has today, so the
+    // `plan` column can only be flipped after it has run. Doing it the other way
+    // round is what silently disabled the Pro→Free grace window.
     if status == "active" {
+        // Storage tier (Pro xN) this product grants. `None` (base/unconfigured)
+        // means the plan default. Upgrades apply at once; a downgrade below the
+        // user's footprint gets a grace window before it shrinks — see
+        // `settle_storage_limit`. (Downgrades should be issued with
+        // `proration_behavior=next_period` so the user also keeps the bigger
+        // tier until their paid period ends.)
+        let storage_override: Option<i64> = cloud
+            .polar
+            .storage_bytes_for_product(product_id)
+            .map(|b| b as i64);
+        let plan_enum =
+            crate::cloud::plans::Plan::from_str(plan).unwrap_or(crate::cloud::plans::Plan::Pro);
+        match crate::cloud::quota::settle_storage_limit(
+            &state.pool,
+            user_id,
+            plan_enum,
+            storage_override,
+            cloud.storage_downgrade_grace_days as i64,
+        )
+        .await
+        {
+            Ok(outcome) => info!(?outcome, user_id = %user_id, "polar webhook: storage tier settled"),
+            Err(e) => warn!(error = ?e, "polar webhook: settling storage tier failed"),
+        }
         if let Err(e) =
             sqlx::query("UPDATE profiles SET plan = $1, updated_at = now() WHERE user_id = $2")
                 .bind(plan)
@@ -338,32 +366,22 @@ pub async fn handle(
         {
             warn!(error = %e, "polar webhook: profile plan update failed");
         }
-        // Storage tier (Pro xN) this product grants. `None` (base/unconfigured)
-        // means the plan default. Upgrades apply at once; a downgrade below the
-        // user's footprint gets a grace window before it shrinks — see
-        // `settle_storage_on_active`. (Downgrades should be issued with
-        // `proration_behavior=next_period` so the user also keeps the bigger
-        // tier until their paid period ends.)
-        let storage_override: Option<i64> = cloud
-            .polar
-            .storage_bytes_for_product(product_id)
-            .map(|b| b as i64);
-        let plan_enum =
-            crate::cloud::plans::Plan::from_str(plan).unwrap_or(crate::cloud::plans::Plan::Pro);
-        if let Err(e) = crate::cloud::quota::settle_storage_on_active(
+    } else if status == "expired" {
+        // Subscription expired: drop to Free. If the user is over Free's limit
+        // they keep their Pro room for `storage_downgrade_grace_days` — nothing
+        // is purged and `/v1/me` counts down — before it shrinks to 2 GB.
+        match crate::cloud::quota::settle_storage_limit(
             &state.pool,
             user_id,
-            plan_enum,
-            storage_override,
+            crate::cloud::plans::Plan::Free,
+            None, // Free has no per-user tier override
             cloud.storage_downgrade_grace_days as i64,
         )
         .await
         {
-            warn!(error = ?e, "polar webhook: settling storage tier failed");
+            Ok(outcome) => info!(?outcome, user_id = %user_id, "polar webhook: storage settled on expiry"),
+            Err(e) => warn!(error = ?e, "polar webhook: settling storage on expiry failed"),
         }
-    } else if status == "expired" {
-        // Subscription expired: downgrade to Free with grace window. User keeps Pro
-        // storage for `storage_downgrade_grace_days` then it shrinks to Free (1 GB).
         if let Err(e) =
             sqlx::query("UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1")
                 .bind(user_id)
@@ -372,20 +390,6 @@ pub async fn handle(
         {
             warn!(error = %e, "polar webhook: plan reset to free failed");
             return CloudError::Db(e).into_response();
-        }
-        // Apply grace window: if user is over Free's limit, schedule the downgrade
-        // instead of applying it immediately.
-        let plan_enum = crate::cloud::plans::Plan::Free;
-        if let Err(e) = crate::cloud::quota::settle_storage_on_active(
-            &state.pool,
-            user_id,
-            plan_enum,
-            None, // Free has no per-user tier override
-            cloud.storage_downgrade_grace_days as i64,
-        )
-        .await
-        {
-            warn!(error = ?e, "polar webhook: settling storage on expiry failed");
         }
     }
 

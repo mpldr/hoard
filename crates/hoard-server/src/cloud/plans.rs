@@ -133,6 +133,36 @@ pub fn effective_storage_limit(plan: Plan, override_bytes: Option<i64>) -> u64 {
     }
 }
 
+/// The storage limit enforced *right now*, honouring an in-flight downgrade
+/// grace window.
+///
+/// While a downgrade is scheduled (`change_at` still in the future) the
+/// `profiles.storage_limit_bytes` column holds an **absolute grant** — the
+/// limit the user had the moment the smaller tier landed — and it wins over the
+/// plan default, **Free included**. That exception is the entire point of the
+/// window: keep the room until the deadline so nothing is purged behind the
+/// user's back, and so `/v1/me` can count down to a date instead of announcing
+/// a deletion that already happened.
+///
+/// This is why `effective_storage_limit`'s "Free ignores any override" guard
+/// isn't enough on its own: a Pro→Free drop flips the plan column immediately,
+/// so without the grace grant the limit collapses to 2 GB the same second and
+/// the auto-purge starts eating history. Once the deadline passes,
+/// `quota::apply_due_downgrade` promotes the pending value into
+/// `storage_limit_bytes` and this collapses back to `effective_storage_limit`.
+pub fn resolved_storage_limit(
+    plan: Plan,
+    override_bytes: Option<i64>,
+    change_at_unix: Option<i64>,
+    now_unix: i64,
+) -> u64 {
+    let base = effective_storage_limit(plan, override_bytes);
+    match (change_at_unix, override_bytes) {
+        (Some(at), Some(grant)) if at > now_unix && grant > 0 => (grant as u64).max(base),
+        _ => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +221,42 @@ mod tests {
             150 * GB
         );
         assert_eq!(STORAGE_STEP_BYTES, 25 * GB);
+    }
+
+    #[test]
+    fn grace_grant_survives_the_plan_flip_to_free() {
+        let now = 1_000_000;
+        let grant = 100 * GB as i64;
+        // Pro→Free with a live window: the plan column already says free, but
+        // the absolute grant rules until the deadline.
+        assert_eq!(
+            resolved_storage_limit(Plan::Free, Some(grant), Some(now + 86_400), now),
+            100 * GB
+        );
+        // Deadline passed → back to the plan default even if the column is
+        // still populated (belt and braces; `apply_due_downgrade` clears it).
+        assert_eq!(
+            resolved_storage_limit(Plan::Free, Some(grant), Some(now - 1), now),
+            2 * GB
+        );
+        // No window at all → plain effective limit, Free ignores the override.
+        assert_eq!(resolved_storage_limit(Plan::Free, Some(grant), None, now), 2 * GB);
+    }
+
+    #[test]
+    fn grace_window_leaves_a_pro_tier_alone() {
+        let now = 1_000_000;
+        // On Pro the column already *is* the bought tier, so an open window
+        // changes nothing: a Pro x6 → Pro x2 downgrade parks 150 GB in the
+        // column and 50 GB in `pending`, and 150 GB is what's enforced.
+        assert_eq!(
+            resolved_storage_limit(Plan::Pro, Some(150 * GB as i64), Some(now + 10), now),
+            150 * GB
+        );
+        // The plan base is the floor when the column is empty, window or not.
+        assert_eq!(
+            resolved_storage_limit(Plan::Pro, None, Some(now + 10), now),
+            100 * GB
+        );
     }
 }

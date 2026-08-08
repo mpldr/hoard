@@ -355,6 +355,21 @@ pub struct GameFootprint {
     pub purge_after: Option<String>,
 }
 
+/// Bytes that only come back when **every** save in `save_ids` is archived.
+///
+/// Content addressing means two saves can point at the same blob — most often
+/// because the same folder ended up tracked twice under two slugs (the mars /
+/// surviving-mars-relaunched case: 1.25 GB, 60% of a Free quota). Those bytes
+/// are exclusive to *neither* save, so they vanish from both `freeable_bytes`
+/// figures and the dialog silently under-reports what the account is carrying —
+/// and archiving either game alone frees nothing at all, which reads as the
+/// feature being broken.
+#[derive(Debug, Serialize)]
+pub struct SharedGroup {
+    pub save_ids: Vec<String>,
+    pub bytes: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StorageGamesOut {
     pub plan: &'static str,
@@ -363,6 +378,11 @@ pub struct StorageGamesOut {
     /// How many bytes over the limit the *live* footprint is (0 if within).
     pub over_bytes: u64,
     pub games: Vec<GameFootprint>,
+    /// Blobs shared between two or more live saves, grouped by the exact set
+    /// sharing them. A client picking what to archive adds a group's `bytes`
+    /// only once its whole `save_ids` set is selected.
+    #[serde(default)]
+    pub shared_groups: Vec<SharedGroup>,
 }
 
 /// `GET /v1/cloud/storage/games` — per-game freeable footprint plus the quota
@@ -424,6 +444,35 @@ pub async fn storage_games(
         )
         .collect();
 
+    // Blobs referenced by more than one *live* save, grouped by the exact set
+    // of saves referencing them. Archived saves are excluded: their references
+    // are already released, so they can't hold anything hostage.
+    let shared_rows: Vec<(Vec<String>, i64)> = sqlx::query_as(
+        r#"
+        WITH per_blob AS (
+            SELECT f.sha256, array_agg(DISTINCT f.save_id ORDER BY f.save_id) AS save_ids
+            FROM save_version_files f
+            JOIN saves s ON s.id = f.save_id
+            WHERE s.user_id = $1 AND s.archived_at IS NULL
+            GROUP BY f.sha256
+            HAVING COUNT(DISTINCT f.save_id) > 1
+        )
+        SELECT pb.save_ids, COALESCE(SUM(b.size_bytes), 0)::bigint AS bytes
+        FROM per_blob pb
+        JOIN cloud_blobs b ON b.user_id = $1 AND b.sha256 = pb.sha256
+        WHERE b.refcount > 0
+        GROUP BY pb.save_ids
+        ORDER BY 2 DESC
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let shared_groups = shared_rows
+        .into_iter()
+        .map(|(save_ids, bytes)| SharedGroup { save_ids, bytes })
+        .collect();
+
     let over = info.used_bytes.saturating_sub(info.limit_bytes);
     Ok(Json(StorageGamesOut {
         plan: info.plan,
@@ -431,6 +480,7 @@ pub async fn storage_games(
         limit_bytes: info.limit_bytes,
         over_bytes: over,
         games,
+        shared_groups,
     })
     .into_response())
 }

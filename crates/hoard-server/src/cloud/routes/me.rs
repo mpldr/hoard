@@ -82,12 +82,20 @@ pub struct Me {
     pub max_versions: Option<i64>,
 }
 
-/// Derive the storage gauge state from the deduped footprint vs. the plan's
-/// limit and per-plan auto-purge threshold.
-fn storage_status(plan: Plan, used: i64, limit: u64) -> &'static str {
+/// Derive the storage gauge state from the deduped footprint vs. the limit
+/// actually in force and the per-plan auto-purge threshold.
+///
+/// `grace` wins over everything: while a downgrade window is open the user is
+/// still on their old, larger limit and **nothing is deleted**, so painting the
+/// bar amber for "purging" would be a lie. The client shows the countdown
+/// instead.
+fn storage_status(plan: Plan, used: i64, limit: u64, grace: bool) -> &'static str {
     let limit = limit as i64;
     if limit <= 0 {
         return "ok";
+    }
+    if grace {
+        return "grace";
     }
     if used >= limit {
         "full"
@@ -112,6 +120,50 @@ pub async fn get_me(
     // the recomputed `devices_count` is the one we return. Best-effort: a
     // client that sends no fingerprint (older builds) leaves the count alone.
     register_device(&state, &user, &headers).await?;
+
+    // Sync any subscriptions that actually expired but status wasn't updated
+    // (retroactive fix for webhooks that didn't fire or were delayed).
+    // Check both renews_at (renewal date) and cancel_at (cancellation scheduled date).
+    // Runs before the profile SELECT so a downgrade settled here is visible in
+    // the very response that reports it, not one poll later.
+    let expired_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM subscriptions
+         WHERE user_id = $1 AND status IN ('active','grace')
+         AND ((renews_at IS NOT NULL AND renews_at <= now())
+              OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
+    )
+    .bind(user.user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if expired_count > 0 {
+        let _ = sqlx::query(
+            "UPDATE subscriptions SET status = 'expired', updated_at = now()
+             WHERE user_id = $1 AND status IN ('active','grace')
+             AND ((renews_at IS NOT NULL AND renews_at <= now())
+                  OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
+        )
+        .bind(user.user_id)
+        .execute(&state.pool)
+        .await;
+        // Grace window first, plan flip second: `settle_storage_limit` reads the
+        // old plan off the row to size the grant (same ordering as the webhook).
+        if let Some(ref cloud) = state.config.cloud {
+            let _ = quota::settle_storage_limit(
+                &state.pool,
+                user.user_id,
+                Plan::Free,
+                None,
+                cloud.storage_downgrade_grace_days as i64,
+            )
+            .await;
+        }
+        let _ =
+            sqlx::query("UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1")
+                .bind(user.user_id)
+                .execute(&state.pool)
+                .await;
+    }
+
     // Promote any downgrade whose grace window elapsed, so the limit + status
     // we report are the live ones.
     quota::apply_due_downgrade(&state.pool, user.user_id).await?;
@@ -140,46 +192,6 @@ pub async fn get_me(
     .fetch_one(&state.pool)
     .await?;
 
-    // Sync any subscriptions that actually expired but status wasn't updated
-    // (retroactive fix for webhooks that didn't fire or were delayed).
-    // Check both renews_at (renewal date) and cancel_at (cancellation scheduled date).
-    let expired_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM subscriptions
-         WHERE user_id = $1 AND status IN ('active','grace')
-         AND ((renews_at IS NOT NULL AND renews_at <= now())
-              OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
-    )
-    .bind(user.user_id)
-    .fetch_one(&state.pool)
-    .await?;
-    if expired_count > 0 {
-        let _ = sqlx::query(
-            "UPDATE subscriptions SET status = 'expired', updated_at = now()
-             WHERE user_id = $1 AND status IN ('active','grace')
-             AND ((renews_at IS NOT NULL AND renews_at <= now())
-                  OR (cancel_at IS NOT NULL AND cancel_at <= now()))",
-        )
-        .bind(user.user_id)
-        .execute(&state.pool)
-        .await;
-        let _ =
-            sqlx::query("UPDATE profiles SET plan = 'free', updated_at = now() WHERE user_id = $1")
-                .bind(user.user_id)
-                .execute(&state.pool)
-                .await;
-        // Apply grace window for storage downgrade (same as webhook).
-        if let Some(ref cloud) = state.config.cloud {
-            let _ = quota::settle_storage_on_active(
-                &state.pool,
-                user.user_id,
-                Plan::Free,
-                None,
-                cloud.storage_downgrade_grace_days as i64,
-            )
-            .await;
-        }
-    }
-
     let sub: Option<(
         String,
         Option<time::OffsetDateTime>,
@@ -207,24 +219,23 @@ pub async fn get_me(
 
     let plan = Plan::from_str(&row.3).unwrap_or(Plan::Free);
     let mut limits = plan.limits();
-    // Per-user storage tier (Pro xN); NULL falls back to the plan default.
-    limits.storage_bytes = crate::cloud::plans::effective_storage_limit(plan, row.8);
-    // A pending downgrade exists iff a change instant is set; its target limit
-    // resolves the override the same way (NULL pending = the plan base).
+    // A pending downgrade exists iff a change instant is set; while it's in the
+    // future `storage_limit_bytes` is the absolute grant the user keeps and the
+    // plan column may already say "free" — so resolve, don't just read the tier.
     let pending_change_at = row.10;
+    limits.storage_bytes = crate::cloud::plans::resolved_storage_limit(
+        plan,
+        row.8,
+        pending_change_at.map(|t| t.unix_timestamp()),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    );
+    // Where the limit is headed when the window closes (NULL pending = the plan
+    // base).
     let pending_limit =
         pending_change_at.map(|_| crate::cloud::plans::effective_storage_limit(plan, row.9) as i64);
     let deleted_at = row.11;
     let purges_at = deleted_at.map(|d| d + time::Duration::days(GRACE_DAYS as i64));
 
-    // Auto-purge if storage usage exceeds 80% of limit.
-    let threshold = (limits.storage_bytes as f64 * 0.80) as i64;
-    if row.4 > threshold {
-        match crate::cloud::purge::maybe_purge(&state, user.user_id).await {
-            Ok(deleted) => tracing::info!(deleted, "auto-purge executed"),
-            Err(e) => tracing::warn!(error = ?e, "auto-purge failed"),
-        }
-    }
     Ok(Json(Me {
         user_id: user.user_id,
         email: row.0,
@@ -244,7 +255,12 @@ pub async fn get_me(
         saves_limit: limits.saves_tracked.map(|n| n as i32).unwrap_or(-1),
         version_history_forever: limits.version_history_forever,
         max_save_size_bytes: bytes_or_unlimited(limits.max_save_size_bytes),
-        storage_status: storage_status(plan, row.4, limits.storage_bytes),
+        storage_status: storage_status(
+            plan,
+            row.4,
+            limits.storage_bytes,
+            pending_change_at.is_some(),
+        ),
         bandwidth_window_secs: limits.bandwidth_window_secs as i32,
         bandwidth_quota_bytes: bytes_or_unlimited(limits.bandwidth_quota_bytes),
         pending_storage_limit_bytes: pending_limit,

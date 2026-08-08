@@ -17,7 +17,7 @@
 //! reclaimable size is only the bytes of blobs nothing else references).
 
 use crate::cloud::errors::CloudError;
-use crate::cloud::plans::{effective_storage_limit, Plan};
+use crate::cloud::plans::{resolved_storage_limit, Plan};
 use crate::cloud::routes::saves::release_blobs;
 use crate::cloud::state::CloudState;
 use uuid::Uuid;
@@ -148,17 +148,28 @@ pub async fn maybe_purge(state: &CloudState, user_id: Uuid) -> Result<usize, Clo
     // limit — until then the user keeps their larger limit and nothing here
     // purges.
     crate::cloud::quota::apply_due_downgrade(&state.pool, user_id).await?;
-    let row: Option<(String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT plan, storage_bytes, storage_limit_bytes FROM profiles WHERE user_id = $1",
+    let row: Option<(String, i64, Option<i64>, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT plan, storage_bytes, storage_limit_bytes, storage_limit_change_at \
+         FROM profiles WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((plan_s, used, limit_override)) = row else {
+    let Some((plan_s, used, limit_override, change_at)) = row else {
         return Ok(0);
     };
     let plan = Plan::from_str(&plan_s).unwrap_or(Plan::Free);
-    let limit = effective_storage_limit(plan, limit_override) as i64;
+    // Resolve against the *granted* limit, not the plan's. A user inside a
+    // downgrade grace window keeps their old room, and deleting their history
+    // during the very window we promised not to is the whole bug this guards.
+    // (`apply_due_downgrade` above already retired any window that came due, so
+    // a surviving `change_at` is genuinely still open.)
+    let limit = resolved_storage_limit(
+        plan,
+        limit_override,
+        change_at.map(|t| t.unix_timestamp()),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    ) as i64;
     let target = (limit as f64 * purge_threshold(plan)) as i64;
     if used <= target {
         return Ok(0);

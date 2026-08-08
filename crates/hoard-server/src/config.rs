@@ -275,7 +275,7 @@ pub struct CloudConfig {
     /// Grace window (days) a user keeps their old, larger storage limit after
     /// dropping to a smaller tier whose size is below their current footprint.
     /// Nothing is purged during the window and `/v1/me` advertises the pending
-    /// change. Defaults to 14. Cloud-only — self-hosted has no quotas.
+    /// change. Defaults to 30. Cloud-only — self-hosted has no quotas.
     #[serde(default = "default_storage_downgrade_grace_days")]
     pub storage_downgrade_grace_days: u64,
     /// Transactional email (account-export "your download is ready"). Optional:

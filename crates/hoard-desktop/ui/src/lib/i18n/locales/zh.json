@@ -643,7 +643,7 @@
   "liberate.retry": "重试",
   "liberate.nothing": "没有可归档的游戏。",
   "liberate.will_archive": "将被归档",
-  "liberate.explain_archive": "继续操作会将这些游戏移入黑盒：云端副本会冻结 7 天（其间仍可下载），之后将被删除。你的本地存档不会受到影响——在这 7 天内可随时从你的“库”中重新启用。",
+  "liberate.explain_archive": "继续后，这些游戏将移入黑箱：云端副本会冻结 7 天（仍可在「账户」中下载），之后删除。你的本地存档不会被动到。你可以在这 7 天内从「库」中重新启用它 — 前提是届时它能放进你的套餐，所以请先升级 Pro，或以其他方式腾出这些空间。",
   "liberate.download": "下载存档",
   "liberate.continue": "继续",
   "liberate.archiving": "归档中…",

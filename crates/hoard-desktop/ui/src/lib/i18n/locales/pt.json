@@ -643,7 +643,7 @@
   "liberate.retry": "Tentar de novo",
   "liberate.nothing": "Nenhum jogo para arquivar.",
   "liberate.will_archive": "Será arquivado",
-  "liberate.explain_archive": "Ao continuar, estes jogos vão para a caixa preta: a cópia na nuvem fica congelada por 7 dias (você ainda pode baixá-la) e depois é apagada. Seu save local nunca é tocado — você pode reativá-lo pela sua Biblioteca a qualquer momento dentro desses 7 dias.",
+  "liberate.explain_archive": "Ao continuar, estes jogos passam para a caixa preta: a cópia na nuvem fica congelada 7 dias (podes descarregá-la em Conta) e depois é apagada. O teu save local nunca é tocado. Podes reativá-lo a partir da tua Biblioteca dentro desses 7 dias, desde que nessa altura caiba no teu plano: muda para Pro, ou liberta antes esse espaço de outra forma.",
   "liberate.download": "Baixar saves",
   "liberate.continue": "Continuar",
   "liberate.archiving": "Arquivando…",

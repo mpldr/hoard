@@ -643,7 +643,7 @@
   "liberate.retry": "Reintentar",
   "liberate.nothing": "No hay juegos que archivar.",
   "liberate.will_archive": "Se archivará",
-  "liberate.explain_archive": "Al continuar, estos juegos pasan a la caja negra: la copia en la nube se congela 7 días (puedes descargarla) y después se borra. Tu guardado local no se toca; puedes reactivarlo desde tu Biblioteca en cualquier momento dentro de esos 7 días.",
+  "liberate.explain_archive": "Al continuar, estos juegos pasan a la caja negra: la copia en la nube se congela 7 días (puedes descargarla desde Cuenta) y después se borra. Tu guardado local no se toca. Puedes reactivarlo desde tu Biblioteca dentro de esos 7 días, siempre que para entonces quepa en tu plan: pasando a Pro, o liberando antes ese espacio de otra forma.",
   "liberate.download": "Descargar guardados",
   "liberate.continue": "Continuar",
   "liberate.archiving": "Archivando…",

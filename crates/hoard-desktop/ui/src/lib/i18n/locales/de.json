@@ -643,7 +643,7 @@
   "liberate.retry": "Erneut versuchen",
   "liberate.nothing": "Keine Spiele zum Archivieren.",
   "liberate.will_archive": "Wird archiviert",
-  "liberate.explain_archive": "Beim Fortfahren wandern diese Spiele in die Blackbox: Die Cloud-Kopie wird 7 Tage eingefroren (du kannst sie noch herunterladen) und danach gelöscht. Dein lokaler Spielstand bleibt unberührt – du kannst ihn innerhalb dieser 7 Tage jederzeit über deine Bibliothek reaktivieren.",
+  "liberate.explain_archive": "Beim Fortfahren wandern diese Spiele in die Blackbox: Die Cloud-Kopie wird 7 Tage eingefroren (du kannst sie unter Konto weiterhin herunterladen) und danach gelöscht. Dein lokaler Spielstand bleibt unberührt. Du kannst ihn innerhalb dieser 7 Tage über deine Bibliothek reaktivieren – sofern er dann in deinen Tarif passt, also vorher auf Pro upgraden oder den Platz anderweitig freimachen.",
   "liberate.download": "Spielstände herunterladen",
   "liberate.continue": "Fortfahren",
   "liberate.archiving": "Wird archiviert…",

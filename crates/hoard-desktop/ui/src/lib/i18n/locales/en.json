@@ -643,7 +643,7 @@
   "liberate.retry": "Retry",
   "liberate.nothing": "No games to archive.",
   "liberate.will_archive": "Will be archived",
-  "liberate.explain_archive": "Continuing moves these games to the black box: the cloud copy is frozen for 7 days (you can still download it), then it's deleted. Your local save is never touched — reactivate it from your Library any time within those 7 days.",
+  "liberate.explain_archive": "Continuing moves these games to the black box: the cloud copy is frozen for 7 days (you can still download it from Account), then it's deleted. Your local save is never touched. You can reactivate it from your Library within those 7 days — as long as it fits your plan by then, so upgrade to Pro or free that space some other way first.",
   "liberate.download": "Download saves",
   "liberate.continue": "Continue",
   "liberate.archiving": "Archiving…",

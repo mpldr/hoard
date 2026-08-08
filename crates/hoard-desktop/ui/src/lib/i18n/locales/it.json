@@ -643,7 +643,7 @@
   "liberate.retry": "Riprova",
   "liberate.nothing": "Nessun gioco da archiviare.",
   "liberate.will_archive": "Verrà archiviato",
-  "liberate.explain_archive": "Continuando, questi giochi finiscono nella scatola nera: la copia nel cloud viene congelata per 7 giorni (puoi ancora scaricarla), poi viene eliminata. Il tuo salvataggio locale non viene mai toccato: puoi riattivarlo dalla tua Libreria quando vuoi entro quei 7 giorni.",
+  "liberate.explain_archive": "Continuando, questi giochi finiscono nella scatola nera: la copia nel cloud viene congelata per 7 giorni (puoi ancora scaricarla da Account), poi viene eliminata. Il tuo salvataggio locale non viene mai toccato. Puoi riattivarlo dalla tua Libreria entro quei 7 giorni, a patto che per allora rientri nel tuo piano: passa a Pro, o libera prima quello spazio in altro modo.",
   "liberate.download": "Scarica i salvataggi",
   "liberate.continue": "Continua",
   "liberate.archiving": "Archiviazione…",

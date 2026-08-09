@@ -35,6 +35,7 @@ use axum::{
     Extension,
 };
 use serde::Serialize;
+use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -370,6 +371,42 @@ pub struct SharedGroup {
     pub bytes: i64,
 }
 
+/// Blobs referenced by more than one *live* save, grouped by the exact set of
+/// saves referencing them. Archived saves are excluded: their references are
+/// already released, so they can't hold anything hostage.
+///
+/// Split out of the handler so it can be exercised against a real database
+/// without standing up a `CloudState` — the array decode (`text[]` → `Vec<String>`,
+/// which hinges on `saves.id` being TEXT rather than UUID) is the kind of thing
+/// that compiles happily and 500s in production.
+pub async fn shared_groups(pool: &PgPool, user_id: Uuid) -> Result<Vec<SharedGroup>, CloudError> {
+    let rows: Vec<(Vec<String>, i64)> = sqlx::query_as(
+        r#"
+        WITH per_blob AS (
+            SELECT f.sha256, array_agg(DISTINCT f.save_id ORDER BY f.save_id) AS save_ids
+            FROM save_version_files f
+            JOIN saves s ON s.id = f.save_id
+            WHERE s.user_id = $1 AND s.archived_at IS NULL
+            GROUP BY f.sha256
+            HAVING COUNT(DISTINCT f.save_id) > 1
+        )
+        SELECT pb.save_ids, COALESCE(SUM(b.size_bytes), 0)::bigint AS bytes
+        FROM per_blob pb
+        JOIN cloud_blobs b ON b.user_id = $1 AND b.sha256 = pb.sha256
+        WHERE b.refcount > 0
+        GROUP BY pb.save_ids
+        ORDER BY 2 DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(save_ids, bytes)| SharedGroup { save_ids, bytes })
+        .collect())
+}
+
 #[derive(Debug, Serialize)]
 pub struct StorageGamesOut {
     pub plan: &'static str,
@@ -444,34 +481,7 @@ pub async fn storage_games(
         )
         .collect();
 
-    // Blobs referenced by more than one *live* save, grouped by the exact set
-    // of saves referencing them. Archived saves are excluded: their references
-    // are already released, so they can't hold anything hostage.
-    let shared_rows: Vec<(Vec<String>, i64)> = sqlx::query_as(
-        r#"
-        WITH per_blob AS (
-            SELECT f.sha256, array_agg(DISTINCT f.save_id ORDER BY f.save_id) AS save_ids
-            FROM save_version_files f
-            JOIN saves s ON s.id = f.save_id
-            WHERE s.user_id = $1 AND s.archived_at IS NULL
-            GROUP BY f.sha256
-            HAVING COUNT(DISTINCT f.save_id) > 1
-        )
-        SELECT pb.save_ids, COALESCE(SUM(b.size_bytes), 0)::bigint AS bytes
-        FROM per_blob pb
-        JOIN cloud_blobs b ON b.user_id = $1 AND b.sha256 = pb.sha256
-        WHERE b.refcount > 0
-        GROUP BY pb.save_ids
-        ORDER BY 2 DESC
-        "#,
-    )
-    .bind(user.user_id)
-    .fetch_all(&state.pool)
-    .await?;
-    let shared_groups = shared_rows
-        .into_iter()
-        .map(|(save_ids, bytes)| SharedGroup { save_ids, bytes })
-        .collect();
+    let shared_groups = shared_groups(&state.pool, user.user_id).await?;
 
     let over = info.used_bytes.saturating_sub(info.limit_bytes);
     Ok(Json(StorageGamesOut {

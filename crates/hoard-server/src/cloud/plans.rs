@@ -163,9 +163,48 @@ pub fn resolved_storage_limit(
     }
 }
 
+/// The device cap actually in force, given the plan and whether the account has
+/// **ever** been Pro (`profiles.first_pro_at`).
+///
+/// Storage and devices come apart on a downgrade, on purpose. Storage is a
+/// recurring cost, so Free means 2 GB and the grace window of
+/// [`resolved_storage_limit`] is what makes that landing survivable. Devices are
+/// not: a user who paired six machines while paying doesn't un-pair them by
+/// letting the subscription lapse, and telling them "6 / 3" turns a working
+/// account into one that reads as broken — or locks them out outright the day
+/// the cap stops being merely informational (`register_device` counts but
+/// deliberately doesn't gate).
+///
+/// So the Pro device allowance is kept for life. It's the one thing a lapsed
+/// subscription doesn't take back.
+pub fn resolved_devices_limit(plan: Plan, ever_pro: bool) -> u32 {
+    if ever_pro {
+        return Plan::Pro.limits().devices;
+    }
+    plan.limits().devices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ex_pro_keeps_unlimited_devices_but_not_the_storage() {
+        // The point of the split: a lapsed Pro is back on 2 GB…
+        assert_eq!(effective_storage_limit(Plan::Free, None), 2 * GB);
+        // …but keeps every machine they paired while paying.
+        assert_eq!(
+            resolved_devices_limit(Plan::Free, true),
+            Plan::Pro.limits().devices
+        );
+        // Someone who was never Pro gets the plain Free cap.
+        assert_eq!(resolved_devices_limit(Plan::Free, false), 3);
+        // And Pro is Pro either way.
+        assert_eq!(
+            resolved_devices_limit(Plan::Pro, false),
+            Plan::Pro.limits().devices
+        );
+    }
 
     #[test]
     fn free_limits_match_spec() {
@@ -240,7 +279,10 @@ mod tests {
             2 * GB
         );
         // No window at all → plain effective limit, Free ignores the override.
-        assert_eq!(resolved_storage_limit(Plan::Free, Some(grant), None, now), 2 * GB);
+        assert_eq!(
+            resolved_storage_limit(Plan::Free, Some(grant), None, now),
+            2 * GB
+        );
     }
 
     #[test]

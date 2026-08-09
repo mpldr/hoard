@@ -51,18 +51,27 @@ pub async fn load(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Option<(PlanLimits, QuotaInfo)>, CloudError> {
-    let row: Option<(String, i64, i32, Option<i64>, Option<time::OffsetDateTime>)> = sqlx::query_as(
-        "SELECT plan, storage_bytes, devices_count, storage_limit_bytes, storage_limit_change_at \
-         FROM profiles WHERE user_id = $1",
+    let row: Option<(
+        String,
+        i64,
+        i32,
+        Option<i64>,
+        Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
+    )> = sqlx::query_as(
+        "SELECT plan, storage_bytes, devices_count, storage_limit_bytes, \
+         storage_limit_change_at, first_pro_at FROM profiles WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    let Some((plan_s, used, devs, limit_override, change_at)) = row else {
+    let Some((plan_s, used, devs, limit_override, change_at, first_pro_at)) = row else {
         return Ok(None);
     };
     let plan = Plan::from_str(&plan_s).unwrap_or(Plan::Free);
     let mut limits = plan.limits();
+    // Devices are kept for life once bought — see `resolved_devices_limit`.
+    limits.devices = super::plans::resolved_devices_limit(plan, first_pro_at.is_some());
     // Apply the per-user storage tier (Pro xN) and any live downgrade grace
     // grant. Overriding here means every downstream consumer — including
     // `check_storage`, which reads `limits.storage_bytes` directly — sees the

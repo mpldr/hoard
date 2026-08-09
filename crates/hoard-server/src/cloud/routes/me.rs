@@ -42,6 +42,11 @@ pub struct Me {
     pub lifetime_storage_bytes: i64,
     pub devices_used: i32,
     pub devices_limit: i32,
+    /// RFC3339 — the first time this account ever went Pro, or `null` if it
+    /// never did. One-way: a downgrade doesn't clear it. It's why an account on
+    /// Free can legitimately report an unlimited `devices_limit`, so the UI can
+    /// say *why* instead of looking like a bug.
+    pub first_pro_at: Option<String>,
     pub saves_used: i32,
     pub saves_limit: i32,
     /// True on every tier post-1.6.1 — kept on the wire as a bool so
@@ -192,6 +197,15 @@ pub async fn get_me(
     .fetch_one(&state.pool)
     .await?;
 
+    // Read on its own rather than widening the tuple above: this is the one
+    // fact that outlives the plan, and a positional tuple that long is already
+    // the most fragile line in this handler.
+    let first_pro_at: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT first_pro_at FROM profiles WHERE user_id = $1")
+            .bind(user.user_id)
+            .fetch_one(&state.pool)
+            .await?;
+
     let sub: Option<(
         String,
         Option<time::OffsetDateTime>,
@@ -219,6 +233,9 @@ pub async fn get_me(
 
     let plan = Plan::from_str(&row.3).unwrap_or(Plan::Free);
     let mut limits = plan.limits();
+    // Devices bought on Pro are kept for life; only the storage goes back. See
+    // `plans::resolved_devices_limit` for why the two part ways.
+    limits.devices = crate::cloud::plans::resolved_devices_limit(plan, first_pro_at.is_some());
     // A pending downgrade exists iff a change instant is set; while it's in the
     // future `storage_limit_bytes` is the absolute grant the user keeps and the
     // plan column may already say "free" — so resolve, don't just read the tier.
@@ -251,6 +268,7 @@ pub async fn get_me(
         lifetime_storage_bytes: row.7,
         devices_used: row.5,
         devices_limit: devices_or_unlimited(limits.devices),
+        first_pro_at: first_pro_at.map(format_dt),
         saves_used: saves_used as i32,
         saves_limit: limits.saves_tracked.map(|n| n as i32).unwrap_or(-1),
         version_history_forever: limits.version_history_forever,

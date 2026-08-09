@@ -42,6 +42,15 @@ async fn pool() -> Option<PgPool> {
     let pool = hoard_server::cloud::db::connect(&url, 5)
         .await
         .expect("connect to the test database");
+    // Serialize the bootstrap across the whole binary. `cargo test` runs these
+    // in parallel and they all set up the same Supabase stand-ins, which had
+    // them racing on `CREATE OR REPLACE FUNCTION` ("tuple concurrently
+    // updated"). An advisory lock is the fix rather than telling everyone to
+    // remember `--test-threads=1`, which only works until someone forgets.
+    sqlx::query("SELECT pg_advisory_lock(8_233_119_402)")
+        .execute(&pool)
+        .await
+        .expect("bootstrap lock");
     // The migrations assume Supabase: an `auth.users` table to hang the
     // `profiles` FK off (0013), an `auth.uid()` for the RLS policies, and the
     // `anon` / `authenticated` roles the admin-metrics grants name (0030). A
@@ -72,6 +81,10 @@ async fn pool() -> Option<PgPool> {
     hoard_server::cloud::db::run_migrations(&pool)
         .await
         .expect("migrations");
+    sqlx::query("SELECT pg_advisory_unlock(8_233_119_402)")
+        .execute(&pool)
+        .await
+        .expect("bootstrap unlock");
     Some(pool)
 }
 
@@ -382,4 +395,51 @@ async fn shared_blobs_between_two_saves_are_reported_as_a_group() {
         .execute(&pool)
         .await;
     cleanup(&pool, id).await;
+}
+
+/// Storage comes back on a downgrade; devices don't. An account that was ever
+/// Pro keeps its machines for life — dropping six paired PCs to three the day a
+/// subscription lapses is a working account turning into a broken-looking one.
+#[tokio::test]
+async fn an_ex_pro_account_keeps_its_devices_after_dropping_to_free() {
+    let Some(pool) = pool().await else {
+        eprintln!("HOARD_PG_TEST_URL unset — skipping");
+        return;
+    };
+    let id = seed_pro(&pool, 500 * 1024 * 1024).await;
+    // The webhook stamps this the first time the account goes Pro.
+    sqlx::query("UPDATE profiles SET first_pro_at = now() - interval '60 days' WHERE user_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("stamp");
+
+    quota::settle_storage_limit(&pool, id, Plan::Free, None, GRACE_DAYS)
+        .await
+        .expect("settle");
+    set_plan(&pool, id, "free").await;
+
+    let (limits, _info) = quota::load(&pool, id)
+        .await
+        .expect("load")
+        .expect("profile");
+    assert_eq!(limits.storage_bytes, 2 * GB as u64, "the storage does go back");
+    assert_eq!(
+        limits.devices,
+        Plan::Pro.limits().devices,
+        "the devices do not"
+    );
+
+    // A neighbour who never paid gets the plain Free cap, so the grandfathering
+    // is the marker's doing and not a blanket grant.
+    let plain = seed_pro(&pool, 0).await;
+    set_plan(&pool, plain, "free").await;
+    let (plain_limits, _) = quota::load(&pool, plain)
+        .await
+        .expect("load")
+        .expect("profile");
+    assert_eq!(plain_limits.devices, 3);
+
+    cleanup(&pool, id).await;
+    cleanup(&pool, plain).await;
 }

@@ -354,15 +354,27 @@ pub async fn handle(
         )
         .await
         {
-            Ok(outcome) => info!(?outcome, user_id = %user_id, "polar webhook: storage tier settled"),
+            Ok(outcome) => {
+                info!(?outcome, user_id = %user_id, "polar webhook: storage tier settled")
+            }
             Err(e) => warn!(error = ?e, "polar webhook: settling storage tier failed"),
         }
-        if let Err(e) =
-            sqlx::query("UPDATE profiles SET plan = $1, updated_at = now() WHERE user_id = $2")
-                .bind(plan)
-                .bind(user_id)
-                .execute(&state.pool)
-                .await
+        // `first_pro_at` is a one-way marker: COALESCE keeps the *first* time
+        // this account ever went Pro, so a re-subscribe doesn't reset it and a
+        // later lapse doesn't clear it. It's what lets a downgraded account keep
+        // its device allowance for life (`plans::resolved_devices_limit`).
+        let becoming_pro = crate::cloud::plans::Plan::from_str(plan)
+            .is_some_and(|p| p != crate::cloud::plans::Plan::Free);
+        if let Err(e) = sqlx::query(
+            "UPDATE profiles SET plan = $1, \
+             first_pro_at = CASE WHEN $3 THEN COALESCE(first_pro_at, now()) ELSE first_pro_at END, \
+             updated_at = now() WHERE user_id = $2",
+        )
+        .bind(plan)
+        .bind(user_id)
+        .bind(becoming_pro)
+        .execute(&state.pool)
+        .await
         {
             warn!(error = %e, "polar webhook: profile plan update failed");
         }
@@ -379,7 +391,9 @@ pub async fn handle(
         )
         .await
         {
-            Ok(outcome) => info!(?outcome, user_id = %user_id, "polar webhook: storage settled on expiry"),
+            Ok(outcome) => {
+                info!(?outcome, user_id = %user_id, "polar webhook: storage settled on expiry")
+            }
             Err(e) => warn!(error = ?e, "polar webhook: settling storage on expiry failed"),
         }
         if let Err(e) =

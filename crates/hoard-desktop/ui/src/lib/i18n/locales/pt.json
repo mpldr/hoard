@@ -239,6 +239,8 @@
   "library.steam_cloud_note_title": "O Steam Cloud também sincroniza este jogo. O Hoard segue-o na mesma: o Steam Cloud só cobre a cópia da Steam, pode ser desligado por jogo e não guarda histórico.",
   "library.backup_too_large_toast": "Não foi possível fazer backup de {name}: {size} ultrapassa o limite de {limit} por save do teu plano. Muda para Pro ou reduz a pasta do save.",
   "library.backup_too_large_generic_toast": "Não foi possível enviar {name}: o servidor recusou por tamanho (413). Se for o teu servidor, verifica o limite de tamanho do proxy.",
+  "library.backup_too_large_server_toast": "Não foi possível enviar {name}: excede o limite de {limit} por cópia do teu servidor. Aumenta `max_snapshot_size_mb` no config.toml dele e reinicia-o.",
+  "library.backup_too_large_proxy_toast": "Não foi possível enviar {name}: recusado por ser grande demais — e não foi o Hoard. Algo entre este PC e o teu servidor (um proxy reverso ou túnel) tem um limite de tamanho. O do nginx é 1 MB por omissão.",
   "library.backup_trimmed_toast": "Backup de {name} feito, mas o teu plano não chega: {omitted} saves antigos ({size}) não foram enviados. Muda para Pro para os guardar todos.",
   "library.tracked_size_title": "Bytes totais armazenados no servidor (soma dos instantâneos)",
   "library.local_size_title": "Espaço usado nesta máquina",

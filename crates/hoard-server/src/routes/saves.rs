@@ -39,7 +39,7 @@ pub async fn create(
         sqlx::query_scalar!("SELECT COUNT(*) as cnt FROM games WHERE slug = ?", slug_str)
             .fetch_one(&state.pool)
             .await
-            .map_err(|_| internal_err())?;
+            .map_err(|e| internal_logged("reading a row", e))?;
 
     if game_count == 0 {
         // Self-heal path: if the client supplied a display_name (newer
@@ -120,7 +120,7 @@ pub async fn create(
 
     let row = fetch_save(&state.pool, &id, &user_id)
         .await
-        .map_err(|_| internal_err())?
+        .map_err(|e| internal_logged("database access", e))?
         .ok_or_else(internal_err)?;
 
     Ok((StatusCode::CREATED, Json(row)))
@@ -148,7 +148,7 @@ pub async fn list(
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| internal_logged_status("listing rows", e))?
         .into_iter()
         .filter_map(|r| {
             Some(Save {
@@ -180,7 +180,7 @@ pub async fn list(
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| internal_logged_status("listing rows", e))?
         .into_iter()
         .filter_map(|r| {
             Some(Save {
@@ -211,7 +211,7 @@ pub async fn get_one(
     let user_id = user.user_id.to_string();
     fetch_save(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| internal_logged_status("database access", e))?
         .ok_or(StatusCode::NOT_FOUND)
         .map(Json)
 }
@@ -233,7 +233,7 @@ pub async fn patch(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| internal_err())?
+    .map_err(|e| internal_logged("reading a row", e))?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -255,7 +255,11 @@ pub async fn patch(
         .filter(|s| !s.is_empty())
     {
         if new_label != current.label {
-            let mut tx = state.pool.begin().await.map_err(|_| internal_err())?;
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .map_err(|e| internal_logged("opening a transaction", e))?;
 
             sqlx::query!("UPDATE saves SET label=? WHERE id=?", new_label, save_id)
                 .execute(&mut *tx)
@@ -328,18 +332,18 @@ pub async fn patch(
         )
         .execute(&state.pool)
         .await
-        .map_err(|_| internal_err())?;
+        .map_err(|e| internal_logged("writing to the database", e))?;
     }
     if let Some(os) = &body.client_os {
         sqlx::query!("UPDATE saves SET client_os=? WHERE id=?", os, save_id)
             .execute(&state.pool)
             .await
-            .map_err(|_| internal_err())?;
+            .map_err(|e| internal_logged("writing to the database", e))?;
     }
 
     fetch_save(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal_err())?
+        .map_err(|e| internal_logged("writing to the database", e))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -363,13 +367,13 @@ pub async fn delete(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| internal_logged_status("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     sqlx::query!("DELETE FROM saves WHERE id=?", save_id)
         .execute(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| internal_logged_status("writing to the database", e))?;
 
     // Remove physical directory
     let dir = state
@@ -430,4 +434,25 @@ fn internal_err() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": "internal server error"})),
     )
+}
+
+/// Same 500 the client already gets, but the cause reaches the log.
+///
+/// Companion to [`internal_err`]. Mapping a fallible call with a closure that
+/// ignores its argument silently deletes the one fact an operator needs; see
+/// the note on `snapshots.rs::internal_logged` for what that cost.
+fn internal_logged<E: std::fmt::Display>(
+    what: &'static str,
+    e: E,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!(error = %e, step = what, "saves request failed");
+    internal_err()
+}
+
+/// Status-only sibling of [`internal_logged`], for the handlers in this module
+/// that answer with a bare [`StatusCode`] instead of a JSON body. Same job:
+/// the client learns nothing new, the operator learns everything.
+fn internal_logged_status<E: std::fmt::Display>(what: &'static str, e: E) -> StatusCode {
+    tracing::error!(error = %e, step = what, "saves request failed");
+    StatusCode::INTERNAL_SERVER_ERROR
 }

@@ -23,7 +23,7 @@ poll_per_minute = 10
 # Not used in cloud mode (snapshots live in R2), but the field is required
 # by the config schema. Any writable path works.
 data_dir = "/tmp/hoard"
-max_snapshot_size_mb = 1024
+max_snapshot_size_mb = 4096
 upload_timeout_secs = 900
 
 [database]

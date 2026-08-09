@@ -3776,20 +3776,23 @@ async fn run_backup_with_retry(
                         _ => None,
                     });
                 if let Some(detail) = too_large {
-                    // El 413 no siempre es el tope de un plan: un self-hoster lo
-                    // recibe de su proxy (nginx trae 1 MB de `client_max_body_size`
-                    // por defecto) y ahí no hay plan ninguno. Se dice lo que se
-                    // sabe —`human()` ya distingue los dos casos— en vez de
-                    // afirmar un tope de plan de 0 bytes, que fue justo lo que
-                    // apareció en el log de un self-hoster en ago-2026.
+                    // Un 413 puede venir de tres sitios y cada uno se arregla en
+                    // un lado distinto: el tope del plan en Cloud, el
+                    // `max_snapshot_size_mb` de un servidor propio, o un proxy
+                    // delante que ni siquiera es Hoard. `kind()` lo decide y
+                    // `human()` lo redacta; afirmar "tope de plan" sin más fue lo
+                    // que mandó a un self-hoster a mirar donde no era (ago-2026).
+                    let kind = detail.kind();
                     tracing::warn!(
                         save_id = %save.save_id,
                         game_slug = %save.game_slug,
+                        kind = ?kind,
                         plan = %detail.plan,
                         limit_bytes = detail.limit_bytes,
                         actual_bytes = detail.actual_bytes,
+                        received_bytes = detail.received_bytes,
                         detail = %detail.human(),
-                        "agent: backup rejected — the server refused the upload as too large"
+                        "agent: backup rejected — the upload was refused as too large"
                     );
                     let _ = done_tx.try_send(BackupDone {
                         save_id: save.save_id.clone(),
@@ -3803,9 +3806,11 @@ async fn run_backup_with_retry(
                             save_id: save.save_id.clone(),
                             game_slug: save.game_slug.clone(),
                             label: save.label.clone(),
+                            kind,
                             plan: detail.plan.clone(),
                             limit_bytes: detail.limit_bytes,
                             actual_bytes: detail.actual_bytes,
+                            received_bytes: detail.received_bytes,
                         })
                         .await;
                     return;

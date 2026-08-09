@@ -49,6 +49,62 @@ fn internal() -> (StatusCode, Json<serde_json::Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
+/// A 500 that says, **in the log**, what actually went wrong.
+///
+/// The client still gets the same opaque `{"error":"internal server error"}` —
+/// it must not learn about our paths or SQL. The operator gets the cause.
+///
+/// This exists because the whole upload route used to discard its errors: every
+/// fallible call was mapped with a closure that ignored its argument, so a real
+/// error ("no space left on device", "permission denied", "database is locked")
+/// went straight to the floor. A self-hoster then saw a bare 500, their server
+/// log showed *nothing*, and pinning it down took four rounds of questions and
+/// two log dumps (2026-08-07). An upload can fail a dozen ways; the server knew
+/// which one every single time and threw it away.
+///
+/// `what` names the step, not the error — the error speaks for itself. Keep the
+/// names coarse and stable: they are what an operator greps for.
+fn internal_logged<E: std::fmt::Display>(
+    what: &'static str,
+    e: E,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!(error = %e, step = what, "snapshot upload failed");
+    internal()
+}
+
+/// 413 for a snapshot that overruns this server's per-snapshot cap.
+///
+/// Structured like Hoard Cloud's `save_too_large` body so a self-hosted user
+/// gets a number to act on instead of a shrug. Before this, self-hosted 413s
+/// carried only `{"error": …}`, the client parsed zeroes out of it and fell back
+/// to "the server refused it as too large (413)" — which is indistinguishable
+/// from the 413 an nginx in front returns, and sends the user hunting through
+/// proxy configs when the answer was `storage.max_snapshot_size_mb`.
+///
+/// `received_bytes` is deliberately **not** `actual_bytes`: we abort mid-stream,
+/// so all we know is how far we got before bailing. Reporting that as the
+/// snapshot's size would be a lie that reads as precision. The client words it
+/// as a floor.
+fn snapshot_too_large(
+    limit_bytes: i64,
+    received_bytes: i64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(
+        limit_bytes,
+        received_bytes,
+        "snapshot rejected: over the per-snapshot size limit (storage.max_snapshot_size_mb)"
+    );
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": "snapshot exceeds size limit",
+            "code": "snapshot_too_large",
+            "limit_bytes": limit_bytes.max(0),
+            "received_bytes": received_bytes.max(0),
+        })),
+    )
+}
+
 /// Is this whole-file blob already stored for the user? The `blobs` table is
 /// the source of truth (a row exists iff the object is stored and refcounted),
 /// so dedup/quota consult it instead of a per-key HEAD against the store —
@@ -127,7 +183,7 @@ pub async fn create(
 
     let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
 
     // Quota check setup
@@ -138,7 +194,7 @@ pub async fn create(
     .fetch_one(&state.pool)
     .await
     .map(|r| (r.storage_quota_bytes, r.storage_used_bytes))
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("quota lookup", e))?;
 
     let max_per_snapshot = (state.config.storage.max_snapshot_size_mb as i64) * 1024 * 1024;
     // Per-file multipart keeps its modest cap (each file is a round-trip and a
@@ -154,7 +210,7 @@ pub async fn create(
     let tmp_root = state.config.storage.data_dir.join("tmp").join(&upload_id);
     tokio::fs::create_dir_all(&tmp_root)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| internal_logged("creating the upload tmp dir", e))?;
 
     // Cleanup helper if anything goes wrong
     let cleanup_tmp = || {
@@ -250,14 +306,14 @@ pub async fn create(
                 }
                 let dest = tmp_root.join(&rel);
                 if let Some(parent) = dest.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|_| {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
                         cleanup_tmp();
-                        internal()
+                        internal_logged("creating a file's parent dir", e)
                     })?;
                 }
-                let mut out = tokio::fs::File::create(&dest).await.map_err(|_| {
+                let mut out = tokio::fs::File::create(&dest).await.map_err(|e| {
                     cleanup_tmp();
-                    internal()
+                    internal_logged("creating the uploaded file", e)
                 })?;
                 let mut hasher = Sha256::new();
                 let mut size: i64 = 0;
@@ -278,10 +334,7 @@ pub async fn create(
                     total_size += n as i64;
                     if total_size > max_per_snapshot {
                         cleanup_tmp();
-                        return Err(err(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "snapshot exceeds size limit",
-                        ));
+                        return Err(snapshot_too_large(max_per_snapshot, total_size));
                     }
                     hasher.update(&buf[..n]);
                     if out.write_all(&buf[..n]).await.is_err() {
@@ -322,15 +375,15 @@ pub async fn create(
 
         let dest = tmp_root.join(&file_name);
         if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|_| {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 cleanup_tmp();
-                internal()
+                internal_logged("creating a file's parent dir", e)
             })?;
         }
 
-        let mut file = tokio::fs::File::create(&dest).await.map_err(|_| {
+        let mut file = tokio::fs::File::create(&dest).await.map_err(|e| {
             cleanup_tmp();
-            internal()
+            internal_logged("creating the uploaded file", e)
         })?;
 
         let mut hasher = Sha256::new();
@@ -350,10 +403,7 @@ pub async fn create(
 
             if total_size > max_per_snapshot {
                 cleanup_tmp();
-                return Err(err(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "snapshot exceeds size limit",
-                ));
+                return Err(snapshot_too_large(max_per_snapshot, total_size));
             }
             // Quota is checked at commit time against deduplicated bytes — a
             // re-upload of mostly-identical files (the OpenTTD case) adds
@@ -426,9 +476,9 @@ pub async fn create(
                 if seen_chunks.insert(c.sha256.clone())
                     && !chunk_in_db(&state.pool, &user_id, &c.sha256)
                         .await
-                        .map_err(|_| {
+                        .map_err(|e| {
                             cleanup_tmp();
-                            internal()
+                            internal_logged("chunk dedup lookup", e)
                         })?
                 {
                     new_chunks.insert(c.sha256.clone());
@@ -436,9 +486,9 @@ pub async fn create(
                 }
             }
         } else if seen_blobs.insert(sha.clone())
-            && !blob_in_db(&state.pool, &user_id, sha).await.map_err(|_| {
+            && !blob_in_db(&state.pool, &user_id, sha).await.map_err(|e| {
                 cleanup_tmp();
-                internal()
+                internal_logged("blob dedup lookup", e)
             })?
         {
             new_blobs.insert(sha.clone());
@@ -560,20 +610,20 @@ pub async fn create(
     }
 
     let snapshot_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await.map_err(|_| {
+    let mut tx = state.pool.begin().await.map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal()
+        internal_logged("opening the commit transaction", e)
     })?;
 
     let head: i64 = sqlx::query!("SELECT latest_version_num FROM saves WHERE id=?", save_id)
         .fetch_one(&mut *tx)
         .await
         .map(|r| r.latest_version_num)
-        .map_err(|_| {
+        .map_err(|e| {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
-            internal()
+            internal_logged("reading the save's latest version", e)
         })?;
 
     // Fast-forward check (the DAG's enforcement). A client that declares a
@@ -616,10 +666,10 @@ pub async fn create(
     .bind(parent_version)
     .execute(&mut *tx)
     .await
-    .map_err(|_| {
+    .map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal()
+        internal_logged("recording the snapshot", e)
     })?;
 
     // From here the transaction only writes rows — the bytes are already in the
@@ -717,10 +767,10 @@ pub async fn create(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| {
+    .map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal()
+        internal_logged("reading the save's latest version", e)
     })?;
 
     let new_used = used + newly_stored_bytes;
@@ -731,10 +781,10 @@ pub async fn create(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| {
+    .map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal()
+        internal_logged("updating storage accounting", e)
     })?;
 
     let audit_id = Uuid::new_v4().to_string();
@@ -756,10 +806,10 @@ pub async fn create(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| {
+    .map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal()
+        internal_logged("the commit transaction", e)
     })?;
 
     if let Err(e) = tx.commit().await {
@@ -837,7 +887,7 @@ pub async fn list(
 
     if ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -865,7 +915,7 @@ pub async fn list(
         .bind(offset)
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("listing snapshot rows", e))?
         .iter()
         .map(|r| Snapshot {
             id: r.get("id"),
@@ -898,7 +948,7 @@ pub async fn detail(
     let user_id = user.user_id.to_string();
     if ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -913,7 +963,7 @@ pub async fn detail(
     .bind(version)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| internal())?
+    .map_err(|e| internal_logged("reading a snapshot row", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "snapshot not found"))?;
 
     let snap_id: String = snap.get("id");
@@ -924,7 +974,7 @@ pub async fn detail(
     )
     .fetch_all(&state.pool)
     .await
-    .map_err(|_| internal())?
+    .map_err(|e| internal_logged("listing snapshot rows", e))?
     .into_iter()
     .map(|r| {
         // El sha lo calcula el propio server al subir, así que uno inválido
@@ -975,7 +1025,7 @@ pub async fn download(
     let user_id = user.user_id.to_string();
     let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
 
     let snap_id: Option<String> = sqlx::query_scalar(
@@ -985,7 +1035,7 @@ pub async fn download(
     .bind(version)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("reading a snapshot row", e))?;
     let snap_id = snap_id.ok_or_else(|| err(StatusCode::NOT_FOUND, "snapshot not found"))?;
 
     // A version is just its list of files; reconstruct the tarball from the
@@ -1000,7 +1050,7 @@ pub async fn download(
     .bind(&snap_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
     let uid = user_id.clone();
 
@@ -1025,7 +1075,7 @@ pub async fn download(
         .bind(&file_id)
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
         if chunk_rows.is_empty() {
             entries.push((rel, DlSource::Blob(crate::store::blob_key(&uid, &sha))));
@@ -1263,7 +1313,7 @@ pub async fn soft_delete(
     let user_id = user.user_id.to_string();
     if ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -1277,7 +1327,7 @@ pub async fn soft_delete(
     .bind(version)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("reading a snapshot row", e))?;
     let snap_id = snap_id.ok_or_else(|| err(StatusCode::NOT_FOUND, "snapshot not found"))?;
 
     // Soft-delete is purely logical now (ADR 0018, eje C): mark deleted_at and
@@ -1285,7 +1335,11 @@ pub async fn soft_delete(
     // snapshot still pins its bytes (and quota) until the trash purge actually
     // decrements the refcounts and GCs blobs that reach 0. No folder to move,
     // no quota change here.
-    let mut tx = state.pool.begin().await.map_err(|_| internal())?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| internal_logged("writing to the database", e))?;
 
     sqlx::query!(
         "UPDATE snapshots SET deleted_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?",
@@ -1293,7 +1347,7 @@ pub async fn soft_delete(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("writing to the database", e))?;
 
     let audit_id = Uuid::new_v4().to_string();
     sqlx::query!(
@@ -1305,9 +1359,11 @@ pub async fn soft_delete(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| internal())?;
+    .map_err(|e| internal_logged("committing the transaction", e))?;
 
-    tx.commit().await.map_err(|_| internal())?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing the transaction", e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1322,7 +1378,7 @@ pub async fn restore(
     let user_id = user.user_id.to_string();
     if ownership_check(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| internal_logged("ownership lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -1340,7 +1396,7 @@ pub async fn restore(
     .bind(version)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| internal())?
+    .map_err(|e| internal_logged("reading a snapshot row", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "snapshot not found"))?;
 
     let snap_id: String = snap.get("id");
@@ -1349,11 +1405,15 @@ pub async fn restore(
         return Err(err(StatusCode::CONFLICT, "snapshot is not deleted"));
     }
 
-    let mut tx = state.pool.begin().await.map_err(|_| internal())?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| internal_logged("writing to the database", e))?;
     sqlx::query!("UPDATE snapshots SET deleted_at=NULL WHERE id=?", snap_id)
         .execute(&mut *tx)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| internal_logged("writing to the database", e))?;
     let audit_id = Uuid::new_v4().to_string();
     sqlx::query!(
         "INSERT INTO audit_log (id, user_id, event_type, entity_id)
@@ -1364,8 +1424,10 @@ pub async fn restore(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| internal())?;
-    tx.commit().await.map_err(|_| internal())?;
+    .map_err(|e| internal_logged("committing the transaction", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing the transaction", e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

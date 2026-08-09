@@ -514,9 +514,13 @@ export type AgentEvent =
       save_id: string;
       game_slug: string;
       label: string;
+      /** Who refused it — and therefore what the user has to change. */
+      kind: "plan_cap" | "server_limit" | "proxy";
       plan: string;
       limit_bytes: number;
       actual_bytes: number;
+      /** Self-hosted only: bytes sent before the server stopped. A floor. */
+      received_bytes: number;
     }
   | {
       /** Account-wide: the plan's storage is full, so no save can upload. */

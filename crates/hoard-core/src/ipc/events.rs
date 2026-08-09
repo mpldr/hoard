@@ -28,6 +28,22 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Who refused an upload for being too big — and therefore what the user has to
+/// change. See [`AgentEvent::BackupTooLarge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TooLargeKind {
+    /// Hoard Cloud's per-save plan cap. The user upgrades or trims the folder.
+    PlanCap,
+    /// A self-hosted Hoard's `storage.max_snapshot_size_mb`. The user edits
+    /// their server's `config.toml`.
+    ServerLimit,
+    /// Not Hoard at all: the reply carried no `code`, so it was written by a
+    /// reverse proxy or tunnel in front of the server. Nothing in Hoard's
+    /// settings will fix it.
+    Proxy,
+}
+
 /// Out-of-agent notifications. Frontend listens to these to drive the
 /// dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,21 +113,30 @@ pub enum AgentEvent {
         label: String,
         retry_after_secs: u32,
     },
-    /// The save is larger than the plan's per-save cap (413 `save_too_large`),
-    /// so the upload can never succeed as-is — retrying is pointless and would
-    /// just spam the feed every time the folder changes. Surfaced as its own
-    /// event (not a generic `BackupFailed`) so the UI can show an actionable
-    /// "supera el límite de tu plan, sube a Pro" message built from the
-    /// structured fields instead of a cryptic raw 413, and mark the save
-    /// terminal rather than "reintentando". `limit_bytes`/`actual_bytes` are
-    /// `0` for a self-hosted 413 with no structured body.
+    /// A 413: the upload can never succeed as-is, so retrying is pointless and
+    /// would just spam the feed every time the folder changes. Its own event
+    /// (not a generic `BackupFailed`) so the UI can show an actionable message
+    /// built from the structured fields and mark the save terminal rather than
+    /// "reintentando".
+    ///
+    /// **Three different things answer 413 and the fix differs for each**, so
+    /// `kind` decides which sentence the UI shows. Getting this wrong sends the
+    /// user to the wrong knob: a self-hoster spent days looking for a Hoard
+    /// limit when the answer was nginx's `client_max_body_size` (2026-08-07).
     BackupTooLarge {
         save_id: String,
         game_slug: String,
         label: String,
+        kind: TooLargeKind,
+        /// Cloud only: the plan whose cap was hit.
         plan: String,
+        /// The cap itself. `0` only when the responder wasn't Hoard.
         limit_bytes: u64,
+        /// Cloud only: the save's real size, known up front.
         actual_bytes: u64,
+        /// Self-hosted only: bytes taken in before the server gave up. A floor,
+        /// not the total — it aborts mid-stream and never learns the size.
+        received_bytes: u64,
     },
     /// The *account* is out of storage (402 `quota_exceeded`), so this upload —
     /// and every other one — will keep failing until the user frees space or

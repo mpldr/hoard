@@ -46,9 +46,17 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           # v1.2.3 -> :1.2.3, :1.2, and :latest (default flavor latest=auto).
+          #
+          # `semver` only matches on a tag ref, so a manual `workflow_dispatch`
+          # used to derive NO tags at all and push an image nobody could pull.
+          # `:edge` gives the run off a branch somewhere to land — the point of
+          # dispatching by hand is shipping a server fix to a self-hoster to
+          # diagnose with, without cutting a release or moving the `:latest`
+          # everyone else's compose is pinned to.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable=${{ github.ref_type != 'tag' }}
 
       - name: Build + push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6

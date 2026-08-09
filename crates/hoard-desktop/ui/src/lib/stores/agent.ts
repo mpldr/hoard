@@ -320,22 +320,42 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
       break;
     }
     case "backup_too_large": {
-      // The save is bigger than the plan's per-save cap, so it can never
-      // upload as-is. Not a transient failure and not "retrying" — show an
-      // actionable message (with the real limit/size) once and mark the row
-      // failed-without-retry so it stops spamming every folder change.
-      const msg =
-        ev.limit_bytes > 0
-          ? get(i18n)("library.backup_too_large_toast", {
-              values: {
-                name: ev.game_slug,
-                limit: formatBytes(ev.limit_bytes),
-                size: formatBytes(ev.actual_bytes),
-              },
-            })
-          : get(i18n)("library.backup_too_large_generic_toast", {
-              values: { name: ev.game_slug },
-            });
+      // The upload was refused as too big, so it can never succeed as-is. Not a
+      // transient failure and not "retrying" — say it once, actionably, and mark
+      // the row failed-without-retry so it stops spamming every folder change.
+      //
+      // Which sentence depends on WHO refused it, because the fix is somewhere
+      // different in each case: the plan (upgrade), the user's own server
+      // (`max_snapshot_size_mb`), or a proxy in front of it (nothing in Hoard
+      // will help). `kind` comes from the agent; the old code only looked at
+      // whether `limit_bytes` was non-zero, which lumped the last two together
+      // and sent a self-hoster hunting through proxy configs for days.
+      let msg: string;
+      switch (ev.kind) {
+        case "server_limit":
+          msg = get(i18n)("library.backup_too_large_server_toast", {
+            values: { name: ev.game_slug, limit: formatBytes(ev.limit_bytes) },
+          });
+          break;
+        case "proxy":
+          msg = get(i18n)("library.backup_too_large_proxy_toast", {
+            values: { name: ev.game_slug },
+          });
+          break;
+        default:
+          msg =
+            ev.limit_bytes > 0
+              ? get(i18n)("library.backup_too_large_toast", {
+                  values: {
+                    name: ev.game_slug,
+                    limit: formatBytes(ev.limit_bytes),
+                    size: formatBytes(ev.actual_bytes),
+                  },
+                })
+              : get(i18n)("library.backup_too_large_generic_toast", {
+                  values: { name: ev.game_slug },
+                });
+      }
       patch(ev.save_id, { state: "failed", error: msg, will_retry: false });
       // No toast: the activity feed carries this now (see live.ts). Native
       // notification stays behind the user's opt-in `notify_on_failure`.

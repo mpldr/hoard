@@ -239,6 +239,8 @@
   "library.steam_cloud_note_title": "Steam Cloud also syncs this game. Hoard still tracks it: Steam Cloud only covers the Steam copy, can be turned off per game, and keeps no history to roll back to.",
   "library.backup_too_large_toast": "Couldn't back up {name}: {size} is over your plan's {limit} per-save limit. Upgrade to Pro or trim the save folder.",
   "library.backup_too_large_generic_toast": "Couldn't upload {name}: the server refused it as too large (413). If it's your own server, check the reverse proxy's body-size limit.",
+  "library.backup_too_large_server_toast": "Couldn't upload {name}: it's over your server's {limit} per-snapshot limit. Raise `max_snapshot_size_mb` in its config.toml and restart it.",
+  "library.backup_too_large_proxy_toast": "Couldn't upload {name}: it was refused as too large — and not by Hoard. Something between this PC and your server (a reverse proxy or tunnel) has a body-size limit. nginx's default is 1 MB.",
   "library.backup_trimmed_toast": "Backed up {name}, but your plan wasn't big enough: {omitted} older saves ({size}) weren't uploaded. Upgrade to Pro to keep them all.",
   "library.tracked_size_title": "Total bytes stored on the server (sum of snapshots)",
   "library.local_size_title": "Space used on this machine",

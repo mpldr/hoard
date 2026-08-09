@@ -47,7 +47,7 @@ pub async fn list(
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| internal_logged("listing rows", e))?
     } else {
         sqlx::query_as!(
             GameRow,
@@ -58,7 +58,7 @@ pub async fn list(
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| internal_logged("listing rows", e))?
     };
 
     Ok(Json(
@@ -84,7 +84,7 @@ pub async fn get_one(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| internal_logged("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(Game {
@@ -123,7 +123,7 @@ pub async fn known_paths(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| internal_logged("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     let paths: serde_json::Value = row
@@ -166,7 +166,7 @@ pub async fn manifest_version(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| internal_logged("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(ManifestVersionResponse {
@@ -203,4 +203,13 @@ struct ManifestVersionRow {
     games_inserted: i64,
     games_updated: i64,
     games_pruned: i64,
+}
+
+/// A bare 500 for the client, the real cause for the log.
+///
+/// The catalog routes answer with a plain [`StatusCode`], so this returns one
+/// too — the point is only that the error stops vanishing on the way out.
+fn internal_logged<E: std::fmt::Display>(what: &'static str, e: E) -> StatusCode {
+    tracing::error!(error = %e, step = what, "games request failed");
+    StatusCode::INTERNAL_SERVER_ERROR
 }

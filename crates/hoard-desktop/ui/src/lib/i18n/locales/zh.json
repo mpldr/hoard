@@ -239,6 +239,8 @@
   "library.steam_cloud_note_title": "Steam 云也会同步此游戏。Hoard 仍会跟踪：Steam 云只覆盖 Steam 版本，可按游戏关闭，且没有可回滚的历史记录。",
   "library.backup_too_large_toast": "无法备份 {name}：{size} 超过了你套餐每个存档 {limit} 的上限。请升级到 Pro 或精简存档文件夹。",
   "library.backup_too_large_generic_toast": "无法上传 {name}：服务器以体积过大拒绝（413）。如果是你自己的服务器，请检查反向代理的请求体大小限制。",
+  "library.backup_too_large_server_toast": "无法上传 {name}：超出你服务器每次备份 {limit} 的上限。请在其 config.toml 中调高 `max_snapshot_size_mb` 并重启。",
+  "library.backup_too_large_proxy_toast": "无法上传 {name}：因过大被拒绝，但拒绝的不是 Hoard。此电脑与你服务器之间的某个环节（反向代理或隧道）设置了大小限制。nginx 的默认值为 1 MB。",
   "library.backup_trimmed_toast": "已备份 {name}，但你的套餐容量不足：{omitted} 个较旧的存档（{size}）未上传。升级到 Pro 即可全部保留。",
   "library.tracked_size_title": "服务器已存总字节数（快照之和）",
   "library.local_size_title": "本机占用空间",

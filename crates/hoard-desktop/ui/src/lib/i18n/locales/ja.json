@@ -239,6 +239,8 @@
   "library.steam_cloud_note_title": "このゲームは Steam Cloud でも同期されます。Hoard も引き続き追跡します: Steam Cloud は Steam 版のみが対象で、ゲームごとに無効化でき、巻き戻せる履歴もありません。",
   "library.backup_too_large_toast": "{name} をバックアップできませんでした: {size} はプランの1セーブあたりの上限 {limit} を超えています。Pro にアップグレードするか、セーブフォルダーを整理してください。",
   "library.backup_too_large_generic_toast": "{name}をアップロードできません: サーバーがサイズ超過(413)として拒否しました。自分のサーバーならプロキシのボディサイズ上限を確認してください。",
+  "library.backup_too_large_server_toast": "{name} をアップロードできません: サーバーの1バックアップあたりの上限 {limit} を超えています。config.toml の `max_snapshot_size_mb` を上げて再起動してください。",
+  "library.backup_too_large_proxy_toast": "{name} をアップロードできません: サイズ超過で拒否されましたが、Hoard ではありません。この PC とサーバーの間にあるもの（リバースプロキシやトンネル）にサイズ制限があります。nginx の既定値は 1 MB です。",
   "library.backup_trimmed_toast": "{name} をバックアップしましたが、プランの容量が足りません: 古いセーブ {omitted} 件（{size}）はアップロードされませんでした。すべて保存するには Pro にアップグレードしてください。",
   "library.tracked_size_title": "サーバー上の総バイト数 (スナップショット合計)",
   "library.local_size_title": "このマシンで使用している容量",

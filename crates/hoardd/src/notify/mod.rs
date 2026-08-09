@@ -396,6 +396,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hoard_core::ipc::events::TooLargeKind;
     use std::sync::Mutex;
 
     fn prefs(success: bool, failure: bool) -> Prefs {
@@ -496,9 +497,11 @@ mod tests {
                 save_id: "s1".into(),
                 game_slug: "factorio".into(),
                 label: String::new(),
+                kind: TooLargeKind::PlanCap,
                 plan: "free".into(),
                 limit_bytes: 100,
                 actual_bytes: 200,
+                received_bytes: 0,
             },
             AgentEvent::SaveAutoRestoreStuck {
                 save_id: "s1".into(),
@@ -521,9 +524,11 @@ mod tests {
             save_id: "s1".into(),
             game_slug: "factorio".into(),
             label: "Mundo nuevo".into(),
+            kind: TooLargeKind::PlanCap,
             plan: "free".into(),
             limit_bytes: 100,
             actual_bytes: 200,
+            received_bytes: 0,
         };
         assert_eq!(
             notice_for(&with_label, &prefs(false, true))

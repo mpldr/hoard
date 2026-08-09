@@ -63,19 +63,46 @@ pub enum ApiError {
     },
 }
 
-/// Structured body of a Hoard Cloud `save_too_large` 413. All fields default
-/// to zero/empty so a self-hosted 413 (or an unparseable body) still yields a
-/// usable [`ApiError::TooLarge`] via [`SaveTooLarge::human`].
+/// Structured body of a 413. All fields default to zero/empty so a body we
+/// can't parse still yields a usable [`ApiError::TooLarge`] via
+/// [`SaveTooLarge::human`].
+///
+/// Three different things answer 413 and the wording has to tell them apart,
+/// because the fix is different in each case:
+///
+/// - **Hoard Cloud** (`code: "save_too_large"`) — the account's per-save plan
+///   cap. Carries `plan` and `actual_bytes`; the user upgrades or trims.
+/// - **A self-hosted Hoard** (`code: "snapshot_too_large"`) — the operator's own
+///   `storage.max_snapshot_size_mb`. Carries `limit_bytes` and `received_bytes`;
+///   the user edits their `config.toml`.
+/// - **Something in front of the server** — nginx, Traefik, a Cloudflare tunnel.
+///   No code, no JSON at all: the body is an HTML error page. See
+///   [`Self::from_foreign_body`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SaveTooLarge {
+    /// `save_too_large` (Cloud) or `snapshot_too_large` (self-hosted). Empty
+    /// when the responder wasn't Hoard.
+    #[serde(default)]
+    pub code: String,
     #[serde(default)]
     pub plan: String,
     #[serde(default)]
     pub limit_bytes: u64,
     #[serde(default)]
     pub actual_bytes: u64,
+    /// Bytes the server had taken in when it gave up. A **floor**, not the
+    /// snapshot's size: a self-hosted server aborts mid-stream, so it never
+    /// learns the total. Kept separate from `actual_bytes` so the two can't be
+    /// confused — Cloud knows the real size up front, self-hosted doesn't.
+    #[serde(default)]
+    pub received_bytes: u64,
     #[serde(default)]
     pub upgrade_url: Option<String>,
+    /// The response body was not Hoard's JSON, so the rejection came from
+    /// something between the client and the server. Set by
+    /// [`Self::from_foreign_body`], never deserialized.
+    #[serde(skip)]
+    pub from_proxy: bool,
 }
 
 /// Structured body of a Hoard Cloud `quota_exceeded` 402. Same defaulting
@@ -120,12 +147,59 @@ impl QuotaExceeded {
 }
 
 impl SaveTooLarge {
-    /// A human, diagnosable one-liner. Falls back to a generic sentence when
-    /// the structured fields are absent (self-hosted / unparseable body). The
-    /// desktop re-localizes the cloud case from the structured fields via the
-    /// `BackupTooLarge` agent event; this string is the log/CLI/self-hosted
-    /// surface.
+    /// Build the "this didn't come from Hoard" case from a body we couldn't
+    /// parse.
+    ///
+    /// A 413 whose body isn't our JSON was written by whatever sits in front of
+    /// the server — and that is worth saying out loud, because the user will
+    /// otherwise go hunting through Hoard's settings for a limit that isn't
+    /// there. It cost a self-hoster days: nginx's default `client_max_body_size`
+    /// is 1 MB, their save was bigger, and every message they saw pointed at
+    /// Hoard (2026-08-07).
+    pub fn from_foreign_body() -> Self {
+        Self {
+            from_proxy: true,
+            ..Self::default()
+        }
+    }
+
+    /// Who refused it, so the UI can name the right knob.
+    pub fn kind(&self) -> hoard_core::ipc::events::TooLargeKind {
+        use hoard_core::ipc::events::TooLargeKind;
+        if self.from_proxy {
+            TooLargeKind::Proxy
+        } else if self.code == "snapshot_too_large" {
+            TooLargeKind::ServerLimit
+        } else {
+            TooLargeKind::PlanCap
+        }
+    }
+
+    /// A human, diagnosable one-liner: *which* limit, and whose. The desktop
+    /// re-localizes from the structured fields via the `BackupTooLarge` agent
+    /// event; this string is the log and CLI surface.
     pub fn human(&self) -> String {
+        if self.from_proxy {
+            return "payload too large (413) — and the reply wasn't Hoard's: \
+                    something between this machine and the server refused it \
+                    (a reverse proxy or tunnel body-size limit)"
+                .into();
+        }
+        if self.code == "snapshot_too_large" && self.limit_bytes > 0 {
+            return format!(
+                "snapshot too large: over this server's limit of {} per snapshot \
+                 (raise storage.max_snapshot_size_mb in its config.toml){}",
+                fmt_bytes(self.limit_bytes),
+                if self.received_bytes > 0 {
+                    format!(
+                        " — {} sent before it stopped",
+                        fmt_bytes(self.received_bytes)
+                    )
+                } else {
+                    String::new()
+                },
+            );
+        }
         if self.limit_bytes == 0 {
             return "payload too large (413): exceeds the server's per-save size limit".into();
         }
@@ -182,14 +256,23 @@ impl ApiError {
             StatusCode::NOT_FOUND => ApiError::NotFound,
             // Cloud-only. Self-hosted never issues a 402, so an unparseable body
             // here is still safest treated as "the account is full".
-            StatusCode::PAYMENT_REQUIRED if extract_code(&body).as_deref() == Some("quota_exceeded") => {
+            StatusCode::PAYMENT_REQUIRED
+                if extract_code(&body).as_deref() == Some("quota_exceeded") =>
+            {
                 ApiError::QuotaExceeded(
                     serde_json::from_str::<QuotaExceeded>(&body).unwrap_or_default(),
                 )
             }
-            StatusCode::PAYLOAD_TOO_LARGE => {
-                ApiError::TooLarge(serde_json::from_str::<SaveTooLarge>(&body).unwrap_or_default())
-            }
+            // A 413 we can't parse wasn't written by Hoard — both our servers
+            // answer with JSON carrying a `code`. Say so instead of shrugging:
+            // the culprit is a proxy limit, and nothing in Hoard's settings will
+            // fix it.
+            StatusCode::PAYLOAD_TOO_LARGE => ApiError::TooLarge(
+                serde_json::from_str::<SaveTooLarge>(&body)
+                    .ok()
+                    .filter(|d| !d.code.is_empty())
+                    .unwrap_or_else(SaveTooLarge::from_foreign_body),
+            ),
             StatusCode::CONFLICT => ApiError::Conflict(extract_message(&body)),
             StatusCode::BAD_REQUEST => ApiError::BadRequest(extract_message(&body)),
             StatusCode::TOO_MANY_REQUESTS => {

@@ -40,7 +40,17 @@ burst = 60
 # even when blobs go to S3.
 data_dir = "/var/lib/hoard"
 # Maximum size of a single snapshot upload in megabytes.
-max_snapshot_size_mb = 1024
+#
+# It is also the ceiling on the request body the server will read, so raising it
+# raises both. Two jobs: keeping a modded save with a few GB of files from being
+# refused, and catching the case where someone points Hoard at a game's *install*
+# directory instead of its saves — that mistake is common, and a cap is the only
+# thing that stops it quietly filling the disk. Raise it if a legitimate save
+# needs more; don't remove the idea of a limit.
+#
+# NOTE: an existing install already has this written to its own config.toml.
+# Changing it here only affects fresh ones.
+max_snapshot_size_mb = 4096
 # How long in seconds a client has to finish an upload.
 upload_timeout_secs = 600
 # Where blob/chunk bytes live: "local" (default — on disk under data_dir) or

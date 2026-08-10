@@ -19,8 +19,16 @@ use crate::routes::repair_username;
 pub async fn whoami(
     Extension(user): Extension<AuthUser>,
     State(state): State<Arc<ServerState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Whoami>, StatusCode> {
     let user_id = user.user_id.to_string();
+    // El cliente llama aquí al iniciar sesión y al arrancar, así que es el sitio
+    // natural para dar de alta la máquina en el censo (`routes::devices`) — el
+    // mismo papel que `/v1/me` en cloud. Best-effort: que el censo falle no
+    // puede tumbar la identidad del usuario, que es de lo que va esta ruta.
+    if let Err(e) = crate::routes::devices::register(&state.pool, &user_id, &headers).await {
+        tracing::warn!(error = %e, "devices: register on whoami failed");
+    }
     // Runtime query (not the `query!` macro) so the new max_versions column
     // can be selected without regenerating the offline sqlx cache.
     let row: (i64, i64, Option<i64>) = sqlx::query_as(

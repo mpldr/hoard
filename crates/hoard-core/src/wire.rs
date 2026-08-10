@@ -83,6 +83,24 @@ pub struct Health {
     /// namespace (`/v1/cloud/*` vs `/v1/saves`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Este server habla el protocolo direccionado por contenido
+    /// (`/v1/saves/{id}/cas/*`): el cliente declara el manifiesto y sólo sube
+    /// los blobs que al server le faltan, en vez de mandar la carpeta entera en
+    /// un multipart.
+    ///
+    /// **Es una capacidad, no una preferencia.** Ausente = server anterior a
+    /// la 1.1.3, que sólo entiende el multipart; el cliente no puede deducirlo
+    /// de la versión porque la versión del server y la del cliente van por
+    /// separado. Se omite cuando es `false` para que el golden de la release
+    /// siga cuadrando byte a byte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cas: bool,
+    /// Este server lleva registro de dispositivos y presencia en vivo
+    /// (`/v1/devices`, `/v1/presence/heartbeat`). Misma disciplina que
+    /// [`Health::cas`]: capacidad del binario, no ajuste; ausente = server
+    /// anterior a la 1.1.3, al que no hay que mandarle latidos.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub devices: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +296,164 @@ mod sha_opt {
             Some(s) => Sha256::parse(s).map(Some).map_err(D::Error::custom),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// /v1/saves/{id}/cas/*  ·  subida direccionada por contenido (self-hosted)
+// ---------------------------------------------------------------------------
+//
+// Hasta la 1.1.2 self-hosted sólo sabía subir en multipart: la carpeta **entera**
+// en cada copia, aunque el server ya tuviera el 99% de los bytes. Deduplicaba al
+// guardar (blobs por sha, ADR 0018), no al transmitir. Una partida de 3 GB que
+// cambia 10 MB costaba 3 GB de subida, y encima chocaba contra
+// `storage.max_snapshot_size_mb` y contra cualquier proxy con un límite de
+// cuerpo por delante.
+//
+// Estas tres llamadas son la negociación que Hoard Cloud ya tenía: declarar el
+// manifiesto, subir sólo lo que falta, confirmar. La diferencia con cloud es
+// dónde aterrizan los bytes — cloud firma URLs de R2 y el cliente escribe en el
+// bucket; aquí el cliente **nunca** habla con el almacenamiento (ADR 0020), así
+// que cada blob que falta se sube al propio server y es él quien lo coloca.
+
+/// Un fichero del manifiesto: qué ruta, qué contenido, cuánto ocupa.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasFile {
+    pub relative_path: String,
+    pub sha256: Sha256,
+    pub size_bytes: i64,
+}
+
+/// Cuerpo de `POST /v1/saves/{id}/cas/init`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasInit {
+    /// La versión sobre la que el cliente cree estar construyendo. Igual que en
+    /// el multipart: si ya no es la cabeza, otro equipo se adelantó y esto se
+    /// rechaza — aquí **antes** de mover un byte, que es la gracia.
+    #[serde(default)]
+    pub base_version: Option<i64>,
+    pub files: Vec<CasFile>,
+}
+
+/// Un blob que el server no tiene y el cliente debe subir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasMissing {
+    pub sha256: Sha256,
+    pub size_bytes: i64,
+}
+
+/// Respuesta de `cas/init`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasInitOut {
+    /// Identifica el área de staging de esta subida
+    /// (`PUT /v1/cas/blobs/{upload_id}/{sha}`). La mina el server; caduca con el
+    /// barrido de `tmp/` (`retention.tmp_cleanup_hours`), así que una subida
+    /// abandonada se limpia sola.
+    pub upload_id: String,
+    /// La versión que saldrá del commit **si nadie se adelanta**. Orientativa:
+    /// el número de verdad lo asigna el commit, bajo la misma transacción que
+    /// comprueba la cabeza.
+    pub version_num: i64,
+    /// Lo que hay que subir. Todo lo demás del manifiesto ya está guardado.
+    pub missing: Vec<CasMissing>,
+    /// Bytes que se van a transmitir de verdad (suma de `missing`), frente al
+    /// tamaño lógico de la partida. La diferencia es lo que ahorra el dedup, y
+    /// el cliente la usa para que la barra de progreso mida la subida real.
+    pub missing_bytes: i64,
+}
+
+/// Cuerpo de `POST /v1/saves/{id}/cas/commit`. Repite el manifiesto: el server
+/// no guarda nada entre init y commit salvo los bytes en staging, así que un
+/// commit es autosuficiente y un init perdido no deja una fila a medias en la
+/// base (que es lo que obliga a cloud a llevar versiones "pendientes").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasCommit {
+    pub upload_id: String,
+    #[serde(default)]
+    pub base_version: Option<i64>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub files: Vec<CasFile>,
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/devices  ·  POST /v1/presence/heartbeat
+// ---------------------------------------------------------------------------
+//
+// Los dos despliegues montan **estas mismas rutas** (no viven bajo
+// `/v1/cloud/`), así que aquí sí compilan las dos puntas contra una única
+// definición. El cliente las usaba ya contra cloud; self-hosted las sirve desde
+// la 1.1.3.
+//
+// Qué contestan, y por qué importa las tres cosas a la vez: de qué máquina salió
+// cada versión (eso ya lo lleva `Snapshot::device_name`), qué máquinas de la
+// misma cuenta existen, y cuáles están encendidas ahora mismo y jugando a qué.
+
+/// Un juego en un latido: slug + segundos que lleva corriendo.
+///
+/// Duración y no timestamp a propósito: el server la ancla a **su** reloj
+/// (`ahora - secs`), así un cliente con la hora desviada no puede declarar que
+/// lleva jugando desde dentro de tres minutos.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayingBeat {
+    pub slug: String,
+    pub for_secs: u64,
+}
+
+/// Cuerpo de `POST /v1/presence/heartbeat`. Todo opcional: un keepalive de una
+/// máquina ociosa es `{}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Heartbeat {
+    /// Juegos corriendo ahora, el más reciente primero. Vacío = ociosa.
+    #[serde(default)]
+    pub playing: Vec<PlayingBeat>,
+    /// Latido final del apagado ordenado: apaga el punto al instante en vez de
+    /// esperar a que la máquina envejezca fuera de la ventana.
+    #[serde(default)]
+    pub closing: bool,
+}
+
+/// Un juego corriendo en un dispositivo (`GET /v1/devices`): slug + RFC3339 del
+/// arranque de la sesión.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePlaying {
+    pub slug: String,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// Un dispositivo de la cuenta con su presencia en vivo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceOut {
+    pub id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Latido fresco y sin latido de cierre. Se calcula **al leer**, no se
+    /// guarda: así una máquina que murió sin despedirse se apaga sola en vez de
+    /// quedarse encendida para siempre.
+    #[serde(default)]
+    pub online: bool,
+    /// Juegos corriendo ahora mismo (el más reciente primero); sólo viene si
+    /// `online`. Vacío = ociosa.
+    #[serde(default)]
+    pub playing: Vec<DevicePlaying>,
+    /// True en la fila que corresponde al fingerprint de quien pregunta, para
+    /// que la UI se reconozca sin conocer su propio id.
+    #[serde(default)]
+    pub this_device: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceListOut {
+    pub devices: Vec<DeviceOut>,
 }
 
 // ---------------------------------------------------------------------------

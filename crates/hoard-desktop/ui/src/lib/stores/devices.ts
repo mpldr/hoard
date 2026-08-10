@@ -8,8 +8,9 @@
  * response body as the event payload. This store just mirrors the latest
  * snapshot; there is nothing to persist (presence is live by definition).
  *
- * Cloud-only: self-hosted sessions never receive the event, the array stays
- * empty, and the Eye panel shows only this machine — same as before.
+ * A self-hosted session gets no Realtime push, so nothing arrives on its own:
+ * there, `refreshDevices()` below asks the server directly while the panel is
+ * open. Same endpoint, same shape — only who does the asking changes.
  */
 import { writable } from "svelte/store";
 
@@ -65,5 +66,26 @@ export async function initDevicesFeed(): Promise<void> {
     await invoke("devices_refresh");
   } catch {
     /* signed out / browser dev — the realtime/poll path covers it later */
+  }
+}
+
+/**
+ * Ask the server for the device list right now and publish it.
+ *
+ * The Eye panel calls this while it's open. It's the only source on a
+ * self-hosted session (no Realtime to push it) and a cheap freshener on a cloud
+ * one — the endpoint is the same in both, and the Rust side picks whichever
+ * session is signed in.
+ *
+ * Silent on failure by design: a device list that didn't load must never paint
+ * an error over the panel. The list simply stays as it was.
+ */
+export async function refreshDevices(): Promise<void> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const out = await invoke<{ devices?: RemoteDevice[] }>("devices_list");
+    remoteDevices.set(out?.devices ?? []);
+  } catch {
+    /* signed out, server too old, or browser dev — keep what we have */
   }
 }

@@ -364,6 +364,17 @@ pub struct ApiClient {
     /// so the next call retries instead of wedging the client into the wrong
     /// protocol forever.
     mode: Arc<OnceCell<Option<String>>>,
+    /// ¿Anuncia este server las rutas `/v1/saves/{id}/cas/*` (subida
+    /// direccionada por contenido)? Se rellena en la **misma** sonda que
+    /// `mode`, no en una aparte: preguntarlo por separado sería elegir
+    /// protocolo con media foto.
+    ///
+    /// Vacío = no se ha sondeado. `Some(false)` = server anterior a la 1.1.3,
+    /// que sólo entiende el multipart.
+    cas: Arc<OnceCell<bool>>,
+    /// ¿Lleva este server censo de dispositivos y presencia (`/v1/devices`,
+    /// `/v1/presence/heartbeat`)? Se rellena en la misma sonda, por lo mismo.
+    devices: Arc<OnceCell<bool>>,
 }
 
 impl ApiClient {
@@ -397,6 +408,8 @@ impl ApiClient {
             upload_http,
             download_http,
             mode: Arc::new(OnceCell::new()),
+            cas: Arc::new(OnceCell::new()),
+            devices: Arc::new(OnceCell::new()),
         })
     }
 
@@ -463,11 +476,45 @@ impl ApiClient {
     /// next call retries.
     pub async fn server_mode(&self) -> Option<String> {
         self.mode
-            .get_or_try_init(|| async { self.health().await.map(|h| h.mode) })
+            .get_or_try_init(|| async {
+                let h = self.health().await?;
+                // Las capacidades salen de la misma respuesta. Se guardan aquí
+                // y no en sondas propias para que modo y capacidades describan
+                // siempre al mismo server.
+                let _ = self.cas.set(h.cas);
+                let _ = self.devices.set(h.devices);
+                Ok::<_, anyhow::Error>(h.mode)
+            })
             .await
             .ok()
             .cloned()
             .flatten()
+    }
+
+    /// ¿Sabe este server negociar el contenido antes de subirlo
+    /// (`/v1/saves/{id}/cas/*`)? `None` mientras no haya sondeo con éxito.
+    ///
+    /// Mismo contrato honesto que [`Self::probed_is_cloud`]: no colapsa "no lo
+    /// soporta" con "todavía no lo sé". Elegir el multipart porque la sonda
+    /// falló sería subir gigas de más sin motivo.
+    pub fn probed_supports_cas(&self) -> Option<bool> {
+        self.cas.get().copied()
+    }
+
+    /// ¿Lleva este server censo de dispositivos y presencia en vivo?
+    ///
+    /// Cloud siempre las tiene y **no** anuncia la bandera (su `/v1/health` es
+    /// otro cuerpo), así que quien pregunte tiene que mirar también
+    /// [`Self::probed_is_cloud`] — es lo que hace [`Self::has_presence`].
+    pub fn probed_supports_devices(&self) -> Option<bool> {
+        self.devices.get().copied()
+    }
+
+    /// ¿Tiene sentido mandarle latidos de presencia a este server? Cloud sí
+    /// siempre; self-hosted desde la 1.1.3. Sondea si hace falta.
+    pub async fn has_presence(&self) -> bool {
+        let _ = self.server_mode().await;
+        self.probed_is_cloud() == Some(true) || self.probed_supports_devices() == Some(true)
     }
 
     /// True when the server is the SaaS (`api.hoard.services`) deployment,
@@ -1079,6 +1126,64 @@ impl ApiClient {
         let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
         Ok(resp.json().await?)
     }
+
+    // ---- Self-hosted, direccionado por contenido ------------------------
+    //
+    // El trío que sustituye al multipart cuando el server lo anuncia
+    // ([`Self::probed_supports_cas`]). Ver `hoard_server::routes::cas` para el
+    // porqué y para en qué se aparta del de cloud.
+
+    /// `POST /v1/saves/{id}/cas/init` — declarar el manifiesto. Devuelve qué
+    /// blobs faltan y el área de staging donde subirlos.
+    pub async fn cas_init(&self, save_id: &str, init: &CasInit) -> Result<CasInitOut> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/saves/{save_id}/cas/init")))
+            .header("authorization", self.auth_header())
+            .json(init)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
+        Ok(resp.json().await?)
+    }
+
+    /// `PUT /v1/cas/blobs/{upload_id}/{sha}` — un blob que falta.
+    ///
+    /// Va por `upload_http` (sin timeout total) por el mismo motivo que el
+    /// multipart: un blob puede ser de gigas y un tope fijo mataría la subida a
+    /// media transferencia.
+    pub async fn cas_upload_blob(
+        &self,
+        upload_id: &str,
+        sha256: &str,
+        body: reqwest::Body,
+        content_length: u64,
+    ) -> Result<()> {
+        let resp = self
+            .upload_http
+            .put(self.url(&format!("/v1/cas/blobs/{upload_id}/{sha256}")))
+            .header("authorization", self.auth_header())
+            .header(reqwest::header::CONTENT_LENGTH, content_length)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
+    /// `POST /v1/saves/{id}/cas/commit` — cerrar la versión.
+    pub async fn cas_commit(&self, save_id: &str, commit: &CasCommit) -> Result<Snapshot> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/saves/{save_id}/cas/commit")))
+            .header("authorization", self.auth_header())
+            .json(commit)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
+        Ok(resp.json().await?)
+    }
 }
 
 // ---- DTOs ---------------------------------------------------------------
@@ -1089,8 +1194,9 @@ impl ApiClient {
 // que `api::Save` y compañía sigan siendo las rutas públicas de siempre.
 
 pub use hoard_core::wire::{
-    CreateSaveRequest, Game, Health, MaxVersionsBody, MaxVersionsResponse, PatchSaveRequest, Save,
-    Snapshot, SnapshotDetail, SnapshotFile,
+    CasCommit, CasFile, CasInit, CasInitOut, CasMissing, CreateSaveRequest, Game, Health,
+    MaxVersionsBody, MaxVersionsResponse, PatchSaveRequest, Save, Snapshot, SnapshotDetail,
+    SnapshotFile,
 };
 pub use hoard_core::wire::{LogBatch, LogEntry, LogIngestResponse, Whoami};
 
@@ -1267,55 +1373,12 @@ pub struct CloudVersionManifestOut {
     pub files: Vec<CloudManifestFile>,
 }
 
-/// Un juego en un latido de presencia: slug + segundos que lleva corriendo.
-/// Duración y no timestamp: el server la ancla a su propio reloj, inmune a
-/// relojes de cliente desviados.
-#[derive(Debug, Clone, Serialize)]
-pub struct PlayingBeat {
-    pub slug: String,
-    pub for_secs: u64,
-}
-
-/// Un juego corriendo en un device (`GET /v1/devices`): slug + RFC3339 del
-/// arranque de la sesión.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevicePlaying {
-    pub slug: String,
-    #[serde(default)]
-    pub since: Option<String>,
-}
-
-/// Un dispositivo de la cuenta con su presencia en vivo (`GET /v1/devices`).
-/// Serialize además de Deserialize: el desktop lo reemite tal cual como
-/// payload del evento Tauri `hoard://devices`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceOut {
-    pub id: String,
-    pub device_name: String,
-    #[serde(default)]
-    pub device_kind: Option<String>,
-    #[serde(default)]
-    pub os: Option<String>,
-    #[serde(default)]
-    pub last_seen_at: Option<String>,
-    #[serde(default)]
-    pub created_at: Option<String>,
-    /// Heartbeat fresco y sin beat de cierre.
-    #[serde(default)]
-    pub online: bool,
-    /// Juegos corriendo ahora mismo (el más reciente primero); solo viene si
-    /// `online`. Vacío = idle.
-    #[serde(default)]
-    pub playing: Vec<DevicePlaying>,
-    /// True en la fila que corresponde al fingerprint del caller.
-    #[serde(default)]
-    pub this_device: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceListOut {
-    pub devices: Vec<DeviceOut>,
-}
+// El censo de dispositivos y la presencia son las MISMAS rutas en los dos
+// despliegues (`/v1/devices`, `/v1/presence/heartbeat`), así que sus formas
+// viven en `hoard_core::wire` y las dos puntas compilan contra una sola
+// definición. Se re-exportan aquí porque `api::DeviceOut` es la ruta pública
+// que el desktop ya importa.
+pub use hoard_core::wire::{DeviceListOut, DeviceOut, DevicePlaying, Heartbeat, PlayingBeat};
 
 /// Un broadcast del operador (`GET /v1/notifications`). Mismo shape que el
 /// `ServerNotification` que espera la UI (stores/notifications.ts) más

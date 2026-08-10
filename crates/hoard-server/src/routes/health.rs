@@ -22,6 +22,12 @@ pub struct ServerState {
 /// Build the body. `log_min_level` is always `"debug"` self-hosted (it keeps
 /// every level); `mode` stays absent — that's what tells the client to speak the
 /// self-hosted protocol instead of `/v1/cloud/*`.
+///
+/// `cas` announces the content-addressed upload routes (`routes::cas`). It is a
+/// capability, not a setting: this binary always has them, and a client that
+/// doesn't see the flag is talking to a server old enough to only understand the
+/// multipart upload. There is no way to infer it from `version` — client and
+/// server are updated independently, which is the whole reason it's here.
 fn body(status: &str, uptime_secs: u64) -> Health {
     Health {
         status: status.to_string(),
@@ -29,6 +35,8 @@ fn body(status: &str, uptime_secs: u64) -> Health {
         uptime_secs,
         log_min_level: Some("debug".to_string()),
         mode: None,
+        cas: true,
+        devices: true,
     }
 }
 

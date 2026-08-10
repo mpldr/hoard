@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Self-hosted backups only upload what changed.** Your server has always
+  stored each file once and let versions share the bytes — but every backup still
+  sent the whole folder and the server threw away the part it already had. A 3 GB
+  save that changed 10 MB cost 3 GB of upload, every time. The client now tells
+  the server what the version contains, the server answers which files it's
+  missing, and only those travel. A second backup of the same game moves
+  megabytes. It also stops a big save from arriving as one enormous request,
+  which is what used to collide with `max_snapshot_size_mb` and with the body
+  limit of any reverse proxy in front — nginx, a Synology's built-in one, a
+  Cloudflare hostname. Nothing to configure: the server announces it and older
+  clients keep working against the same server. (Hoard Cloud has worked this way
+  since launch.)
+
+- **Your own server now knows your machines.** The Eye panel used to show only
+  the computer you were sitting at — the list of other devices was never wired
+  up, on either deployment. Now it shows every machine on the account: which are
+  on right now, what each is playing and for how long. Self-hosted included, and
+  there it stays entirely between your machines and your server: the census
+  lives in your own database and nothing about it is sent anywhere. Machines
+  identify themselves by a stable fingerprint, so reinstalling doesn't duplicate
+  them, and one that goes months without appearing is forgotten.
+
 ### Fixed
 - **Dropping from Pro to Free deleted your history without warning.** The
   grace window that was supposed to give you a month before a smaller plan takes

@@ -1,5 +1,5 @@
 //! Presencia en vivo para el Eye panel: heartbeats a
-//! `POST /v1/presence/heartbeat` (solo Hoard Cloud).
+//! `POST /v1/presence/heartbeat`.
 //!
 //! Una única implementación que comparten los dos frontends (desktop y
 //! daemon CLI): se hace `spawn` junto al agente, se le reenvían los
@@ -15,8 +15,13 @@
 //!   apague al instante en vez de esperar el umbral.
 //!
 //! Todo best-effort: un latido fallido se loguea en debug y el siguiente tick
-//! reintenta. Contra un server self-hosted (sin el endpoint) no se emite nada
-//! — el gate es el probe cacheado de [`ApiClient::is_cloud`].
+//! reintenta. El gate es la capacidad que anuncia el server
+//! ([`ApiClient::has_presence`], sobre el probe cacheado de `/v1/health`), no el
+//! despliegue: desde la 1.1.3 un server self-hosted también lleva el censo, y
+//! contra uno anterior no se emite nada.
+//!
+//! En self-hosted esto no habla con Hoard ni con nadie de fuera: los latidos van
+//! al servidor del propio usuario y sólo los ve él.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -129,9 +134,11 @@ async fn run(api: ApiClient, mut rx: mpsc::Receiver<Cmd>) {
 }
 
 async fn beat(api: &ApiClient, running: &HashMap<String, (u32, Instant)>, closing: bool) {
-    // Gate Cloud: el probe se cachea al primer éxito, así que en régimen esto
-    // no cuesta red. Self-hosted (o probe fallido) → silencio.
-    if !api.is_cloud().await {
+    // Gate por capacidad, no por despliegue: cloud siempre la tiene y
+    // self-hosted desde la 1.1.3, que es cuando su server empezó a llevar censo
+    // de dispositivos. El probe se cachea al primer éxito, así que en régimen
+    // esto no cuesta red; un server viejo (o un probe fallido) → silencio.
+    if !api.has_presence().await {
         return;
     }
     // Lista completa, la más reciente primero — el mismo orden en que el

@@ -15,9 +15,9 @@ use tracing::info;
 use hoard_server::auth::require_auth;
 use hoard_server::cleanup;
 use hoard_server::routes::{
-    admin as admin_routes, auth as auth_routes, events as event_routes, games as game_routes,
-    health, logs as log_routes, playtime as playtime_routes, saves as save_routes,
-    snapshots as snap_routes,
+    admin as admin_routes, auth as auth_routes, cas as cas_routes, devices as device_routes,
+    events as event_routes, games as game_routes, health, logs as log_routes,
+    playtime as playtime_routes, saves as save_routes, snapshots as snap_routes,
 };
 
 #[derive(Parser)]
@@ -232,6 +232,28 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
             "/v1/saves/:save_id/snapshots/:version/restore",
             post(snap_routes::restore),
         )
+        // Subida direccionada por contenido: declarar el manifiesto, subir sólo
+        // los blobs que falten, confirmar (ver `routes::cas`). El multipart de
+        // arriba se queda para los clientes que no la anuncian — `/v1/health`
+        // lleva `cas: true` desde la 1.1.3.
+        .route("/v1/saves/:save_id/cas/init", post(cas_routes::init))
+        .route("/v1/saves/:save_id/cas/commit", post(cas_routes::commit))
+        // Fuera del árbol de `:save_id` a propósito: un blob es del usuario, no
+        // de una partida — el mismo contenido puede acabar referenciado por
+        // varias.
+        .route(
+            "/v1/cas/blobs/:upload_id/:sha256",
+            axum::routing::put(cas_routes::upload_blob),
+        )
+        // Censo de dispositivos + presencia en vivo (ver `routes::devices`).
+        // Mismas rutas que en cloud a propósito: el cliente ya las hablaba, y
+        // así no hay dos protocolos para lo mismo.
+        .route("/v1/devices", get(device_routes::list))
+        .route(
+            "/v1/devices/:id",
+            axum::routing::delete(device_routes::delete),
+        )
+        .route("/v1/presence/heartbeat", post(device_routes::heartbeat))
         .layer(axum::extract::DefaultBodyLimit::max(
             (cfg.storage.max_snapshot_size_mb as usize) * 1024 * 1024 + 16 * 1024 * 1024,
         ))

@@ -12,6 +12,8 @@
 
 pub mod admin;
 pub mod auth;
+pub mod cas;
+pub mod devices;
 pub mod events;
 pub mod games;
 pub mod health;

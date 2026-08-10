@@ -79,6 +79,8 @@ enum Commands {
     Saves,
     /// Show server status (uses /v1/health)
     Status,
+    /// List the machines on this account: which are on and what they're playing
+    Devices,
     /// Configuration file management
     Config {
         #[command(subcommand)]
@@ -302,6 +304,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
+        Commands::Devices => commands::devices::run().await,
         Commands::Config { action } => commands::config::run(action),
         Commands::Login {
             token,

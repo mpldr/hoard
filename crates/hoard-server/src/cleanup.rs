@@ -58,8 +58,21 @@ pub async fn run_once(
     purge_tmp(data_dir, tmp_cleanup_hours).await?;
     purge_trash(pool, data_dir, store, trash_retention_days).await?;
     purge_client_logs(pool, CLIENT_LOG_RETENTION_DAYS).await?;
+    // Olvidar máquinas que llevan meses sin aparecer, o el censo acumula para
+    // siempre cada portátil que alguien usó una tarde. Best-effort: que esto
+    // falle no puede tumbar el resto de la limpieza.
+    match crate::routes::devices::prune_stale(pool, DEVICE_RETENTION_DAYS).await {
+        Ok(n) if n > 0 => info!(removed = n, "forgot devices with no recent activity"),
+        Err(e) => warn!(error = %e, "device pruning error"),
+        _ => {}
+    }
     Ok(())
 }
+
+/// Cuánto sobrevive un dispositivo en el censo sin dar señales. 90 días es lo
+/// mismo que usa cloud: largo para que un equipo que sólo se enciende en
+/// vacaciones no desaparezca, corto para que el listado siga significando algo.
+const DEVICE_RETENTION_DAYS: i64 = 90;
 
 /// Age-weighted snapshot pruning (ADR 0018, eje B). For each save, decide
 /// which live snapshots are redundant per `policy` and soft-delete them

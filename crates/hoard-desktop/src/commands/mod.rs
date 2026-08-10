@@ -13,6 +13,7 @@ pub mod cloud_feed;
 pub mod cloud_pull;
 pub mod cloud_realtime;
 pub mod covers;
+pub mod devices;
 pub mod emulators;
 pub mod error;
 pub mod history;

@@ -10,13 +10,27 @@
    * Super clean: one row per device, no noise.
    */
   import { _ } from "svelte-i18n";
+  import { onMount } from "svelte";
   import { activity, status } from "../stores/agent";
   import { auth } from "../stores/auth";
   import { cloud } from "../stores/cloud";
+  import { remoteDevices, refreshDevices } from "../stores/devices";
   import { Gamepad2, Server } from "@lucide/svelte";
   import OsLogo from "./OsLogo.svelte";
 
   let { now }: { now: number } = $props();
+
+  // Presence goes stale in 90s server-side (three missed beats), so a refresh
+  // every 15s while the panel is open keeps a sibling's dot honest without
+  // polling anything when nobody is looking. Cloud sessions also get Realtime
+  // pushes; this just makes the first paint immediate.
+  const REFRESH_MS = 15_000;
+
+  onMount(() => {
+    void refreshDevices();
+    const t = setInterval(() => void refreshDevices(), REFRESH_MS);
+    return () => clearInterval(t);
+  });
 
   // --- OS detection -------------------------------------------------------
   // Read from the <html> class set by App.svelte on boot. Returns the OS key
@@ -41,6 +55,20 @@
         since: a.running_since ?? now,
       })),
   );
+
+  /** The `os` a sibling reported in its headers → the logo + label pair. */
+  function osFor(os: string | null | undefined): OsInfo {
+    switch ((os ?? "").toLowerCase()) {
+      case "linux":
+        return { key: "linux", name: "Linux" };
+      case "macos":
+        return { key: "macos", name: "macOS" };
+      case "windows":
+        return { key: "windows", name: "Windows" };
+      default:
+        return { key: "unknown", name: "" };
+    }
+  }
 
   function prettySlug(slug: string): string {
     const parts = slug.split(/[-_]+/).filter(Boolean);
@@ -79,10 +107,28 @@
     playingSince: runningGames[0]?.since,
   });
 
-  // Other devices: NOT available yet. The server doesn't expose a live device
-  // list — see vista.md for the spec of what needs to be added backend-side.
-  // When it lands, poll or listen for a Tauri event and populate this array.
-  const otherDevices: Device[] = $derived([]);
+  // The rest of the account's machines, from `GET /v1/devices`. `this_device`
+  // is dropped: this machine is rendered above from live local state, which is
+  // always fresher than its own heartbeat echoed back by the server.
+  //
+  // `since` comes as RFC3339 anchored to the *server's* clock, which is what
+  // makes the elapsed time trustworthy: a sibling with a skewed clock can't
+  // claim it's been playing since tomorrow.
+  const otherDevices = $derived<Device[]>(
+    $remoteDevices
+      .filter((d) => !d.this_device)
+      .map((d) => {
+        const game = d.playing?.[0];
+        const since = game?.since ? Date.parse(game.since) : NaN;
+        return {
+          name: d.device_name,
+          os: osFor(d.os),
+          online: d.online,
+          playing: game ? prettySlug(game.slug) : undefined,
+          playingSince: Number.isNaN(since) ? undefined : since,
+        };
+      }),
+  );
 
   const allDevices = $derived([thisDevice, ...otherDevices]);
 </script>

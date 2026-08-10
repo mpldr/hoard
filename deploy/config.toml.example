@@ -41,12 +41,17 @@ burst = 60
 data_dir = "/var/lib/hoard"
 # Maximum size of a single snapshot upload in megabytes.
 #
-# It is also the ceiling on the request body the server will read, so raising it
-# raises both. Two jobs: keeping a modded save with a few GB of files from being
-# refused, and catching the case where someone points Hoard at a game's *install*
-# directory instead of its saves — that mistake is common, and a cap is the only
-# thing that stops it quietly filling the disk. Raise it if a legitimate save
-# needs more; don't remove the idea of a limit.
+# Two jobs: keeping a modded save with a few GB of files from being refused, and
+# catching the case where someone points Hoard at a game's *install* directory
+# instead of its saves — that mistake is common, and a cap is the only thing
+# that stops it quietly filling the disk. Raise it if a legitimate save needs
+# more; don't remove the idea of a limit.
+#
+# It is measured against the save's total size, and clients from 1.1.3 on are
+# told the number up front instead of finding out mid-upload. It is also the
+# ceiling on any single request body — but since 1.1.3 a save no longer travels
+# in one request (each file that the server is missing is its own upload), so
+# this stopped being the thing a big save collides with.
 #
 # NOTE: an existing install already has this written to its own config.toml.
 # Changing it here only affects fresh ones.

@@ -20,7 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 
-use crate::api::{ApiClient, CloudCasFileEntry, CloudCasInit, CloudCasMissingBlob, Snapshot};
+use crate::api::{
+    ApiClient, CasCommit, CasFile, CasInit, CloudCasFileEntry, CloudCasInit, CloudCasMissingBlob,
+    Snapshot,
+};
 use crate::state::{CliState, SaveState};
 use hoard_core::ids::SaveId;
 
@@ -459,6 +462,17 @@ where
         .await;
     }
 
+    // Self-hosted que sepa negociar el contenido: se le declara el manifiesto y
+    // sólo viajan los blobs que no tenga. El multipart de aquí abajo se queda
+    // para los servers anteriores a la 1.1.3, que no anuncian la capacidad.
+    //
+    // La condición es `Some(true)`, no `unwrap_or(false)`: un `None` significa
+    // que la sonda no ha resuelto, y ese caso ya lo cortó el `bail!` de arriba.
+    if client.probed_supports_cas() == Some(true) {
+        return upload_directory_cas(client, save_id, &files, total_bytes, base_version, progress)
+            .await;
+    }
+
     // Ingesta adaptativa por forma del save (ADR 0019): muchos archivos
     // pequeños viajan mejor como un único tar (un round-trip, un handle) que
     // como N partes multipart. El umbral es por número de archivos; el server
@@ -549,6 +563,190 @@ where
     })
 }
 
+/// Whole-file SHA-256 of every file in the manifest, a few in flight at once so
+/// per-file open/read latency overlaps instead of adding up.
+///
+/// (The futures are built eagerly into a Vec of `BoxFuture`s rather than through
+/// `iter().map(closure)`: a closure over borrowed items retained inside the
+/// stream trips rustc's "Send/FnOnce is not general enough" false positive when
+/// the whole upload future crosses a `tokio::spawn`. One small allocation per
+/// file, all of them IO-bound.)
+async fn hash_manifest(files: &[UploadFile]) -> Result<HashMap<&str, String>> {
+    let mut hash_futs = Vec::with_capacity(files.len());
+    for f in files {
+        hash_futs.push(
+            async move {
+                let sha = hash_file(&f.absolute_path).await?;
+                Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
+            }
+            .boxed(),
+        );
+    }
+    stream::iter(hash_futs)
+        .buffer_unordered(TRANSFER_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// Subida self-hosted direccionada por contenido: hashear → declarar el
+/// manifiesto → subir sólo los blobs que al server le falten → confirmar.
+///
+/// Es el mismo trato que [`upload_directory_cloud`] con una diferencia que
+/// manda: los bytes van **al server**, no a un bucket. Self-hosted no firma URLs
+/// (ADR 0020) porque detrás puede haber disco, MinIO o un `rclone serve s3`
+/// sobre OneDrive; el server siempre está en medio. A cambio, self-hosted no
+/// tiene plan ni tope por partida, así que aquí no hay recorte-y-reintento.
+///
+/// Lo que esto le quita a un self-hoster es la subida repetida: hasta la 1.1.2
+/// una copia mandaba la carpeta entera aunque el server ya tuviera el contenido
+/// —deduplicaba al guardar, no al transmitir—, así que una partida de 3 GB que
+/// cambia 10 MB costaba 3 GB de subida, y por el camino chocaba contra
+/// `max_snapshot_size_mb` y contra el límite de cuerpo de cualquier proxy que
+/// hubiera delante.
+async fn upload_directory_cas<F>(
+    client: &ApiClient,
+    save_id: &str,
+    files: &[UploadFile],
+    total_bytes: u64,
+    base_version: Option<i64>,
+    progress: F,
+) -> Result<UploadOutcome>
+where
+    F: Fn(u64, u64) + Send + Sync,
+{
+    use hoard_core::ids::Sha256 as Sha256Hex;
+
+    progress(0, total_bytes);
+    let sha_by_path = hash_manifest(files).await?;
+
+    let mut manifest: Vec<CasFile> = Vec::with_capacity(files.len());
+    for f in files {
+        let sha = &sha_by_path[f.relative_path.as_str()];
+        manifest.push(CasFile {
+            relative_path: f.relative_path.clone(),
+            sha256: Sha256Hex::parse(sha)
+                .with_context(|| format!("hashing {}", f.relative_path))?,
+            size_bytes: f.size_bytes as i64,
+        });
+    }
+
+    let init = client
+        .cas_init(
+            save_id,
+            &CasInit {
+                base_version,
+                files: manifest.clone(),
+            },
+        )
+        .await
+        .context("cas init")?;
+
+    // Varios ficheros con el mismo contenido comparten blob: se sube una vez.
+    let mut by_sha: HashMap<&str, &UploadFile> = HashMap::new();
+    for f in files {
+        by_sha
+            .entry(sha_by_path[f.relative_path.as_str()].as_str())
+            .or_insert(f);
+    }
+
+    // Resolver cada blob que falta a su fichero de origen **antes** de mover un
+    // byte, para que un manifiesto que no cuadra aborte de entrada y no a media
+    // subida.
+    let mut pending: Vec<(&UploadFile, String)> = Vec::with_capacity(init.missing.len());
+    for blob in &init.missing {
+        let Some(f) = by_sha.get(blob.sha256.as_str()) else {
+            bail!(
+                "server requested a blob not in the manifest: {}",
+                blob.sha256.as_str()
+            );
+        };
+        pending.push((*f, blob.sha256.as_str().to_string()));
+    }
+
+    let upload_total: u64 = init
+        .missing
+        .iter()
+        .map(|b| b.size_bytes.max(0) as u64)
+        .sum();
+    tracing::info!(
+        save_id,
+        files = files.len(),
+        upload_blobs = pending.len(),
+        upload_bytes = upload_total,
+        logical_bytes = total_bytes,
+        "self-hosted upload negotiated: only the missing blobs travel"
+    );
+
+    // La barra mide lo que de verdad se transmite, no el tamaño de la partida:
+    // es la cifra que el usuario está esperando.
+    let denom = upload_total.max(1);
+    let uploaded = AtomicU64::new(0);
+    progress(0, denom);
+    let mut put_futs = Vec::with_capacity(pending.len());
+    for (f, sha) in pending {
+        let uploaded = &uploaded;
+        let progress = &progress;
+        let upload_id = init.upload_id.as_str();
+        put_futs.push(
+            async move {
+                let file = tokio::fs::File::open(&f.absolute_path)
+                    .await
+                    .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                let (stream, sent) = hashing_stream(file);
+                client
+                    .cas_upload_blob(
+                        upload_id,
+                        &sha,
+                        reqwest::Body::wrap_stream(stream),
+                        f.size_bytes,
+                    )
+                    .await
+                    .with_context(|| format!("uploading {}", f.relative_path))?;
+                // El server rechaza un blob cuyo contenido no case con su sha,
+                // así que aquí ya no puede colarse contenido cruzado. Se
+                // comprueba igual para dar el mensaje bueno —"el juego rotó el
+                // save mientras subía"— en vez del 400 crudo del server.
+                {
+                    let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
+                    verify_sent(&f.relative_path, &sha, f.size_bytes, &sent)?;
+                }
+                let done = uploaded.fetch_add(f.size_bytes, Ordering::Relaxed) + f.size_bytes;
+                progress(done, denom);
+                Ok::<_, anyhow::Error>(())
+            }
+            .boxed(),
+        );
+    }
+    stream::iter(put_futs)
+        .buffer_unordered(TRANSFER_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    progress(denom, denom);
+
+    let snapshot = client
+        .cas_commit(
+            save_id,
+            &CasCommit {
+                upload_id: init.upload_id,
+                base_version,
+                device_name: crate::logship::device_name(),
+                notes: None,
+                files: manifest,
+            },
+        )
+        .await
+        .context("cas commit")?;
+
+    Ok(UploadOutcome {
+        snapshot,
+        file_count: files.len(),
+        total_bytes,
+        // Sin plan no hay tope por partida que recortar.
+        trimmed: None,
+        landed: false,
+    })
+}
+
 /// Hoard Cloud upload (content-addressed): hash each file → declare manifest
 /// → upload only the blobs the server is missing → commit.
 ///
@@ -575,27 +773,8 @@ where
 
     // 1. Whole-file SHA-256 of every file — the dedup key. Hashed once up
     //    front and cached by path so a per-save-cap trim-and-retry (below)
-    //    doesn't re-read the files. A few files hash in flight at once so
-    //    per-file open/read latency overlaps instead of adding up.
-    // (The futures are built eagerly into a Vec of `BoxFuture`s rather than
-    // through `iter().map(closure)`: a closure over borrowed items retained
-    // inside the stream trips rustc's "Send/FnOnce is not general enough"
-    // false positive when the whole upload future crosses a `tokio::spawn`.
-    // One small allocation per file, all of them IO-bound.)
-    let mut hash_futs = Vec::with_capacity(files.len());
-    for f in files {
-        hash_futs.push(
-            async move {
-                let sha = hash_file(&f.absolute_path).await?;
-                Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
-            }
-            .boxed(),
-        );
-    }
-    let sha_by_path: HashMap<&str, String> = stream::iter(hash_futs)
-        .buffer_unordered(TRANSFER_CONCURRENCY)
-        .try_collect()
-        .await?;
+    //    doesn't re-read the files.
+    let sha_by_path = hash_manifest(files).await?;
 
     // 1b. **¿Ya está arriba?** (ADR 0021 D.8.3.) Con los hashes ya calculados,
     // preguntarle a la verdad del server si este contenido exacto es su cabeza

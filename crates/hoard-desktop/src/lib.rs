@@ -345,6 +345,7 @@ pub fn run() {
             commands::cloud::cloud_sync_playtime,
             commands::cloud_feed::notifications_backlog,
             commands::cloud_feed::devices_refresh,
+            commands::devices::devices_list,
             commands::cloud_feed::notification_dismiss,
             commands::screen::screen_open,
             commands::screen::screen_send,

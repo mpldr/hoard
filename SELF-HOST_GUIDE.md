@@ -45,9 +45,12 @@ service itself, so an in-flight sync isn't killed).
 tunnel in front of it. **Two proxy defaults will break syncing** and the
 symptoms don't look like proxy problems:
 
-- **Upload body size.** nginx allows 1 MB by default, and every save bigger
-  than that gets a `413` before it ever reaches Hoard. The app can only report
-  what it's told, so the backup shows up as rejected for size.
+- **Upload body size.** nginx allows 1 MB by default, and anything bigger gets
+  a `413` before it ever reaches Hoard. The app can only report what it's told,
+  so the backup shows up as rejected for size. From 1.1.3 the limit that
+  matters is your biggest single *file*, not the whole save (see
+  [How uploads travel](#how-uploads-travel)) — but the default is still 1 MB,
+  which nothing survives.
 - **Timeouts.** A big restore or upload that runs past `proxy_read_timeout`
   (60 s by default) is cut off mid-transfer and surfaces as a `502` with an
   HTML body — HTML that Hoard never emits.
@@ -63,8 +66,55 @@ proxy_request_buffering off;   # stream uploads instead of spooling to disk
 
 Caddy needs neither (no body cap, and it streams by default). A Cloudflare
 proxied hostname caps request bodies at 100 MB on the free plan regardless of
-your own config — if any of your saves are bigger, use a tunnel to a hostname
-that isn't proxied, or connect over your LAN/VPN.
+your own config — since 1.1.3 that cap applies per file rather than per save,
+so it only bites if a single save file is over 100 MB; if one is, use a tunnel
+to a hostname that isn't proxied, or connect over your LAN/VPN.
+
+### How uploads travel
+
+Hoard has always stored each unique file once (keyed by its SHA-256) and let
+versions share the bytes. Until 1.1.2 that only applied to *storage*: a backup
+still uploaded the whole folder every time, and the server threw away the 99%
+it already had. A 3 GB save that changed 10 MB cost 3 GB of upload.
+
+From 1.1.3 the client negotiates first. It hashes the save, tells the server
+what the version contains, and the server answers which of those files it is
+missing. Only those travel — each as its own request — and a final call closes
+the version. In practice a second backup of the same game moves megabytes.
+
+What this changes for you:
+
+- **Upload time and bandwidth** drop to whatever actually changed.
+- **Request bodies** are now one file each, not the whole save, so proxy body
+  caps stop being the thing that breaks big saves.
+- **`max_snapshot_size_mb`** still limits how big a save may be, but the client
+  now learns the number before uploading instead of failing mid-transfer.
+- **Nothing to configure**, and nothing to migrate: the server advertises the
+  capability in `/v1/health` and older clients keep using the old upload path
+  against the same server.
+
+The client still never talks to the storage backend — every byte goes through
+the server, exactly as before.
+
+### Your machines
+
+From 1.1.3 the server keeps a census of the machines on each account: which
+exist, which are on right now, and what each is playing. The Eye panel in the
+app shows it. Every version in a game's history already said which machine it
+came from; this adds the live half.
+
+It works because each machine sends a small heartbeat to **your** server every
+30 seconds. A machine counts as on while its last heartbeat is under 90 seconds
+old, so one that loses power goes dark on its own — nothing has to notice it
+left. Machines identify themselves by a stable fingerprint, so reinstalling the
+app doesn't create a duplicate, and one that goes 90 days without appearing is
+forgotten. You can also forget one on the spot; its saves and their history are
+untouched.
+
+Nothing here leaves your server. The census lives in your SQLite, your machines
+write to it directly, and there is no endpoint that forwards it anywhere. It's
+your computers talking to each other through your own server — which is why
+this belongs in self-hosted and operator broadcasts don't.
 
 ## External storage (S3-compatible)
 

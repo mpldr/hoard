@@ -41,11 +41,11 @@ fn default_limit() -> i64 {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(serde_json::json!({ "error": msg })))
 }
 
-fn internal() -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn internal() -> (StatusCode, Json<serde_json::Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
@@ -64,7 +64,7 @@ fn internal() -> (StatusCode, Json<serde_json::Value>) {
 ///
 /// `what` names the step, not the error — the error speaks for itself. Keep the
 /// names coarse and stable: they are what an operator greps for.
-fn internal_logged<E: std::fmt::Display>(
+pub(crate) fn internal_logged<E: std::fmt::Display>(
     what: &'static str,
     e: E,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -85,7 +85,7 @@ fn internal_logged<E: std::fmt::Display>(
 /// so all we know is how far we got before bailing. Reporting that as the
 /// snapshot's size would be a lie that reads as precision. The client words it
 /// as a floor.
-fn snapshot_too_large(
+pub(crate) fn snapshot_too_large(
     limit_bytes: i64,
     received_bytes: i64,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -109,7 +109,7 @@ fn snapshot_too_large(
 /// the source of truth (a row exists iff the object is stored and refcounted),
 /// so dedup/quota consult it instead of a per-key HEAD against the store —
 /// which on the S3 backend would be one network round-trip per file.
-async fn blob_in_db(
+pub(crate) async fn blob_in_db(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     sha: &str,
@@ -125,7 +125,7 @@ async fn blob_in_db(
 }
 
 /// Chunk-store analogue of [`blob_in_db`] (ADR 0019 chunk table).
-async fn chunk_in_db(
+pub(crate) async fn chunk_in_db(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     sha: &str,
@@ -142,7 +142,7 @@ async fn chunk_in_db(
 
 /// Validate that a relative path stays inside its parent directory.
 /// Rejects: absolute paths, "..", empty components, drive prefixes.
-fn is_safe_relative_path(p: &str) -> bool {
+pub(crate) fn is_safe_relative_path(p: &str) -> bool {
     if p.is_empty() || p.starts_with('/') || p.starts_with('\\') {
         return false;
     }
@@ -156,7 +156,7 @@ fn is_safe_relative_path(p: &str) -> bool {
     true
 }
 
-async fn ownership_check(
+pub(crate) async fn ownership_check(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,

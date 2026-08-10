@@ -57,6 +57,26 @@ fn parses<T: DeserializeOwned>(name: &str) -> T {
 #[test]
 fn health_round_trips() {
     round_trip::<Health>("health");
+    // El golden de la release no lleva `cas`, y el cliente debe leerlo como
+    // "este server no negocia el contenido" en vez de tropezar. Si esto se
+    // rompiera, un self-hoster con un server viejo vería subidas contra unas
+    // rutas que no existen.
+    let h: Health = parses("health");
+    assert!(!h.cas, "ausente → el server sólo entiende el multipart");
+    assert!(!h.devices, "ausente → no lleva censo, no le mandes latidos");
+}
+
+/// El `/v1/health` de un server 1.1.3. Las banderas tienen que sobrevivir el
+/// round-trip **y** valer `true`: son lo único que separa hablar el protocolo
+/// nuevo de mandar la carpeta entera, y llevar censo de dispositivos de no
+/// mandarle latidos a un server que no sabe qué hacer con ellos.
+#[test]
+fn cas_capable_health_round_trips() {
+    round_trip::<Health>("health_cas");
+    let h: Health = parses("health_cas");
+    assert!(h.cas);
+    assert!(h.devices);
+    assert!(h.mode.is_none(), "sigue siendo self-hosted");
 }
 
 /// Cloud emite su propio `HealthBody` (en `server::cloud::run`, fuera del

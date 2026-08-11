@@ -231,13 +231,16 @@ h3 {
 }
 
 /* ------------------------------------------------------------------
-   Fact marquee — the trust strip scrolls right-to-left instead of sitting
-   in a 4-cell grid. The track holds the same list twice, so animating it
-   to -50% lands exactly where it started and the loop has no seam. Edge
-   mask fades items in and out instead of clipping them dead at the border.
+   Fact marquee — the trust strip scrolls instead of sitting in a 4-cell
+   grid. The motion itself lives in lib/actions/marquee.ts: a CSS keyframe
+   loop always returns to its first frame (the wrap reads as a restart) and
+   the global reduced-motion rule clamped it to a standstill. Here CSS only
+   clips, masks and sets the cursor. The edge mask fades items in and out
+   instead of cutting them dead at the border.
 ------------------------------------------------------------------ */
 .marquee {
   overflow: hidden;
+  cursor: grab;
   mask-image: linear-gradient(
     to right,
     transparent 0,
@@ -246,26 +249,13 @@ h3 {
     transparent 100%
   );
 }
+.marquee:active {
+  cursor: grabbing;
+}
 .marquee-inner {
   display: flex;
   width: max-content;
-  /* !important on purpose: the global prefers-reduced-motion rule below clamps
-     every animation to 0.001ms, which freezes this strip dead instead of
-     calming it. A "scrolling" strip that never scrolls is just broken, so the
-     owner's call is that it always moves. `.marquee-inner` outranks `*`. */
-  animation: marquee-scroll 40s linear infinite !important;
-}
-/* Only keyboard focus stops it. Hover used to as well, but this band spans the
-   full width of the page: a cursor resting anywhere inside it — including
-   wherever it happened to sit while scrolling — froze the whole thing. */
-.marquee:focus-within .marquee-inner {
-  animation-play-state: paused !important;
-}
-@keyframes marquee-scroll {
-  from {
-    transform: translateX(0);
-  }
-  to {
-    transform: translateX(-50%);
-  }
+  /* touch-action keeps a horizontal drag from scrolling the page under it. */
+  touch-action: pan-y;
+  user-select: none;
 }

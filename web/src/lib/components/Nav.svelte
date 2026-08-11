@@ -64,13 +64,19 @@
 <header
   class="sticky top-0 z-40 w-full bg-bg/80 backdrop-blur-md"
 >
-  <nav class="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
-    <a href={$localeHref('/')} class="flex items-center gap-2.5 rounded-md ring-focus" aria-label="Hoard home">
+  <nav
+    class="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6 md:grid md:grid-cols-[1fr_auto_1fr]"
+  >
+    <a
+      href={$localeHref('/')}
+      class="flex items-center gap-2.5 rounded-md ring-focus md:justify-self-start"
+      aria-label="Hoard home"
+    >
       <LogoMark size={28} />
       <span class="font-display text-base font-semibold tracking-tight text-ink">Hoard</span>
     </a>
 
-    <div class="hidden items-center gap-7 md:flex">
+    <div class="hidden items-center gap-7 md:flex md:justify-self-center">
       <a
         href={$localeHref('/download')}
         class="link-underline ring-focus text-sm transition-colors {isActive('/download')
@@ -113,7 +119,7 @@
       </a>
     </div>
 
-    <div class="hidden items-center gap-3 md:flex">
+    <div class="hidden items-center gap-3 md:flex md:justify-self-end">
       <!-- Language switcher: <details> keeps every locale link in the static
            HTML so the prerender crawler discovers all 8 URLs of each page. -->
       <details

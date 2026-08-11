@@ -5,6 +5,7 @@
   import HowItWorks from '$lib/components/HowItWorks.svelte';
   import DownloadCTA from '$lib/components/DownloadCTA.svelte';
   import { reveal } from '$lib/actions/reveal';
+  import { marquee } from '$lib/actions/marquee';
   import { tilt } from '$lib/actions/tilt';
   import { localeHref } from '$lib/i18n/href';
   import { SITE_URL } from '$lib/i18n/locales';
@@ -179,7 +180,7 @@
   <!-- The second track is the same list again: it fills the right edge while
        the first scrolls out, and it is aria-hidden so nothing reads twice. -->
   <div class="marquee">
-    <div class="marquee-inner">
+    <div class="marquee-inner" use:marquee={{ speed: 52 }}>
       {#each [false, true] as duplicate (duplicate)}
         <dl class="flex shrink-0 items-center" aria-hidden={duplicate || undefined}>
           {#each facts as f (f)}
@@ -344,18 +345,18 @@ docker compose up -d --build</code
 <section class="border-t border-line">
   <div class="mx-auto max-w-6xl px-4 py-16 sm:px-6">
     <div
-      class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 rounded-xl border border-line bg-surface px-6 py-10 text-center"
+      class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 rounded-xl border-2 border-red-600 bg-rose-100 px-6 py-10 text-center"
       use:reveal
     >
       <div>
         <h2
-          class="flex items-center justify-center gap-3 font-display text-2xl font-semibold text-ink"
+          class="flex items-center justify-center gap-3 font-display text-2xl font-semibold text-rose-950"
         >
-          <Heart class="h-5 w-5 shrink-0 fill-current text-red-500" aria-hidden="true" />
+          <Heart class="h-5 w-5 shrink-0 text-red-600" aria-hidden="true" />
           {$_('support.title')}
-          <Heart class="h-5 w-5 shrink-0 fill-current text-red-500" aria-hidden="true" />
+          <Heart class="h-5 w-5 shrink-0 text-red-600" aria-hidden="true" />
         </h2>
-        <p class="mt-2 text-pretty text-sm text-ink-soft">{$_('support.body')}</p>
+        <p class="mt-2 text-pretty text-sm text-rose-900">{$_('support.body')}</p>
       </div>
       <div class="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
         <Button href="https://github.com/sponsors/rleeon" target="_blank" variant="support">
@@ -365,7 +366,7 @@ docker compose up -d --build</code
         <Button
           href="https://github.com/rleeon/hoard/blob/main/FUNDING.md"
           target="_blank"
-          variant="secondary"
+          variant="support-quiet"
         >
           {$_('support.funding')}
         </Button>

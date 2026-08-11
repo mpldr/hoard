@@ -249,12 +249,17 @@ h3 {
 .marquee-inner {
   display: flex;
   width: max-content;
-  animation: marquee-scroll 70s linear infinite;
+  /* !important on purpose: the global prefers-reduced-motion rule below clamps
+     every animation to 0.001ms, which freezes this strip dead instead of
+     calming it. A "scrolling" strip that never scrolls is just broken, so the
+     owner's call is that it always moves. `.marquee-inner` outranks `*`. */
+  animation: marquee-scroll 40s linear infinite !important;
 }
-/* Reading the fine print shouldn't be a chase — hovering or tabbing in stops it. */
-.marquee:hover .marquee-inner,
+/* Only keyboard focus stops it. Hover used to as well, but this band spans the
+   full width of the page: a cursor resting anywhere inside it — including
+   wherever it happened to sit while scrolling — froze the whole thing. */
 .marquee:focus-within .marquee-inner {
-  animation-play-state: paused;
+  animation-play-state: paused !important;
 }
 @keyframes marquee-scroll {
   from {
@@ -262,11 +267,5 @@ h3 {
   }
   to {
     transform: translateX(-50%);
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .marquee-inner {
-    animation: none !important;
-    transform: none !important;
   }
 }

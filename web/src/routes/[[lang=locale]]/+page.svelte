@@ -348,11 +348,17 @@ docker compose up -d --build</code
       use:reveal
     >
       <div>
-        <h2 class="font-display text-2xl font-semibold text-ink">{$_('support.title')}</h2>
+        <h2
+          class="flex items-center justify-center gap-3 font-display text-2xl font-semibold text-ink"
+        >
+          <Heart class="h-5 w-5 shrink-0 fill-current text-red-500" aria-hidden="true" />
+          {$_('support.title')}
+          <Heart class="h-5 w-5 shrink-0 fill-current text-red-500" aria-hidden="true" />
+        </h2>
         <p class="mt-2 text-pretty text-sm text-ink-soft">{$_('support.body')}</p>
       </div>
       <div class="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
-        <Button href="https://github.com/sponsors/rleeon" target="_blank" variant="outline">
+        <Button href="https://github.com/sponsors/rleeon" target="_blank" variant="support">
           <Heart class="h-4 w-4" />
           {$_('support.cta')}
         </Button>

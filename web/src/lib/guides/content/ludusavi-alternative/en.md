@@ -1,7 +1,7 @@
 ---
 title: "Ludusavi alternative: automatic cloud sync for your game saves"
 description: "A fair comparison of Ludusavi and Hoard. Ludusavi is a great open-source local backup tool; Hoard adds managed cloud sync and versioned history across all your PCs — using the same save-location data."
-order: 4
+order: 5
 updated: 2026-06-28
 ---
 

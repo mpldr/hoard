@@ -1,7 +1,7 @@
 ---
 title: "Comment sauvegarder et synchroniser les sauvegardes d'émulateur (RetroArch, Dolphin, PCSX2)"
 description: "Sauvegardez et synchronisez vos fichiers de sauvegarde et vos save states d'émulateur entre PC — RetroArch, Dolphin, PCSX2, DuckStation et plus — automatiquement avec Hoard."
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

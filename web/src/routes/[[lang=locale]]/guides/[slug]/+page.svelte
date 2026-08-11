@@ -159,6 +159,35 @@
     padding: 0;
     font-size: 0.85rem;
   }
+  /* First guide to carry a Markdown table is the tool comparison, and a
+     six-column table never fits a phone. `display: block` + `width: max-content`
+     is the only way to make it scroll on its own without a wrapper element —
+     the Markdown pipeline strips raw HTML, so there is no div to hang it on. */
+  .prose :global(table) {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    font-size: 0.92rem;
+  }
+  .prose :global(th),
+  .prose :global(td) {
+    border: 1px solid var(--color-pine-line);
+    padding: 0.55rem 0.8rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  .prose :global(th) {
+    background: var(--color-pine-elev);
+    color: var(--color-ink);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .prose :global(tbody tr:nth-child(even)) {
+    background: var(--color-pine);
+  }
   .prose :global(blockquote) {
     border-left: 3px solid var(--color-accent-deep);
     padding-left: 1rem;

@@ -1,7 +1,7 @@
 ---
 title: "Cómo hacer copia y sincronizar partidas de emuladores (RetroArch, Dolphin, PCSX2)"
 description: "Haz copia y sincroniza los archivos de guardado y los estados guardados de tus emuladores entre PC —RetroArch, Dolphin, PCSX2, DuckStation y más— automáticamente con Hoard."
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: "Ludusavi 替代方案：游戏存档的自动云同步"
 description: "对 Ludusavi 与 Hoard 的公平对比。Ludusavi 是出色的开源本地备份工具；Hoard 在使用相同位置数据的同时，为你的所有 PC 增加托管式云同步与版本历史。"
-order: 4
+order: 5
 updated: 2026-06-28
 ---
 

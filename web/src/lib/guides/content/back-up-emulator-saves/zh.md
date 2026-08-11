@@ -1,7 +1,7 @@
 ---
 title: "如何备份和同步模拟器存档（RetroArch、Dolphin、PCSX2）"
 description: "用 Hoard 在多台 PC 之间自动备份和同步你的模拟器存档文件与即时存档——支持 RetroArch、Dolphin、PCSX2、DuckStation 等。"
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

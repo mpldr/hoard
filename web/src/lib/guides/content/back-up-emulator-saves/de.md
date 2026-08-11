@@ -1,7 +1,7 @@
 ---
 title: "So sicherst und synchronisierst du Emulator-Spielstände (RetroArch, Dolphin, PCSX2)"
 description: "Sichere und synchronisiere deine Emulator-Speicherdateien und Savestates über mehrere PCs — RetroArch, Dolphin, PCSX2, DuckStation und mehr — automatisch mit Hoard."
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

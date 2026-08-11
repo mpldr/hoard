@@ -1,7 +1,7 @@
 ---
 title: "Como fazer backup e sincronizar saves de emuladores (RetroArch, Dolphin, PCSX2)"
 description: "Faz backup e sincroniza os ficheiros de save e os save states dos teus emuladores entre PCs — RetroArch, Dolphin, PCSX2, DuckStation e mais — automaticamente com o Hoard."
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

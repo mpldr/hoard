@@ -1,7 +1,7 @@
 ---
 title: "Ludusavi の代替：セーブデータの自動クラウド同期"
 description: "Ludusavi と Hoard の公平な比較。Ludusavi はローカルバックアップに優れたオープンソースツール。Hoard は同じ位置データを使いつつ、すべての PC でマネージドなクラウド同期と世代履歴を追加します。"
-order: 4
+order: 5
 updated: 2026-06-28
 ---
 

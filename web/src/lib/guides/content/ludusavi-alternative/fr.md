@@ -1,7 +1,7 @@
 ---
 title: "Alternative à Ludusavi : synchronisation cloud automatique de vos parties"
 description: "Une comparaison équitable entre Ludusavi et Hoard. Ludusavi est un excellent outil open source de sauvegarde locale ; Hoard ajoute une synchro cloud gérée et un historique versionné sur tous vos PC — avec les mêmes données d'emplacement."
-order: 4
+order: 5
 updated: 2026-06-28
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: "How to back up and sync emulator saves (RetroArch, Dolphin, PCSX2)"
 description: "Back up and sync your emulator save files and save states across PCs — RetroArch, Dolphin, PCSX2, DuckStation and more — automatically with Hoard."
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

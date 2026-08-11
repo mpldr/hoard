@@ -1,7 +1,7 @@
 ---
 title: "エミュレーターのセーブをバックアップ・同期する方法（RetroArch、Dolphin、PCSX2）"
 description: "エミュレーターのセーブファイルとセーブステートを PC 間でバックアップ・同期。RetroArch、Dolphin、PCSX2、DuckStation などに対応し、Hoard が自動で処理します。"
-order: 5
+order: 6
 updated: 2026-06-28
 ---
 

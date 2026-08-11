@@ -66,6 +66,10 @@ pub struct TrackedSave {
     pub local_size_bytes: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// El "sí" del usuario a que se le escriba la config de este juego al
+    /// restaurar. Ver [`crate::state::SaveState::allow_device_local`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_device_local: Option<bool>,
 }
 
 /// Args para [`add_to_tracking`].
@@ -518,9 +522,11 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         game_slug: slug.to_string(),
         display_name,
         label: "playtime".to_string(),
+        allow_device_local: None,
         local_path: PathBuf::new(),
         steam_install_dir: install_dir,
         processes,
+        // del catálogo de playtime, que es un juego por entrada.
         policy: SavePolicy::default(),
         known_version: None,
         set_hash: None,
@@ -584,6 +590,7 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
             steam_install_dir,
             processes,
             policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
+            allow_device_local: s.allow_device_local,
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
             track_only: false,
@@ -595,6 +602,7 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
 
 /// `WatchedSave` para un save recién añadido/renombrado, desde inputs mínimos.
 /// Resuelve dir de Steam, política y procesos igual que el hydrate.
+#[allow(clippy::too_many_arguments)]
 pub fn watched_save_from(
     save_id: String,
     game_slug: String,
@@ -603,6 +611,7 @@ pub fn watched_save_from(
     local_path: PathBuf,
     preset: Option<&str>,
     processes_override: Vec<String>,
+    allow_device_local: Option<bool>,
 ) -> WatchedSave {
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
     let steam_install_dir = steam_apps
@@ -615,6 +624,7 @@ pub fn watched_save_from(
         processes_override
     };
     WatchedSave {
+        allow_device_local,
         save_id,
         game_slug: game_slug.clone(),
         display_name,
@@ -882,6 +892,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 preset: preset_name.clone(),
                 set_hash: None,
                 processes: pinned_processes.clone(),
+                allow_device_local: None,
             },
         );
         cli_state.save(&path)?;
@@ -894,6 +905,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             local_path.clone(),
             preset_name.as_deref(),
             pinned_processes.clone(),
+            None,
         );
         return Ok(TrackOutcome {
             tracked: TrackedSave {
@@ -909,6 +921,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 orphan: false,
                 local_size_bytes: None,
                 preset: preset_name,
+            allow_device_local: None,
             },
             watched,
         });
@@ -972,6 +985,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             preset: preset_name.clone(),
             set_hash: None,
             processes: pinned_processes.clone(),
+            allow_device_local: None,
         },
     );
     cli_state.save(&path)?;
@@ -984,6 +998,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         local_path.clone(),
         preset_name.as_deref(),
         pinned_processes.clone(),
+        None,
     );
 
     Ok(TrackOutcome {
@@ -1003,6 +1018,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             orphan: false,
             local_size_bytes: None,
             preset: preset_name,
+            allow_device_local: None,
         },
         watched,
     })
@@ -1074,6 +1090,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             preset: preset.clone(),
             set_hash: None,
             processes: Vec::new(),
+            allow_device_local: None,
         },
     );
     cli_state.save(&path)?;
@@ -1086,6 +1103,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         local_path.clone(),
         preset.as_deref(),
         Vec::new(),
+        None,
     );
 
     Ok(TrackOutcome {
@@ -1102,6 +1120,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             orphan: false,
             local_size_bytes: None,
             preset,
+            allow_device_local: None,
         },
         watched,
     })
@@ -1453,6 +1472,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: false,
                 local_size_bytes: None,
                 preset: st.preset.clone(),
+            allow_device_local: st.allow_device_local,
             });
         }
 
@@ -1476,6 +1496,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: true,
                 local_size_bytes: None,
                 preset: None,
+            allow_device_local: None,
             });
         }
         fill_local_sizes(&mut out);
@@ -1525,6 +1546,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: false,
                 local_size_bytes: None,
                 preset: st.preset.clone(),
+            allow_device_local: st.allow_device_local,
             }),
             None => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
@@ -1539,6 +1561,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: true,
                 local_size_bytes: None,
                 preset: None,
+            allow_device_local: None,
             }),
         }
     }
@@ -1563,7 +1586,7 @@ pub async fn rename_label(
     let updated = client.rename_save_label(save_id, trimmed).await?;
 
     let (mut cli_state, path) = CliState::load_default()?;
-    let (local_path_string, preset, processes, local_cursor) =
+    let (local_path_string, preset, processes, local_cursor, allow_device_local) =
         if let Some(entry) = cli_state.saves.get_mut(save_id) {
             entry.label = updated.label.clone();
             (
@@ -1571,9 +1594,10 @@ pub async fn rename_label(
                 entry.preset.clone(),
                 entry.processes.clone(),
                 entry.last_version_num,
+                entry.allow_device_local,
             )
         } else {
-            (String::new(), None, Vec::new(), None)
+            (String::new(), None, Vec::new(), None, None)
         };
     cli_state.save(&path)?;
 
@@ -1586,6 +1610,7 @@ pub async fn rename_label(
             PathBuf::from(&local_path_string),
             preset.as_deref(),
             processes,
+            allow_device_local,
         )
     });
 
@@ -1603,6 +1628,7 @@ pub async fn rename_label(
             orphan: false,
             local_size_bytes: None,
             preset,
+            allow_device_local,
         },
         watched,
     ))
@@ -1665,6 +1691,7 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         s.local_path.clone(),
         s.preset.as_deref(),
         s.processes.clone(),
+        s.allow_device_local,
     )
 }
 
@@ -1711,6 +1738,34 @@ pub fn set_preset(save_id: &str, preset: Option<String>) -> Result<LiveReseat> {
     let snapshot = entry.clone();
     cli_state.save(&path)?;
 
+    Ok(if snapshot.paused {
+        LiveReseat::Noop
+    } else {
+        LiveReseat::Reseat(
+            save_id.to_string(),
+            Box::new(watched_from_snapshot(save_id.to_string(), &snapshot)),
+        )
+    })
+}
+
+/// Decide, para este juego, si un restore escribe su config
+/// (`FileClass::DeviceLocal`) o la deja pasar.
+///
+/// `None` devuelve el save a "sin decidir": no se escribe y el diálogo de
+/// restore vuelve a preguntar cada vez. Ver
+/// [`crate::state::SaveState::allow_device_local`].
+pub fn set_allow_device_local(save_id: &str, allow: Option<bool>) -> Result<LiveReseat> {
+    let (mut cli_state, path) = CliState::load_default()?;
+    let entry = cli_state
+        .saves
+        .get_mut(save_id)
+        .context("That save isn't tracked on this machine.")?;
+    entry.allow_device_local = allow;
+    let snapshot = entry.clone();
+    cli_state.save(&path)?;
+
+    // Un save pausado no está en el agente, así que no hay nada que reasentar:
+    // volverá a leer el estado al reanudarse. Igual que `set_preset`.
     Ok(if snapshot.paused {
         LiveReseat::Noop
     } else {
@@ -1781,6 +1836,7 @@ mod tests {
             last_version_num: None,
             paused: false,
             preset: None,
+            allow_device_local: None,
             set_hash: None,
             processes: Vec::new(),
         }

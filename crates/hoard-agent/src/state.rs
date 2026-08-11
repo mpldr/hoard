@@ -98,6 +98,25 @@ pub struct SaveState {
     /// loading without migration.
     #[serde(default)]
     pub processes: Vec<String>,
+    /// ¿Se escribe la config de este juego al restaurar?
+    ///
+    /// Los ficheros que [`hoard_core::kernel::fileclass`] clasifica como
+    /// `DeviceLocal` —`graphics.ini`, `settings.cfg`, lo que lleva dentro la
+    /// resolución de ESTE monitor— se suben siempre pero por defecto no se
+    /// escriben: restaurarlos de un PC a otro es el camino corto a un juego que
+    /// arranca en negro. El interruptor del diálogo de restore lo salta una
+    /// vez; esto lo deja decidido para el juego.
+    ///
+    /// Es **por juego** porque la respuesta lo es. En un juego la config y la
+    /// partida viven en el mismo fichero y hay que escribirla; en otro es la
+    /// resolución y no hay que tocarla. Un interruptor global obliga a acertar
+    /// con los dos a la vez, que es imposible.
+    ///
+    /// `None` = sin decidir: no se escribe, y el diálogo sigue preguntando.
+    /// `Some(true)` la escribe **también en los restores automáticos**, que es
+    /// lo que hace útil el ajuste; `Some(false)` es un no explícito.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_device_local: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -561,6 +580,7 @@ mod tests {
             last_version_num: Some(34),
             paused: false,
             preset: None,
+            allow_device_local: None,
             set_hash: None,
             processes: vec![],
         }

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::StreamReader;
 
+use hoard_core::kernel::fileclass::RestoreGate;
 use crate::api::{ApiClient, SnapshotDetail, SnapshotFile};
 use hoard_core::ids::Sha256 as Sha256Hex;
 
@@ -35,6 +36,18 @@ pub struct RestoreOptions {
     /// bytes worth reusing live in the *live save folder*, not in `dest`. A
     /// direct restore writes straight into the save folder and passes `dest`.
     pub reuse_from: Option<PathBuf>,
+    /// Qué ficheros del snapshot pueden tocar el disco.
+    ///
+    /// El snapshot lleva dentro la configuración de la máquina que lo subió
+    /// (ver [`hoard_core::kernel::fileclass`]): se sube a propósito, para no
+    /// perderla nunca, pero escribirla encima de OTRA máquina es meterle al
+    /// juego una resolución, un GPU o una ruta que ahí no existen. Por defecto
+    /// la puerta está cerrada para esa clase de fichero y sólo la abre el
+    /// usuario a mano (`--allow-ini`, el interruptor del diálogo).
+    ///
+    /// [`RestoreGate::permissive`] restaura todo, como antes de que esto
+    /// existiera.
+    pub gate: RestoreGate,
 }
 
 /// Result summary after a successful restore.
@@ -129,6 +142,14 @@ fn restore_byte_cap(declared_expanded: Option<u64>) -> u64 {
 /// Se reconoce por dos vías, porque las dos ocurren: el fichero ya está en
 /// disco (lo normal), o la máquina es nueva y no hay nada — y entonces manda
 /// la forma del snapshot: una sola entrada llamada igual que el destino.
+/// Un snapshot de **fichero suelto** no se filtra nunca, ni al subir ni al
+/// restaurar: el usuario apuntó a ese fichero concreto, y eso pesa más que
+/// cualquier regla por nombre. Sin esta excepción, un save que se llame
+/// `settings.ini` se subiría (el walk ya lo exceptúa) pero no volvería jamás.
+pub(crate) fn is_single_file_snapshot(dest: &Path, snapshot_names: &[&str]) -> bool {
+    extraction_root(dest, snapshot_names) != dest
+}
+
 fn extraction_root(dest: &Path, snapshot_names: &[&str]) -> PathBuf {
     let is_single_file_save = dest.is_file()
         || (!dest.exists()
@@ -292,6 +313,12 @@ where
         }
 
         let key = safe_rel.to_string_lossy().replace('\\', "/");
+        // Config y basura de la máquina que subió el snapshot no se escriben
+        // encima de ésta salvo que el usuario lo haya pedido.
+        if !single_file && !options.gate.allows(&key) {
+            tracing::debug!(path = %key, "restore: skipping device-local file");
+            continue;
+        }
         let expected_file = expected.get(&key);
 
         // Stream the entry to disk in fixed-size chunks while hashing, instead
@@ -484,7 +511,11 @@ enum ByteSource {
 /// Every failure degrades into a *smaller* index rather than an error: an
 /// unreadable file (a lock a running game holds, a permission we don't have)
 /// just means one more blob to download. Never fails the restore.
-async fn build_reuse_index(dir: &Path, wanted_sizes: &HashSet<u64>) -> ReuseIndex {
+async fn build_reuse_index(
+    dir: &Path,
+    wanted_sizes: &HashSet<u64>,
+    shields: &[String],
+) -> ReuseIndex {
     if wanted_sizes.is_empty() || !dir.exists() {
         // Empty or missing destination: no index, everything downloads — the
         // pre-dedup behaviour, bit for bit.
@@ -492,7 +523,7 @@ async fn build_reuse_index(dir: &Path, wanted_sizes: &HashSet<u64>) -> ReuseInde
     }
     // `walk_source` is the same walk the backup side uses: sorted by relative
     // path, symlinks and transient game locks already filtered out.
-    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir) {
+    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir, shields) {
         Ok(files) => files
             .into_iter()
             .filter(|f| wanted_sizes.contains(&f.size_bytes))
@@ -683,19 +714,40 @@ where
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     }
 
-    let total: u64 = manifest
-        .files
-        .iter()
-        .map(|f| f.size_bytes.max(0) as u64)
-        .sum();
+    // La puerta se aplica **una sola vez y aquí**, y todo lo de abajo —el total
+    // del progreso, los trabajos, el plan de bytes— sale de ESTA lista. Filtrar
+    // sólo los trabajos y dejar que el plan se calculara sobre el manifiesto
+    // entero los desalineaba: `jobs[i]` recibía el `plan[i]` de otro fichero, la
+    // copia local fallaba la verificación de sha y todo caía a la red. No
+    // corrompe (por eso se verifica), pero mata en silencio justo la
+    // deduplicación contra disco de D.13 — los 400 MB→8 MB de Factorio.
+    //
+    // Un save de fichero suelto no se filtra: ver `is_single_file_snapshot`.
+    let kept: Vec<&crate::api::CloudManifestFile> = if single_file {
+        manifest.files.iter().collect()
+    } else {
+        manifest
+            .files
+            .iter()
+            .filter(|f| {
+                let ok = options.gate.allows(&f.relative_path);
+                if !ok {
+                    tracing::debug!(path = %f.relative_path, "restore: skipping device-local file");
+                }
+                ok
+            })
+            .collect()
+    };
+
+    let total: u64 = kept.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
     // Sanitize every path before moving any bytes: a hostile manifest aborts
     // up front, not after some files have already landed in dest.
-    let mut jobs = Vec::with_capacity(manifest.files.len());
-    for file in &manifest.files {
+    let mut jobs = Vec::with_capacity(kept.len());
+    for file in &kept {
         let safe_rel = sanitize(Path::new(&file.relative_path))
             .ok_or_else(|| anyhow!("unsafe path in manifest: {}", file.relative_path))?;
-        jobs.push((file, root.join(safe_rel)));
+        jobs.push((*file, root.join(safe_rel)));
     }
 
     // Dedup against the disk before touching the network. Hashing the folder
@@ -704,13 +756,9 @@ where
     let index_started = std::time::Instant::now();
     let plan = match options.reuse_from.as_deref() {
         Some(reuse_dir) => {
-            let wanted: HashSet<u64> = manifest
-                .files
-                .iter()
-                .map(|f| f.size_bytes.max(0) as u64)
-                .collect();
-            let index = build_reuse_index(reuse_dir, &wanted).await;
-            let shas: Vec<String> = manifest.files.iter().map(|f| f.sha256.clone()).collect();
+            let wanted: HashSet<u64> = kept.iter().map(|f| f.size_bytes.max(0) as u64).collect();
+            let index = build_reuse_index(reuse_dir, &wanted, &options.gate.shields).await;
+            let shas: Vec<String> = kept.iter().map(|f| f.sha256.clone()).collect();
             plan_byte_sources(&shas, &index)
         }
         None => vec![ByteSource::Download; jobs.len()],
@@ -941,6 +989,7 @@ where
     // save de fichero suelto porque el fichero ya esté en disco. Basta: esta
     // ruta sólo la toman versiones antiguas ya subidas.
     let root = extraction_root(dest, &[]);
+    let single_file = root != dest;
     let resp = client.get_presigned(&meta.download).await?;
     let total = resp
         .content_length()
@@ -1014,6 +1063,11 @@ where
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating parent {}", parent.display()))?;
+        }
+
+        if !single_file && !options.gate.allows(&safe_rel.to_string_lossy().replace('\\', "/")) {
+            tracing::debug!(path = %safe_rel.display(), "restore: skipping device-local file");
+            continue;
         }
 
         let mut writer = tokio::fs::File::create(&dest_path)
@@ -1298,7 +1352,7 @@ mod tests {
             seed(dir.path(), &format!("_autosave{i}.zip"), blob);
         }
 
-        let index = build_reuse_index(dir.path(), &sizes_of(&blobs)).await;
+        let index = build_reuse_index(dir.path(), &sizes_of(&blobs), &[]).await;
         let plan = plan_byte_sources(&manifest_shas, &index);
 
         assert_eq!(plan.len(), N);
@@ -1309,6 +1363,73 @@ mod tests {
             let expected = dir.path().join(format!("_autosave{i}.zip"));
             assert_eq!(*source, ByteSource::Reuse(expected));
         }
+    }
+
+    /// La regresión que se coló al meter la puerta: el plan de bytes se
+    /// calculaba sobre el manifiesto **entero** y luego se emparejaba por
+    /// posición con la lista de trabajos ya **filtrada**. Un solo fichero
+    /// vetado corría todos los demás una posición, cada copia local fallaba la
+    /// verificación de sha y caía a la red — la deduplicación contra disco
+    /// muerta en silencio.
+    ///
+    /// Aquí se comprueba la invariante que lo evita: el plan se deriva de la
+    /// misma lista filtrada, así que `plan[i]` es el de `kept[i]`.
+    #[tokio::test]
+    async fn the_byte_plan_lines_up_with_the_filtered_job_list() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Tres ficheros en el snapshot; el de en medio es config y la puerta lo
+        // veta. Los otros dos ya están en disco con sus bytes buenos.
+        let save_a = b"partida A".to_vec();
+        let conf = b"res=1920x1080".to_vec();
+        let save_b = b"partida B, distinta longitud".to_vec();
+        seed(dir.path(), "a.sav", &save_a);
+        seed(dir.path(), "b.sav", &save_b);
+        seed(dir.path(), "graphics.ini", &conf);
+
+        let gate = RestoreGate::default();
+        let all = [
+            ("a.sav", &save_a),
+            ("graphics.ini", &conf),
+            ("b.sav", &save_b),
+        ];
+        let kept: Vec<_> = all
+            .iter()
+            .filter(|(rel, _)| gate.allows(rel))
+            .copied()
+            .collect();
+        assert_eq!(kept.len(), 2, "la puerta debe vetar el .ini");
+
+        let sizes: HashSet<u64> = kept.iter().map(|(_, b)| b.len() as u64).collect();
+        let index = build_reuse_index(dir.path(), &sizes, &gate.shields).await;
+        let shas: Vec<String> = kept.iter().map(|(_, b)| sha_of(b)).collect();
+        let plan = plan_byte_sources(&shas, &index);
+
+        assert_eq!(plan.len(), kept.len());
+        // Cada entrada del plan apunta al fichero local que de verdad tiene
+        // esos bytes. Con el desfase, `a.sav` recibía el plan de `graphics.ini`.
+        assert_eq!(plan[0], ByteSource::Reuse(dir.path().join("a.sav")));
+        assert_eq!(plan[1], ByteSource::Reuse(dir.path().join("b.sav")));
+    }
+
+    /// Un save de fichero suelto se restaura pase lo que pase: el usuario
+    /// apuntó a ese fichero. Sin la excepción, un save llamado `settings.ini`
+    /// se subía (el walk ya lo exceptúa) pero no volvía nunca.
+    #[test]
+    fn a_single_file_save_is_never_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("settings.ini");
+        std::fs::write(&dest, b"en realidad es la partida").unwrap();
+        assert!(is_single_file_snapshot(&dest, &["settings.ini"]));
+        // La puerta lo vetaría por nombre si se le preguntara.
+        assert!(!RestoreGate::default().allows("settings.ini"));
+
+        // Y también en una máquina nueva, donde el fichero aún no existe: manda
+        // la forma del snapshot.
+        let fresh = dir.path().join("save.cfg");
+        assert!(is_single_file_snapshot(&fresh, &["save.cfg"]));
+        // Una carpeta con varios ficheros no es un save de fichero suelto.
+        assert!(!is_single_file_snapshot(dir.path(), &["a.sav", "b.sav"]));
     }
 
     /// Same relative path, different bytes: reuse is keyed on content, never on
@@ -1324,7 +1445,7 @@ mod tests {
 
         seed(dir.path(), "save.dat", &local);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote))).await;
+        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote)), &[]).await;
         let plan = plan_byte_sources(&[sha_of(&remote)], &index);
 
         assert_eq!(plan, vec![ByteSource::Download]);
@@ -1339,7 +1460,7 @@ mod tests {
         let wanted = sizes_of(&blobs);
 
         let empty = tempfile::tempdir().unwrap();
-        let index = build_reuse_index(empty.path(), &wanted).await;
+        let index = build_reuse_index(empty.path(), &wanted, &[]).await;
         assert!(index.is_empty());
         assert_eq!(
             plan_byte_sources(&shas, &index),
@@ -1347,7 +1468,7 @@ mod tests {
         );
 
         let missing = empty.path().join("not-created-yet");
-        let index = build_reuse_index(&missing, &wanted).await;
+        let index = build_reuse_index(&missing, &wanted, &[]).await;
         assert!(index.is_empty());
         assert_eq!(
             plan_byte_sources(&shas, &index),
@@ -1363,7 +1484,7 @@ mod tests {
         let blob = vec![7u8; 8192];
         seed(dir.path(), "nested/old-name.zip", &blob);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob))).await;
+        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob)), &[]).await;
         let plan = plan_byte_sources(&[sha_of(&blob)], &index);
 
         assert_eq!(

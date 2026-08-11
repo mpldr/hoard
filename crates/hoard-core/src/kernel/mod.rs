@@ -36,6 +36,7 @@
 //! (fs, realtime) quedan como *hints* que sólo adelantan un tick, nunca deciden.
 
 pub mod correlation;
+pub mod fileclass;
 pub mod reconcile;
 pub mod restore_merge;
 pub mod session;

@@ -368,6 +368,9 @@ async fn medir_restore(
         // haya, que es justo lo que hace el motor de verdad.
         force: true,
         reuse_from: dedup.then(|| dest.to_path_buf()),
+        // El banco mide transferencia, no política: restaura todo lo que el
+        // snapshot traiga para que los números no dependan del filtro.
+        gate: hoard_core::kernel::fileclass::RestoreGate::permissive(),
     };
 
     let t0 = Instant::now();

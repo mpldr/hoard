@@ -74,8 +74,51 @@
   // Modal state
   let restoreTarget = $state<SnapshotEntry | null>(null);
   let backupFirst = $state(true);
+  // Escribir también la config del snapshot encima de la de esta máquina.
+  // Apagado por defecto: lleva la resolución, el GPU y las rutas del PC que
+  // subió la copia, y es lo que hace que el juego reviente. Cada restore
+  // vuelve a preguntar… salvo que el juego lo tenga decidido en sus ajustes
+  // (`allow_device_local`), que es justo para los juegos donde la config y la
+  // partida son el mismo fichero y responder "no" cada vez restaura a medias.
+  let allowConfig = $state(false);
   let restoring = $state(false);
   let restoreProgress = $state<RestoreProgress | null>(null);
+
+  // Qué le va a pasar a la carpeta. Se pide al abrir el modal y no descarga
+  // nada: cruza el manifiesto de la versión con lo que hay en disco. `null`
+  // mientras carga; `failed` si no se pudo mirar, en cuyo caso el restore
+  // sigue disponible — no saber qué cambia no es motivo para bloquearlo.
+  let preview = $state<api.RestorePreview | null>(null);
+  let previewFailed = $state(false);
+
+  function openRestore(snap: SnapshotEntry) {
+    restoreTarget = snap;
+    // Cada restore arranca del ajuste del juego (apagado si no lo tiene
+    // decidido): la elección de UN restore no se recuerda. Se pone ANTES de
+    // pedir la previsualización, y por eso abrir y recargar son dos funciones
+    // — el interruptor recarga sin resetearse, que si no se apagaba solo en
+    // cuanto lo tocabas.
+    allowConfig = save?.allow_device_local ?? false;
+    loadPreview(snap);
+  }
+
+  async function loadPreview(snap: SnapshotEntry) {
+    preview = null;
+    previewFailed = false;
+    if (!save) return;
+    try {
+      const out = await api.previewRestore(
+        save.save_id,
+        snap.version_num,
+        null,
+        allowConfig,
+      );
+      // Otro clic pudo cambiar de versión mientras esto viajaba.
+      if (restoreTarget?.version_num === snap.version_num) preview = out;
+    } catch {
+      if (restoreTarget?.version_num === snap.version_num) previewFailed = true;
+    }
+  }
 
   let deleteTarget = $state<SnapshotEntry | null>(null);
   let deleting = $state(false);
@@ -275,6 +318,7 @@
         version: target.version_num,
         backup_first: backupFirst,
         destination_override: destinationOverride,
+        allow_config: allowConfig,
       });
       const safety = out.safety_version
         ? $_("history.safety_suffix", {
@@ -425,6 +469,24 @@
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
       savingPreset = false;
+    }
+  }
+
+  let savingAllowConfig = $state(false);
+
+  /** Deja decidido, para este juego, si un restore le escribe la config. El
+   *  diálogo de restore arranca de aquí y los restores automáticos lo
+   *  respetan, que es lo que hace útil el ajuste. */
+  async function changeAllowConfig(allow: boolean) {
+    if (!save) return;
+    savingAllowConfig = true;
+    try {
+      await api.setSaveAllowConfig(saveId, allow);
+      await hydrate();
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      savingAllowConfig = false;
     }
   }
 
@@ -617,7 +679,21 @@
             </select>
           </label>
         {/if}
+        <label class="flex items-center gap-2 text-xs text-zinc-400">
+          <input
+            type="checkbox"
+            class="h-3.5 w-3.5 rounded border-white/20 bg-zinc-900 accent-emerald-600 disabled:opacity-50"
+            disabled={savingAllowConfig}
+            checked={save.allow_device_local ?? false}
+            onchange={(e) =>
+              changeAllowConfig((e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="text-zinc-500">{$_("history.allow_config_game")}</span>
+        </label>
       </div>
+      <p class="mt-2 text-xs text-zinc-500">
+        {$_("history.allow_config_game_hint")}
+      </p>
       {#if save.preset}
         <p class="mt-2 text-xs text-zinc-500">
           {$_(`presets.${save.preset}.desc`)}
@@ -833,7 +909,7 @@
                   <Button
                     variant="secondary"
                     size="md"
-                    onclick={() => (restoreTarget = snap)}
+                    onclick={() => openRestore(snap)}
                   >
                     <RotateCcw size={12} /> {$_("history.restore")}
                   </Button>
@@ -925,6 +1001,77 @@
         </span>
       </span>
     </label>
+
+    <label class="flex items-start gap-3">
+      <input
+        type="checkbox"
+        class="mt-0.5 h-4 w-4 shrink-0 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+        checked={allowConfig}
+        disabled={restoring}
+        onchange={(e) => {
+          allowConfig = (e.currentTarget as HTMLInputElement).checked;
+          if (restoreTarget) loadPreview(restoreTarget);
+        }}
+      />
+      <span>
+        <span class="font-medium text-zinc-100">
+          {$_("history.allow_config_label")}
+        </span>
+        <span class="mt-0.5 block text-xs text-zinc-400">
+          {$_("history.allow_config_hint")}
+        </span>
+      </span>
+    </label>
+
+    {#if !restoring}
+      <div
+        class="rounded-md border border-white/[0.08] bg-zinc-900/60 p-3 text-xs"
+      >
+        <div class="mb-1.5 font-medium text-zinc-300">
+          {$_("history.preview_title")}
+        </div>
+        {#if previewFailed}
+          <div class="text-zinc-400">{$_("history.preview_failed")}</div>
+        {:else if !preview}
+          <div class="text-zinc-500">{$_("history.preview_loading")}</div>
+        {:else if !preview.comparable}
+          <div class="text-zinc-400">{$_("history.preview_unavailable")}</div>
+        {:else if preview.modified.length === 0 && preview.added.length === 0}
+          <div class="text-zinc-400">{$_("history.preview_nothing")}</div>
+        {:else}
+          <ul class="space-y-1 text-zinc-300">
+            {#if preview.modified.length > 0}
+              <li class="text-amber-200">
+                {$_("history.preview_modified", {
+                  values: { count: preview.modified.length },
+                })}
+              </li>
+            {/if}
+            {#if preview.added.length > 0}
+              <li class="text-emerald-300">
+                {$_("history.preview_added", {
+                  values: { count: preview.added.length },
+                })}
+              </li>
+            {/if}
+            {#if preview.unchanged > 0}
+              <li class="text-zinc-500">
+                {$_("history.preview_unchanged", {
+                  values: { count: preview.unchanged },
+                })}
+              </li>
+            {/if}
+          </ul>
+        {/if}
+        {#if preview && preview.local_only.length > 0}
+          <div class="mt-1.5 text-zinc-400">
+            {$_("history.preview_local_only", {
+              values: { count: preview.local_only.length },
+            })}
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     {#if restoreProgress}
       <div>

@@ -26,6 +26,7 @@ use crate::api::{
 };
 use crate::state::{CliState, SaveState};
 use hoard_core::ids::SaveId;
+use hoard_core::kernel::fileclass;
 
 /// Bounded fan-out for per-file work in the cloud path (hashing local files,
 /// PUTting missing blobs). Saves are mostly many small files, so per-file
@@ -270,23 +271,27 @@ fn join_signature(cheap: &str, content: &str) -> String {
     format!("{cheap}:{content}")
 }
 
-/// Walk `root` recursively and return all regular files, sorted by relative path.
+/// Recorre `root` y devuelve los ficheros que **son dato de partida**.
+///
+/// `shields` son los patrones de fichero que el manifiesto declara para este
+/// juego ([`crate::savefilter::shields_for_slug`]); pasar `&[]` deja al kernel
+/// decidiendo sólo por nombre. Lo que
+/// [`fileclass::classify`](hoard_core::kernel::fileclass::classify) marque como
+/// [`Junk`](hoard_core::kernel::fileclass::FileClass::Junk) —basura del SO,
+/// temporales, volcados de crash, telemetría del motor, cerrojos que el juego
+/// tiene abiertos— no entra en el snapshot. La configuración sí entra: es en el
+/// restore donde se decide si se escribe (ver `RestoreOptions::gate`).
+///
+/// **Todo el mundo tiene que pasar por aquí con los mismos `shields`.** La
+/// firma barata de [`compute_set_signature`] se calcula sobre esta lista, y el
+/// muestreo L1 del motor (`observe_local_fingerprint`) la compara contra la que
+/// guardó el backup: dos filtros distintos dan dos firmas distintas para la
+/// misma carpeta quieta, el reductor ve un cambio pendiente que nunca se
+/// resuelve y queda un bucle caliente.
 ///
 /// Symlinks are skipped on purpose: we don't want to follow links out of the
 /// save directory, and tar archives with symlinks make restore ambiguous.
-/// Transient lock files a running game keeps exclusively open. They carry no
-/// save data and on Windows can't even be opened for reading while the game
-/// holds them (sharing violation, os error 32), which used to abort the whole
-/// backup mid-walk — e.g. Minecraft's `.minecraft/saves/<world>/session.lock`.
-/// Matched case-insensitively on the file name.
-const TRANSIENT_LOCK_FILES: &[&str] = &["session.lock"];
-
-fn is_transient_lock(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    TRANSIENT_LOCK_FILES.iter().any(|n| lower == *n)
-}
-
-pub fn walk_source(root: &Path) -> Result<Vec<UploadFile>> {
+pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
     // Save de fichero suelto: el `local_path` ES el fichero. Sale un único
     // `UploadFile` con su nombre base como ruta relativa, de modo que el
     // snapshot tiene exactamente la misma forma que el de una carpeta con un
@@ -300,6 +305,10 @@ pub fn walk_source(root: &Path) -> Result<Vec<UploadFile>> {
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("save file has no usable name: {}", root.display()))?;
+        // Un save de fichero suelto ES el fichero: la ruta se eligió apuntando
+        // a él, así que aquí no se clasifica nada. Filtrarlo dejaría el save
+        // vacío y el backup entero en `EmptySource` — el usuario señaló ese
+        // fichero, y eso pesa más que cualquier regla por nombre.
         return Ok(vec![UploadFile {
             relative_path: name.to_string(),
             absolute_path: root.to_path_buf(),
@@ -341,18 +350,16 @@ pub fn walk_source(root: &Path) -> Result<Vec<UploadFile>> {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                // Skip lock files the game holds open: they're never save data
-                // and trying to read them aborts the backup while the game runs.
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if is_transient_lock(name) {
-                        continue;
-                    }
-                }
                 let rel = path
                     .strip_prefix(root)
                     .map_err(|e| anyhow!("strip_prefix: {e}"))?
                     .to_string_lossy()
                     .replace('\\', "/");
+                // Lo que no es dato de partida no entra en el snapshot.
+                if !fileclass::classify(&rel, shields).is_backed_up() {
+                    tracing::debug!(path = %rel, "skipping non-save file");
+                    continue;
+                }
                 // A file we can't stat (locked, vanished mid-walk, permission)
                 // is skipped with a warning rather than failing the whole
                 // upload — one unreadable transient file shouldn't lose the
@@ -412,7 +419,7 @@ where
         bail!("source must be a folder or a file: {}", source.display());
     }
 
-    let files = walk_source(&source)?;
+    let files = walk_source(&source, &crate::savefilter::shields_for_slug(game_slug))?;
     if files.is_empty() {
         return Err(EmptySource { path: source }.into());
     }
@@ -1206,7 +1213,7 @@ where
         }
         .into());
     }
-    let files = walk_source(&canonical)?;
+    let files = walk_source(&canonical, &crate::savefilter::shields_for_slug(game_slug))?;
     if files.is_empty() {
         return Err(EmptySource { path: canonical }.into());
     }
@@ -1284,6 +1291,10 @@ pub async fn remember_save(
             .get(save_id)
             .map(|s| s.processes.clone())
             .unwrap_or_default();
+        // Igual que la pausa y el preset: un refresco de metadatos no puede
+        // deshacer un ajuste del usuario. Éste decide si se le escribe la
+        // config al restaurar, así que perderlo aquí sería perderlo callando.
+        let prev_allow_device_local = state.saves.get(save_id).and_then(|s| s.allow_device_local);
         state.saves.insert(
             save_id.to_string(),
             SaveState {
@@ -1296,6 +1307,7 @@ pub async fn remember_save(
                 preset: prev_preset,
                 set_hash: prev_hash,
                 processes: prev_processes,
+                allow_device_local: prev_allow_device_local,
             },
         );
     } else if let Some(existing) = state.saves.get(save_id).cloned() {
@@ -1516,7 +1528,7 @@ mod tests {
         std::fs::write(locked.join("inner.dat"), b"x").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let files = walk_source(root).expect("un subdir ilegible no debe abortar el walk");
+        let files = walk_source(root, &[]).expect("un subdir ilegible no debe abortar el walk");
         // Restaura permisos para que el tempdir se pueda limpiar.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1535,7 +1547,7 @@ mod tests {
     #[test]
     fn an_unreadable_root_is_still_an_error() {
         let missing = std::path::Path::new("/definitely/not/here/hoard-test");
-        assert!(walk_source(missing).is_err());
+        assert!(walk_source(missing, &[]).is_err());
     }
 
     /// Save de fichero suelto: 4.900 juegos del catálogo sólo tienen
@@ -1613,13 +1625,100 @@ mod tests {
         );
     }
 
+    /// La carpeta real de Cell to Singularity: partidas y telemetría de Unity
+    /// mezcladas. Antes de esto el snapshot se llevaba las dos cosas, y el
+    /// `Player.log` —reescrito en cada arranque— cortaba una versión nueva en
+    /// la nube cada vez que el usuario abría el juego.
+    #[test]
+    fn the_walk_leaves_engine_telemetry_out_of_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (rel, body) in [
+            ("savedGames.gd", "partida"),
+            ("savedGames2.gd", "partida"),
+            ("Player.log", "log"),
+            ("Player-prev.log", "log"),
+            ("steam_autocloud.vdf", "vdf"),
+        ] {
+            std::fs::write(root.join(rel), body).unwrap();
+        }
+        let analytics = root.join("Unity/0a8833bc-a8ad/Analytics");
+        std::fs::create_dir_all(&analytics).unwrap();
+        std::fs::write(analytics.join("values"), "telemetría").unwrap();
+
+        let files = walk_source(root, &[]).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["savedGames.gd", "savedGames2.gd"], "{names:?}");
+    }
+
+    /// La config **sí** sube: perderla no es una opción, y la protección contra
+    /// el crash está en el restore, no aquí.
+    #[test]
+    fn config_still_goes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("slot1.sav"), "partida").unwrap();
+        std::fs::write(root.join("graphics.ini"), "res=1920x1080").unwrap();
+
+        let files = walk_source(root, &[]).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["graphics.ini", "slot1.sav"], "{names:?}");
+    }
+
+    /// El log que reescribe el juego en cada arranque ya no mueve la firma, así
+    /// que deja de cortar una versión por sesión.
+    #[test]
+    fn a_rewritten_engine_log_no_longer_drifts_the_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("slot1.sav"), "partida").unwrap();
+        std::fs::write(root.join("Player.log"), "arranque 1").unwrap();
+        let before = compute_set_signature(&walk_source(root, &[]).unwrap());
+
+        std::fs::write(root.join("Player.log"), "arranque 2, más largo").unwrap();
+        let after = compute_set_signature(&walk_source(root, &[]).unwrap());
+        assert_eq!(before, after, "el log no debe mover la firma");
+
+        // Y la partida sí la mueve, que es lo que tiene que seguir pasando.
+        std::fs::write(root.join("slot1.sav"), "partida avanzada").unwrap();
+        assert_ne!(
+            before,
+            compute_set_signature(&walk_source(root, &[]).unwrap())
+        );
+    }
+
+    /// El blindaje del manifiesto rescata lo que las reglas por nombre se
+    /// llevarían: `.log` es el patrón de save de 64 plantillas del catálogo.
+    #[test]
+    fn a_manifest_pattern_rescues_a_file_the_rules_would_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("player.log"), "esto sí es la partida").unwrap();
+
+        assert!(walk_source(root, &[]).unwrap().is_empty());
+        let shielded = walk_source(root, &["*.log".to_string()]).unwrap();
+        assert_eq!(shielded.len(), 1);
+    }
+
+    /// Un save de fichero suelto se sube aunque su nombre parezca config: el
+    /// usuario apuntó a ese fichero, y eso pesa más que cualquier regla.
+    #[test]
+    fn a_single_file_save_is_never_filtered_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.ini");
+        std::fs::write(&file, "en realidad es la partida").unwrap();
+        let files = walk_source(&file, &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "settings.ini");
+    }
+
     #[test]
     fn a_single_file_save_walks_to_one_entry_named_after_it() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("ssr_save.bin");
         std::fs::write(&file, b"0123456789").unwrap();
 
-        let files = walk_source(&file).unwrap();
+        let files = walk_source(&file, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, "ssr_save.bin");
         assert_eq!(files[0].absolute_path, file);
@@ -1634,11 +1733,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("save.dat");
         std::fs::write(&file, b"a").unwrap();
-        let before = compute_set_signature(&walk_source(&file).unwrap());
+        let before = compute_set_signature(&walk_source(&file, &[]).unwrap());
         // Un tamaño distinto mueve la firma aunque el mtime tenga poca
         // resolución en este sistema de ficheros.
         std::fs::write(&file, b"bbbb").unwrap();
-        let after = compute_set_signature(&walk_source(&file).unwrap());
+        let after = compute_set_signature(&walk_source(&file, &[]).unwrap());
         assert_ne!(before, after);
     }
 }

@@ -205,6 +205,10 @@ export type TrackedSave = {
    *  inherit". A built-in per-game preset may still apply at the agent
    *  level when this is `null`; this only reflects the manual override. */
   preset: string | null;
+  /** Whether restoring this game writes its device-local files (`.ini`,
+   *  `.cfg`, settings) instead of skipping them. `null` = undecided: they are
+   *  not written and the restore dialog keeps asking each time. */
+  allow_device_local: boolean | null;
 };
 
 /** Run a full auto-detection sweep. Subscribe to `library://scan-progress`
@@ -951,6 +955,35 @@ export function setMaxVersions(maxVersions: number | null): Promise<void> {
   return invoke<void>("set_max_versions", { maxVersions });
 }
 
+/** What restoring this version will do to the folder, before confirming it.
+ *  Downloads nothing: crosses the version's manifest with what's on disk.
+ *
+ *  `comparable: false` means the version publishes no per-file hashes (the
+ *  legacy whole-archive ones), so `modified` can't be told from `unchanged`
+ *  and the UI must say it can't preview rather than show an empty diff. */
+export type RestorePreview = {
+  unchanged: number;
+  modified: string[];
+  added: string[];
+  local_only: string[];
+  bytes_to_write: number;
+  comparable: boolean;
+};
+
+export function previewRestore(
+  saveId: string,
+  version: number,
+  destinationOverride?: string | null,
+  allowConfig = false,
+): Promise<RestorePreview> {
+  return invoke<RestorePreview>("preview_restore", {
+    saveId,
+    version,
+    destinationOverride: destinationOverride ?? null,
+    allowConfig,
+  });
+}
+
 export function restoreSnapshot(args: {
   save_id: string;
   version: number;
@@ -960,12 +993,18 @@ export function restoreSnapshot(args: {
    *  records the (save_id → path) mapping in CliState so subsequent
    *  restores skip the dialog. */
   destination_override?: string | null;
+  /** Escribir también los ficheros de config del snapshot (.ini, .cfg, ajustes)
+   *  encima de los de esta máquina. Apagado por defecto: llevan la resolución,
+   *  el GPU y las rutas del PC que subió la copia, y el juego revienta con
+   *  ellos. */
+  allow_config?: boolean;
 }): Promise<RestoreOutcome> {
   return invoke<RestoreOutcome>("restore_snapshot", {
     saveId: args.save_id,
     version: args.version,
     backupFirst: args.backup_first,
     destinationOverride: args.destination_override ?? null,
+    allowConfig: args.allow_config ?? false,
   });
 }
 
@@ -999,6 +1038,16 @@ export function setSavePreset(
   preset: string | null,
 ): Promise<void> {
   return invoke<void>("set_save_preset", { saveId, preset });
+}
+
+/** Decide whether restoring this game writes its device-local files (`.ini`,
+ *  `.cfg`, settings) or skips them. `null` goes back to undecided: not
+ *  written, and the restore dialog keeps asking each time. */
+export function setSaveAllowConfig(
+  saveId: string,
+  allow: boolean | null,
+): Promise<void> {
+  return invoke<void>("set_save_allow_config", { saveId, allow });
 }
 
 export function tailLogs(maxLines?: number): Promise<LogLine[]> {

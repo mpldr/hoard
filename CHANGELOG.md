@@ -31,6 +31,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   them, and one that goes months without appearing is forgotten.
 
 ### Fixed
+- **Save folders are no longer synced whole, junk and all.** A game's save
+  folder rarely holds only saves: sitting next to your world files there are
+  engine logs, crash telemetry, the analytics queue with the GUID that
+  identifies *that* installation, shader information about *that* GPU, and
+  settings files carrying *that* monitor's resolution. Hoard swept all of it
+  into the snapshot and wrote all of it back on restore, which is how a save
+  restored from one machine can crash the game on another. Now every file in
+  the folder is sorted before it moves. Logs, crash dumps, temporary files, OS
+  clutter and engine telemetry stay out of the backup entirely. Settings files
+  are backed up as before — losing them is not an option — but a restore no
+  longer writes them over the machine you're restoring onto unless you ask:
+  there's a checkbox in the restore dialog, off by default, and `--allow-ini`
+  on the CLI. Your save files themselves are unaffected either way. Two things
+  fall out of it: a Unity game whose `Player.log` is rewritten at every launch
+  used to cut a fresh cloud version on every single launch even when you hadn't
+  played, and that stops; and the save catalog's own file patterns (`*.sav`,
+  `*.plr` — 20,499 of them) are now read and used to protect anything the
+  catalog says is real save data, so a game that genuinely saves into `.ini` or
+  `.log` files is left alone.
 - **Dropping from Pro to Free deleted your history without warning.** The
   grace window that was supposed to give you a month before a smaller plan takes
   effect never ran on the one downgrade that matters: the code worked out "how

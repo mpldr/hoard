@@ -225,6 +225,11 @@ pub struct WatchedSave {
     /// [`crate::presets`].
     #[serde(default)]
     pub policy: crate::presets::SavePolicy,
+    /// El "sí" permanente del usuario a que se le escriba la config de ESTE
+    /// juego al restaurar. Ver [`crate::state::SaveState::allow_device_local`].
+    /// `None`/`Some(false)` = puerta cerrada, como siempre.
+    #[serde(default)]
+    pub allow_device_local: Option<bool>,
     /// Cloud version this device last committed or restored, read from
     /// `state.json` (`last_version_num`). Seeds the slot's `known_version`
     /// so the reconciliation sweep's version-gate is armed from the first
@@ -799,8 +804,11 @@ fn fingerprint_from_set_hash(composite: &str) -> u64 {
 /// hasheada a `u64`. Sólo se llama cuando L0 cambió o un hint enfocó el save.
 /// `None` si la carpeta no se pudo caminar (se cae al `has_pending` en el
 /// reductor).
-fn observe_local_fingerprint(path: &Path) -> Option<u64> {
-    let files = crate::backup::walk_source(path).ok()?;
+fn observe_local_fingerprint(path: &Path, game_slug: &str) -> Option<u64> {
+    // El mismo blindaje que usa el backup, o las dos firmas divergen para
+    // siempre y el reductor ve un cambio pendiente que nunca se resuelve.
+    let shields = crate::savefilter::shields_for_slug(game_slug);
+    let files = crate::backup::walk_source(path, &shields).ok()?;
     Some(fingerprint_of(&crate::backup::compute_set_signature(
         &files,
     )))
@@ -1061,7 +1069,7 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
     let compute_l1 = !slot.save.track_only && !local_empty && (l0_changed || slot.needs_l1);
     slot.needs_l1 = false;
     let local_fingerprint = if compute_l1 {
-        observe_local_fingerprint(&slot.save.local_path)
+        observe_local_fingerprint(&slot.save.local_path, &slot.save.game_slug)
     } else {
         None
     };
@@ -2012,7 +2020,7 @@ fn mark_pending_if_diverged(slot: &mut SaveSlot) {
     if slot.save.track_only || is_path_empty_or_missing(&slot.save.local_path) {
         return;
     }
-    let fp = observe_local_fingerprint(&slot.save.local_path);
+    let fp = observe_local_fingerprint(&slot.save.local_path, &slot.save.game_slug);
     if fp.is_some() && fp != slot.synced_fingerprint {
         slot.has_pending = true;
         slot.needs_l1 = true;
@@ -2650,6 +2658,16 @@ async fn run_auto_restore(
             // from R2, and the merge below treats them exactly like downloaded
             // ones (ADR 0021 D.13).
             reuse_from: Some(save.local_path.clone()),
+            // Auto-restore: la puerta cerrada salvo que el usuario la haya
+            // abierto para este juego. Escribir sin que nadie mire la config
+            // del PC que subió el snapshot encima de éste es justo el crash
+            // que se quiere evitar, así que el default sigue siendo no; pero
+            // hay juegos donde la config y la partida son el mismo fichero, y
+            // ahí cerrarla siempre restaura una partida a medias.
+            gate: hoard_core::kernel::fileclass::RestoreGate {
+                shields: crate::savefilter::shields_for_slug(&save.game_slug),
+                allow_device_local: save.allow_device_local.unwrap_or(false),
+            },
         },
         |_, _| {},
     )
@@ -2678,7 +2696,13 @@ async fn run_auto_restore(
     });
 
     let copy_result =
-        restore_files_into(&save.local_path, &staging, conflict_backup_dir.as_deref()).await;
+        restore_files_into(
+            &save.local_path,
+            &staging,
+            conflict_backup_dir.as_deref(),
+            &crate::savefilter::shields_for_slug(&save.game_slug),
+        )
+        .await;
     cleanup_staging(&staging).await;
 
     // Best-effort TTL sweep regardless of the per-file outcome — we want
@@ -2705,8 +2729,11 @@ async fn run_auto_restore(
     // content half is fine because the fast-path skip only compares the cheap
     // half. Best-effort: a walk error just drops the redundant-upload
     // optimisation, never blocks the restore.
-    let disk_set_hash = crate::backup::walk_source(&save.local_path)
-        .ok()
+    let disk_set_hash = crate::backup::walk_source(
+        &save.local_path,
+        &crate::savefilter::shields_for_slug(&save.game_slug),
+    )
+    .ok()
         .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
 
     Ok(Some(AutoRestoreOutcome {
@@ -2846,6 +2873,7 @@ pub(crate) async fn restore_files_into(
     target: &Path,
     source: &Path,
     conflict_backup_dir: Option<&Path>,
+    shields: &[String],
 ) -> Result<RestoreStats> {
     let mut stats = RestoreStats::default();
     let mut stack: Vec<PathBuf> = vec![source.to_path_buf()];
@@ -2988,6 +3016,21 @@ pub(crate) async fn restore_files_into(
             let Ok(rel) = path.strip_prefix(target) else {
                 continue;
             };
+            // Un fichero que el backup **nunca sube** tampoco es divergencia.
+            // `disk_set_hash` se calcula con `walk_source`, que ya deja fuera
+            // la basura; contarla aquí desajusta las dos mitades y marca
+            // `local_diverged` en cada auto-restore de cualquier juego con un
+            // `Player.log` o un `.DS_Store` — un walk y un hash de contenido
+            // completos de más, para siempre.
+            //
+            // La config sí sigue contando, y a propósito: existe sólo en local
+            // hasta que se sube, así que descartarla aquí adoptaría una firma
+            // de "estamos en sync" y el backup siguiente se saltaría el fichero
+            // por la vía rápida sin haberlo subido nunca.
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !kernel::fileclass::classify(&rel_str, shields).is_backed_up() {
+                continue;
+            }
             if !source_rels.contains(rel) {
                 stats.target_only += 1;
             }
@@ -4855,6 +4898,7 @@ mod tests {
             steam_install_dir: None,
             processes: vec![],
             policy: Default::default(),
+            allow_device_local: None,
             known_version: None,
             set_hash: None,
             track_only: false,
@@ -4987,6 +5031,7 @@ mod tests {
             steam_install_dir: None,
             processes: vec![],
             policy: Default::default(),
+            allow_device_local: None,
             known_version: None,
             set_hash: None,
             track_only: false,
@@ -5066,6 +5111,7 @@ mod tests {
             steam_install_dir: None,
             processes: vec![],
             policy: Default::default(),
+            allow_device_local: None,
             known_version: None,
             set_hash: None,
             track_only: false,
@@ -5123,7 +5169,7 @@ mod tests {
         write_file(&source.join("nested/c.dat"), b"gamma");
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 2, "B and C should be copied");
         assert_eq!(stats.skipped, 1, "A is identical, skipped silently");
@@ -5145,6 +5191,32 @@ mod tests {
         );
     }
 
+    /// La basura local no es divergencia. `disk_set_hash` no la cuenta (sale de
+    /// `walk_source`), así que contarla aquí marcaría `local_diverged` en cada
+    /// auto-restore de cualquier juego con un log, y el motor repetiría un walk
+    /// y un hash de contenido enteros cada vez.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_files_into_ignores_junk_when_counting_local_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = &dir.path().join("staging");
+        let target = &dir.path().join("live");
+        std::fs::create_dir_all(source).unwrap();
+        std::fs::create_dir_all(target).unwrap();
+        std::fs::write(source.join("slot1.sav"), b"partida").unwrap();
+        std::fs::write(target.join("slot1.sav"), b"partida").unwrap();
+        // Sólo en local, y de las que el backup nunca sube.
+        std::fs::write(target.join("Player.log"), b"log").unwrap();
+        std::fs::write(target.join(".DS_Store"), b"junk").unwrap();
+
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        assert_eq!(stats.target_only, 0, "la basura no es divergencia");
+
+        // Pero la config sí cuenta: existe sólo en local hasta que se sube.
+        std::fs::write(target.join("graphics.ini"), b"res=1080").unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        assert_eq!(stats.target_only, 1, "la config sí debe contar");
+    }
+
     /// Local-only files: a file present in the target but absent from the
     /// remote snapshot is left untouched and counted under `target_only`.
     /// This is the divergence signal the conflict/auto-restore path keys on
@@ -5164,7 +5236,7 @@ mod tests {
         write_file(&target.join("local-only.sav"), b"unsynced");
         write_file(&target.join("nested/also-local.sav"), b"more");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 0, "a.dat is identical, nothing copied");
         assert_eq!(stats.skipped, 1, "a.dat skipped");
@@ -5200,7 +5272,7 @@ mod tests {
         // Target only has a.dat (subset); b.dat will be copied in.
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 1, "b.dat copied");
         assert_eq!(stats.skipped, 1, "a.dat identical");
@@ -5220,7 +5292,7 @@ mod tests {
         write_file(&source.join("a.dat"), b"remote-version");
         write_file(&target.join("a.dat"), b"LOCAL-WORK");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 0, "nothing copied — A is a conflict");
         assert_eq!(stats.skipped, 0);
@@ -5249,7 +5321,7 @@ mod tests {
         write_file(&target.join("a.dat"), b"alpha");
         write_file(&target.join("sub/b.dat"), b"beta");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 0);
         assert_eq!(stats.skipped, 2);
@@ -5272,7 +5344,7 @@ mod tests {
         write_file(&source.join("b.dat"), b"beta-bytes");
         write_file(&source.join("deep/nested/c.dat"), b"gamma!");
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.restored, 3);
         assert_eq!(stats.skipped, 0);
@@ -5316,7 +5388,7 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, Some(backup))
+        let stats = restore_files_into(target, source, Some(backup), &[])
             .await
             .unwrap();
 
@@ -5348,7 +5420,7 @@ mod tests {
         set_mtime(&source.join("a.dat"), now - Duration::from_secs(60));
         set_mtime(&target.join("a.dat"), now);
 
-        let stats = restore_files_into(target, source, Some(backup))
+        let stats = restore_files_into(target, source, Some(backup), &[])
             .await
             .unwrap();
 
@@ -5385,7 +5457,7 @@ mod tests {
         set_mtime(&source.join("clash.dat"), old + Duration::from_secs(20));
         set_mtime(&target.join("clash.dat"), old);
 
-        let stats = restore_files_into(target, source, Some(backup))
+        let stats = restore_files_into(target, source, Some(backup), &[])
             .await
             .unwrap();
         assert_eq!(stats.restored, 1);
@@ -5426,7 +5498,7 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, None).await.unwrap();
+        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
 
         assert_eq!(stats.conflicts_resolved_local, 1);
         assert_eq!(stats.conflicts_resolved_remote, 0);

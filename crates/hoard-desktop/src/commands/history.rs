@@ -98,6 +98,61 @@ pub async fn list_save_snapshots(
     Ok(snaps.into_iter().map(snapshot_to_wire).collect())
 }
 
+/// Qué le hará a la carpeta restaurar esta versión, antes de confirmarla.
+/// No descarga blobs: cruza el manifiesto de la versión con lo que hay en el
+/// destino. Ver [`hoard_agent::preview`].
+/// La puerta del restore para `save_id`: blindaje del manifiesto + el "sí" del
+/// usuario a escribir su config.
+///
+/// La calculan igual el preview y el restore para que el diálogo no prometa
+/// una cosa y el botón haga otra.
+fn restore_gate(save_id: &str, allow_config: bool) -> hoard_core::kernel::fileclass::RestoreGate {
+    let shields = CliState::load_default()
+        .ok()
+        .and_then(|(st, _)| st.saves.get(save_id).map(|s| s.game_slug.clone()))
+        .map(|slug| hoard_agent::savefilter::shields_for_slug(&slug))
+        .unwrap_or_default();
+    hoard_core::kernel::fileclass::RestoreGate {
+        shields,
+        allow_device_local: allow_config,
+    }
+}
+
+#[tauri::command]
+pub async fn preview_restore(
+    app: AppHandle,
+    save_id: String,
+    version: i64,
+    destination_override: Option<String>,
+    allow_config: bool,
+    state: State<'_, AppState>,
+) -> Result<hoard_agent::preview::RestorePreview, String> {
+    let client = current_client(&app, &state).await?;
+    let dest: PathBuf = match destination_override.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => PathBuf::from(raw),
+        _ => {
+            let (cli_state, _) = CliState::load_default().map_err(|e| e.to_string())?;
+            cli_state
+                .saves
+                .get(&save_id)
+                .map(|s| s.local_path.clone())
+                // El mismo código que usa `restore_snapshot`: sin carpeta local
+                // la UI abre el selector. Aquí se propaga igual para que el
+                // preview no invente un destino que el restore no usaría.
+                .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
+        }
+    };
+    hoard_agent::preview::restore_preview(
+        &client,
+        &save_id,
+        version,
+        &dest,
+        &restore_gate(&save_id, allow_config),
+    )
+    .await
+    .map_err(pretty_error)
+}
+
 /// Detail view: snapshot metadata + per-file list, used by the expandable
 /// row on the History page.
 #[tauri::command]
@@ -298,6 +353,9 @@ pub async fn restore_snapshot(
     version: i64,
     backup_first: bool,
     destination_override: Option<String>,
+    // El interruptor del diálogo, apagado por defecto: escribir encima la
+    // config de la máquina que subió el snapshot.
+    allow_config: bool,
     state: State<'_, AppState>,
 ) -> Result<RestoreOutcome, String> {
     let client = current_client(&app, &state).await?;
@@ -334,6 +392,7 @@ pub async fn restore_snapshot(
         let entry = cli_state.saves.entry(save_id.clone()).or_insert_with(|| {
             // Defaults that get patched below from the server response.
             hoard_agent::state::SaveState {
+            allow_device_local: None,
                 local_path: p.clone(),
                 game_slug: String::new(),
                 label: String::new(),
@@ -449,6 +508,7 @@ pub async fn restore_snapshot(
             // dedup against is the destination itself: anything already there
             // with the right bytes is copied (or left) instead of re-downloaded.
             reuse_from: Some(local_path.clone()),
+            gate: restore_gate(&save_id, allow_config),
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(
@@ -528,6 +588,26 @@ pub async fn set_save_preset(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let reseat = hoard_agent::library::set_preset(&save_id, preset).map_err(|e| e.to_string())?;
+    apply_reseat(&state, reseat).await;
+    Ok(())
+}
+
+/// Decide, para este juego, si un restore le escribe la config (`.ini`,
+/// `.cfg`, ajustes: lo que `fileclass` clasifica como `DeviceLocal`) o la deja
+/// pasar. `null` vuelve a "sin decidir": no se escribe, y el diálogo de restore
+/// sigue preguntando cada vez.
+///
+/// Es por juego porque la respuesta lo es: en unos la config y la partida son
+/// el mismo fichero y hay que escribirla, en otros lleva dentro la resolución
+/// de este monitor y escribirla arranca el juego en negro.
+#[tauri::command]
+pub async fn set_save_allow_config(
+    save_id: String,
+    allow: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let reseat =
+        hoard_agent::library::set_allow_device_local(&save_id, allow).map_err(|e| e.to_string())?;
     apply_reseat(&state, reseat).await;
     Ok(())
 }

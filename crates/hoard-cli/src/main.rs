@@ -177,6 +177,14 @@ enum Commands {
         /// Allow extracting into a non-empty directory
         #[arg(long)]
         force: bool,
+        /// Show what would change in the folder and stop, without restoring
+        #[arg(long)]
+        dry_run: bool,
+        /// Also write the snapshot's config files (.ini, .cfg, .toml, settings…)
+        /// over this machine's. Off by default: those files carry the other
+        /// machine's resolution, GPU and paths, and games crash on them.
+        #[arg(long, alias = "allow-config")]
+        allow_ini: bool,
     },
 }
 
@@ -335,7 +343,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             to,
             no_verify,
             force,
-        } => commands::restore::apply(save_id, version, to, no_verify, force).await,
+            dry_run,
+            allow_ini,
+        } => {
+            commands::restore::apply(save_id, version, to, no_verify, force, dry_run, allow_ini)
+                .await
+        }
     }
 }
 

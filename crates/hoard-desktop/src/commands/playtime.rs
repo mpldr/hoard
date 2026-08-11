@@ -95,6 +95,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         .map(|g| g.processes.iter().map(|p| p.to_string()).collect())
         .unwrap_or_default();
     WatchedSave {
+        allow_device_local: None,
         save_id: playtime_save_id(slug),
         game_slug: slug.to_string(),
         display_name,

@@ -20,6 +20,8 @@ pub async fn apply(
     to: Option<PathBuf>,
     no_verify: bool,
     force: bool,
+    dry_run: bool,
+    allow_ini: bool,
 ) -> Result<()> {
     let (cfg, _) = CliConfig::load_default()?;
     let token = cfg.require_token()?;
@@ -40,6 +42,46 @@ pub async fn apply(
                 })?
         }
     };
+
+    // Qué se deja escribir. Los patrones del manifiesto sólo se pueden mirar si
+    // sabemos de qué juego es la carpeta; un `--to` a pelo sobre un save que no
+    // está en el estado local se queda sin blindaje y decide el kernel solo.
+    let shields = {
+        let slug = CliState::load_default()
+            .ok()
+            .and_then(|(st, _)| st.saves.get(&save_id).map(|s| s.game_slug.clone()));
+        slug.map(|s| hoard_agent::savefilter::shields_for_slug(&s))
+            .unwrap_or_default()
+    };
+    let gate = hoard_core::kernel::fileclass::RestoreGate {
+        shields,
+        allow_device_local: allow_ini,
+    };
+
+    // Qué le va a pasar a la carpeta. No descarga nada: cruza el manifiesto de
+    // la versión con lo que hay en disco. Se enseña siempre, porque restaurar
+    // sobrescribe y merece decir antes qué sobrescribe; con `--dry-run` es todo
+    // lo que hace el comando.
+    match hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate).await {
+        Ok(p) if !p.comparable => {
+            println!("this version doesn't list its files one by one, so there's nothing to compare against the folder");
+        }
+        Ok(p) => {
+            println!(
+                "{} file(s) overwritten, {} created, {} already match, {} only here ({} to write)",
+                p.modified.len(),
+                p.added.len(),
+                p.unchanged,
+                p.local_only.len(),
+                indicatif::HumanBytes(p.bytes_to_write),
+            );
+        }
+        // No poder mirar qué cambia no es motivo para bloquear el restore.
+        Err(e) => println!("couldn't check what changes ({e})"),
+    }
+    if dry_run {
+        return Ok(());
+    }
 
     println!(
         "restoring v{} of {} to {}",
@@ -72,6 +114,7 @@ pub async fn apply(
         // Extraction goes straight into `dest`, so that's also the folder worth
         // deduping against: identical bytes already there aren't downloaded again.
         reuse_from: Some(dest.clone()),
+        gate,
     };
     let outcome = download_snapshot(&client, &save_id, version, &dest, options, on_progress)
         .await

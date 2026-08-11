@@ -16,6 +16,8 @@
     type Locale
   } from '$lib/i18n/locales';
   import LogoMark from './LogoMark.svelte';
+  import DiscordIcon from './DiscordIcon.svelte';
+  const DISCORD_URL = 'https://discord.gg/BYpXT8v4rh';
   import { Menu, X, Globe, Check } from 'lucide-svelte';
   import { onMount } from 'svelte';
 
@@ -92,14 +94,6 @@
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.cli')}
-      </a>
-      <a
-        href="https://discord.gg/BYpXT8v4rh"
-        target="_blank"
-        rel="noopener noreferrer"
-        class="link-underline ring-focus text-sm text-ink-soft transition-colors hover:text-ink"
-      >
-        Discord
       </a>
       <a
         href={$localeHref('/guides')}
@@ -191,6 +185,18 @@
           {$_('nav.signin')}
         </a>
       {/if}
+      <!-- Icon-only in Discord's blurple: it reads as a second call to action
+           without fighting the emerald one next to it. -->
+      <a
+        href={DISCORD_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Discord"
+        title="Discord"
+        class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[#5865F2] text-white ring-focus transition-colors hover:bg-[#4752C4]"
+      >
+        <DiscordIcon class="h-[18px] w-[18px]" />
+      </a>
     </div>
 
     <button
@@ -229,9 +235,6 @@
         <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/cli')} onclick={() => (open = false)}>
           {$_('nav.cli')}
         </a>
-        <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href="https://discord.gg/BYpXT8v4rh" target="_blank" rel="noopener noreferrer" onclick={() => (open = false)}>
-          Discord
-        </a>
         <a class="rounded-md px-3 py-2.5 text-ink hover:bg-ink/5" href={$localeHref('/guides')} onclick={() => (open = false)}>
           {$_('nav.guides')}
         </a>
@@ -254,6 +257,16 @@
             {$_('nav.signin')}
           </a>
         {/if}
+        <a
+          class="mt-1 inline-flex items-center justify-center gap-2 rounded-md bg-[#5865F2] px-3 py-2.5 font-medium text-white hover:bg-[#4752C4]"
+          href={DISCORD_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          onclick={() => (open = false)}
+        >
+          <DiscordIcon class="h-[18px] w-[18px]" />
+          Discord
+        </a>
 
         <div class="mt-2 border-t border-line pt-3">
           <p class="px-3 pb-1 font-mono text-[10px] uppercase tracking-[0.16em] text-ink-faint">

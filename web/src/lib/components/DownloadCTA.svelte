@@ -22,21 +22,21 @@
   );
 </script>
 
-<div class="flex flex-col items-start gap-3 sm:flex-row sm:items-center">
-  <Button href={$localeHref('/download')} size="lg" variant="primary">
-    {cta}
-    <ArrowRight class="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
-  </Button>
-  <span class="text-sm text-ink-faint">
-    {$_('cta_section.subnote')}
-    <a
+<div class="flex flex-col items-center gap-4">
+  <div class="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
+    <Button href={$localeHref('/download')} size="lg" variant="primary">
+      {cta}
+      <ArrowRight class="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+    </Button>
+    <Button
       href="https://github.com/rleeon/hoard/releases"
       target="_blank"
-      rel="noreferrer noopener"
-      class="link-underline inline-flex items-center gap-1 text-accent hover:text-emerald-300"
+      size="lg"
+      variant="secondary"
     >
-      <Github class="h-3.5 w-3.5" />
+      <Github class="h-4 w-4" />
       GitHub Releases
-    </a>
-  </span>
+    </Button>
+  </div>
+  <p class="text-sm text-ink-faint">{$_('cta_section.subnote')}</p>
 </div>

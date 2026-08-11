@@ -18,7 +18,8 @@
     ScanSearch,
     MonitorSmartphone,
     FileDown,
-    Check
+    Check,
+    Heart
   } from 'lucide-svelte';
 
 
@@ -31,7 +32,22 @@
     { key: 'export', icon: FileDown }
   ];
 
-  const facts = ['sha', 'agpl', 'eu', 'os'];
+  // Twelve facts, all of them checkable in the repo — a marquee with four
+  // items announces its own loop every few seconds.
+  const facts = [
+    'sha',
+    'agpl',
+    'eu',
+    'os',
+    'rust',
+    'selfhost',
+    'proton',
+    'saves',
+    'history',
+    'export',
+    'noads',
+    'solo'
+  ];
 
   // Structured data for rich results: the product + its two pricing tiers and
   // the operating organization. Description tracks the page locale.
@@ -159,22 +175,26 @@
 </section>
 
 <!-- ───────── FACT STRIP ───────── -->
-<section class="border-y border-line">
-  <div class="mx-auto max-w-6xl px-4 sm:px-6">
-    <dl class="grid grid-cols-2 sm:grid-cols-4">
-      {#each facts as f, i (f)}
-        <div
-          class="px-4 py-6 text-center {i > 0 ? 'border-l border-line' : ''} {i >= 2
-            ? 'max-sm:border-t max-sm:border-line'
-            : ''} {i === 2 ? 'max-sm:border-l-0' : ''}"
-        >
-          <dt class="font-mono text-sm font-medium tracking-tight text-ink">
-            {$_(`facts.${f}.value`)}
-          </dt>
-          <dd class="mt-1 text-xs text-ink-faint">{$_(`facts.${f}.label`)}</dd>
-        </div>
+<section class="border-y border-line" aria-label={$_('facts.aria')}>
+  <!-- The second track is the same list again: it fills the right edge while
+       the first scrolls out, and it is aria-hidden so nothing reads twice. -->
+  <div class="marquee">
+    <div class="marquee-inner">
+      {#each [false, true] as duplicate (duplicate)}
+        <dl class="flex shrink-0 items-center" aria-hidden={duplicate || undefined}>
+          {#each facts as f (f)}
+            <div class="flex shrink-0 items-center gap-2.5 whitespace-nowrap px-7 py-5">
+              <dt class="font-mono text-sm font-medium tracking-tight text-ink">
+                {$_(`facts.${f}.value`)}
+              </dt>
+              <dd class="text-xs text-ink-faint">{$_(`facts.${f}.label`)}</dd>
+              <span class="ml-4 h-1 w-1 shrink-0 rounded-full bg-accent/40" aria-hidden="true"
+              ></span>
+            </div>
+          {/each}
+        </dl>
       {/each}
-    </dl>
+    </div>
   </div>
 </section>
 
@@ -315,6 +335,34 @@ docker compose up -d --build</code
       <p class="mt-3 text-pretty text-ink-soft">{$_('cta_section.body')}</p>
       <div class="mt-8">
         <DownloadCTA />
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────── SUPPORT ───────── -->
+<section class="border-t border-line">
+  <div class="mx-auto max-w-6xl px-4 py-16 sm:px-6">
+    <div
+      class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 rounded-xl border border-line bg-surface px-6 py-10 text-center"
+      use:reveal
+    >
+      <div>
+        <h2 class="font-display text-2xl font-semibold text-ink">{$_('support.title')}</h2>
+        <p class="mt-2 text-pretty text-sm text-ink-soft">{$_('support.body')}</p>
+      </div>
+      <div class="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
+        <Button href="https://github.com/sponsors/rleeon" target="_blank" variant="outline">
+          <Heart class="h-4 w-4" />
+          {$_('support.cta')}
+        </Button>
+        <Button
+          href="https://github.com/rleeon/hoard/blob/main/FUNDING.md"
+          target="_blank"
+          variant="secondary"
+        >
+          {$_('support.funding')}
+        </Button>
       </div>
     </div>
   </div>

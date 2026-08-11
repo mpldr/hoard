@@ -46,6 +46,21 @@ html {
   scroll-behavior: smooth;
 }
 
+/* Large-display scaling — every measure on the site is in rem (type, spacing,
+   the max-w-* containers), so raising the root size grows the whole layout in
+   proportion instead of leaving a 1152px column marooned in the middle of a
+   1440p panel. Steps, not a fluid clamp: a clamp keeps resizing under the
+   reader and makes the design impossible to pin down. 1080p is untouched. */
+@media (min-width: 1536px) {
+  html { font-size: 17px; }
+}
+@media (min-width: 1920px) {
+  html { font-size: 18px; }
+}
+@media (min-width: 2400px) {
+  html { font-size: 19px; }
+}
+
 body {
   font-family: var(--font-sans);
   font-feature-settings: "cv11", "ss01";
@@ -213,4 +228,45 @@ h3 {
 ::view-transition-new(root) {
   animation-duration: 0.24s;
   animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ------------------------------------------------------------------
+   Fact marquee — the trust strip scrolls right-to-left instead of sitting
+   in a 4-cell grid. The track holds the same list twice, so animating it
+   to -50% lands exactly where it started and the loop has no seam. Edge
+   mask fades items in and out instead of clipping them dead at the border.
+------------------------------------------------------------------ */
+.marquee {
+  overflow: hidden;
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 5rem,
+    #000 calc(100% - 5rem),
+    transparent 100%
+  );
+}
+.marquee-inner {
+  display: flex;
+  width: max-content;
+  animation: marquee-scroll 70s linear infinite;
+}
+/* Reading the fine print shouldn't be a chase — hovering or tabbing in stops it. */
+.marquee:hover .marquee-inner,
+.marquee:focus-within .marquee-inner {
+  animation-play-state: paused;
+}
+@keyframes marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .marquee-inner {
+    animation: none !important;
+    transform: none !important;
+  }
 }

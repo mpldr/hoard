@@ -116,7 +116,7 @@
 
 <!-- ───────── HERO ───────── -->
 <section class="relative">
-  <div class="mx-auto max-w-6xl px-4 pt-16 sm:px-6 sm:pt-24 2xl:pt-12">
+  <div class="mx-auto max-w-6xl px-4 pt-16 sm:px-6 sm:pt-24 2xl:pt-8">
     <div class="flex flex-col items-center text-center">
       <h1
         class="max-w-4xl text-balance text-[2.4rem] font-semibold leading-[1.05] text-ink sm:text-6xl lg:text-[4.4rem] animate-fade-up"
@@ -155,7 +155,7 @@
 
 <!-- ───────── SCREENSHOT ───────── -->
 <section class="relative">
-  <div class="relative mx-auto max-w-[84rem] px-4 pt-14 sm:px-6 2xl:pb-7 2xl:pt-6">
+  <div class="relative mx-auto max-w-[84rem] px-4 pt-14 sm:px-6 2xl:pb-7 2xl:pt-4">
     <div class="flex flex-col items-center gap-8 lg:flex-row lg:items-center lg:justify-center lg:gap-7">
       <figure
         class="tilt animate-fade-up relative w-full lg:w-auto"

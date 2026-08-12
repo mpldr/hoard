@@ -4,6 +4,11 @@
 
 > Steam Cloud is not a backup strategy. Hoard is.
 
+**Hoard is an open-source (AGPL-3.0) game save backup and sync system.** Run the
+server on your own hardware, or use [Hoard Cloud](https://hoard.services) hosted
+in the EU — the desktop app and the CLI work the same against either. Self-hosting
+needs no Hoard account and has no quota beyond your own disk.
+
 ![Hoard app photo](web/static/WEB.png)
 
 > *Ships in eight languages, Spanish included.*

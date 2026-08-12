@@ -69,6 +69,8 @@
           name: 'Hoard',
           url: SITE_URL,
           logo: `${SITE_URL}/icon.png`,
+          // Ties the site to the repo as one entity instead of two loose names.
+          sameAs: ['https://github.com/rleeon/hoard'],
           founder: { '@type': 'Person', name: 'Raimundo León Oliva' }
         },
         {
@@ -77,7 +79,13 @@
           applicationCategory: 'UtilitiesApplication',
           operatingSystem: 'Windows, macOS, Linux',
           url: SITE_URL,
-          description: $_('seo.home.desc'),
+          // The long form, not the meta description: nothing truncates this one,
+          // and it is where "Hoard the software" and "Hoard Cloud the service"
+          // get told apart in so many words.
+          description: $_('seo.home.desc_long'),
+          license: 'https://www.gnu.org/licenses/agpl-3.0.html',
+          isAccessibleForFree: true,
+          codeRepository: 'https://github.com/rleeon/hoard',
           publisher: { '@id': `${SITE_URL}/#org` },
           offers: [
             {

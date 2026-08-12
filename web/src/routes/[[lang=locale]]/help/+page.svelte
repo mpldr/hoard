@@ -13,6 +13,8 @@
     { q: 'help.faq_q1', a: 'help.faq_a1', group: 'billing' },
     { q: 'help.faq_q2', a: 'help.faq_a2', group: 'billing' },
     { q: 'help.faq_q3', a: 'help.faq_a3', group: 'selfhost' },
+    { q: 'help.faq_q8', a: 'help.faq_a8', group: 'selfhost' },
+    { q: 'help.faq_q9', a: 'help.faq_a9', group: 'selfhost' },
     { q: 'help.faq_q4', a: 'help.faq_a4', group: 'privacy' },
     { q: 'help.faq_q5', a: 'help.faq_a5', group: 'privacy' },
     { q: 'help.faq_q6', a: 'help.faq_a6', group: 'limits' },

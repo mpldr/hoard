@@ -6,7 +6,7 @@
 // restart. Here the offset wraps modulo one copy of the track, which is
 // exactly where the duplicate copy sits, so the seam never shows.
 //
-// The node is expected to hold the same list twice.
+// The node is expected to hold the same list two or more times over.
 export type MarqueeOptions = {
   /** Scroll speed in CSS pixels per second. */
   speed?: number;
@@ -19,7 +19,7 @@ export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
 
   const container = node.parentElement ?? node;
   let offset = 0;
-  let copy = 0; // width of one of the two copies
+  let copy = 0; // width of a single copy of the list
   let last = 0;
   let frame = 0;
   let hovering = false;
@@ -29,7 +29,9 @@ export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
   let dragStartOffset = 0;
 
   const measure = () => {
-    copy = node.scrollWidth / 2;
+    // Derived from the copy count so the markup can add copies without the
+    // wrap point silently going wrong.
+    copy = node.scrollWidth / Math.max(node.childElementCount, 1);
   };
 
   const wrap = () => {

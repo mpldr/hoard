@@ -38,10 +38,9 @@
   const facts = [
     'sha',
     'agpl',
-    'eu',
+    'privacy',
     'os',
     'rust',
-    'selfhost',
     'proton',
     'saves',
     'history',
@@ -49,6 +48,14 @@
     'noads',
     'solo'
   ];
+  // Facts that are a whole sentence on their own, with no quiet half. Kept as
+  // an explicit set: svelte-i18n echoes the key name back for an empty string,
+  // so "does this have a label?" cannot be asked of the translation itself.
+  const SENTENCE_FACTS = new Set(['privacy']);
+  // Three copies, not two: the wrap needs one copy to be at least as wide as
+  // the viewport, and one copy of this list is ~3.7k px — short of a 4K panel
+  // at 100%. The action derives the wrap point from the copy count.
+  const FACT_COPIES = [0, 1, 2];
 
   // Structured data for rich results: the product + its two pricing tiers and
   // the operating organization. Description tracks the page locale.
@@ -181,14 +188,16 @@
        the first scrolls out, and it is aria-hidden so nothing reads twice. -->
   <div class="marquee">
     <div class="marquee-inner" use:marquee={{ speed: 52 }}>
-      {#each [false, true] as duplicate (duplicate)}
-        <dl class="flex shrink-0 items-center" aria-hidden={duplicate || undefined}>
+      {#each FACT_COPIES as copy (copy)}
+        <dl class="flex shrink-0 items-center" aria-hidden={copy > 0 || undefined}>
           {#each facts as f (f)}
             <div class="flex shrink-0 items-center gap-2.5 whitespace-nowrap px-7 py-5 2xl:py-4">
               <dt class="font-mono text-sm font-medium tracking-tight text-ink">
                 {$_(`facts.${f}.value`)}
               </dt>
-              <dd class="text-xs text-ink-faint">{$_(`facts.${f}.label`)}</dd>
+              {#if !SENTENCE_FACTS.has(f)}
+                <dd class="text-xs text-ink-faint">{$_(`facts.${f}.label`)}</dd>
+              {/if}
               <span class="ml-4 h-1 w-1 shrink-0 rounded-full bg-accent/40" aria-hidden="true"
               ></span>
             </div>

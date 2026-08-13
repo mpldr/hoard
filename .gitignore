@@ -99,6 +99,11 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # si la base tiene aplicada una versión que el binario no trae — por eso el
 # server cloud se construye desde este árbol (deploy/fly/Dockerfile), donde
 # los dos ficheros sí están en disco, y no desde un clon limpio del repo.
+# Desde el 2026-08-13 eso ya no es sólo una regla que hay que recordar: el
+# migrador va con `set_ignore_missing(true)` (cloud/db.rs), así que un build
+# sin estos ficheros arranca en vez de quedarse en bucle de reinicios. Se
+# perdió una mañana de servicio aprendiéndolo: despliegue desde un worktree,
+# `VersionMissing(30)`, y la API abajo hasta el rollback.
 /crates/hoard-server/migrations/postgres/0039_admin_metrics_v2.sql
 
 # Visión del rediseño del CLI. Doc de trabajo local.

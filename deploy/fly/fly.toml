@@ -75,3 +75,9 @@ kill_timeout = "10s"
 [deploy]
   strategy = "rolling"
   max_unavailable = 0.3
+  # Migrate as its own deploy step, in a throwaway machine, before any traffic
+  # moves. A migration that fails here fails the deploy and the version already
+  # serving keeps serving. Run from inside `serve` — which is what happened on
+  # 2026-08-13 — the same failure exits the process, Fly restarts it into the
+  # identical failure, and the API stays down until someone rolls back by hand.
+  release_command = "migrate"

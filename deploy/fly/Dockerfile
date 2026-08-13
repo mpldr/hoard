@@ -38,4 +38,8 @@ EXPOSE 8082
 
 # distroless has no shell; ENTRYPOINT is the binary directly. Fly's
 # healthcheck (configured in fly.toml) probes /v1/health over HTTP.
-ENTRYPOINT ["/usr/local/bin/hoard-server", "--config", "/etc/hoard/config.toml", "serve"]
+# `serve` goes in CMD, not ENTRYPOINT: Fly's release_command replaces CMD and
+# keeps ENTRYPOINT, so with `serve` baked in, the migrate step ran as
+# `... serve migrate` and clap rejected the extra argument.
+ENTRYPOINT ["/usr/local/bin/hoard-server", "--config", "/etc/hoard/config.toml"]
+CMD ["serve"]

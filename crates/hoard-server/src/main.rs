@@ -44,6 +44,15 @@ enum Cmd {
         #[arg(long)]
         target: Option<PathBuf>,
     },
+    /// Apply pending database migrations and exit.
+    ///
+    /// Meant to run as a deploy step (Fly's `release_command`), not by hand:
+    /// migrations that fail there abort the deploy and leave the version
+    /// that's already serving untouched. Applied from inside `serve` instead,
+    /// the same failure takes the server down and keeps it down, because the
+    /// supervisor restarts it straight back into the migration that failed.
+    Migrate,
+
     /// Re-read every cloud blob and check that its bytes hash to its name.
     ///
     /// The forensic half of the rotation-corruption fix: the client can no
@@ -80,6 +89,33 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&args.config)?;
 
     init_logging(&cfg);
+
+    if matches!(args.cmd, Some(Cmd::Migrate)) {
+        match cfg.database.backend {
+            DbBackend::Postgres => {
+                #[cfg(feature = "cloud")]
+                {
+                    // `db::` here is the self-hosted SQLite module; the cloud
+                    // pool lives in its own.
+                    use hoard_server::cloud::db as cloud_db;
+                    let pool =
+                        cloud_db::connect(&cfg.database.url, cfg.database.max_connections).await?;
+                    cloud_db::run_migrations(&pool).await?;
+                    pool.close().await;
+                    return Ok(());
+                }
+                #[cfg(not(feature = "cloud"))]
+                {
+                    anyhow::bail!(
+                        "database.backend = \"postgres\" requires building with --features cloud"
+                    )
+                }
+            }
+            DbBackend::Sqlite => {
+                anyhow::bail!("`migrate` is cloud-only; self-hosted migrates on start-up")
+            }
+        }
+    }
 
     #[cfg(feature = "cloud")]
     if let Some(Cmd::VerifyBlobs {

@@ -99,6 +99,12 @@ winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # `GetLogicalDrives` + `GetDriveTypeW` en `roots::internal_drive_roots`: un
+    # emulador descomprimido en D: no deja rastro en %APPDATA%, así que hay que
+    # preguntarle al SO qué unidades fijas hay antes de buscarlo.
+    "Win32_Storage_FileSystem",
+    # `DRIVE_FIXED`, que vive en otro módulo que las dos funciones que lo usan.
+    "Win32_System_WindowsProgramming",
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 

@@ -90,12 +90,15 @@ pub async fn run(args: SoakArgs) -> Result<()> {
         let outcome = hoard_agent::library::add_to_tracking(
             &active.client,
             hoard_agent::library::AddGameArgs {
+            slot: None,
+            repoint: false,
                 game_slug: slug.clone(),
                 label: Some(format!("pruebas-{nombre}")),
                 local_path: carpeta.to_string_lossy().to_string(),
                 display_name: Some(format!("Pruebas {nombre}")),
                 steam_app_id: None,
                 preset: None,
+                shared_processes: false,
                 // Atar el save al nombre del proceso: sin esto dependeríamos
                 // de que la correlación adivine, que es otra prueba distinta.
                 processes: Some(vec![nombre.clone()]),

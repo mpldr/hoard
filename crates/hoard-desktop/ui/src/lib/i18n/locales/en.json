@@ -492,6 +492,8 @@
   "library.ignore_blacklist_check": "Add to permanent blacklist (don't detect again)",
   "library.ignore_confirm": "Remove",
   "library.ignored_toast": "Game ignored",
+  "library.slot_saves": "{n} · saves",
+  "library.slot_other": "{n}",
   "history.browse": "Browse…",
   "history.choose_destination_title": "Where should we restore to?",
   "history.choose_destination_description": "Hoard doesn't know a save folder for this game on this machine yet. Pick a folder and we'll create it if it doesn't exist.",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "Paused",
   "overlay.save_playing": "Playing",
   "overlay.save_behind": "Behind the cloud"
+  "library.slot_other_title": "Backed up like any other folder, but never restored on its own — pull it with the restore button.",
+  "library.add_folder_aria": "Add another folder for this game",
+  "library.slot_pick_title": "Which folder of this game is it?",
+  "library.slot_pick_body": "{path} will be backed up under {name}. The number is what pairs it with the same folder on your other machines, so pick the one it already has there.",
+  "library.slot_pick_here": "Taken on this machine: {path}",
+  "library.slot_pick_cloud": "In the cloud from another machine — pick this to sync them together",
+  "library.slot_pick_free": "Free",
+  "library.slot_clash_title": "That folder, or another one?",
+  "library.slot_clash_body": "Hoard already backs up {current} for {name}. Is {chosen} where that folder moved to, or is it a second folder of the same game?",
+  "library.slot_clash_move": "It moved there",
+  "library.slot_clash_add": "Add it as folder {n}"
 }

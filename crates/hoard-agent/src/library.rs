@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hoard_manifest::ludusavi;
+use hoard_core::kernel::slots;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -32,6 +33,15 @@ pub struct TrackedSave {
     pub save_id: String,
     pub game_slug: String,
     pub label: String,
+    /// Which slot of the title this folder is, derived from `label`
+    /// ([`slots::slot_of`]). `None` = one of the older free-form labels, which
+    /// renders with its text as-is.
+    ///
+    /// Computed here rather than in the frontend so the equivalences (`"main"`
+    /// and `"default"` are slot 1) have a single owner; the CLI and the desktop
+    /// render the same list.
+    #[serde(default)]
+    pub slot: Option<u32>,
     pub local_path: String,
     /// Cabeza del **server**: la última versión que existe en la nube (o en el
     /// server self-hosted), venga de donde venga — normalmente de otra máquina.
@@ -77,6 +87,14 @@ pub struct TrackedSave {
 pub struct AddGameArgs {
     pub game_slug: String,
     pub label: Option<String>,
+    /// Which slot of the title this folder goes in (see
+    /// [`hoard_core::kernel::slots`]). Wins over `label`, which is derived from
+    /// it.
+    ///
+    /// `None` = slot 1, the saved games. That is what an ordinary add means, and
+    /// what the code did before slots existed.
+    #[serde(default)]
+    pub slot: Option<u32>,
     pub local_path: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -86,6 +104,17 @@ pub struct AddGameArgs {
     pub preset: Option<String>,
     #[serde(default)]
     pub processes: Option<Vec<String>>,
+    /// Los procesos de este save los comparten otros saves rastreados, así que
+    /// verlos correr no dice que se esté jugando a ÉSTE. Lo marca el alta de
+    /// una consola emulada partida por juego. Ver
+    /// [`crate::state::SaveState::shared_processes`].
+    #[serde(default)]
+    pub shared_processes: bool,
+    /// The user has already agreed to **move** this slot to another folder.
+    /// Without it, finding the slot held by a different folder is an error (see
+    /// [`occupied_slot`]) instead of a silent overwrite.
+    #[serde(default)]
+    pub repoint: bool,
 }
 
 /// Args para [`adopt`].
@@ -382,9 +411,18 @@ pub fn name_matches(steam_name: &str, slug: &str) -> bool {
 
 /// Política de sync efectiva: el preset fijado por el usuario gana; sin él, cae
 /// al catálogo built-in (R.E.P.O. → short-session). Nombre desconocido ⇒ vacía.
-pub fn resolve_policy(game_slug: &str, stored_preset: Option<&str>) -> SavePolicy {
+///
+/// `label` comes in to apply the slot rule: from 2 up a folder does not restore
+/// on its own ([`slots::restores_automatically`]). Only when nobody said
+/// otherwise — a preset that pins `auto_restore` is an explicit decision by the
+/// user about that save, and it wins.
+pub fn resolve_policy(game_slug: &str, stored_preset: Option<&str>, label: &str) -> SavePolicy {
     let name = stored_preset.or_else(|| presets::builtin_preset_for(game_slug));
-    SavePolicy::from_preset(name)
+    let mut policy = SavePolicy::from_preset(name);
+    if policy.auto_restore.is_none() && !slots::restores_automatically(slots::slot_of(label)) {
+        policy.auto_restore = Some(false);
+    }
+    policy
 }
 
 /// Nombres de proceso que marcan "jugando" para este slug.
@@ -526,7 +564,9 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         local_path: PathBuf::new(),
         steam_install_dir: install_dir,
         processes,
+        // Un slot de sólo-horas no comparte proceso con nadie: su lista viene
         // del catálogo de playtime, que es un juego por entrada.
+        shared_processes: false,
         policy: SavePolicy::default(),
         known_version: None,
         set_hash: None,
@@ -589,7 +629,8 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
             local_path: s.local_path.clone(),
             steam_install_dir,
             processes,
-            policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
+            shared_processes: s.shared_processes,
+            policy: resolve_policy(&s.game_slug, s.preset.as_deref(), &s.label),
             allow_device_local: s.allow_device_local,
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
@@ -611,6 +652,7 @@ pub fn watched_save_from(
     local_path: PathBuf,
     preset: Option<&str>,
     processes_override: Vec<String>,
+    shared_processes: bool,
     allow_device_local: Option<bool>,
 ) -> WatchedSave {
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
@@ -623,6 +665,7 @@ pub fn watched_save_from(
     } else {
         processes_override
     };
+    let policy = resolve_policy(&game_slug, preset, &label);
     WatchedSave {
         allow_device_local,
         save_id,
@@ -632,7 +675,8 @@ pub fn watched_save_from(
         local_path,
         steam_install_dir,
         processes,
-        policy: resolve_policy(&game_slug, preset),
+        shared_processes,
+        policy,
         known_version: None,
         set_hash: None,
         track_only: false,
@@ -819,6 +863,58 @@ fn rows_unknown_to_server(state: &CliState, known: &HashSet<String>) -> Vec<Stri
     stale
 }
 
+/// Prefix of the error the UI turns into the "move it or add it?" dialog. The
+/// shape is `slot_occupied:<label>:<free slot>:<current folder>`, with the
+/// folder last because on Windows it has a `:` inside.
+pub const ERR_SLOT_OCCUPIED: &str = "slot_occupied";
+
+/// Fails when the requested slot of the game is already held by a **different**
+/// folder and nobody said they wanted it moved.
+///
+/// Without this the add reused the (game, label) row and overwrote its
+/// `local_path`: pointing at a second folder added nothing, it **moved** the
+/// first one, silently and with no undo. That is what happened to a user in
+/// aug-2026 with Factorio, which ended up backing up a loose desktop folder
+/// while the game's real folder stopped uploading with nothing to say so.
+///
+/// Re-pointing is still legitimate — a game reinstalled on another drive does
+/// move its folder — so this does not forbid it: it takes it out of silence.
+/// The error carries the folder that is there now and the lowest free number,
+/// which is all the UI needs to ask "do I move slot 1, or is this your slot
+/// 2?".
+fn occupied_slot(
+    state: &CliState,
+    slug: &str,
+    label: &str,
+    local_path: &Path,
+    repoint: bool,
+) -> Result<()> {
+    if repoint {
+        return Ok(());
+    }
+    let Some(current) = state
+        .saves
+        .values()
+        .find(|st| st.game_slug == slug && st.label == label)
+        .map(|st| st.local_path.clone())
+    else {
+        return Ok(());
+    };
+    if same_folder(&current, local_path) {
+        return Ok(());
+    }
+    let taken = state
+        .saves
+        .values()
+        .filter(|st| st.game_slug == slug)
+        .filter_map(|st| slots::slot_of(&st.label));
+    anyhow::bail!(
+        "{ERR_SLOT_OCCUPIED}:{label}:{}:{}",
+        slots::next_free(taken),
+        current.display()
+    )
+}
+
 fn conflicting_save<'a>(
     state: &'a CliState,
     local_path: &Path,
@@ -839,7 +935,13 @@ fn conflicting_save<'a>(
 /// Devuelve la fila + el `WatchedSave` a enganchar. La CLI (`track.rs`) y el
 /// desktop llaman aquí en vez de reimplementar el flujo.
 pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<TrackOutcome> {
-    let label = args.label.clone().unwrap_or_else(|| "main".to_string());
+    // The slot outranks the label: `label` only survives for the older
+    // free-form labels (and for the CLI, which still accepts them).
+    let label = args
+        .slot
+        .map(slots::label_for)
+        .or_else(|| args.label.clone())
+        .unwrap_or_else(|| slots::label_for(slots::SAVES));
     let pinned_processes = args.processes.clone().unwrap_or_default();
     let preset_name: Option<String> = args
         .preset
@@ -856,13 +958,25 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     // appid de Steam, el catálogo o el launcher. Si además de por (slug,
     // etiqueta) se reconoce **la carpeta**, un re-alta bajo otro nombre reusa
     // la fila en vez de estrellarse contra ella.
+    if let Ok((state, _)) = CliState::load_default() {
+        occupied_slot(&state, &args.game_slug, &label, &local_path, args.repoint)?;
+    }
     let reusing = CliState::load_default().ok().and_then(|(state, _)| {
         state
             .saves
             .iter()
             .find(|(_, st)| st.game_slug == args.game_slug && st.label == label)
             .map(|(id, _)| id.clone())
-            .or_else(|| row_for_same_folder(&state, &local_path).map(str::to_string))
+            .or_else(|| {
+                // The same folder under another name for the SAME game
+                // (`vrising` vs `v-rising`) is a re-add and reuses the row.
+                // Under a different slot it is not: there the user is filing an
+                // already-tracked folder in a second place, and that is two
+                // histories over the same bytes. Let the rule fire.
+                row_for_same_folder(&state, &local_path)
+                    .filter(|id| state.saves.get(*id).is_some_and(|st| st.label == label))
+                    .map(str::to_string)
+            })
     });
     let except: Vec<&str> = reusing.iter().map(String::as_str).collect();
     validate_folder(&local_path, &except)?;
@@ -892,6 +1006,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 preset: preset_name.clone(),
                 set_hash: None,
                 processes: pinned_processes.clone(),
+                shared_processes: args.shared_processes,
                 allow_device_local: None,
             },
         );
@@ -905,12 +1020,14 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             local_path.clone(),
             preset_name.as_deref(),
             pinned_processes.clone(),
+            args.shared_processes,
             None,
         );
         return Ok(TrackOutcome {
             tracked: TrackedSave {
                 save_id,
                 game_slug: args.game_slug,
+                slot: slots::slot_of(&label),
                 label,
                 local_path: local_path.to_string_lossy().into_owned(),
                 cloud_version_num: None,
@@ -985,6 +1102,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             preset: preset_name.clone(),
             set_hash: None,
             processes: pinned_processes.clone(),
+            shared_processes: args.shared_processes,
             allow_device_local: None,
         },
     );
@@ -998,6 +1116,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         local_path.clone(),
         preset_name.as_deref(),
         pinned_processes.clone(),
+        args.shared_processes,
         None,
     );
 
@@ -1005,6 +1124,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         tracked: TrackedSave {
             save_id: save.id.into_inner(),
             game_slug: save.game_slug.into_inner(),
+            slot: slots::slot_of(&save.label),
             label: save.label,
             local_path: local_path.to_string_lossy().into_owned(),
             cloud_version_num: save.latest_version_num,
@@ -1090,6 +1210,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             preset: preset.clone(),
             set_hash: None,
             processes: Vec::new(),
+            shared_processes: false,
             allow_device_local: None,
         },
     );
@@ -1103,6 +1224,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         local_path.clone(),
         preset.as_deref(),
         Vec::new(),
+        false,
         None,
     );
 
@@ -1110,6 +1232,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         tracked: TrackedSave {
             save_id: args.save_id,
             game_slug: args.game_slug,
+            slot: slots::slot_of(&args.label),
             label: args.label,
             local_path: local_path.to_string_lossy().into_owned(),
             cloud_version_num: None,
@@ -1460,6 +1583,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             out.push(TrackedSave {
                 save_id: id.clone(),
                 game_slug: st.game_slug.clone(),
+                slot: slots::slot_of(&st.label),
                 label: st.label.clone(),
                 local_path: st.local_path.to_string_lossy().into_owned(),
                 cloud_version_num: entry.map(|e| e.latest_version_num),
@@ -1486,6 +1610,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             out.push(TrackedSave {
                 save_id: entry.save_id.clone(),
                 game_slug: entry.game_slug.clone(),
+                slot: slots::slot_of(&entry.label),
                 label: entry.label.clone(),
                 local_path: String::new(),
                 cloud_version_num: Some(entry.latest_version_num),
@@ -1536,6 +1661,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             Some(st) => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
                 game_slug: s.game_slug.into_inner(),
+                slot: slots::slot_of(&s.label),
                 label: s.label,
                 local_path: st.local_path.to_string_lossy().into_owned(),
                 cloud_version_num: s.latest_version_num,
@@ -1551,6 +1677,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             None => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
                 game_slug: s.game_slug.into_inner(),
+                slot: slots::slot_of(&s.label),
                 label: s.label,
                 local_path: String::new(),
                 cloud_version_num: s.latest_version_num,
@@ -1586,18 +1713,19 @@ pub async fn rename_label(
     let updated = client.rename_save_label(save_id, trimmed).await?;
 
     let (mut cli_state, path) = CliState::load_default()?;
-    let (local_path_string, preset, processes, local_cursor, allow_device_local) =
+    let (local_path_string, preset, processes, shared_processes, local_cursor, allow_device_local) =
         if let Some(entry) = cli_state.saves.get_mut(save_id) {
             entry.label = updated.label.clone();
             (
                 entry.local_path.to_string_lossy().into_owned(),
                 entry.preset.clone(),
                 entry.processes.clone(),
+                entry.shared_processes,
                 entry.last_version_num,
                 entry.allow_device_local,
             )
         } else {
-            (String::new(), None, Vec::new(), None, None)
+            (String::new(), None, Vec::new(), false, None, None)
         };
     cli_state.save(&path)?;
 
@@ -1610,6 +1738,7 @@ pub async fn rename_label(
             PathBuf::from(&local_path_string),
             preset.as_deref(),
             processes,
+            shared_processes,
             allow_device_local,
         )
     });
@@ -1618,6 +1747,7 @@ pub async fn rename_label(
         TrackedSave {
             save_id: updated.id.into_inner(),
             game_slug: updated.game_slug.into_inner(),
+            slot: slots::slot_of(&updated.label),
             label: updated.label,
             local_path: local_path_string,
             cloud_version_num: updated.latest_version_num,
@@ -1691,6 +1821,7 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         s.local_path.clone(),
         s.preset.as_deref(),
         s.processes.clone(),
+        s.shared_processes,
         s.allow_device_local,
     )
 }
@@ -1754,25 +1885,74 @@ pub fn set_preset(save_id: &str, preset: Option<String>) -> Result<LiveReseat> {
 /// `None` devuelve el save a "sin decidir": no se escribe y el diálogo de
 /// restore vuelve a preguntar cada vez. Ver
 /// [`crate::state::SaveState::allow_device_local`].
+/// Writes the decision onto every row of `slug` and returns one **live**
+/// (non-paused) row to reseat, if there is one.
+///
+/// Split out of [`set_allow_device_local`] because that one enters through
+/// `CliState::load_default()`, which reads the user's real paths and takes no
+/// override: without this seam there is no way to test the per-game spread.
+///
+/// A paused save is not in the agent, so there is nothing to reseat — it
+/// re-reads the state when it resumes, same as `set_preset`. One live row is
+/// enough to make the engine reload all of them.
+fn spread_allow_device_local(
+    cli_state: &mut CliState,
+    slug: &str,
+    allow: Option<bool>,
+) -> Option<(String, SaveState)> {
+    let ids: Vec<String> = cli_state
+        .saves
+        .iter()
+        .filter(|(_, s)| s.game_slug == slug)
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    let mut live: Option<(String, SaveState)> = None;
+    for id in &ids {
+        let Some(entry) = cli_state.saves.get_mut(id) else {
+            continue;
+        };
+        entry.allow_device_local = allow;
+        if !entry.paused && live.is_none() {
+            live = Some((id.clone(), entry.clone()));
+        }
+    }
+    live
+}
+
 pub fn set_allow_device_local(save_id: &str, allow: Option<bool>) -> Result<LiveReseat> {
     let (mut cli_state, path) = CliState::load_default()?;
-    let entry = cli_state
+    let slug = cli_state
         .saves
-        .get_mut(save_id)
-        .context("That save isn't tracked on this machine.")?;
-    entry.allow_device_local = allow;
-    let snapshot = entry.clone();
+        .get(save_id)
+        // A cloud-only row reaches this point with an id that is not in
+        // `state.json`. That is not user error: this machine simply has no
+        // folder to apply the decision to, and the message says so.
+        .context(
+            "This game isn't tracked on this machine — link a local folder before choosing this.",
+        )?
+        .game_slug
+        .clone();
+
+    // The decision belongs to **the game**, not the folder. The question it
+    // answers — does this game's config carry this monitor's resolution, or does
+    // it carry the save inside? — has one answer per title, so a game with two
+    // tracked folders cannot have two. Answering it on one and leaving the other
+    // asking would be the same old trap: the user believes they already said it,
+    // and the second folder's automatic restore writes them nothing.
+    //
+    // It is still stored **row by row** rather than in a per-slug table, because
+    // the slug is NOT stable identity (the same game arrives as `vrising` from
+    // Steam and `v-rising` from the catalog); the folder is. The slug is only
+    // used here to group at the moment of the click.
+    let live = spread_allow_device_local(&mut cli_state, &slug, allow);
     cli_state.save(&path)?;
 
-    // Un save pausado no está en el agente, así que no hay nada que reasentar:
-    // volverá a leer el estado al reanudarse. Igual que `set_preset`.
-    Ok(if snapshot.paused {
-        LiveReseat::Noop
-    } else {
-        LiveReseat::Reseat(
-            save_id.to_string(),
-            Box::new(watched_from_snapshot(save_id.to_string(), &snapshot)),
-        )
+    Ok(match live {
+        Some((id, snapshot)) => {
+            LiveReseat::Reseat(id.clone(), Box::new(watched_from_snapshot(id, &snapshot)))
+        }
+        None => LiveReseat::Noop,
     })
 }
 
@@ -1816,15 +1996,16 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
 mod tests {
     use super::{
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in,
-        local_detection, manual_override_conflict, prune_poisoned_rows, reconcile_plan,
-        resolve_processes, row_for_same_folder, rows_unknown_to_server, superseded_rows, AutoTrack,
+        local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
+        reconcile_plan, resolve_processes, row_for_same_folder, rows_unknown_to_server,
+        spread_allow_device_local, superseded_rows, AutoTrack, ERR_SLOT_OCCUPIED,
         CachedDetection, ServerRow,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
     };
     use crate::state::{CliState, SaveState};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use time::OffsetDateTime;
 
     fn save_state(slug: &str, path: &str) -> SaveState {
@@ -1839,7 +2020,52 @@ mod tests {
             allow_device_local: None,
             set_hash: None,
             processes: Vec::new(),
+            shared_processes: false,
         }
+    }
+
+    /// The aug-2026 Factorio incident, as a test.
+    ///
+    /// The user pointed at a loose desktop folder for a game already tracked at
+    /// its real save folder. The add reused the (game, "main") row, overwrote
+    /// its path, and left the real folder silently unsynced. Now the same move
+    /// is an error carrying everything the UI needs to ask what was meant.
+    #[test]
+    fn a_second_folder_never_moves_the_slot_in_silence() {
+        let real = "/home/rl261/.factorio/saves";
+        let desktop = "/home/rl261/Desktop/saves";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("factorio-1".into(), save_state("factorio", real));
+
+        let err = occupied_slot(&state, "factorio", "main", Path::new(desktop), false)
+            .expect_err("slot 1 is held by another folder");
+        let msg = err.to_string();
+        assert!(msg.starts_with(ERR_SLOT_OCCUPIED), "{msg}");
+        assert!(msg.ends_with(real), "carries the folder that is there now: {msg}");
+        assert!(msg.contains(":2:"), "offers the lowest free number: {msg}");
+
+        // Saying yes to the move is what makes it go through.
+        occupied_slot(&state, "factorio", "main", Path::new(desktop), true)
+            .expect("an explicit re-point is still allowed");
+    }
+
+    /// Re-adding the very same folder is a re-track, not a move: it must not
+    /// stop to ask anything.
+    #[test]
+    fn re_adding_the_same_folder_is_not_a_clash() {
+        let real = "/home/rl261/.factorio/saves";
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("factorio-1".into(), save_state("factorio", real));
+
+        occupied_slot(&state, "factorio", "main", Path::new(real), false)
+            .expect("same folder, same slot");
+        // And an empty slot has nothing to clash with.
+        occupied_slot(&state, "factorio", "2", Path::new("/tmp/config"), false)
+            .expect("slot 2 is free");
     }
 
     /// Un informe de detección con un solo juego en una sola carpeta.
@@ -2262,6 +2488,65 @@ mod tests {
 
         assert!(prune_poisoned_rows(&mut state).is_empty());
         assert_eq!(state.saves.len(), 2);
+    }
+
+    /// The question this answers ("does this game's config carry the monitor's
+    /// resolution, or the save itself?") has one answer per title, so a game
+    /// tracked in two folders must not end up with two. Answering it on one
+    /// folder and leaving the other asking is how the user believes they said
+    /// it while the second folder's automatic restore keeps writing nothing.
+    #[test]
+    fn allowing_config_covers_every_folder_of_that_game_only() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("a".into(), save_state("factorio", "/home/u/.factorio/saves"));
+        state
+            .saves
+            .insert("b".into(), save_state("factorio", "/home/u/Desktop/saves"));
+        state
+            .saves
+            .insert("c".into(), save_state("stardew-valley", "/home/u/sdv"));
+
+        let live = spread_allow_device_local(&mut state, "factorio", Some(true));
+
+        assert_eq!(state.saves["a"].allow_device_local, Some(true));
+        assert_eq!(state.saves["b"].allow_device_local, Some(true), "la otra carpeta del mismo juego");
+        assert_eq!(state.saves["c"].allow_device_local, None, "otro juego, intacto");
+        let (id, _) = live.expect("hay filas vivas que reasentar");
+        assert!(id == "a" || id == "b");
+    }
+
+    /// A paused save is not in the agent, so it must not be picked as the row to
+    /// reseat — but it still has to receive the flag, or resuming it would
+    /// silently drop the decision.
+    #[test]
+    fn allowing_config_still_writes_paused_rows_but_reseats_a_live_one() {
+        let mut state = CliState::default();
+        let mut paused = save_state("factorio", "/home/u/.factorio/saves");
+        paused.paused = true;
+        state.saves.insert("paused".into(), paused);
+        state
+            .saves
+            .insert("live".into(), save_state("factorio", "/home/u/Desktop/saves"));
+
+        let live = spread_allow_device_local(&mut state, "factorio", Some(true));
+
+        assert_eq!(state.saves["paused"].allow_device_local, Some(true));
+        assert_eq!(live.map(|(id, _)| id).as_deref(), Some("live"));
+    }
+
+    /// Every row paused = nothing to reseat, and `set_allow_device_local` turns
+    /// that into `LiveReseat::Noop` instead of waking the engine for nothing.
+    #[test]
+    fn allowing_config_on_an_all_paused_game_has_nothing_to_reseat() {
+        let mut state = CliState::default();
+        let mut paused = save_state("factorio", "/home/u/.factorio/saves");
+        paused.paused = true;
+        state.saves.insert("only".into(), paused);
+
+        assert!(spread_allow_device_local(&mut state, "factorio", Some(true)).is_none());
+        assert_eq!(state.saves["only"].allow_device_local, Some(true));
     }
 
     #[test]

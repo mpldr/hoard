@@ -75,10 +75,11 @@ pub enum DetectionSource {
     SteamLibrary,
     Both,
     /// User picked the save folder by hand; the override lives in
-    /// `CliState::manual_paths` and wins over every heuristic. The row's
-    /// `found_paths` is the chosen path verbatim and `confidence` is
-    /// `High` — the user knows where their saves are better than any
-    /// scrape.
+    /// `CliState::manual_paths` and leads `found_paths` with `High` — the user
+    /// knows where their saves are better than any scrape.
+    ///
+    /// Leads it, does **not** replace it: whatever the heuristic found stays
+    /// behind it. See [`apply_manual_overrides`].
     ManualOverride,
 }
 
@@ -1524,10 +1525,18 @@ fn name_matches_save_pattern(name: &str) -> bool {
 ///
 /// Three cases per `(slug, path)`:
 ///
-/// * Slug already in `by_slug` (heuristic found something): replace
-///   `found_paths` with `[path]`, lift confidence to `High`, tag the row
-///   `ManualOverride`. We keep `steam_app_id`/`install_dir` from the
-///   existing entry so the UI still shows the Steam hint when available.
+/// * Slug already in `by_slug` (heuristic found something): the chosen path
+///   moves to the **front** of `found_paths` with `High`, and the heuristic's
+///   hits stay behind it. `steam_app_id`/`install_dir` are kept from the
+///   existing entry so the UI still shows the Steam hint.
+///
+///   Leading rather than replacing is what fixes the aug-2026 Factorio case:
+///   pointing at a folder by hand — to add it as a second one, or just to try
+///   it — left the card showing **only** that folder, and the game's real save
+///   folder vanished from the list with nothing to say it was still there. The
+///   manual path already wins by going first (it is what automatic tracking
+///   picks and what the UI proposes); wiping the rest added nothing and hid the
+///   good one.
 /// * Slug not in `by_slug` but present in the catalog: synthesise a fresh
 ///   row from the catalog's display name. Covers the "user added a game
 ///   the heuristic would never find" case.
@@ -1548,7 +1557,7 @@ fn apply_manual_overrides(
     let mut orphaned = 0usize;
     for (slug, path) in manual_paths {
         if let Some(existing) = by_slug.get_mut(slug) {
-            existing.found_paths = vec![path.clone()];
+            promote_manual_path(existing, path);
             existing.confidence = Confidence::High;
             existing.source = DetectionSource::ManualOverride;
             applied += 1;
@@ -1584,6 +1593,36 @@ fn apply_manual_overrides(
         tracing::info!(applied, orphaned, "manual_paths overrides applied");
     }
     (applied, orphaned)
+}
+
+/// Puts `path` first in `found_paths` with `High` confidence and leaves the rest
+/// behind it. A path already in the list is moved to the front rather than
+/// duplicated.
+///
+/// `path_confidences` runs 1:1 with `found_paths` — the UI relies on it to grade
+/// each folder and automatic tracking to keep the best one — so it is reordered
+/// alongside. It gets resized first in case the entry came from a cached report
+/// written before that field existed.
+fn promote_manual_path(game: &mut DetectedGame, path: &Path) {
+    game.path_confidences
+        .resize(game.found_paths.len(), game.confidence);
+    if let Some(i) = game.found_paths.iter().position(|p| same_path(p, path)) {
+        game.found_paths.remove(i);
+        game.path_confidences.remove(i);
+    }
+    game.found_paths.insert(0, path.to_path_buf());
+    game.path_confidences.insert(0, Confidence::High);
+}
+
+/// The exact same folder, Windows casing accounted for. Unlike
+/// [`paths_overlap`], which also counts nesting: all this needs is to avoid
+/// listing one path twice.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
 }
 
 /// One leg of a [`DetectionTrace`]: the result of a single pipeline step
@@ -3470,12 +3509,12 @@ mod tests {
         }
     }
 
-    /// Manual override replaces a heuristic hit: the existing row's
-    /// `found_paths` is swapped for `[override]`, source becomes
-    /// `ManualOverride`, confidence is lifted to `High`, and the Steam
-    /// hint (`install_dir`, `steam_app_id`) is preserved.
+    /// The manual override **leads** what the heuristic found: the chosen path
+    /// goes first with `High`, the heuristic stays behind with its own grade,
+    /// the row flips to `ManualOverride` and the Steam hint (`install_dir`,
+    /// `steam_app_id`) survives.
     #[test]
-    fn manual_override_replaces_heuristic_hit() {
+    fn manual_override_leads_heuristic_hit() {
         let mut by_slug: HashMap<String, DetectedGame> = HashMap::new();
         by_slug.insert(
             "stellaris".into(),
@@ -3504,10 +3543,78 @@ mod tests {
         assert_eq!(g.confidence, Confidence::High);
         assert_eq!(
             g.found_paths,
-            vec![PathBuf::from("/home/x/Stellaris/save games")]
+            vec![
+                PathBuf::from("/home/x/Stellaris/save games"),
+                PathBuf::from("/wrong/path"),
+            ],
+            "the hand-picked one goes first; the heuristic stays behind"
+        );
+        assert_eq!(
+            g.path_confidences,
+            vec![Confidence::High, Confidence::Medium],
+            "grades stay 1:1 with found_paths"
         );
         assert_eq!(g.steam_app_id, Some(281990));
         assert_eq!(g.install_dir, Some(PathBuf::from("/steam/stellaris")));
+    }
+
+    /// The aug-2026 Factorio case: the user hand-picked a folder of their own
+    /// on the desktop and the game's REAL folder vanished from the card. The
+    /// real one has to stay listed, behind the chosen one.
+    #[test]
+    fn manual_override_keeps_the_real_folder_visible() {
+        let real = PathBuf::from("/home/x/AppData/Roaming/Factorio/saves");
+        let picked = PathBuf::from("/home/x/Desktop/saves");
+        let mut by_slug: HashMap<String, DetectedGame> = HashMap::new();
+        by_slug.insert(
+            "factorio".into(),
+            DetectedGame {
+                slug: "factorio".into(),
+                display_name: "Factorio".into(),
+                found_paths: vec![real.clone()],
+                path_confidences: vec![Confidence::High],
+                confidence: Confidence::High,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+        let overrides = HashMap::from([("factorio".to_string(), picked.clone())]);
+
+        apply_manual_overrides(&overrides, &mut by_slug);
+
+        assert_eq!(by_slug["factorio"].found_paths, vec![picked, real]);
+    }
+
+    /// Hand-picking a folder the heuristic was ALREADY proposing promotes it to
+    /// the front instead of listing it twice.
+    #[test]
+    fn manual_override_does_not_duplicate_a_path_already_found() {
+        let a = PathBuf::from("/games/a/saves");
+        let b = PathBuf::from("/games/b/saves");
+        let mut by_slug: HashMap<String, DetectedGame> = HashMap::new();
+        by_slug.insert(
+            "stellaris".into(),
+            DetectedGame {
+                slug: "stellaris".into(),
+                display_name: "Stellaris".into(),
+                found_paths: vec![a.clone(), b.clone()],
+                path_confidences: vec![Confidence::Medium, Confidence::Low],
+                confidence: Confidence::Medium,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+        let overrides = HashMap::from([("stellaris".to_string(), b.clone())]);
+
+        apply_manual_overrides(&overrides, &mut by_slug);
+
+        let g = &by_slug["stellaris"];
+        assert_eq!(g.found_paths, vec![b, a]);
+        assert_eq!(g.path_confidences, vec![Confidence::High, Confidence::Medium]);
     }
 
     /// Manual override for a slug the heuristic never produced: the catalog

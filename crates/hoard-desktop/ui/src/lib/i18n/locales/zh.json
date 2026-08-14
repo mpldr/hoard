@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "加入永久黑名单(不再检测)",
   "library.ignore_confirm": "删除",
   "library.ignored_toast": "已忽略游戏",
+  "library.slot_saves": "{n} · 存档",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard 云",
   "settings.account_desc": "登录后即可将存档同步到 Hoard 云。",
   "settings.account_plan": "{plan} 方案",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "已暂停",
   "overlay.save_playing": "游戏中",
   "overlay.save_behind": "落后于云端"
+  "library.slot_other_title": "和其他文件夹一样会被备份，但不会自动还原——用还原按钮取回。",
+  "library.add_folder_aria": "为这个游戏再添加一个文件夹",
+  "library.slot_pick_title": "这是这个游戏的哪个文件夹？",
+  "library.slot_pick_body": "{path} 会作为 {name} 的一部分备份。编号决定它和你其他机器上的哪个文件夹配对，所以请选那边已经在用的号。",
+  "library.slot_pick_here": "本机已占用：{path}",
+  "library.slot_pick_cloud": "云端来自另一台机器——选它就能互相同步",
+  "library.slot_pick_free": "空闲",
+  "library.slot_clash_title": "是这个文件夹，还是另一个？",
+  "library.slot_clash_body": "Hoard 已经在为 {name} 备份 {current}。{chosen} 是同一个文件夹挪了位置，还是同一游戏的第二个文件夹？",
+  "library.slot_clash_move": "它挪到那里了",
+  "library.slot_clash_add": "添加为文件夹 {n}"
 }

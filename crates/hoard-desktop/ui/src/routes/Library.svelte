@@ -301,17 +301,20 @@
   async function trackWithPath(
     game: DetectedGame,
     chosen: string,
-    label?: string,
+    slot?: number,
+    repoint = false,
   ) {
     try {
       const saved = await api.addGameToTracking({
         game_slug: game.slug,
         local_path: chosen,
-        // A per-path track of an *additional* save folder needs a distinct
-        // label so the server's UNIQUE(user, slug, label) doesn't collide
-        // with the primary save (both folders often end in `…/saves`). The
-        // first folder keeps the default label; extras carry one.
-        label,
+        // Which folder of the title this is. 1 is the saved games; from 2 up
+        // it is everything else (config, mods), backed up the same but never
+        // restored on its own. The number is what pairs this folder with the
+        // one on another machine, so it goes in explicitly, not derived from
+        // the path.
+        slot,
+        repoint,
         // Pass the catalog metadata so the server can self-heal its games
         // table when its Ludusavi catalog is older than ours. Older servers
         // (pre-v1.3.0) ignore the extra fields; newer servers insert a
@@ -324,8 +327,39 @@
         $_("library.now_tracking", { values: { name: game.display_name } }),
       );
     } catch (e) {
+      // The slot already points somewhere else. Don't decide for the user:
+      // until aug-2026 this overwrote the path in silence, and anyone pointing
+      // at a second folder ended up with the game backing up the new one and
+      // the real one out of sync without a single warning.
+      const busy = api.slotOccupied(e);
+      if (busy) {
+        slotClash = { game, chosen, busy };
+        return;
+      }
       toastError(typeof e === "string" ? e : (e as Error).message);
     }
+  }
+
+  /** An add that landed on an occupied slot, waiting for the user to say
+   *  whether to move what's there or whether this is a new folder. */
+  let slotClash = $state<{
+    game: DetectedGame;
+    chosen: string;
+    busy: api.SlotOccupied;
+  } | null>(null);
+
+  /** "Yes, same folder as always, it moved": move the slot. */
+  async function resolveClashByMoving() {
+    const c = slotClash;
+    slotClash = null;
+    if (c) await trackWithPath(c.game, c.chosen, undefined, true);
+  }
+
+  /** "No, this is something else of the same game": take the first free slot. */
+  async function resolveClashAsNewSlot() {
+    const c = slotClash;
+    slotClash = null;
+    if (c) await trackWithPath(c.game, c.chosen, c.busy.free_slot);
   }
 
   /** Track one specific save folder from the per-path list inside a card.
@@ -348,11 +382,105 @@
         return;
       }
     }
-    // The path becomes the label only when this machine genuinely tracks
-    // another folder for the slug (real multi-folder). The first folder keeps
-    // the default label.
-    const slugHasTracked = localFolders.length > 0;
-    await trackWithPath(game, path, slugHasTracked ? path : undefined);
+    // The title's first folder is slot 1 (the saved games) and there is
+    // nothing to ask. After that there is: the number decides which folder on
+    // the other machines this one pairs with, and Hoard cannot guess that.
+    await addFolder(game, path);
+  }
+
+  /** Add a folder to a title. The first one goes to slot 1 with no questions.
+   *  Once the title has slots — here or in the cloud — this opens the picker.
+   *
+   *  Auto-numbering does not work, and this is why: the same folder added on two
+   *  machines came out with two different numbers (2 on Windows, 3 on Linux
+   *  because by then Linux could see Windows' 2 taken) and then they never
+   *  synced with each other, which was the whole point. Picking the number is
+   *  picking what it pairs with. */
+  async function addFolder(game: DetectedGame, chosen: string) {
+    const opts = slotMap(game.slug);
+    const usados = opts.filter((o) => o.kind !== "free").length;
+    if (usados === 0) {
+      await trackWithPath(game, chosen, 1);
+      return;
+    }
+    slotPick = { game, chosen, opts, sel: nextFreeSlot(game.slug) };
+  }
+
+  /** An add waiting on the user to say which number it is. */
+  let slotPick = $state<{
+    game: DetectedGame;
+    chosen: string;
+    opts: SlotOption[];
+    sel: number;
+  } | null>(null);
+
+  /** Commit the chosen number. Hooking onto a slot that already exists in the
+   *  cloud means adopting its row — that is how the two machines share history,
+   *  which is the entire point — not minting a new one with the same number. */
+  async function confirmSlotPick() {
+    const p = slotPick;
+    slotPick = null;
+    if (!p) return;
+    const opt = p.opts.find((o) => o.n === p.sel);
+    if (opt?.kind === "cloud" && opt.orphan) {
+      await adoptOrphan(opt.orphan, p.chosen);
+      return;
+    }
+    // A slot held here by another folder hits the engine's guard, which comes
+    // back as the "did it move, or is it another one?" dialog.
+    await trackWithPath(p.game, p.chosen, p.sel);
+  }
+
+  /** One slot of the title as offered to the user when adding a folder.
+   *  `here` = already has a folder on this machine; `cloud` = exists in the
+   *  cloud from another machine but nothing here; `free` = unused number. */
+  type SlotOption = {
+    n: number;
+    kind: "here" | "cloud" | "free";
+    /** The folder holding the slot on this machine, when `kind === "here"`. */
+    path?: string;
+    /** The cloud row to hook onto, when `kind === "cloud"`. */
+    orphan?: TrackedSave;
+  };
+
+  /** A title's slot map: which numbers are taken here, which are waiting in the
+   *  cloud, and which is the first free one.
+   *
+   *  It counts the cloud rows, not just this machine's, because the number IS
+   *  the identity across machines: if the config ended up as 2 on Windows, it has
+   *  to be able to be 2 on Linux too, or the two folders never see each other. */
+  function slotMap(slug: string): SlotOption[] {
+    const rows = tracked.filter((t) => t.game_slug === slug && t.slot !== null);
+    const top = rows.reduce((m, t) => Math.max(m, t.slot as number), 0);
+    const out: SlotOption[] = [];
+    for (let n = 1; n <= top + 1; n += 1) {
+      const here = rows.find((t) => t.slot === n && !t.orphan && t.local_path);
+      if (here) {
+        out.push({ n, kind: "here", path: here.local_path });
+        continue;
+      }
+      const cloud = rows.find((t) => t.slot === n);
+      out.push(
+        cloud ? { n, kind: "cloud", orphan: cloud } : { n, kind: "free" },
+      );
+    }
+    return out;
+  }
+
+  /** The lowest number nobody uses, here or in the cloud. What gets proposed by
+   *  default for a folder that really is new. */
+  function nextFreeSlot(slug: string): number {
+    const opts = slotMap(slug);
+    return (opts.find((o) => o.kind === "free") ?? opts[opts.length - 1]).n;
+  }
+
+  /** How a slot is labelled: "1 · saved games", "2", or the free-form label of
+   *  the rows that predate any of this. */
+  function slotLabel(save: TrackedSave): string {
+    if (save.slot === null) return save.label;
+    return save.slot === 1
+      ? $_("library.slot_saves", { values: { n: save.slot } })
+      : $_("library.slot_other", { values: { n: save.slot } });
   }
 
   function toggleExpand(slug: string) {
@@ -375,11 +503,17 @@
     const game = folderTargetGame;
     folderTargetGame = null;
     if (!game) return;
-    // Si el override se rechaza —la carpeta es de otro juego— rastrear igual
-    // sería quedarse con la mitad mala del trato: el juego vigilando bytes
-    // ajenos y el dueño real sin poder rastrear los suyos.
-    if (!(await persistManualPath(game, chosen))) return;
-    await trackWithPath(game, chosen);
+    // The override only makes sense for the saved-games slot: that is what
+    // detection proposes and what automatic tracking picks up. Pinning it at the
+    // config folder would put that one first on every rescan, so it is only
+    // written when this folder is going to be slot 1.
+    //
+    // If it gets rejected — the folder belongs to another game — tracking anyway
+    // would keep the bad half of the deal: this game watching someone else's
+    // bytes and the real owner unable to track its own.
+    const primera = slotMap(game.slug).every((o) => o.kind === "free");
+    if (primera && !(await persistManualPath(game, chosen))) return;
+    await addFolder(game, chosen);
   }
 
   /** Best-known save folder for a game: the tracked local path if it's already
@@ -1119,7 +1253,7 @@
                           <span class="truncate">{$_("archived.frozen_note", { values: { date: purgeDate(save.save_id) } })}</span>
                         </span>
                       {:else}
-                        <span class="flex items-center gap-1.5 text-[11px]">
+                        <span class="flex min-w-0 items-center gap-1.5 text-[11px]">
                           <span
                             class="inline-block h-1.5 w-1.5 shrink-0 rounded-full {save.paused
                               ? 'bg-amber-400'
@@ -1128,6 +1262,22 @@
                           <span class={save.paused ? "text-amber-400" : "text-emerald-300"}>
                             {save.paused ? $_("library.paused_badge") : $_("library.monitored_badge")}
                           </span>
+                          <!-- Which folder of the game this is. Only shown
+                               when there is more than one: with a single
+                               folder, saying "1 · saved games" is noise. -->
+                          {#if entry.saves.length > 1}
+                            <span
+                              class="truncate rounded px-1.5 py-0.5 text-[10px] font-medium {save.slot === 1 ||
+                              save.slot === null
+                                ? 'bg-emerald-500/15 text-emerald-300'
+                                : 'bg-zinc-700/40 text-zinc-400'}"
+                              title={save.slot !== null && save.slot > 1
+                                ? $_("library.slot_other_title")
+                                : undefined}
+                            >
+                              {slotLabel(save)}
+                            </span>
+                          {/if}
                         </span>
                       {/if}
                       <div class="flex shrink-0 items-center gap-0.5">
@@ -1306,13 +1456,19 @@
                     {$_("library.no_save_folder_yet")}
                   </button>
                 {/if}
-                <!-- Otra carpeta para este juego: escaneo, no explorador. Deja
-                     un override que sobrevive al re-escaneo. -->
+                <!-- Another folder for this game: a scan, not a file browser.
+                     With the game already tracked the folder lands in the next
+                     free slot (config, mods…), and the manual override is only
+                     pinned for the saved-games one. -->
                 <button
                   type="button"
                   onclick={() => (folderTargetGame = game)}
-                  aria-label={$_("library.track_pick_folder_aria")}
-                  title={$_("library.track_pick_folder_aria")}
+                  aria-label={isTracked
+                    ? $_("library.add_folder_aria")
+                    : $_("library.track_pick_folder_aria")}
+                  title={isTracked
+                    ? $_("library.add_folder_aria")
+                    : $_("library.track_pick_folder_aria")}
                   class="shrink-0 rounded p-1.5 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
                 >
                   <FolderOpen size={14} />
@@ -1582,6 +1738,100 @@
       tracked = [...tracked, saved];
     }}
   />
+
+  <!-- Which folder of the game this is. The number is not decoration: it is
+       what pairs this folder with the ones on the other machines, so it gets
+       asked instead of handed out in arrival order. Auto-numbered, the same
+       folder added on Windows and on Linux came out 2 and 3 and never met. -->
+  <Modal
+    open={slotPick !== null}
+    title={$_("library.slot_pick_title")}
+    onClose={() => (slotPick = null)}
+  >
+    {#if slotPick}
+      <p class="text-sm text-zinc-300">
+        {$_("library.slot_pick_body", {
+          values: { name: slotPick.game.display_name, path: slotPick.chosen },
+        })}
+      </p>
+      <div class="mt-3 flex flex-col gap-1.5">
+        {#each slotPick.opts as opt (opt.n)}
+          <label
+            class="flex cursor-pointer items-start gap-2.5 rounded-lg border p-2.5 transition-colors {slotPick.sel ===
+            opt.n
+              ? 'border-emerald-500/40 bg-emerald-500/[0.07]'
+              : 'border-white/[0.08] hover:border-white/[0.14]'}"
+          >
+            <input
+              type="radio"
+              name="slot-pick"
+              class="mt-0.5 accent-emerald-600"
+              checked={slotPick.sel === opt.n}
+              onchange={() => slotPick && (slotPick.sel = opt.n)}
+            />
+            <span class="min-w-0 flex-1">
+              <span class="block text-sm text-zinc-200">
+                {opt.n === 1
+                  ? $_("library.slot_saves", { values: { n: opt.n } })
+                  : $_("library.slot_other", { values: { n: opt.n } })}
+              </span>
+              <span class="block truncate text-xs text-zinc-500">
+                {#if opt.kind === "here"}
+                  {$_("library.slot_pick_here", { values: { path: opt.path } })}
+                {:else if opt.kind === "cloud"}
+                  {$_("library.slot_pick_cloud")}
+                {:else}
+                  {$_("library.slot_pick_free")}
+                {/if}
+              </span>
+            </span>
+          </label>
+        {/each}
+      </div>
+    {/if}
+    {#snippet footer()}
+      <Button variant="secondary" onclick={() => (slotPick = null)}>
+        {$_("common.cancel")}
+      </Button>
+      <Button onclick={confirmSlotPick}>{$_("common.continue")}</Button>
+    {/snippet}
+  </Modal>
+
+  <!-- The requested slot already points at another folder. This used to be a
+       silent overwrite: pointing at a second folder moved the game onto it and
+       left the real one out of sync with no warning. Both answers are
+       legitimate — a game reinstalled on another drive DOES move its folder —
+       so it asks instead of choosing for them. -->
+  <Modal
+    open={slotClash !== null}
+    title={$_("library.slot_clash_title")}
+    onClose={() => (slotClash = null)}
+  >
+    {#if slotClash}
+      <p class="text-sm text-zinc-300">
+        {$_("library.slot_clash_body", {
+          values: {
+            name: slotClash.game.display_name,
+            current: slotClash.busy.current_path,
+            chosen: slotClash.chosen,
+          },
+        })}
+      </p>
+    {/if}
+    {#snippet footer()}
+      <Button variant="secondary" onclick={() => (slotClash = null)}>
+        {$_("common.cancel")}
+      </Button>
+      <Button variant="secondary" onclick={resolveClashByMoving}>
+        {$_("library.slot_clash_move")}
+      </Button>
+      <Button onclick={resolveClashAsNewSlot}>
+        {$_("library.slot_clash_add", {
+          values: { n: slotClash?.busy.free_slot ?? 2 },
+        })}
+      </Button>
+    {/snippet}
+  </Modal>
 
   <!-- Destructive: stop tracking a game. Snapshots already on the server
        are NOT deleted by this — only the local watch/auto-backup link.

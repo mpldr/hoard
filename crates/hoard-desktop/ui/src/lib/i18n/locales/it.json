@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "Aggiungi alla blacklist permanente (non rilevare più)",
   "library.ignore_confirm": "Rimuovi",
   "library.ignored_toast": "Gioco ignorato",
+  "library.slot_saves": "{n} · salvataggi",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard Cloud",
   "settings.account_desc": "Accedi per sincronizzare i tuoi salvataggi con Hoard Cloud.",
   "settings.account_plan": "Piano {plan}",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "In pausa",
   "overlay.save_playing": "In gioco",
   "overlay.save_behind": "Indietro rispetto al cloud"
+  "library.slot_other_title": "Viene salvata come ogni altra cartella, ma non si ripristina da sola — recuperala col pulsante di ripristino.",
+  "library.add_folder_aria": "Aggiungi un'altra cartella per questo gioco",
+  "library.slot_pick_title": "Quale cartella del gioco è?",
+  "library.slot_pick_body": "{path} verrà salvata sotto {name}. Il numero è ciò che la abbina alla stessa cartella sulle altre macchine: scegli quello che ha già lì.",
+  "library.slot_pick_here": "Occupata su questa macchina: {path}",
+  "library.slot_pick_cloud": "Nel cloud da un'altra macchina — scegli questa per sincronizzarle",
+  "library.slot_pick_free": "Libera",
+  "library.slot_clash_title": "Quella cartella, o un'altra?",
+  "library.slot_clash_body": "Hoard salva già {current} per {name}. {chosen} è la stessa cartella, spostata, o è una seconda cartella dello stesso gioco?",
+  "library.slot_clash_move": "È stata spostata lì",
+  "library.slot_clash_add": "Aggiungila come cartella {n}"
 }

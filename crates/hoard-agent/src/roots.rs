@@ -122,6 +122,124 @@ pub fn deep_save_roots(os: Os) -> Vec<PathBuf> {
     out
 }
 
+/// Carpetas donde la gente agrupa programas descomprimidos. Se miran un nivel
+/// por dentro además de la propia raíz de la unidad.
+const COLLECTION_DIRS: &[&str] = &["Emulators", "Emulation", "Emus", "Games", "Juegos", "ROMs"];
+
+/// Sitios donde buscar programas que se instalaron descomprimiendo una carpeta
+/// en vez de con un instalador.
+///
+/// Son dos: la **raíz de cada unidad interna** (`D:\RetroArch`) y **un nivel
+/// dentro** de una carpeta-colección (`D:\Emulators\RetroArch`). Devuelve los
+/// directorios a listar, no los candidatos: quien pregunta decide qué nombres
+/// le valen.
+///
+/// Acotado a propósito, y esto es la mitad del diseño: un listado por unidad
+/// más uno por colección, sin recorrer nada por debajo. Un barrido de un disco
+/// de juegos leería decenas de miles de directorios para encontrar un puñado
+/// de aciertos, y lo pagaría el arranque de cada escaneo.
+///
+/// Las unidades extraíbles, ópticas y de red se saltan: un recurso compartido
+/// desconectado bloquea segundos en cada llamada, y ese coste lo notaría todo
+/// el escaneo.
+pub fn portable_install_roots(os: Os) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if seen.insert(p.clone()) && p.is_dir() {
+            out.push(p);
+        }
+    };
+
+    for drive in internal_drive_roots(os) {
+        for dir in COLLECTION_DIRS {
+            push(drive.join(dir), &mut out);
+        }
+        push(drive, &mut out);
+    }
+    out
+}
+
+/// Raíces de las unidades internas de este equipo.
+///
+/// En Windows son las letras de unidad fijas. En Linux y macOS no hay letras,
+/// así que se toman los puntos de montaje habituales de discos secundarios —
+/// que es donde acaba un segundo SSD o la microSD de una Deck.
+#[cfg(windows)]
+pub fn internal_drive_roots(_os: Os) -> Vec<PathBuf> {
+    // `DRIVE_FIXED` no está junto a las dos funciones que lo consumen: vive en
+    // `System::WindowsProgramming`. Compila igual en cualquiera de los dos
+    // sitios, así que el error sólo aparece al construir para Windows.
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+
+    let mask = unsafe { GetLogicalDrives() };
+    if mask == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        // `GetDriveTypeW` quiere la raíz con barra final y en UTF-16 terminado
+        // en nulo: "D:\\\0".
+        let root: Vec<u16> = format!("{letter}:\\\0").encode_utf16().collect();
+        // SAFETY: `root` es un UTF-16 válido terminado en nulo y vive durante
+        // toda la llamada.
+        if unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_FIXED {
+            out.push(PathBuf::from(format!("{letter}:\\")));
+        }
+    }
+    out
+}
+
+/// Equivalente no-Windows: los puntos de montaje donde aparece un disco
+/// secundario. `/media/<user>` y `/run/media/<user>` los usan los escritorios
+/// Linux (y la Deck para la microSD); `/mnt` es el montaje a mano de toda la
+/// vida; `/Volumes` es el de macOS.
+#[cfg(not(windows))]
+pub fn internal_drive_roots(os: Os) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if seen.insert(p.clone()) && p.is_dir() {
+            out.push(p);
+        }
+    };
+
+    let containers: &[&str] = match os {
+        Os::Mac => &["/Volumes"],
+        _ => &["/media", "/run/media", "/mnt"],
+    };
+    for container in containers {
+        let Ok(entries) = std::fs::read_dir(container) else {
+            continue;
+        };
+        for entry in entries.flatten().map(|e| e.path()) {
+            if !entry.is_dir() {
+                continue;
+            }
+            // `/media/<user>/<volumen>` y `/media/<volumen>` conviven según la
+            // distribución, así que se aceptan los dos niveles.
+            let mut had_child = false;
+            if let Ok(children) = std::fs::read_dir(&entry) {
+                for child in children.flatten().map(|e| e.path()) {
+                    if child.is_dir() {
+                        had_child = true;
+                        push(child, &mut out);
+                    }
+                }
+            }
+            if !had_child {
+                push(entry, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// Nombres de usuario Windows reales dentro de un prefijo Wine/Proton.
 ///
 /// Lista los directorios bajo `drive_c/users/` que son usuarios reales —

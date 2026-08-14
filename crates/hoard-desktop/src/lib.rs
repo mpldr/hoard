@@ -272,6 +272,7 @@ pub fn run() {
             commands::library::set_manual_path,
             commands::library::clear_manual_path,
             commands::emulators::list_emulator_presets,
+            commands::emulators::list_emulator_titles,
             commands::emulators::list_running_processes,
             commands::library::ignore_detected_game,
             commands::library::unignore_detected_game,

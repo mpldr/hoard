@@ -1291,9 +1291,10 @@ pub async fn remember_save(
             .get(save_id)
             .map(|s| s.processes.clone())
             .unwrap_or_default();
-        // Igual que la pausa y el preset: un refresco de metadatos no puede
-        // deshacer un ajuste del usuario. Éste decide si se le escribe la
-        // config al restaurar, así que perderlo aquí sería perderlo callando.
+        let prev_shared = state.saves.get(save_id).is_some_and(|s| s.shared_processes);
+        // Same as the pause flag and the preset: a metadata refresh cannot undo
+        // a user setting. This one decides whether their config gets written on
+        // restore, so losing it here would be losing it silently.
         let prev_allow_device_local = state.saves.get(save_id).and_then(|s| s.allow_device_local);
         state.saves.insert(
             save_id.to_string(),
@@ -1307,6 +1308,7 @@ pub async fn remember_save(
                 preset: prev_preset,
                 set_hash: prev_hash,
                 processes: prev_processes,
+                shared_processes: prev_shared,
                 allow_device_local: prev_allow_device_local,
             },
         );

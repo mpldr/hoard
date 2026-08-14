@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "Auf permanente Blacklist setzen (nicht mehr erkennen)",
   "library.ignore_confirm": "Entfernen",
   "library.ignored_toast": "Spiel ignoriert",
+  "library.slot_saves": "{n} · Spielstände",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard Cloud",
   "settings.account_desc": "Melde dich an, um deine Spielstände mit Hoard Cloud zu synchronisieren.",
   "settings.account_plan": "Plan: {plan}",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "Pausiert",
   "overlay.save_playing": "Läuft",
   "overlay.save_behind": "Hinter der Cloud"
+  "library.slot_other_title": "Wird wie jeder andere Ordner gesichert, aber nie von allein wiederhergestellt — hol ihn mit der Wiederherstellen-Schaltfläche.",
+  "library.add_folder_aria": "Weiteren Ordner für dieses Spiel hinzufügen",
+  "library.slot_pick_title": "Welcher Ordner des Spiels ist das?",
+  "library.slot_pick_body": "{path} wird unter {name} gesichert. Die Nummer verbindet ihn mit demselben Ordner auf deinen anderen Rechnern — nimm die, die er dort schon hat.",
+  "library.slot_pick_here": "Auf diesem Rechner belegt: {path}",
+  "library.slot_pick_cloud": "In der Cloud von einem anderen Rechner — wähl sie, damit beide synchron laufen",
+  "library.slot_pick_free": "Frei",
+  "library.slot_clash_title": "Dieser Ordner oder ein anderer?",
+  "library.slot_clash_body": "Hoard sichert für {name} bereits {current}. Ist {chosen} derselbe Ordner, nur verschoben, oder ein zweiter Ordner desselben Spiels?",
+  "library.slot_clash_move": "Er wurde dorthin verschoben",
+  "library.slot_clash_add": "Als Ordner {n} hinzufügen"
 }

@@ -402,6 +402,7 @@ pub async fn restore_snapshot(
                 preset: None,
                 set_hash: None,
                 processes: Vec::new(),
+                shared_processes: false,
             }
         });
         entry.local_path = p.clone();

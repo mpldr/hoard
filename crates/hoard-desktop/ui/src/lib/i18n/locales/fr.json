@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "Ajouter à la liste noire permanente (ne plus détecter)",
   "library.ignore_confirm": "Supprimer",
   "library.ignored_toast": "Jeu ignoré",
+  "library.slot_saves": "{n} · sauvegardes",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard Cloud",
   "settings.account_desc": "Connecte-toi pour synchroniser tes sauvegardes avec Hoard Cloud.",
   "settings.account_plan": "Forfait {plan}",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "En pause",
   "overlay.save_playing": "En cours",
   "overlay.save_behind": "En retard sur le cloud"
+  "library.slot_other_title": "Sauvegardé comme n'importe quel autre dossier, mais jamais restauré tout seul — récupère-le avec le bouton de restauration.",
+  "library.add_folder_aria": "Ajouter un autre dossier pour ce jeu",
+  "library.slot_pick_title": "Quel dossier du jeu est-ce ?",
+  "library.slot_pick_body": "{path} sera sauvegardé sous {name}. Le numéro est ce qui l'associe au même dossier sur tes autres machines : prends celui qu'il y porte déjà.",
+  "library.slot_pick_here": "Occupé sur cette machine : {path}",
+  "library.slot_pick_cloud": "Dans le cloud depuis une autre machine — choisis-le pour les synchroniser",
+  "library.slot_pick_free": "Libre",
+  "library.slot_clash_title": "Ce dossier, ou un autre ?",
+  "library.slot_clash_body": "Hoard sauvegarde déjà {current} pour {name}. Est-ce que {chosen} est ce même dossier, déplacé, ou un second dossier du même jeu ?",
+  "library.slot_clash_move": "Il a été déplacé là",
+  "library.slot_clash_add": "L'ajouter comme dossier {n}"
 }

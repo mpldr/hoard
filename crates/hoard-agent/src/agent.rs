@@ -219,15 +219,20 @@ pub struct WatchedSave {
     /// multiplataforma — ver `game_identity_tokens` / `process_identity_candidates`).
     #[serde(default)]
     pub processes: Vec<String>,
+    /// [`Self::processes`] los comparte con otros saves rastreados, así que ver
+    /// el proceso no identifica a cuál de ellos se está jugando. Ver
+    /// [`crate::state::SaveState::shared_processes`].
+    #[serde(default)]
+    pub shared_processes: bool,
     /// Resolved per-save sync overrides (from the save's preset). Empty by
     /// default = inherit every global `AgentConfig` setting. The agent reads
     /// `policy.<field>.unwrap_or(config.<field>)` at each decision point. See
     /// [`crate::presets`].
     #[serde(default)]
     pub policy: crate::presets::SavePolicy,
-    /// El "sí" permanente del usuario a que se le escriba la config de ESTE
-    /// juego al restaurar. Ver [`crate::state::SaveState::allow_device_local`].
-    /// `None`/`Some(false)` = puerta cerrada, como siempre.
+    /// The user's standing yes to writing THIS game's config back on restore.
+    /// See [`crate::state::SaveState::allow_device_local`]. `None`/`Some(false)`
+    /// = gate shut, as always.
     #[serde(default)]
     pub allow_device_local: Option<bool>,
     /// Cloud version this device last committed or restored, read from
@@ -2130,6 +2135,17 @@ const HEAVY_PROCESS_CPU_PCT: f32 = 25.0;
 /// un helper en reposo. Por debajo de `HEAVY_PROCESS_CPU_PCT` para que un juego
 /// moderadamente activo siga contando.
 const CORRELATION_MIN_CPU_PCT: f32 = 5.0;
+
+/// Cuánto vale una escritura en la carpeta como prueba de "de todos los saves
+/// que comparten este proceso, se está jugando a ÉSTE".
+///
+/// Diez títulos de una misma consola emulada declaran el mismo ejecutable, así
+/// que el nombre del proceso no elige entre ellos y hay que mirar quién recibe
+/// los guardados. La ventana es generosa a propósito: un juego que guarda cada
+/// veinte minutos seguiría contando entre autoguardados, y el precio de pasarse
+/// es acotado — el otro título tendría que haber guardado él también dentro de
+/// la misma ventana para colarse.
+const SHARED_PROCESS_ACTIVITY: time::Duration = time::Duration::minutes(30);
 
 /// Grace window (in *poll ticks*) before a slot that dropped out of the running
 /// set is declared stopped. A correlation match is CPU-gated
@@ -4127,6 +4143,22 @@ fn open_paths_matching(_pid: Pid, _folders: &[(&str, &Path)]) -> Vec<String> {
     Vec::new()
 }
 
+/// De todos los saves que declaran el mismo ejecutable, ¿es ÉSTE el que se
+/// está jugando?
+///
+/// El nombre del proceso no puede responder: diez títulos de una consola
+/// emulada lo comparten. Lo que sí distingue es quién recibe los guardados, así
+/// que la prueba es una escritura reciente en su propia carpeta. Sin escrituras
+/// no se afirma nada — que es lo correcto: perder el arranque de una sesión
+/// sólo cuesta unos minutos de horas contadas, mientras que darlo por bueno
+/// para todos inventaría una sesión entera en las otras nueve partidas.
+fn shared_process_is_corroborated(
+    last_fs_event_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> bool {
+    last_fs_event_at.is_some_and(|t| now - t <= SHARED_PROCESS_ACTIVITY)
+}
+
 /// One sweep of the process table. Emits transitions + schedules a
 /// post-game backup when a watched game stops running.
 ///
@@ -4175,6 +4207,20 @@ fn process_poll(
     // rebuilt a HashSet per slot per tick, which got worse now that playtime-
     // only games add up to ~16 extra slots.
     let mut name_index: HashMap<String, Vec<&str>> = HashMap::new();
+    // Saves cuyos nombres de proceso comparten con otros saves (una consola
+    // emulada partida en una carpeta por juego). Van a un índice aparte porque
+    // el nombre NO los identifica: diez títulos de la misma máquina listan el
+    // mismo ejecutable, y meterlos en `name_index` marcaría los diez como
+    // "jugando" en cuanto arranca el emulador. Aquí sólo se recogen candidatos;
+    // se corroboran más abajo contra la actividad de CADA carpeta.
+    let mut shared_name_index: HashMap<String, Vec<&str>> = HashMap::new();
+    // Saves de proceso compartido con escrituras recientes en su carpeta. Es la
+    // única evidencia de "este de los diez es el que se está jugando" que
+    // funciona en los tres SO: los handles abiertos sólo se pueden leer en
+    // Linux (`/proc`). Coste: las horas de un título emulado empiezan a contar
+    // en su primer guardado, no al arrancar el emulador. Se prefiere perder ese
+    // arranque a inventar horas en las otras nueve partidas.
+    let mut shared_fs_active: HashSet<&str> = HashSet::new();
     // Índice genérico de identidad (slug/nombre → save_ids), list-free y
     // multiplataforma. Es la vía que arregla los juegos sin procesos
     // configurados (Stellaris, Victoria…): antes solo casaban por correlación
@@ -4197,7 +4243,15 @@ fn process_poll(
         // Identidad genérica: vale para TODOS los slots (con o sin procesos
         // configurados, `track_only` incluido). Es aditivo sobre un HashSet, así
         // que solaparse con `name_index` es inocuo.
-        for tok in game_identity_tokens(&slot.save.game_slug, &slot.save.display_name) {
+        //
+        // Salvo los de proceso compartido: su identidad es justo lo que NO
+        // distingue una partida de otra, y dejarlos entrar aquí reabriría por
+        // esta puerta el "arranca el emulador, corren los diez títulos".
+        for tok in if slot.save.shared_processes {
+            Vec::new()
+        } else {
+            game_identity_tokens(&slot.save.game_slug, &slot.save.display_name)
+        } {
             token_index
                 .entry(tok)
                 .or_default()
@@ -4241,8 +4295,16 @@ fn process_poll(
             }
             continue;
         }
+        let index = if slot.save.shared_processes {
+            if shared_process_is_corroborated(slot.last_fs_event_at, OffsetDateTime::now_utc()) {
+                shared_fs_active.insert(slot.save.save_id.as_str());
+            }
+            &mut shared_name_index
+        } else {
+            &mut name_index
+        };
         for p in &slot.save.processes {
-            name_index
+            index
                 .entry(p.to_lowercase())
                 .or_default()
                 .push(slot.save.save_id.as_str());
@@ -4303,6 +4365,19 @@ fn process_poll(
         if !defunct && !name_index.is_empty() {
             if let Some(ids) = name_index.get(&name) {
                 running.extend(ids.iter().map(|id| id.to_string()));
+            }
+        }
+        // Proceso compartido: el nombre por sí solo no elige entre los saves
+        // que lo listan, así que sólo cuenta el que además está recibiendo
+        // escrituras. Los handles abiertos, cuando se pueden leer, resuelven lo
+        // mismo un poco antes y entran por su propia rama más abajo.
+        if !defunct && !shared_name_index.is_empty() {
+            if let Some(ids) = shared_name_index.get(&name) {
+                running.extend(
+                    ids.iter()
+                        .filter(|id| shared_fs_active.contains(*id))
+                        .map(|id| id.to_string()),
+                );
             }
         }
         // Match genérico por identidad (list-free): el proceso lleva el nombre
@@ -4404,6 +4479,7 @@ fn process_poll(
         // via `name_index` (their launch is already handled by the barrier).
         if proc.cpu_usage() >= HEAVY_PROCESS_CPU_PCT
             && !name_index.contains_key(&name)
+            && !shared_name_index.contains_key(&name)
             && !corr_index.contains_key(&name)
             && !reported_heavy.contains(pid)
             && crate::correlation::is_game_like(&name, proc.exe())
@@ -4857,6 +4933,35 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_process_needs_a_write_in_this_saves_own_folder() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(10);
+
+        // Arranca el emulador y todavía no ha guardado nadie: ningún título
+        // cuenta como "jugando". Éste es el caso que evita inventar horas en
+        // las nueve partidas que no se están tocando.
+        assert!(!shared_process_is_corroborated(None, now));
+
+        // El título que acaba de guardar sí.
+        assert!(shared_process_is_corroborated(
+            Some(now - time::Duration::minutes(1)),
+            now
+        ));
+
+        // Y sigue contando entre autoguardados espaciados.
+        assert!(shared_process_is_corroborated(
+            Some(now - time::Duration::minutes(25)),
+            now
+        ));
+
+        // Pero una partida que se tocó esta mañana no se cuela en la sesión de
+        // ahora sólo porque el emulador esté abierto.
+        assert!(!shared_process_is_corroborated(
+            Some(now - time::Duration::hours(3)),
+            now
+        ));
+    }
+
+    #[test]
     fn probe_seeds_baseline_then_reports_writes() {
         let dir = tempfile::tempdir().unwrap();
         let cand = dir.path().to_path_buf();
@@ -4897,6 +5002,7 @@ mod tests {
             local_path: PathBuf::from("/tmp/saves/stardew"),
             steam_install_dir: None,
             processes: vec![],
+            shared_processes: false,
             policy: Default::default(),
             allow_device_local: None,
             known_version: None,
@@ -5030,6 +5136,7 @@ mod tests {
             local_path: save_path.clone(),
             steam_install_dir: None,
             processes: vec![],
+            shared_processes: false,
             policy: Default::default(),
             allow_device_local: None,
             known_version: None,
@@ -5110,6 +5217,7 @@ mod tests {
             local_path: tmp.path().to_path_buf(),
             steam_install_dir: None,
             processes: vec![],
+            shared_processes: false,
             policy: Default::default(),
             allow_device_local: None,
             known_version: None,

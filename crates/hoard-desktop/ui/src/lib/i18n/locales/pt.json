@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "Adicionar à blacklist permanente (não detectar novamente)",
   "library.ignore_confirm": "Remover",
   "library.ignored_toast": "Jogo ignorado",
+  "library.slot_saves": "{n} · jogos guardados",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard Cloud",
   "settings.account_desc": "Faça login para sincronizar seus saves com a Hoard Cloud.",
   "settings.account_plan": "Plano {plan}",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "Pausada",
   "overlay.save_playing": "A jogar",
   "overlay.save_behind": "Atrás da nuvem"
+  "library.slot_other_title": "É copiada como qualquer outra pasta, mas nunca restaurada sozinha — traz-la com o botão de restaurar.",
+  "library.add_folder_aria": "Adicionar outra pasta deste jogo",
+  "library.slot_pick_title": "Que pasta do jogo é?",
+  "library.slot_pick_body": "{path} vai ser copiada dentro de {name}. O número é o que a emparelha com essa mesma pasta nas tuas outras máquinas, por isso escolhe o que já tem lá.",
+  "library.slot_pick_here": "Ocupada nesta máquina: {path}",
+  "library.slot_pick_cloud": "Na nuvem, vinda de outra máquina — escolhe esta para se sincronizarem",
+  "library.slot_pick_free": "Livre",
+  "library.slot_clash_title": "Essa pasta, ou outra?",
+  "library.slot_clash_body": "O Hoard já faz cópia de {current} para {name}. {chosen} é essa mesma pasta, que mudou de sítio, ou é uma segunda pasta do mesmo jogo?",
+  "library.slot_clash_move": "Mudou para lá",
+  "library.slot_clash_add": "Adicionar como pasta {n}"
 }

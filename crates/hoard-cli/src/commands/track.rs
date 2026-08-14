@@ -64,6 +64,8 @@ pub async fn run(args: Args) -> Result<()> {
     let outcome = library::add_to_tracking(
         client,
         AddGameArgs {
+        slot: None,
+        repoint: false,
             game_slug: target.slug.clone(),
             label: Some(label),
             local_path: local_path.to_string_lossy().into_owned(),
@@ -71,6 +73,8 @@ pub async fn run(args: Args) -> Result<()> {
             steam_app_id: target.steam_app_id.map(|id| id as i64),
             preset: None,
             processes: None,
+            // Un juego por entrada: nadie más rastrea su proceso.
+            shared_processes: false,
         },
     )
     .await?;

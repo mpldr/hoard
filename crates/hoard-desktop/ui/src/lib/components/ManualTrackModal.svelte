@@ -25,9 +25,11 @@
   import Input from "./Input.svelte";
   import {
     listEmulatorPresets,
+    listEmulatorTitles,
     listRunningProcesses,
     addGameToTracking,
     type EmulatorPreset,
+    type EmulatorTitle,
     type RunningProcess,
     type TrackedSave,
   } from "../api";
@@ -53,6 +55,31 @@
   let selectedId = $state("");
   let customName = $state("");
 
+  // Juegos encontrados dentro de la carpeta del emulador, cuando su árbol se
+  // puede partir por título. Se ofrece elegirlos porque el nivel intermedio
+  // lleva un identificador de perfil que se genera en cada instalación: copiar
+  // el árbol entero deja la partida colgando de un perfil que el emulador de la
+  // otra máquina no ha visto nunca, y ésta la rechaza. La carpeta del título es
+  // la parte en la que las dos instalaciones sí están de acuerdo.
+  //
+  // Lista vacía tras buscar = el árbol no tiene la forma esperada; entonces se
+  // añade la raíz tal cual, como siempre. Una suposición que falle dejaría al
+  // usuario sin nada, que es peor que el problema que esto resuelve.
+  let titles = $state<EmulatorTitle[]>([]);
+  let chosenTitles = $state<Set<string>>(new Set());
+  let scanningTitles = $state(false);
+  let scannedTitles = $state(false);
+  // Nombre que el usuario le pone a cada título, por ruta. La carpeta se llama
+  // con el id de la consola (`0100152000022000`) y no hay forma de traducirlo:
+  // el manifiesto que usa Hoard es de Steam y no sabe nada de Switch. Así que
+  // se pregunta, una vez, en el único momento en que el usuario tiene delante
+  // la lista y sabe cuál es cuál.
+  //
+  // **El nombre no entra en el slug.** El slug lo forma el id, que es idéntico
+  // en las dos máquinas; si dependiera de lo que alguien teclea, el mismo juego
+  // se rastrearía dos veces al escribirlo distinto en el otro PC.
+  let titleNames = $state<Record<string, string>>({});
+
   // --- Shared ------------------------------------------------------------
   let folder = $state("");
   let procs = $state<string[]>([]);
@@ -71,6 +98,7 @@
     presets.find((p) => p.id === selectedId) ?? null,
   );
   const isCustom = $derived(selectedId === "custom");
+  const splitsPerTitle = $derived(selectedPreset?.splits_per_title ?? false);
   // Game mode needs a name + folder; emulator mode also needs a chosen
   // emulator and at least one process (no catalog to derive it from).
   const canSubmit = $derived(
@@ -100,6 +128,38 @@
     selectedId = "";
     customName = "";
     backupOnly = m === "emulator";
+    clearTitles();
+  }
+
+  function clearTitles() {
+    titles = [];
+    chosenTitles = new Set();
+    titleNames = {};
+    scanningTitles = false;
+    scannedTitles = false;
+  }
+
+  async function scanTitles() {
+    if (!selectedId || !folder.trim() || scanningTitles) return;
+    scanningTitles = true;
+    try {
+      titles = await listEmulatorTitles(selectedId, folder.trim());
+      // Todos marcados: quien busca sus juegos los quiere, y desmarcar es más
+      // rápido que marcar diez.
+      chosenTitles = new Set(titles.map((t) => t.path));
+      scannedTitles = true;
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    } finally {
+      scanningTitles = false;
+    }
+  }
+
+  function toggleTitle(path: string) {
+    const next = new Set(chosenTitles);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    chosenTitles = next;
   }
 
   async function loadPresets() {
@@ -125,6 +185,7 @@
     }
     running = [];
     detected = false;
+    clearTitles();
   }
 
   async function pickFolder() {
@@ -188,6 +249,7 @@
     backupOnly = true;
     running = [];
     detected = false;
+    clearTitles();
   }
 
   function close() {
@@ -210,6 +272,36 @@
         display = gameName.trim();
         slug = slugify(display);
       }
+
+      // Títulos elegidos: una entrada por juego en vez de una por el árbol
+      // entero. Todas comparten el ejecutable del emulador, así que van
+      // marcadas como proceso compartido: si no, arrancar el emulador contaría
+      // como estar jugando a los diez a la vez, inventando horas en nueve
+      // partidas y vetándoles el sync sin que nadie las haya tocado.
+      const picked = titles.filter((t) => chosenTitles.has(t.path));
+      if (isEmulator && picked.length > 0) {
+        let last = null;
+        for (const t of picked) {
+          const named = (titleNames[t.path] ?? "").trim();
+          last = await addGameToTracking({
+            // El id, no el nombre: es lo que las dos máquinas llaman igual.
+            game_slug: `${slug}-${t.title_id.toLowerCase()}`,
+            local_path: t.path,
+            display_name: named ? named : `${display} — ${t.title_id}`,
+            preset: backupOnly ? "backup_only" : undefined,
+            processes: procs,
+            shared_processes: true,
+          });
+          onAdded(last);
+        }
+        toastSuccess(
+          $_("emulators.titles_selected", { values: { count: picked.length } }),
+        );
+        reset();
+        onClose();
+        return;
+      }
+
       const saved = await addGameToTracking({
         game_slug: slug,
         local_path: folder.trim(),
@@ -354,6 +446,67 @@
             : $_("manual.game_folder_hint")}
         </p>
       </div>
+
+      <!-- Juegos dentro del árbol de la consola. Sólo para los emuladores
+           cuyo nivel intermedio lleva un identificador por instalación: ahí
+           copiar la raíz entera rompe la partida en la otra máquina. -->
+      {#if isEmulator && splitsPerTitle && folder.trim().length > 0}
+        <div>
+          <span class="mb-1.5 block text-xs font-medium text-zinc-400">
+            {$_("emulators.titles_label")}
+          </span>
+          <p class="mb-2 text-xs text-zinc-500">
+            {$_("emulators.titles_hint")}
+          </p>
+          {#if !scannedTitles}
+            <Button
+              variant="secondary"
+              onclick={scanTitles}
+              loading={scanningTitles}
+            >
+              {$_("emulators.titles_scan")}
+            </Button>
+          {:else if titles.length === 0}
+            <p class="text-xs text-amber-200/80">
+              {$_("emulators.titles_none")}
+            </p>
+          {:else}
+            <div
+              class="max-h-40 space-y-1 overflow-y-auto rounded-md border border-white/[0.08] bg-zinc-900/60 p-2"
+            >
+              {#each titles as t (t.path)}
+                <div
+                  class="flex items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-white/[0.04]"
+                >
+                  <input
+                    type="checkbox"
+                    class="h-3.5 w-3.5 shrink-0 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+                    checked={chosenTitles.has(t.path)}
+                    onchange={() => toggleTitle(t.path)}
+                    aria-label={t.title_id}
+                  />
+                  <input
+                    type="text"
+                    class="min-w-0 flex-1 rounded border border-white/[0.08] bg-zinc-900 px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-600 focus:border-emerald-500/40 focus:outline-none"
+                    placeholder={$_("emulators.titles_name_placeholder")}
+                    disabled={!chosenTitles.has(t.path)}
+                    bind:value={titleNames[t.path]}
+                  />
+                  <span class="shrink-0 font-mono text-[10px] text-zinc-600">
+                    {t.title_id}
+                  </span>
+                </div>
+              {/each}
+            </div>
+            <p class="mt-1.5 text-xs text-zinc-500">
+              {$_("emulators.titles_selected", {
+                values: { count: chosenTitles.size },
+              })}
+              · {$_("emulators.titles_name_hint")}
+            </p>
+          {/if}
+        </div>
+      {/if}
 
       <!-- Process(es) -->
       <div>

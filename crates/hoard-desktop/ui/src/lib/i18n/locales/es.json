@@ -492,6 +492,8 @@
   "library.ignore_blacklist_check": "Añadir a blacklist permanente (no volver a detectar)",
   "library.ignore_confirm": "Eliminar",
   "library.ignored_toast": "Juego ignorado",
+  "library.slot_saves": "{n} · partidas",
+  "library.slot_other": "{n}",
   "history.browse": "Examinar…",
   "history.choose_destination_title": "¿Dónde quieres restaurar?",
   "history.choose_destination_description": "Hoard aún no conoce una carpeta de partidas para este juego en este equipo. Elige una carpeta y la crearemos si no existe.",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "Pausada",
   "overlay.save_playing": "Jugando",
   "overlay.save_behind": "Por detrás de la nube"
+  "library.slot_other_title": "Se respalda como cualquier otra carpeta, pero no se restaura sola — bájala con el botón de restaurar.",
+  "library.add_folder_aria": "Añadir otra carpeta de este juego",
+  "library.slot_pick_title": "¿Qué carpeta del juego es?",
+  "library.slot_pick_body": "{path} se va a respaldar dentro de {name}. El número es lo que la empareja con esa misma carpeta en tus otras máquinas, así que elige el que ya tenga allí.",
+  "library.slot_pick_here": "Ocupada en esta máquina: {path}",
+  "library.slot_pick_cloud": "En la nube desde otra máquina — elígela para que se sincronicen",
+  "library.slot_pick_free": "Libre",
+  "library.slot_clash_title": "¿Esa carpeta, u otra?",
+  "library.slot_clash_body": "Hoard ya respalda {current} para {name}. ¿{chosen} es esa misma carpeta, que se ha movido, o es una segunda carpeta del mismo juego?",
+  "library.slot_clash_move": "Se ha movido ahí",
+  "library.slot_clash_add": "Añadirla como carpeta {n}"
 }

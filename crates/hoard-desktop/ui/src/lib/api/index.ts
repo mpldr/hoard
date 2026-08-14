@@ -176,6 +176,12 @@ export type TrackedSave = {
   save_id: string;
   game_slug: string;
   label: string;
+  /** Which numbered folder of the title this is: 1 = saved games, 2+ = the
+   *  rest (config, mods…), which Hoard carries but never restores on its own.
+   *  `null` for the free-form labels rows had before slots existed — those
+   *  render with their text as-is. Derived from `label` by the engine so both
+   *  frontends agree on what counts as slot 1. */
+  slot: number | null;
   local_path: string;
   /** The **server's** head version: the newest version that exists in the
    *  cloud, whoever uploaded it — usually another machine. Never render this
@@ -269,6 +275,9 @@ export function detectedPathsForGame(
 export function addGameToTracking(args: {
   game_slug: string;
   label?: string;
+  /** Which numbered folder of the title this is (1 = saved games). Wins over
+   *  `label`, which only survives for the free-form labels of older rows. */
+  slot?: number;
   local_path: string;
   display_name?: string;
   steam_app_id?: number | null;
@@ -276,8 +285,38 @@ export function addGameToTracking(args: {
   preset?: string;
   /** Pin the process exe names that mark this save as "playing". */
   processes?: string[];
+  /** Those exe names are shared with other tracked saves, so seeing one run
+   *  doesn't say which of them is being played — one entry per game of an
+   *  emulated console. The engine then needs a write in this save's own folder
+   *  before it counts as running, instead of marking all of them at once. */
+  shared_processes?: boolean;
+  /** The user already said yes to *moving* this slot to another folder. Without
+   *  it, a slot already pointing somewhere else is an error instead of a silent
+   *  overwrite — see `slotOccupied`. */
+  repoint?: boolean;
 }): Promise<TrackedSave> {
   return invoke<TrackedSave>("add_game_to_tracking", { args });
+}
+
+/** What a folder is currently in, when an add lands on an occupied slot.
+ *  Parsed out of the engine's `slot_occupied:<label>:<free>:<path>` error. */
+export interface SlotOccupied {
+  label: string;
+  /** Lowest number this title has free — what to offer as "add it as N". */
+  free_slot: number;
+  /** The folder the slot points at right now. */
+  current_path: string;
+}
+
+/** Recognise the "that slot already holds another folder" error so the caller
+ *  can ask whether to move it or add the folder as a new slot. Returns `null`
+ *  for every other failure. */
+export function slotOccupied(e: unknown): SlotOccupied | null {
+  const msg = typeof e === "string" ? e : ((e as Error)?.message ?? "");
+  const m = /^slot_occupied:([^:]*):(\d+):([\s\S]*)$/.exec(msg);
+  return m
+    ? { label: m[1], free_slot: Number(m[2]), current_path: m[3] }
+    : null;
 }
 
 /** One curated emulator, with native-save folders resolved for this host. */
@@ -289,6 +328,20 @@ export interface EmulatorPreset {
   /** Existing save folders found on this machine; first is the best default.
    *  May be empty — then the user must pick the folder by hand. */
   save_paths: string[];
+  /** True when this emulator's save root can be split into one folder per
+   *  game. The dialog then offers picking titles instead of adding the whole
+   *  tree — el árbol lleva un identificador de perfil que se genera en cada
+   *  instalación, así que copiarlo entero deja la partida colgando de un
+   *  perfil que el emulador de la otra máquina no conoce. */
+  splits_per_title: boolean;
+}
+
+/** One game found inside an emulator's save tree. */
+export interface EmulatorTitle {
+  /** Title id as the folder names it — lo único que las dos instalaciones
+   *  llaman igual. */
+  title_id: string;
+  path: string;
 }
 
 /** One live process candidate for the emulator picker. */
@@ -304,6 +357,16 @@ export interface RunningProcess {
  *  with `processes`/`preset` pinned — no detection-pipeline changes. */
 export function listEmulatorPresets(): Promise<EmulatorPreset[]> {
   return invoke<EmulatorPreset[]>("list_emulator_presets");
+}
+
+/** The games inside an emulator's save folder. Empty is not an error: it means
+ *  the tree doesn't have the expected shape and the caller should keep
+ *  offering the root as it always did. */
+export function listEmulatorTitles(
+  emulatorId: string,
+  root: string,
+): Promise<EmulatorTitle[]> {
+  return invoke<EmulatorTitle[]>("list_emulator_titles", { emulatorId, root });
 }
 
 /** Live snapshot of game-like processes, sorted by CPU, for the process

@@ -616,6 +616,8 @@
   "library.ignore_blacklist_check": "永続的なブラックリストに追加(今後検出しない)",
   "library.ignore_confirm": "削除",
   "library.ignored_toast": "ゲームを無視しました",
+  "library.slot_saves": "{n} · セーブ",
+  "library.slot_other": "{n}",
   "settings.account_label": "Hoard Cloud",
   "settings.account_desc": "サインインしてセーブを Hoard Cloud と同期します。",
   "settings.account_plan": "{plan} プラン",
@@ -909,4 +911,15 @@
   "overlay.save_paused": "一時停止",
   "overlay.save_playing": "プレイ中",
   "overlay.save_behind": "クラウドより古い"
+  "library.slot_other_title": "他のフォルダーと同じようにバックアップされますが、自動では復元されません。復元ボタンから取り出してください。",
+  "library.add_folder_aria": "このゲームのフォルダーをもう1つ追加",
+  "library.slot_pick_title": "このゲームのどのフォルダーですか？",
+  "library.slot_pick_body": "{path} を {name} のバックアップに追加します。番号は他のマシンにある同じフォルダーと結びつけるためのものなので、向こうで使っている番号を選んでください。",
+  "library.slot_pick_here": "このマシンで使用中: {path}",
+  "library.slot_pick_cloud": "別のマシンからクラウドにあります — これを選ぶと同期します",
+  "library.slot_pick_free": "空き",
+  "library.slot_clash_title": "そのフォルダー、それとも別のもの？",
+  "library.slot_clash_body": "Hoard は {name} の {current} をすでにバックアップしています。{chosen} は移動した同じフォルダーですか、それとも同じゲームの2つ目のフォルダーですか？",
+  "library.slot_clash_move": "そこへ移動した",
+  "library.slot_clash_add": "フォルダー {n} として追加"
 }

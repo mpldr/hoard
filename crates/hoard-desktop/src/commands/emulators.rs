@@ -1,256 +1,108 @@
-//! Manual emulator-add support (Hoard **free**).
+//! Puente Tauri del alta manual de emuladores.
 //!
-//! Emulators reuse the host filesystem, so Hoard can already back up their
-//! native saves once the user points at the folder — and the existing engine
-//! already tracks "is the user playing", playtime and date for *any* save that
-//! carries a process list (that's the same signal hoard-pro's recap consumes;
-//! nothing here is Pro-specific). What the engine can't do for an emulator is
-//! auto-detect the save folder (no storefront, no Steam dir, no manifest) or
-//! guess the emulator's process name. This module supplies both as *manual*
-//! helpers:
-//!
-//! 1. [`list_emulator_presets`] — a curated catalog (suggested native-save
-//!    folders + typical executables) to pre-fill the "Add emulator" dialog.
-//! 2. [`list_running_processes`] — a live picker so the user clicks the running
-//!    emulator instead of typing its exe name.
-//!
-//! The actual tracking goes through the unchanged
-//! [`crate::commands::library::add_game_to_tracking`] with `processes` and
-//! `preset` pinned. No detection-pipeline or agent-loop changes.
-//!
-//! Catalog paths target **native saves** (memory cards, per-title save folders)
-//! — not savestates, which are emulator-version-fragile and not worth syncing.
+//! El catálogo, la resolución de rutas y los dos sondeos (instalación portable
+//! en otra unidad, partición por título) viven en
+//! [`hoard_agent::emulators`]: son detección, y la detección la comparten los
+//! dos frontends. Aquí sólo quedan los `#[tauri::command]` que sirven esos
+//! datos a la UI, más el picker de procesos en vivo.
 
-use hoard_agent::manifest::Os;
-use hoard_agent::pathexpand::expand_path;
-use hoard_agent::proclist::RunningProcess;
+use hoard_agent::emulators;
 use serde::Serialize;
 
-/// Static catalog entry. Kept separate from the serialized [`EmulatorPreset`]
-/// so the path *templates* (cross-platform, Ludusavi-style placeholders) live
-/// here and get expanded to real host paths at call time.
-struct EmulatorDef {
-    /// Stable id; the UI forms the synthesized game slug as `emu-<id>`.
-    id: &'static str,
-    display_name: &'static str,
-    /// Console / platform label, shown as a sub-line in the picker.
-    system: &'static str,
-    /// Executable names that mark the emulator as running. The agent matches
-    /// any of them (case-insensitive, exact name), so variants across OSes and
-    /// builds are all listed.
-    processes: &'static [&'static str],
-    /// Native-save folder templates. Expanded with [`expand_path`] and filtered
-    /// to existing directories; empty (or all-missing) means the user picks the
-    /// folder by hand — common for portable emulators that save next to the ROM.
-    save_templates: &'static [&'static str],
-}
+use hoard_agent::proclist::RunningProcess;
 
-/// Curated set. Conservative on purpose: a wrong suggested path is worse than
-/// none (the user would back up an empty folder), so entries only list folders
-/// the emulator uses for *native* saves on a default install.
-const CATALOG: &[EmulatorDef] = &[
-    EmulatorDef {
-        id: "pcsx2",
-        display_name: "PCSX2",
-        system: "PlayStation 2",
-        processes: &[
-            "pcsx2-qt.exe",
-            "pcsx2-qtx64.exe",
-            "pcsx2-qtx64-avx2.exe",
-            "pcsx2.exe",
-            "pcsx2",
-        ],
-        save_templates: &[
-            "<winDocuments>/PCSX2/memcards",
-            "<xdgConfig>/PCSX2/memcards",
-        ],
-    },
-    EmulatorDef {
-        id: "rpcs3",
-        display_name: "RPCS3",
-        system: "PlayStation 3",
-        processes: &["rpcs3.exe", "rpcs3"],
-        save_templates: &[
-            "<xdgConfig>/rpcs3/dev_hdd0/home/00000001/savedata",
-            "<home>/.config/rpcs3/dev_hdd0/home/00000001/savedata",
-        ],
-    },
-    EmulatorDef {
-        id: "duckstation",
-        display_name: "DuckStation",
-        system: "PlayStation 1",
-        processes: &[
-            "duckstation-qt-x64-ReleaseLTCG.exe",
-            "duckstation-nogui-x64-ReleaseLTCG.exe",
-            "duckstation-qt",
-            "duckstation",
-        ],
-        save_templates: &[
-            "<winDocuments>/DuckStation/memcards",
-            "<xdgData>/duckstation/memcards",
-            "<xdgConfig>/duckstation/memcards",
-        ],
-    },
-    EmulatorDef {
-        id: "ppsspp",
-        display_name: "PPSSPP",
-        system: "PSP",
-        processes: &[
-            "PPSSPPWindows64.exe",
-            "PPSSPPWindows.exe",
-            "PPSSPPSDL",
-            "ppsspp-qt",
-            "ppsspp",
-        ],
-        save_templates: &[
-            "<winDocuments>/PPSSPP/PSP/SAVEDATA",
-            "<xdgConfig>/ppsspp/PSP/SAVEDATA",
-            "<home>/.config/ppsspp/PSP/SAVEDATA",
-        ],
-    },
-    EmulatorDef {
-        id: "dolphin",
-        display_name: "Dolphin",
-        system: "GameCube / Wii",
-        processes: &["Dolphin.exe", "dolphin-emu", "dolphin-emu-qt2"],
-        save_templates: &[
-            "<winDocuments>/Dolphin Emulator/GC",
-            "<winDocuments>/Dolphin Emulator/Wii",
-            "<xdgData>/dolphin-emu/GC",
-            "<xdgData>/dolphin-emu/Wii",
-        ],
-    },
-    EmulatorDef {
-        id: "cemu",
-        display_name: "Cemu",
-        system: "Wii U",
-        processes: &["Cemu.exe", "cemu"],
-        save_templates: &[
-            "<winAppData>/Cemu/mlc01/usr/save",
-            "<home>/.local/share/Cemu/mlc01/usr/save",
-        ],
-    },
-    EmulatorDef {
-        id: "ryujinx",
-        display_name: "Ryujinx",
-        system: "Switch",
-        processes: &["Ryujinx.exe", "Ryujinx.Ava.exe", "Ryujinx"],
-        save_templates: &[
-            "<winAppData>/Ryujinx/bis/user/save",
-            "<xdgConfig>/Ryujinx/bis/user/save",
-            "<home>/.local/share/Ryujinx/bis/user/save",
-        ],
-    },
-    EmulatorDef {
-        id: "citra",
-        display_name: "Citra / Azahar",
-        system: "Nintendo 3DS",
-        processes: &[
-            "citra-qt.exe",
-            "azahar.exe",
-            "citra.exe",
-            "citra-qt",
-            "citra",
-        ],
-        save_templates: &[
-            "<winAppData>/Citra/sdmc",
-            "<winAppData>/Azahar/sdmc",
-            "<xdgData>/citra-emu/sdmc",
-            "<xdgData>/azahar-emu/sdmc",
-        ],
-    },
-    EmulatorDef {
-        id: "retroarch",
-        display_name: "RetroArch",
-        system: "Multi-system",
-        processes: &["retroarch.exe", "retroarch"],
-        save_templates: &[
-            "<winAppData>/RetroArch/saves",
-            "<xdgConfig>/retroarch/saves",
-            "<home>/.config/retroarch/saves",
-        ],
-    },
-    EmulatorDef {
-        id: "mgba",
-        display_name: "mGBA",
-        system: "Game Boy Advance",
-        // Saves default to next-to-ROM, so no reliable folder template.
-        processes: &["mGBA.exe", "mgba-qt", "mgba"],
-        save_templates: &[],
-    },
-    EmulatorDef {
-        id: "melonds",
-        display_name: "melonDS",
-        system: "Nintendo DS",
-        processes: &["melonDS.exe", "melonDS", "melonds"],
-        save_templates: &[],
-    },
-    EmulatorDef {
-        id: "project64",
-        display_name: "Project64",
-        system: "Nintendo 64",
-        processes: &["Project64.exe"],
-        save_templates: &["<winAppData>/Project64/Save"],
-    },
-];
-
-/// One catalog entry, with paths resolved for this host.
+/// Una entrada del catálogo, con las rutas ya resueltas para este equipo.
 #[derive(Debug, Clone, Serialize)]
 pub struct EmulatorPreset {
     pub id: &'static str,
     pub display_name: &'static str,
     pub system: &'static str,
     pub processes: Vec<&'static str>,
-    /// Existing native-save folders found on this machine; first entry is the
-    /// best default. May be empty (portable emulator / non-default install) —
-    /// then the UI asks the user to pick the folder.
+    /// Carpetas de save nativas que existen en este equipo; la primera es el
+    /// mejor default. Puede venir vacía (emulador portable, instalación fuera
+    /// de lo normal) — entonces la UI pide la carpeta al usuario.
     pub save_paths: Vec<String>,
+    /// True cuando la raíz de saves de este emulador se puede partir en una
+    /// carpeta por juego. La UI ofrece entonces elegir títulos en vez de
+    /// añadir el árbol entero.
+    pub splits_per_title: bool,
 }
 
-/// Expand a def's templates against this OS and keep the existing folders,
-/// de-duplicated and order-preserving. If none exist but a template still
-/// expands to a concrete path, return that single best-guess so the dialog has
-/// something to show (the user can correct it before adding).
-fn resolve_save_paths(def: &EmulatorDef) -> Vec<String> {
-    let os = Os::current();
-    let mut existing: Vec<String> = Vec::new();
-    let mut first_guess: Option<String> = None;
-    for tmpl in def.save_templates {
-        for path in expand_path(tmpl, os) {
-            let s = path.to_string_lossy().into_owned();
-            if first_guess.is_none() {
-                first_guess = Some(s.clone());
-            }
-            if path.is_dir() && !existing.contains(&s) {
-                existing.push(s);
-            }
-        }
-    }
-    if existing.is_empty() {
-        first_guess.into_iter().collect()
-    } else {
-        existing
-    }
-}
-
-/// Curated emulator catalog with host-resolved save folders. Drives the
-/// "Add emulator" dialog. Cheap (a handful of `stat`s); safe as a sync command.
+/// Catálogo de emuladores con las carpetas resueltas contra el host. Alimenta
+/// el diálogo "Añadir emulador". Barato (un puñado de `stat`s) salvo cuando
+/// hay que sondear unidades, de ahí el `spawn_blocking`.
 #[tauri::command]
-pub fn list_emulator_presets() -> Vec<EmulatorPreset> {
-    CATALOG
-        .iter()
-        .map(|def| EmulatorPreset {
-            id: def.id,
-            display_name: def.display_name,
-            system: def.system,
-            processes: def.processes.to_vec(),
-            save_paths: resolve_save_paths(def),
-        })
-        .collect()
+pub async fn list_emulator_presets() -> Result<Vec<EmulatorPreset>, String> {
+    tokio::task::spawn_blocking(|| {
+        emulators::CATALOG
+            .iter()
+            .map(|def| {
+                // Instalado primero, portable después: si alguien tiene las dos
+                // cosas, la copia instalada es la que su emulador abre por
+                // defecto y debe quedar de default.
+                let mut save_paths = emulators::resolve_save_paths(def);
+                for p in emulators::portable_save_paths(def) {
+                    let s = p.to_string_lossy().into_owned();
+                    if !save_paths.contains(&s) {
+                        save_paths.push(s);
+                    }
+                }
+                EmulatorPreset {
+                    id: def.id,
+                    display_name: def.display_name,
+                    system: def.system,
+                    processes: def.processes.to_vec(),
+                    save_paths,
+                    splits_per_title: def.title_layout.is_some(),
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("No se pudo leer el catálogo de emuladores: {e}"))
 }
 
-/// Live snapshot of game-like processes for the emulator process picker. Runs
-/// the brief blocking CPU sample off the async runtime.
+/// Un juego encontrado dentro del árbol de saves de una consola.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmulatorTitle {
+    /// Id del título tal cual lo nombra la carpeta. Es lo único que dos
+    /// instalaciones distintas llaman igual.
+    pub title_id: String,
+    pub path: String,
+}
+
+/// Los juegos que hay dentro de la carpeta de saves de un emulador.
+///
+/// Devuelve vacío cuando el árbol no tiene la forma esperada, y eso **no es un
+/// error**: significa que quien pregunta debe seguir ofreciendo la raíz tal
+/// cual. Una suposición de distribución que falle dejaría al usuario sin
+/// ninguna detección, que es peor que el problema que esto resuelve.
+#[tauri::command]
+pub async fn list_emulator_titles(
+    emulator_id: String,
+    root: String,
+) -> Result<Vec<EmulatorTitle>, String> {
+    let Some(layout) = emulators::find(&emulator_id).and_then(|d| d.title_layout) else {
+        return Ok(Vec::new());
+    };
+    let found = tokio::task::spawn_blocking(move || {
+        emulators::split_per_title(std::path::Path::new(&root), layout)
+    })
+    .await
+    .map_err(|e| format!("No se pudieron leer los juegos del emulador: {e}"))?;
+
+    Ok(found
+        .into_iter()
+        .map(|t| EmulatorTitle {
+            title_id: t.title_id,
+            path: t.path.to_string_lossy().into_owned(),
+        })
+        .collect())
+}
+
+/// Retrato en vivo de los procesos con pinta de juego, para el picker que
+/// evita teclear el nombre del ejecutable. La muestra de CPU bloquea un
+/// instante, así que va fuera del runtime async.
 #[tauri::command]
 pub async fn list_running_processes() -> Result<Vec<RunningProcess>, String> {
     tokio::task::spawn_blocking(hoard_agent::proclist::list_game_like_processes)

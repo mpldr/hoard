@@ -506,10 +506,19 @@ fn manual_override_wins_over_heuristic() {
             .expect("stardew-valley should appear in the report");
         assert_eq!(game.source, DetectionSource::ManualOverride);
         assert_eq!(game.confidence, Confidence::High);
-        assert_eq!(game.found_paths, vec![override_dir]);
+        assert_eq!(
+            game.found_paths.first(),
+            Some(&override_dir),
+            "the hand-picked folder leads the list; got {:?}",
+            game.found_paths,
+        );
+        // Leading, not replacing. Wiping the heuristic hit is how a user who
+        // pointed at a second folder in aug-2026 lost sight of the game's real
+        // save folder: the card showed only their pick, with nothing to say the
+        // other one was still there.
         assert!(
-            !game.found_paths.iter().any(|p| p == &heuristic_dir),
-            "manual override must replace the heuristic path; got {:?}",
+            game.found_paths.contains(&heuristic_dir),
+            "the heuristic path stays listed behind it; got {:?}",
             game.found_paths,
         );
     });

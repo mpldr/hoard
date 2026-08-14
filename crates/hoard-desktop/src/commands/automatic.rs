@@ -342,6 +342,8 @@ pub async fn run_scan(app: &AppHandle) {
         emit_phase(app, "tracking", Some(done), Some(total));
         done += 1;
         let args = crate::commands::library::AddGameArgs {
+            slot: None,
+            repoint: false,
             game_slug: game.slug.clone(),
             label: None,
             local_path: game.found_paths[0].to_string_lossy().into_owned(),
@@ -350,6 +352,9 @@ pub async fn run_scan(app: &AppHandle) {
             // Auto-detected real games: derive preset/processes from the slug.
             preset: None,
             processes: None,
+            // Un juego detectado es una entrada por juego: su proceso no lo
+            // comparte con nada más rastreado.
+            shared_processes: false,
         };
         // Don't abort the batch over one game — a single 422/409 on an old
         // server shouldn't stop the other nine from being tracked.

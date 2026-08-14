@@ -105,6 +105,9 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         local_path: PathBuf::new(),
         steam_install_dir: install_dir,
         processes,
+        // Sólo-horas: su lista de procesos viene del catálogo de playtime, que
+        // es un juego por entrada, así que nadie la comparte.
+        shared_processes: false,
         policy: Default::default(),
         known_version: None,
         set_hash: None,

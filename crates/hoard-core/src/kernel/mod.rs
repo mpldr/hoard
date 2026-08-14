@@ -40,6 +40,7 @@ pub mod fileclass;
 pub mod reconcile;
 pub mod restore_merge;
 pub mod session;
+pub mod slots;
 
 use time::OffsetDateTime;
 

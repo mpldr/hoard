@@ -817,6 +817,36 @@ pub async fn cloud_reactivate_save(app: AppHandle, save_id: String) -> Result<()
         .map_err(cloud_err_to_string)
 }
 
+/// Record that this user accepted the Terms, and report what the server has on
+/// file. Called right after a successful sign-in — the checkbox is shown before
+/// the OAuth round-trip, when there is no account to attach the record to yet.
+///
+/// Idempotent server-side per `(user, version)`, so calling it on every launch
+/// costs one row the first time and nothing afterwards.
+#[tauri::command]
+pub async fn cloud_accept_terms(app: AppHandle) -> Result<cloud_account::TermsStatus, String> {
+    let creds = active_creds_or_msg(&app).await?;
+    cloud_account::accept_terms(
+        &creds.server_url,
+        &creds.access_token,
+        "desktop",
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+    .await
+    .map_err(cloud_err_to_string)
+}
+
+/// What this account accepted, and whether the text changed since. The UI asks
+/// on start-up so a substantive change to the Terms can re-prompt instead of
+/// being silently binding.
+#[tauri::command]
+pub async fn cloud_terms_status(app: AppHandle) -> Result<cloud_account::TermsStatus, String> {
+    let creds = active_creds_or_msg(&app).await?;
+    cloud_account::terms_status(&creds.server_url, &creds.access_token)
+        .await
+        .map_err(cloud_err_to_string)
+}
+
 /// Delete the cloud account. The server soft-deletes and *freezes* it: every
 /// data route 403s immediately (no longer a silent logout), and a background
 /// job hard-purges R2 + DB after a 30-day grace. During that window the user

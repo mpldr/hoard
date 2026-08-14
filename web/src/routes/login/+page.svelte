@@ -26,6 +26,10 @@
   }
 
   let email = $state('');
+  // Explicit acceptance, matching what the desktop app has always asked for.
+  // "By continuing you accept" is an inference; a tick is a decision, and it is
+  // the one we can actually record against the account afterwards.
+  let accepted = $state(false);
   let sent = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
@@ -118,7 +122,16 @@
     }
   }
 
+  /** Guard shared by the three sign-in paths. Returns false and explains
+   *  itself rather than silently doing nothing on a disabled-looking button. */
+  function requireAcceptance(): boolean {
+    if (accepted) return true;
+    error = $_('login.terms_required');
+    return false;
+  }
+
   async function withGoogle() {
+    if (!requireAcceptance()) return;
     error = null;
     busy = true;
     try {
@@ -130,6 +143,7 @@
   }
 
   async function withGithub() {
+    if (!requireAcceptance()) return;
     error = null;
     busy = true;
     try {
@@ -152,6 +166,7 @@
 
   async function withEmail(e: SubmitEvent) {
     e.preventDefault();
+    if (!requireAcceptance()) return;
     if (!email) return;
     if (captchaEnabled && !captchaToken) {
       error = $_('login.captcha_required');
@@ -232,10 +247,21 @@
     </div>
   {:else}
   <div class="mt-10 w-full space-y-5">
+    <label
+      class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-surface p-4 text-left text-xs leading-relaxed text-ink-soft [&_a]:text-accent [&_a]:underline [&_a]:underline-offset-2"
+    >
+      <input
+        type="checkbox"
+        bind:checked={accepted}
+        class="ring-focus mt-0.5 h-4 w-4 shrink-0 rounded border-line-strong bg-bg text-accent"
+      />
+      <span>{@html $_('login.terms_html')}</span>
+    </label>
+
     <button
       class="ring-focus flex w-full items-center justify-center gap-3 rounded-lg border border-line-strong bg-surface px-4 py-3 text-sm font-medium text-ink transition-colors hover:bg-bg disabled:opacity-50"
       onclick={withGoogle}
-      disabled={busy}
+      disabled={busy || !accepted}
     >
       <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
         <path
@@ -261,7 +287,7 @@
     <button
       class="ring-focus flex w-full items-center justify-center gap-3 rounded-lg border border-line-strong bg-surface px-4 py-3 text-sm font-medium text-ink transition-colors hover:bg-bg disabled:opacity-50"
       onclick={withGithub}
-      disabled={busy}
+      disabled={busy || !accepted}
     >
       <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path
@@ -336,7 +362,7 @@
           type="submit"
           variant="primary"
           full
-          disabled={busy || (captchaEnabled && !captchaToken)}
+          disabled={busy || !accepted || (captchaEnabled && !captchaToken)}
           loading={busy}
         >
           {$_('login.email_cta')}
@@ -348,11 +374,6 @@
       <p class="text-sm text-red-400">{error}</p>
     {/if}
 
-    <p
-      class="text-center text-xs text-ink-faint [&_a]:text-accent [&_a]:underline [&_a]:underline-offset-2 [&_a:hover]:text-accent"
-    >
-      {@html $_('login.terms_html')}
-    </p>
   </div>
   {/if}
 </section>

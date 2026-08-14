@@ -189,6 +189,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     let authed_always = Router::new()
         .route("/v1/me", get(me::get_me).delete(me::delete_me))
         .route("/v1/me/reactivate", post(me::reactivate_me))
+        // Va con las de "siempre" y no con las guardadas: aceptar los Términos
+        // es lo primero que hace un cliente al entrar, y tiene que poder
+        // hacerlo aunque el resto de la cuenta esté congelada.
+        .route("/v1/me/terms", get(me::get_terms).post(me::accept_terms))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_cloud_auth,

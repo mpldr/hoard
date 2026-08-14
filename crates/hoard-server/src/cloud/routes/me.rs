@@ -248,6 +248,26 @@ pub async fn get_me(
             .fetch_one(&state.pool)
             .await?;
 
+    // La última aceptación registrada. Va suelta y no en el SELECT gordo de
+    // arriba porque su tabla es append-only y vive aparte de `profiles`: un
+    // JOIN aquí sólo serviría para que un fallo tonto de este añadido pudiera
+    // tumbar la respuesta entera de la cuenta.
+    let accepted_terms: Option<String> = sqlx::query_scalar(
+        "SELECT version FROM terms_acceptances
+          WHERE user_id = $1 ORDER BY accepted_at DESC LIMIT 1",
+    )
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or_else(|e| {
+        // Y si falla, se calla: `/v1/me` es la llamada de la que cuelga la
+        // pantalla de cuenta entera. Un dato de papeleo no puede ser lo que
+        // deje a alguien sin poder mirar su plan — el cliente lee `null` y
+        // vuelve a pedir la casilla, que es el lado seguro del fallo.
+        tracing::warn!("terms acceptance lookup failed: {e}");
+        None
+    });
+
     let plan = Plan::from_str(&row.3).unwrap_or(Plan::Free);
     let mut limits = plan.limits();
     // Devices bought on Pro are kept for life; only the storage goes back. See
@@ -304,6 +324,8 @@ pub async fn get_me(
         purges_at: purges_at.map(format_dt),
         max_versions: row.12.map(|n| n as i64),
         max_manual_versions: row.13.map(|n| n as i64),
+        terms_version_accepted: accepted_terms,
+        terms_version_current: hoard_core::wire::TERMS_VERSION,
     }))
 }
 

@@ -544,6 +544,21 @@ pub struct DeviceListOut {
 /// anuncia. Un `where target = 'hoard::telemetry'` es toda la consulta.
 pub const TELEMETRY_TARGET: &str = "hoard::telemetry";
 
+/// La versión de los Términos que el cliente pide aceptar, tal y como la
+/// enseña la web: una **fecha**, no un semver.
+///
+/// Es contrato de los dos lados. El cliente la manda a `POST /v1/me/terms` al
+/// entrar y el server la guarda tal cual; `GET /v1/me` devuelve la última
+/// aceptada, y si no coincide con ésta el cliente vuelve a pedir la casilla.
+/// Por eso es una fecha: lo que hay que poder casar el día de una disputa es
+/// "qué texto estaba publicado cuando esta persona dijo que sí", y la fecha es
+/// justo lo que la página enseña.
+///
+/// Súbela **sólo** cuando cambie el fondo del documento. Un cambio de coma que
+/// mueva este literal vuelve a interrumpir a todo el mundo para nada. Va en
+/// pareja con `TERMS_VERSION` de `web/src/lib/legal.ts`.
+pub const TERMS_VERSION: &str = "2026-08-11";
+
 /// Metadatos del dispositivo, una vez por lote.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviceMeta {

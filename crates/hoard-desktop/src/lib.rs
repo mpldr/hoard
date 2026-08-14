@@ -346,6 +346,8 @@ pub fn run() {
             commands::cloud::cloud_archive_save,
             commands::cloud::cloud_reactivate_save,
             commands::cloud::cloud_delete_account,
+            commands::cloud::cloud_accept_terms,
+            commands::cloud::cloud_terms_status,
             commands::cloud::cloud_reactivate_account,
             commands::cloud::cloud_entitlements,
             commands::cloud::cloud_activate_feature,

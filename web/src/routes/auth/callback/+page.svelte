@@ -5,6 +5,7 @@
   import { page } from '$app/stores';
   import { supabase, dropLocalSession } from '$lib/auth/supabase';
   import { safeNext } from '$lib/safeNext';
+  import { api } from '$lib/api';
   import { CheckCircle2 } from 'lucide-svelte';
   import type { Session } from '@supabase/supabase-js';
 
@@ -83,6 +84,11 @@
       bounceToApp(s);
       return;
     }
+    // File the acceptance ticked on /login. Best-effort and un-awaited: this
+    // is bookkeeping, and a user who just signed in must not be left staring
+    // at a spinner because a side call was slow. The desktop branch above does
+    // its own recording from the app once it owns the session.
+    api.acceptTerms().catch((e) => console.warn('terms acceptance not recorded:', e));
     const next = safeNext($page.url.searchParams.get('next'));
     goto(next, { replaceState: true });
   }

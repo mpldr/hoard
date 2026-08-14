@@ -1,4 +1,5 @@
 import { config } from '../config';
+import { TERMS_VERSION } from '../legal';
 import { auth } from '../auth';
 import type { AccountProfile, BillingCycle, DeviceRow, PlanId, UsageEvent } from '../types';
 
@@ -183,5 +184,21 @@ export const api = {
 
   async deleteAccount(): Promise<void> {
     await request('/v1/me', { method: 'DELETE' });
+  },
+
+  /**
+   * Record that this account accepted the Terms. Called once a browser
+   * sign-in completes — the tick happens on /login, before there is a session
+   * to attach it to.
+   *
+   * The server is idempotent per (user, version) and rejects any version other
+   * than the one it currently publishes, so an old cached bundle gets a 400
+   * instead of quietly filing an acceptance of a text nobody read.
+   */
+  async acceptTerms(source: 'web' = 'web'): Promise<void> {
+    await request('/v1/me/terms', {
+      method: 'POST',
+      body: JSON.stringify({ version: TERMS_VERSION, source })
+    });
   }
 };

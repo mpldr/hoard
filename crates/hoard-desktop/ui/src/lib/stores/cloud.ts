@@ -174,6 +174,12 @@ export async function completeCloudLogin(
       callbackState,
     });
     internal.set({ account, hydrated: true, loading: false });
+    // Leave a record of the acceptance the user gave on the onboarding screen.
+    // OAuth round-trip, when there is no account yet to attach it to.
+    // because a bookkeeping call failed, and the server is idempotent, so the
+    // next launch writes it.
+    invoke("cloud_accept_terms").catch((e) =>
+      console.warn("terms acceptance not recorded:", e),
     // Boot the live agent for the freshly signed-in account so watching starts
     // immediately — same as `signIn` does for self-hosted. Rust already pointed
     // `CliState` at this account's context inside `cloud_complete_login`, so the

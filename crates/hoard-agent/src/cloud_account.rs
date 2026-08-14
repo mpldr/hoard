@@ -263,6 +263,66 @@ pub async fn dismiss_notification(base: &str, token: &str, id: &str) -> Result<(
     Ok(())
 }
 
+// ---- términos ---------------------------------------------------------
+
+/// Lo que el server sabe de la aceptación de esta cuenta.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TermsStatus {
+    pub accepted_version: Option<String>,
+    pub accepted_at: Option<String>,
+    pub current_version: String,
+    /// `true` cuando hay que enseñar la casilla otra vez.
+    pub needs_acceptance: bool,
+}
+
+/// `POST {base}/v1/me/terms` — deja constancia de la aceptación.
+///
+/// La versión no la elige quien llama: es la que este binario tiene compilada
+/// ([`hoard_core::wire::TERMS_VERSION`]), que es la única que el usuario ha
+/// podido ver desde aquí. El server rechaza cualquier otra, así que un cliente
+/// viejo se lleva un 400 en vez de dejar registrada una aceptación de un texto
+/// que ya no existe.
+pub async fn accept_terms(
+    base: &str,
+    token: &str,
+    source: &str,
+    app_version: Option<&str>,
+) -> Result<TermsStatus, CloudError> {
+    let url = format!("{base}/v1/me/terms");
+    let resp = http_client()?
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "version": hoard_core::wire::TERMS_VERSION,
+            "source": source,
+            "app_version": app_version,
+        }))
+        .send()
+        .await
+        .map_err(|e| CloudError::Network(format!("Network error: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(into_error(resp).await);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    parse_json(&body)
+}
+
+/// `GET {base}/v1/me/terms` — qué aceptó esta cuenta y si toca preguntar.
+pub async fn terms_status(base: &str, token: &str) -> Result<TermsStatus, CloudError> {
+    let url = format!("{base}/v1/me/terms");
+    let resp = http_client()?
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| CloudError::Network(format!("Network error: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(into_error(resp).await);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    parse_json(&body)
+}
+
 // ---- cuenta -----------------------------------------------------------
 
 /// `DELETE {base}/v1/me` — soft-delete + freeze de la cuenta (gracia 30 días).

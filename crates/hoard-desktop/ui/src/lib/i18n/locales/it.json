@@ -941,7 +941,7 @@
   "overlay.save_cloud_none": "mai caricata",
   "overlay.save_paused": "In pausa",
   "overlay.save_playing": "In gioco",
-  "overlay.save_behind": "Indietro rispetto al cloud"
+  "overlay.save_behind": "Indietro rispetto al cloud",
   "update_gate.required_title": "Hoard deve aggiornarsi",
   "update_gate.required_body": "La versione {version} aspetta da due giorni per installarsi. Serve il tuo permesso perché questa installazione viene da un pacchetto di sistema: accetta la richiesta e Hoard riprende da dov'era.",
   "update_gate.installing_title": "Aggiornamento di Hoard",

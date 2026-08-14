@@ -941,7 +941,7 @@
   "overlay.save_cloud_none": "未アップロード",
   "overlay.save_paused": "一時停止",
   "overlay.save_playing": "プレイ中",
-  "overlay.save_behind": "クラウドより古い"
+  "overlay.save_behind": "クラウドより古い",
   "update_gate.required_title": "Hoard の更新が必要です",
   "update_gate.required_body": "バージョン {version} は 2 日前からインストールを待っています。このインストールはシステムパッケージ由来のため許可が必要です。表示されるダイアログを承認すれば、Hoard は元の状態から再開します。",
   "update_gate.installing_title": "Hoard を更新中",

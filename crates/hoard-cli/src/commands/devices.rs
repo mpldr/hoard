@@ -37,11 +37,17 @@ pub async fn run() -> Result<()> {
     );
     for d in &list.devices {
         let state = if d.online { "online" } else { "offline" };
-        let playing = d
-            .playing
-            .first()
-            .map(|g| g.slug.as_str())
-            .unwrap_or(if d.online { "-" } else { "" });
+        // Todos los juegos, no el primero: dos partidas abiertas a la vez son
+        // dos, y quedarse con una las hace indistinguibles de una sola.
+        let playing = if d.playing.is_empty() {
+            (if d.online { "-" } else { "" }).to_string()
+        } else {
+            d.playing
+                .iter()
+                .map(|g| g.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         // La máquina desde la que se pregunta se marca, para no tener que
         // adivinar cuál es la propia en una lista de nombres parecidos.
         let name = if d.this_device {

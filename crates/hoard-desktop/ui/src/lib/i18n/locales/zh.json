@@ -941,7 +941,7 @@
   "overlay.save_cloud_none": "从未上传",
   "overlay.save_paused": "已暂停",
   "overlay.save_playing": "游戏中",
-  "overlay.save_behind": "落后于云端"
+  "overlay.save_behind": "落后于云端",
   "update_gate.required_title": "Hoard 需要更新",
   "update_gate.required_body": "版本 {version} 已经等待安装两天了。因为这份安装来自系统软件包，需要你的许可——确认弹出的提示，Hoard 会从原来的地方继续。",
   "update_gate.installing_title": "正在更新 Hoard",

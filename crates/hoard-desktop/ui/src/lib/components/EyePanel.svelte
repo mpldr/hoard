@@ -15,6 +15,8 @@
   import { auth } from "../stores/auth";
   import { cloud } from "../stores/cloud";
   import { remoteDevices, refreshDevices } from "../stores/devices";
+  import { customNames, hydrateGameNames } from "../stores/gameNames";
+  import { prettifySlug } from "../utils/format";
   import { Gamepad2, Server } from "@lucide/svelte";
   import OsLogo from "./OsLogo.svelte";
 
@@ -27,6 +29,9 @@
   const REFRESH_MS = 15_000;
 
   onMount(() => {
+    // The panel opens from the header, on any route, so it can't assume the
+    // Library already pulled the display-name overrides off disk.
+    void hydrateGameNames();
     void refreshDevices();
     const t = setInterval(() => void refreshDevices(), REFRESH_MS);
     return () => clearInterval(t);
@@ -46,15 +51,27 @@
   });
 
   // --- This machine's running games ---------------------------------------
-  const runningGames = $derived(
-    Object.entries($activity)
-      .filter(([, a]) => a.state === "running")
-      .map(([saveId, a]) => ({
-        saveId,
-        slug: saveId,
-        since: a.running_since ?? now,
-      })),
-  );
+  // One entry per *game*, not per tracked save: two saves of the same game are
+  // a single session to the eye, exactly like the heartbeat this machine sends
+  // out (see hoard-agent/src/presence.rs). Most recently started first, which
+  // is also the order the server hands the other machines back in.
+  const runningGames = $derived.by<PlayingGame[]>(() => {
+    const bySlug = new Map<string, number>();
+    for (const [saveId, a] of Object.entries($activity)) {
+      if (a.state !== "running") continue;
+      // The activity map is keyed by save id (a UUID). The slug rides along on
+      // the `game_started` event; falling back to the key is only for an entry
+      // that predates it, and it's the reason this panel used to name a game
+      // "2fabb61b Fa7a 4e3f...".
+      const slug = a.game_slug ?? saveId;
+      const since = a.running_since ?? now;
+      const prev = bySlug.get(slug);
+      if (prev === undefined || since < prev) bySlug.set(slug, since);
+    }
+    return [...bySlug]
+      .map(([slug, since]) => ({ name: gameName(slug), since }))
+      .sort((a, b) => b.since - a.since);
+  });
 
   /** The `os` a sibling reported in its headers → the logo + label pair. */
   function osFor(os: string | null | undefined): OsInfo {
@@ -70,11 +87,13 @@
     }
   }
 
-  function prettySlug(slug: string): string {
-    const parts = slug.split(/[-_]+/).filter(Boolean);
-    if (parts.length === 0) return slug;
-    if (parts.length > 1 && parts[parts.length - 1] === "main") parts.pop();
-    return parts.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  /** What to call a game on screen. Same rule as the Library cards: the
+   *  user's own name for it if they set one, the prettified slug otherwise —
+   *  so the panel and the cards never disagree about what a game is called.
+   *  It applies to the other machines too: the override is this device's way
+   *  of naming a slug, and the slug is the same everywhere. */
+  function gameName(slug: string): string {
+    return $customNames[slug] ?? prettifySlug(slug);
   }
 
   function fmtElapsed(since: number): string {
@@ -87,24 +106,24 @@
   }
 
   // --- Device model -------------------------------------------------------
-  // This machine is always present. Other devices from the same account would
-  // come from a server endpoint (see vista.md). The panel is structured so
-  // they slot in below this machine — when the API lands, just populate the
-  // `otherDevices` array.
+  // This machine is always present and always first, painted from live local
+  // state; the rest of the account comes from `GET /v1/devices` below.
+  /** A game a device is running: display name + session start (epoch ms). */
+  type PlayingGame = { name: string; since?: number };
+
   type Device = {
     name: string;
     os: OsInfo;
     online: boolean;
-    playing?: string;
-    playingSince?: number;
+    /** Every game running there, most recently started first. Empty = idle. */
+    games: PlayingGame[];
   };
 
   const thisDevice = $derived<Device>({
     name: $_("eye.this_machine"),
     os: thisOs,
     online: $status.running,
-    playing: runningGames.length > 0 ? prettySlug(runningGames[0].slug) : undefined,
-    playingSince: runningGames[0]?.since,
+    games: runningGames,
   });
 
   // The rest of the account's machines, from `GET /v1/devices`. `this_device`
@@ -117,17 +136,21 @@
   const otherDevices = $derived<Device[]>(
     $remoteDevices
       .filter((d) => !d.this_device)
-      .map((d) => {
-        const game = d.playing?.[0];
-        const since = game?.since ? Date.parse(game.since) : NaN;
-        return {
-          name: d.device_name,
-          os: osFor(d.os),
-          online: d.online,
-          playing: game ? prettySlug(game.slug) : undefined,
-          playingSince: Number.isNaN(since) ? undefined : since,
-        };
-      }),
+      .map((d) => ({
+        name: d.device_name,
+        os: osFor(d.os),
+        online: d.online,
+        // All of them: the server keeps up to eight per device and a machine
+        // with two games open must read as two, not as whichever one started
+        // last.
+        games: (d.playing ?? []).map((g) => {
+          const since = g.since ? Date.parse(g.since) : NaN;
+          return {
+            name: gameName(g.slug),
+            since: Number.isNaN(since) ? undefined : since,
+          };
+        }),
+      })),
   );
 
   const allDevices = $derived([thisDevice, ...otherDevices]);
@@ -140,11 +163,11 @@
       <!-- Online dot (green pulse when online + playing, green solid when
            online idle, grey when offline) -->
       <span class="relative flex h-2.5 w-2.5 shrink-0">
-        {#if d.online && d.playing}
+        {#if d.online && d.games.length > 0}
           <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400/60"></span>
         {/if}
         <span class="relative inline-flex h-2.5 w-2.5 rounded-full {d.online
-          ? d.playing ? 'bg-sky-400' : 'bg-emerald-400'
+          ? d.games.length > 0 ? 'bg-sky-400' : 'bg-emerald-400'
           : 'bg-zinc-600'}"></span>
       </span>
       <!-- OS logo — real SVG, tinted green when online, grey when offline -->
@@ -156,10 +179,12 @@
         {d.name}
         {#if d.os.name}<span class="text-zinc-500">· {d.os.name}</span>{/if}
       </span>
-      <!-- Status: playing (sky) or online (green) or offline (grey) -->
-      {#if d.playing}
+      <!-- Status: playing (sky) or online (green) or offline (grey). With two
+           games open the clock moves down to each game's own row — one number
+           up here couldn't say which session it was timing. -->
+      {#if d.games.length === 1}
         <span class="shrink-0 font-mono text-[11px] tabular-nums text-sky-400">
-          {fmtElapsed(d.playingSince ?? now)}
+          {fmtElapsed(d.games[0].since ?? now)}
         </span>
       {:else if d.online}
         <span class="shrink-0 text-[10px] font-medium uppercase tracking-wide text-emerald-400">
@@ -171,13 +196,18 @@
         </span>
       {/if}
     </div>
-    <!-- Running game indented under the device -->
-    {#if d.playing}
-      <div class="flex items-center gap-2.5 pl-9 pr-1 py-0.5">
+    <!-- Running games indented under the device, one row each -->
+    {#each d.games as g (g.name)}
+      <div class="flex items-center gap-2.5 py-0.5 pl-9 pr-1">
         <Gamepad2 size={12} class="shrink-0 text-sky-400" />
-        <span class="flex-1 truncate text-[11px] text-zinc-400">{d.playing}</span>
+        <span class="flex-1 truncate text-[11px] text-zinc-400">{g.name}</span>
+        {#if d.games.length > 1}
+          <span class="shrink-0 font-mono text-[11px] tabular-nums text-sky-400">
+            {fmtElapsed(g.since ?? now)}
+          </span>
+        {/if}
       </div>
-    {/if}
+    {/each}
   {/each}
 
   <!-- Self-hosted server (if connected, separate section) -->

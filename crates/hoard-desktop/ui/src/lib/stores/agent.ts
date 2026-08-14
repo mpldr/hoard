@@ -71,6 +71,10 @@ export type SaveActivity = {
   /** When the current game session started (epoch ms), if running. Drives
    *  the elapsed-time counter in the Eye panel. */
   running_since?: number;
+  /** The game this save belongs to, as it rides on the events. The map is
+   *  keyed by `save_id` — a UUID — so anything that wants to *name* what is
+   *  running needs the slug kept next to it. */
+  game_slug?: string;
   reason?: BackupReason;
   /** The version **this device** now holds — set by an upload that committed
    *  and by an auto-restore that landed. Never the cloud head: the panel keeps
@@ -194,7 +198,11 @@ function patch(save_id: string, partial: Partial<SaveActivity>) {
 function applyEvent(ev: AgentEvent, at: number = Date.now()) {
   switch (ev.type) {
     case "game_started":
-      patch(ev.save_id, { state: "running", running_since: at });
+      patch(ev.save_id, {
+        state: "running",
+        running_since: at,
+        game_slug: ev.game_slug,
+      });
       break;
     case "game_stopped":
       patch(ev.save_id, { state: "idle", running_since: undefined });

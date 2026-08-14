@@ -941,7 +941,7 @@
   "overlay.save_cloud_none": "nie hochgeladen",
   "overlay.save_paused": "Pausiert",
   "overlay.save_playing": "Läuft",
-  "overlay.save_behind": "Hinter der Cloud"
+  "overlay.save_behind": "Hinter der Cloud",
   "update_gate.required_title": "Hoard muss aktualisiert werden",
   "update_gate.required_body": "Version {version} wartet seit zwei Tagen auf die Installation. Sie braucht deine Erlaubnis, weil diese Installation aus einem Systempaket stammt — bestätige die Abfrage, und Hoard macht dort weiter, wo es war.",
   "update_gate.installing_title": "Hoard wird aktualisiert",

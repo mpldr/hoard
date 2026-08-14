@@ -264,10 +264,15 @@ async fn load_candidates(
 /// user, without touching anything. Same predicate as
 /// [`prune_version_caps`]; powers the confirmation dialog the panel shows
 /// before lowering the cap.
+///
+/// `manual = true` pregunta por el cupo de las copias deliberadas; `false`, por
+/// el de las automáticas. Cada clase se cuenta contra las de su clase, igual
+/// que en la poda, para que el diálogo prometa exactamente lo que va a pasar.
 pub async fn count_version_cap_excess(
     state: &CloudState,
     user_id: Uuid,
     cap: i64,
+    manual: bool,
 ) -> Result<i64, CloudError> {
     let cap = cap.max(1);
     let n: i64 = sqlx::query_scalar(
@@ -279,41 +284,62 @@ pub async fn count_version_cap_excess(
            AND v.deleted_at IS NULL
            AND v.is_pinned = FALSE
            AND v.version_num <> s.latest_version_num
+           AND (COALESCE(v.notes, '') IN ('manual', 'pre-restore')) = $3
            AND (SELECT COUNT(*) FROM save_versions w
                  WHERE w.save_id = v.save_id
                    AND w.sha256 <> ''
                    AND w.deleted_at IS NULL
+                   AND (COALESCE(w.notes, '') IN ('manual', 'pre-restore')) = $3
                    AND w.version_num > v.version_num) >= $2
         "#,
     )
     .bind(user_id)
     .bind(cap)
+    .bind(manual)
     .fetch_one(&state.pool)
     .await?;
     Ok(n.max(0))
 }
 
-/// Enforce the user's own "max versions per save" cap (`profiles.max_versions`,
-/// NULL = unlimited). Unlike the quota purge this is user-opt-in and
+/// Enforce the user's own "max versions per save" caps (`profiles.max_versions`
+/// para las automáticas, `profiles.max_manual_versions` para las que pidió a
+/// mano; NULL = sin límite). Unlike the quota purge this is user-opt-in and
 /// unconditional: for every save, the oldest committed live versions beyond
 /// the newest `cap` are deleted — never the head, never pinned ones. Handles
 /// both content-addressed versions (blob release, like [`purge_one`]) and
 /// legacy whole-archive ones (R2 object drop, like the manual delete route).
 /// Returns how many versions were deleted.
+///
+/// **Las dos clases se cuentan por separado**, y ésa es toda la gracia. Con un
+/// único cupo, una partida que autoguarda cada minuto llena el historial entero
+/// en una sesión y se lleva por delante la copia que alguien hizo a propósito
+/// antes de un jefe. Contando aparte, una ráfaga automática sólo puede
+/// desplazar a otras automáticas. De qué clase es cada versión lo dice
+/// `notes`; nulo = automática, que es lo que son todas las filas anteriores a
+/// esto (ver [`VersionOrigin`]).
 pub async fn prune_version_caps(state: &CloudState, user_id: Uuid) -> Result<usize, CloudError> {
-    let cap: Option<Option<i32>> =
-        sqlx::query_scalar("SELECT max_versions FROM profiles WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-    let Some(Some(cap)) = cap else { return Ok(0) };
-    let cap = i64::from(cap).max(1);
+    let caps: Option<(Option<i32>, Option<i32>)> = sqlx::query_as(
+        "SELECT max_versions, max_manual_versions FROM profiles WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((auto_cap, manual_cap)) = caps else {
+        return Ok(0);
+    };
+    if auto_cap.is_none() && manual_cap.is_none() {
+        return Ok(0);
+    }
+    // Un cupo sin poner es "sin límite". Se traduce a un número imposible de
+    // alcanzar en vez de a una rama aparte, para que la consulta sea una sola.
+    let auto_cap = auto_cap.map_or(i64::MAX, |c| i64::from(c).max(1));
+    let manual_cap = manual_cap.map_or(i64::MAX, |c| i64::from(c).max(1));
 
     // Victims: live committed versions with `cap`-or-more newer live committed
-    // siblings (i.e. outside the newest-`cap` window), excluding pinned rows
-    // and the head. The head is always inside the window since cap >= 1, but
-    // the explicit guard keeps that invariant even if a stale
-    // `latest_version_num` points elsewhere.
+    // siblings **de su misma clase** (i.e. outside the newest-`cap` window),
+    // excluding pinned rows and the head. The head is always inside the window
+    // since cap >= 1, but the explicit guard keeps that invariant even if a
+    // stale `latest_version_num` points elsewhere.
     let victims: Vec<(String, i64, bool, String)> = sqlx::query_as(
         r#"
         SELECT v.save_id, v.version_num, v.content_addressed, v.r2_key
@@ -328,12 +354,17 @@ pub async fn prune_version_caps(state: &CloudState, user_id: Uuid) -> Result<usi
                  WHERE w.save_id = v.save_id
                    AND w.sha256 <> ''
                    AND w.deleted_at IS NULL
-                   AND w.version_num > v.version_num) >= $2
+                   AND (COALESCE(w.notes, '') IN ('manual', 'pre-restore'))
+                     = (COALESCE(v.notes, '') IN ('manual', 'pre-restore'))
+                   AND w.version_num > v.version_num)
+               >= (CASE WHEN COALESCE(v.notes, '') IN ('manual', 'pre-restore')
+                        THEN $3 ELSE $2 END)
       ORDER BY v.save_id, v.version_num ASC
         "#,
     )
     .bind(user_id)
-    .bind(cap)
+    .bind(auto_cap)
+    .bind(manual_cap)
     .fetch_all(&state.pool)
     .await?;
 
@@ -355,7 +386,13 @@ pub async fn prune_version_caps(state: &CloudState, user_id: Uuid) -> Result<usi
     }
 
     if deleted > 0 {
-        tracing::info!(user_id = %user_id, deleted, cap, "version cap: pruned versions over max_versions");
+        tracing::info!(
+            user_id = %user_id,
+            deleted,
+            auto_cap,
+            manual_cap,
+            "version cap: pruned versions over the per-class caps"
+        );
     }
     Ok(deleted)
 }

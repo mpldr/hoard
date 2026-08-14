@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 
 use hoard_agent::api::ApiClient;
 use hoard_agent::backup::upload_directory;
+use hoard_core::wire::VersionOrigin;
 use hoard_agent::restore::{download_snapshot, RestoreOptions, RestoreOutcome};
 
 use crate::fixture::{self, Mutation, Shape};
@@ -303,6 +304,7 @@ async fn medir_backup(
         src,
         base_version,
         None,
+        VersionOrigin::Automatic,
         move |done, _total| {
             seen_cb.store(done, Ordering::Relaxed);
         },

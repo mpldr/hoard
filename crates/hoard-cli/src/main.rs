@@ -208,9 +208,17 @@ enum SnapshotCommand {
     Undelete { save_id: String, version: i64 },
     /// Show or set your cap on stored versions per save. No value = show;
     /// a number = set; `off` = unlimited. The server prunes immediately.
+    ///
+    /// Las copias que pides tú (`hoard backup`, y la de seguridad previa a un
+    /// restore) tienen su propio cupo, sin límite por defecto: `--manual`.
+    /// Así una partida que autoguarda cada minuto no puede llenar el
+    /// historial y llevarse por delante la copia que hiciste antes del jefe.
     MaxVersions {
         /// New cap (1–10000), or `off` to remove the cap
         value: Option<String>,
+        /// Act on the budget for the copies you asked for, not the automatic ones
+        #[arg(long)]
+        manual: bool,
         /// Skip the confirmation when the new cap would delete versions
         #[arg(long)]
         yes: bool,
@@ -383,15 +391,16 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
             println!("undeleted v{} of save {}", version, save_id);
             Ok(())
         }
-        SnapshotCommand::MaxVersions { value, yes } => {
+        SnapshotCommand::MaxVersions { value, manual, yes } => {
+            let kind = if manual { "manual" } else { "automatic" };
             match value.as_deref() {
-                None => match client.get_max_versions().await? {
-                    Some(n) => println!("max versions per save: {n}"),
-                    None => println!("max versions per save: unlimited"),
+                None => match client.get_max_versions(manual).await? {
+                    Some(n) => println!("max {kind} versions per save: {n}"),
+                    None => println!("max {kind} versions per save: unlimited"),
                 },
                 Some("off") => {
-                    client.set_max_versions(None).await?;
-                    println!("max versions per save: unlimited");
+                    client.set_max_versions(None, manual).await?;
+                    println!("max {kind} versions per save: unlimited");
                 }
                 Some(raw) => {
                     let n: i64 = raw
@@ -399,7 +408,7 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
                         .map_err(|_| anyhow::anyhow!("expected a number or `off`, got {raw:?}"))?;
                     // Dry-run first: if the cap would delete stored versions,
                     // confirm before the server prunes them.
-                    let would_prune = client.preview_max_versions(n).await?;
+                    let would_prune = client.preview_max_versions(n, manual).await?;
                     if would_prune > 0 && !yes {
                         use std::io::Write;
                         print!(
@@ -413,11 +422,13 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
                             return Ok(());
                         }
                     }
-                    client.set_max_versions(Some(n)).await?;
+                    client.set_max_versions(Some(n), manual).await?;
                     if would_prune > 0 {
-                        println!("max versions per save: {n} ({would_prune} old versions pruned)");
+                        println!(
+                            "max {kind} versions per save: {n} ({would_prune} old versions pruned)"
+                        );
                     } else {
-                        println!("max versions per save: {n}");
+                        println!("max {kind} versions per save: {n}");
                     }
                 }
             }

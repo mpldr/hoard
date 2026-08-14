@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "The sync service can't read your saved session — the system keyring didn't hand it over. Signing in again stores it under the service and fixes it for good.",
   "dashboard.service_offline_expired": "Your session expired, so backups are paused. Sign in again to resume.",
   "dashboard.service_offline_signin": "Sign in again",
+  "dashboard.max_manual_label": "Max manual copies",
+  "dashboard.max_manual_hint": "Separate cap for the copies you asked for (and the safety copy taken before a restore). Empty = unlimited, so a game that autosaves can't push them out of the history.",
   "covers.change": "Change cover",
   "covers.restore": "Restore original cover",
   "emulators.add_button": "Add emulator",

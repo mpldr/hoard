@@ -669,33 +669,49 @@ impl ApiClient {
     }
 
     /// Current "max versions per save" cap for the logged-in user. `None` =
-    /// unlimited. Self-hosted reads it off `whoami`; cloud reads the
-    /// `max_versions` field of `/v1/me` (other fields ignored).
-    pub async fn get_max_versions(&self) -> Result<Option<i64>> {
+    /// unlimited. Self-hosted reads it off `whoami`; cloud reads it off
+    /// `/v1/me` (other fields ignored).
+    ///
+    /// `manual` elige el cupo: el de las copias que pidió el usuario o el de
+    /// las automáticas. Se cuentan por separado para que una ráfaga de
+    /// autoguardados no pueda echar del historial la copia deliberada.
+    pub async fn get_max_versions(&self, manual: bool) -> Result<Option<i64>> {
         if self.is_cloud().await {
             #[derive(Deserialize)]
             struct MeMaxVersions {
                 #[serde(default)]
                 max_versions: Option<i64>,
+                #[serde(default)]
+                max_manual_versions: Option<i64>,
             }
             let resp = self.http_get("/v1/me").await?;
             let me: MeMaxVersions = resp.json().await?;
-            return Ok(me.max_versions);
+            return Ok(if manual {
+                me.max_manual_versions
+            } else {
+                me.max_versions
+            });
         }
-        Ok(self.whoami().await?.max_versions)
+        let who = self.whoami().await?;
+        Ok(if manual {
+            who.max_manual_versions
+        } else {
+            who.max_versions
+        })
     }
 
     /// `PUT /v1/me/max-versions` — set (`Some(n)`) or clear (`None`) the
     /// per-user cap on stored versions per save. Both server modes mount the
     /// same path; both prune immediately, so the freed space is visible on
     /// the next quota poll.
-    pub async fn set_max_versions(&self, max_versions: Option<i64>) -> Result<()> {
+    pub async fn set_max_versions(&self, max_versions: Option<i64>, manual: bool) -> Result<()> {
         let resp = self
             .http
             .put(self.url("/v1/me/max-versions"))
             .header("authorization", self.auth_header())
             .json(&MaxVersionsBody {
                 max_versions,
+                manual,
                 dry_run: false,
             })
             .send()
@@ -707,13 +723,14 @@ impl ApiClient {
     /// Dry-run of [`set_max_versions`]: how many stored versions a cap of
     /// `max_versions` would delete right now. Nothing is written. Frontends
     /// call this first and ask for confirmation when the count is > 0.
-    pub async fn preview_max_versions(&self, max_versions: i64) -> Result<i64> {
+    pub async fn preview_max_versions(&self, max_versions: i64, manual: bool) -> Result<i64> {
         let resp = self
             .http
             .put(self.url("/v1/me/max-versions"))
             .header("authorization", self.auth_header())
             .json(&MaxVersionsBody {
                 max_versions: Some(max_versions),
+                manual,
                 dry_run: true,
             })
             .send()

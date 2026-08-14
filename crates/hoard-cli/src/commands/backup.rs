@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use hoard_agent::api::ApiClient;
 use hoard_agent::backup::{remember_save, upload_directory_checked, BackupResult};
 use hoard_agent::config::CliConfig;
+use hoard_core::wire::VersionOrigin;
 use hoard_agent::state::CliState;
 
 pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Result<()> {
@@ -75,6 +76,9 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
         // el manifiesto sólo para adivinar si puede ahorrársela sería una
         // petición extra en el camino de un comando que ya sabe lo que quiere.
         None,
+        // `hoard backup` lo teclea una persona: es una copia deliberada, y la
+        // retención debe tratarla como tal.
+        VersionOrigin::Manual,
         on_progress,
         || {},
     )

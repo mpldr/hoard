@@ -30,6 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hoard_core::kernel;
 use hoard_core::kernel::correlation::accept_correlation_signals;
+use hoard_core::wire::VersionOrigin;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::{Deserialize, Serialize};
 use sysinfo::{
@@ -730,6 +731,13 @@ struct SaveSlot {
     /// horario (`SweepAll`) y el backup manual (`BackupNow`). Se limpia tras
     /// muestrear.
     needs_l1: bool,
+    /// El usuario ha pedido esta copia a mano (`BackupNow`) y todavía no ha
+    /// salido. Lo consume el lanzamiento del backup para etiquetar la versión
+    /// como deliberada, que es lo que la protege de que una ráfaga de copias
+    /// automáticas la eche del historial. Se limpia al lanzar, no al terminar:
+    /// si la subida falla y el reductor la reintenta, el reintento sigue siendo
+    /// la copia que pidió el usuario.
+    manual_requested: bool,
     /// Resultado de una op de IO que acaba de terminar, en cola para que el
     /// próximo `reconcile` lo ingiera (limpia `in_flight`, actualiza
     /// contabilidad/backoff). En el modelo invertido la finalización de una op
@@ -1303,6 +1311,11 @@ fn execute_backup(
         .unwrap_or(config.auto_restore || config.global_sync);
     let conflict_root = config.conflict_root.clone();
     let conflict_retention_days = config.conflict_retention_days;
+    let origin = if std::mem::take(&mut slot.manual_requested) {
+        VersionOrigin::Manual
+    } else {
+        VersionOrigin::Automatic
+    };
     let api = api.clone();
     let events_tx = events_tx.clone();
     let done_tx = done_tx.clone();
@@ -1315,6 +1328,7 @@ fn execute_backup(
             prev_set_hash,
             base_version,
             head,
+            origin,
             events_tx,
             done_tx,
             cmd_tx,
@@ -1687,6 +1701,7 @@ async fn run_agent(
                         // reductor decida. `needs_l1` fuerza un fingerprint fresco.
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.needs_l1 = true;
+                            slot.manual_requested = true;
                             mark_pending_if_diverged(slot);
                         }
                         reconcile_all(
@@ -2066,6 +2081,7 @@ fn handle_add(
         save,
         watcher: None,
         pending: None,
+        manual_requested: false,
         is_running: false,
         weak_session: false,
         last_running_seen: None,
@@ -3285,6 +3301,9 @@ async fn run_backup_with_retry(
     // anti-relanzamiento de D.8.3: si lo que íbamos a subir ya es esa cabeza, la
     // subida anterior aterrizó y volver a subir sólo crea una versión duplicada.
     head: Option<ServerHead>,
+    // Qué clase de copia es. Sólo cambia la etiqueta que se guarda con la
+    // versión; el camino de subida es el mismo.
+    origin: VersionOrigin,
     events_tx: mpsc::Sender<AgentEvent>,
     done_tx: mpsc::Sender<BackupDone>,
     cmd_tx: mpsc::Sender<AgentCommand>,
@@ -3352,6 +3371,7 @@ async fn run_backup_with_retry(
             // retry instead of clobbering the newer remote version.
             base_version,
             head.as_ref(),
+            origin,
             |_, _| {},
             // Emit "uploading…" only once the signature checks have decided a
             // real upload is happening — a Skipped/Unchanged settle stays
@@ -5033,6 +5053,7 @@ mod tests {
                 synced_fingerprint: None,
                 last_l0_mtime: None,
                 needs_l1: false,
+                manual_requested: false,
                 pending_op_result: None,
                 pending_upload_landed: None,
                 last_restore_error: None,
@@ -5227,7 +5248,19 @@ mod tests {
 
         // `max_retries: 0` → the first failure is already the last.
         run_backup_with_retry(
-            api, save, None, None, None, events_tx, done_tx, cmd_tx, 0, false, None, 14,
+            api,
+            save,
+            None,
+            None,
+            None,
+            VersionOrigin::Automatic,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
         )
         .await;
 

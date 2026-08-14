@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "Der Sync-Dienst kann deine gespeicherte Sitzung nicht lesen — der Schlüsselbund gibt sie nicht heraus. Eine erneute Anmeldung speichert sie unter dem Dienst und behebt das dauerhaft.",
   "dashboard.service_offline_expired": "Deine Sitzung ist abgelaufen, deshalb pausieren die Backups. Melde dich erneut an, um fortzufahren.",
   "dashboard.service_offline_signin": "Erneut anmelden",
+  "dashboard.max_manual_label": "Max. manuelle Kopien",
+  "dashboard.max_manual_hint": "Getrenntes Kontingent für selbst angeforderte Kopien (und die Sicherheitskopie vor einer Wiederherstellung). Leer = unbegrenzt, damit ein automatisch speicherndes Spiel sie nicht aus dem Verlauf verdrängt.",
   "covers.change": "Cover ändern",
   "covers.restore": "Originalcover wiederherstellen",
   "emulators.add_button": "Emulator hinzufügen",

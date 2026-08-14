@@ -27,6 +27,7 @@ use crate::api::{
 use crate::state::{CliState, SaveState};
 use hoard_core::ids::SaveId;
 use hoard_core::kernel::fileclass;
+use hoard_core::wire::VersionOrigin;
 
 /// Bounded fan-out for per-file work in the cloud path (hashing local files,
 /// PUTting missing blobs). Saves are mostly many small files, so per-file
@@ -403,6 +404,7 @@ pub async fn upload_directory<F>(
     source: &Path,
     base_version: Option<i64>,
     head: Option<&ServerHead>,
+    origin: VersionOrigin,
     progress: F,
 ) -> Result<UploadOutcome>
 where
@@ -464,6 +466,7 @@ where
             total_bytes,
             base_version,
             head,
+            origin,
             progress,
         )
         .await;
@@ -476,8 +479,16 @@ where
     // La condición es `Some(true)`, no `unwrap_or(false)`: un `None` significa
     // que la sonda no ha resuelto, y ese caso ya lo cortó el `bail!` de arriba.
     if client.probed_supports_cas() == Some(true) {
-        return upload_directory_cas(client, save_id, &files, total_bytes, base_version, progress)
-            .await;
+        return upload_directory_cas(
+            client,
+            save_id,
+            &files,
+            total_bytes,
+            base_version,
+            origin,
+            progress,
+        )
+        .await;
     }
 
     // Ingesta adaptativa por forma del save (ADR 0019): muchos archivos
@@ -499,6 +510,12 @@ where
     // partida.
     if let Some(device) = crate::logship::device_name() {
         form = form.text("device_name", device);
+    }
+    // Origen de la versión: el server acepta este campo desde siempre y nadie
+    // lo rellenaba. Sin él la retención no puede distinguir la copia que el
+    // usuario hizo antes del jefe de las cuarenta que hizo el temporizador.
+    if let Some(note) = origin.as_note() {
+        form = form.text("notes", note);
     }
     progress(0, total_bytes);
 
@@ -616,6 +633,7 @@ async fn upload_directory_cas<F>(
     files: &[UploadFile],
     total_bytes: u64,
     base_version: Option<i64>,
+    origin: VersionOrigin,
     progress: F,
 ) -> Result<UploadOutcome>
 where
@@ -737,7 +755,7 @@ where
                 upload_id: init.upload_id,
                 base_version,
                 device_name: crate::logship::device_name(),
-                notes: None,
+                notes: origin.as_note().map(str::to_string),
                 files: manifest,
             },
         )
@@ -771,6 +789,7 @@ async fn upload_directory_cloud<F>(
     total_bytes: u64,
     base_version: Option<i64>,
     head: Option<&ServerHead>,
+    origin: VersionOrigin,
     progress: F,
 ) -> Result<UploadOutcome>
 where
@@ -850,7 +869,7 @@ where
                 game_slug: game_slug.to_string(),
                 label: Some(label.to_string()),
                 device_name: crate::logship::device_name(),
-                notes: None,
+                notes: origin.as_note().map(str::to_string),
                 backup_only: false,
                 base_version,
                 files: manifest,
@@ -1023,7 +1042,7 @@ where
         version_num: commit.version_num,
         parent_version: base_version,
         device_name: crate::logship::device_name(),
-        notes: None,
+        notes: origin.as_note().map(str::to_string),
         file_count: file_count as i64,
         total_size_bytes: total_bytes as i64,
         is_pinned: false,
@@ -1181,6 +1200,7 @@ pub async fn upload_directory_checked<F, G>(
     prev_signature: Option<&str>,
     base_version: Option<i64>,
     head: Option<&ServerHead>,
+    origin: VersionOrigin,
     progress: F,
     on_upload_start: G,
 ) -> Result<BackupResult>
@@ -1245,6 +1265,7 @@ where
         &canonical,
         base_version,
         head,
+        origin,
         progress,
     )
     .await?;
@@ -1585,6 +1606,7 @@ mod tests {
             None,
             None,
             None,
+            VersionOrigin::Automatic,
             |_, _| {},
             || {},
         )
@@ -1616,6 +1638,7 @@ mod tests {
             None,
             None,
             None,
+            VersionOrigin::Automatic,
             |_, _| {},
             || {},
         )

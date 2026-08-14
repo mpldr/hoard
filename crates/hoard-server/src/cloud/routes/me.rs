@@ -84,7 +84,23 @@ pub struct Me {
     /// User-chosen cap on stored versions per save. `null` = unlimited.
     /// Enforced server-side after every commit (oldest non-pinned versions
     /// beyond the cap are deleted). Set via `PUT /v1/me/max-versions`.
+    ///
+    /// Sólo cuenta las copias **automáticas**. Las que el usuario pidió a mano
+    /// tienen su propio cupo ([`Self::max_manual_versions`]) para que una
+    /// ráfaga de autoguardados no pueda echarlas del historial.
     pub max_versions: Option<i64>,
+    /// Cupo de las copias deliberadas (las que el usuario pidió y la red de
+    /// seguridad previa a un restore). `null` = sin límite, que es el defecto:
+    /// son pocas y son justo las que se quieren conservar.
+    pub max_manual_versions: Option<i64>,
+    /// La versión de los Términos que esta cuenta aceptó por última vez, o
+    /// `null` si nunca se registró ninguna (cuentas anteriores a que esto
+    /// existiera). Es la mitad del par que el cliente compara.
+    pub terms_version_accepted: Option<String>,
+    /// La versión vigente hoy. Viaja aunque el cliente ya la tenga compilada:
+    /// un binario viejo que se quedó en el literal anterior seguiría creyendo
+    /// que está al día, y es justo al revés — quien manda es el server.
+    pub terms_version_current: &'static str,
 }
 
 /// Derive the storage gauge state from the deduped footprint vs. the limit
@@ -189,8 +205,9 @@ pub async fn get_me(
         Option<time::OffsetDateTime>,
         Option<time::OffsetDateTime>,
         Option<i32>,
+        Option<i32>,
     ) = sqlx::query_as(
-        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at, deleted_at, max_versions
+        "SELECT email, display_name, avatar_url, plan, storage_bytes, devices_count, created_at, lifetime_storage_bytes, storage_limit_bytes, pending_storage_limit_bytes, storage_limit_change_at, deleted_at, max_versions, max_manual_versions
            FROM profiles WHERE user_id = $1",
     )
     .bind(user.user_id)
@@ -198,8 +215,8 @@ pub async fn get_me(
     .await?;
 
     // Read on its own rather than widening the tuple above: this is the one
-    // fact that outlives the plan, and a positional tuple that long is already
-    // the most fragile line in this handler.
+    // fact that outlives the plan, and a positional 15-tuple is already the
+    // most fragile line in this handler.
     let first_pro_at: Option<time::OffsetDateTime> =
         sqlx::query_scalar("SELECT first_pro_at FROM profiles WHERE user_id = $1")
             .bind(user.user_id)
@@ -286,6 +303,7 @@ pub async fn get_me(
         deleted_at: deleted_at.map(format_dt),
         purges_at: purges_at.map(format_dt),
         max_versions: row.12.map(|n| n as i64),
+        max_manual_versions: row.13.map(|n| n as i64),
     }))
 }
 
@@ -293,6 +311,11 @@ pub async fn get_me(
 pub struct MaxVersionsBody {
     /// `null` clears the cap (unlimited).
     pub max_versions: Option<i64>,
+    /// A qué cupo se refiere: `true` = el de las copias deliberadas, `false`
+    /// (por defecto) = el de las automáticas. Un solo endpoint para los dos
+    /// porque la validación, la poda y el `dry_run` son idénticos.
+    #[serde(default)]
+    pub manual: bool,
     /// When true, nothing is written or deleted: `pruned` reports how many
     /// versions the given cap WOULD delete. The client shows that number in
     /// a confirmation dialog before committing the real call.
@@ -303,6 +326,8 @@ pub struct MaxVersionsBody {
 #[derive(Debug, Serialize)]
 pub struct MaxVersionsOut {
     pub max_versions: Option<i64>,
+    /// Qué cupo se acaba de tocar, eco de la petición.
+    pub manual: bool,
     /// Versions deleted right away because they were over the new cap (or,
     /// on `dry_run`, how many would be).
     pub pruned: usize,
@@ -329,17 +354,31 @@ pub async fn set_max_versions(
         // Clearing the cap never prunes; only a concrete number needs a count.
         let pruned = match body.max_versions {
             Some(n) => {
-                crate::cloud::purge::count_version_cap_excess(&state, user.user_id, n).await?
+                crate::cloud::purge::count_version_cap_excess(
+                    &state,
+                    user.user_id,
+                    n,
+                    body.manual,
+                )
+                .await?
             }
             None => 0,
         };
         return Ok(Json(MaxVersionsOut {
             max_versions: body.max_versions,
+            manual: body.manual,
             pruned: pruned.max(0) as usize,
         }));
     }
 
-    sqlx::query("UPDATE profiles SET max_versions = $1, updated_at = now() WHERE user_id = $2")
+    // La columna se elige por el flag, no por interpolación: dos consultas
+    // literales en vez de coser el nombre de una columna dentro del SQL.
+    let sql = if body.manual {
+        "UPDATE profiles SET max_manual_versions = $1, updated_at = now() WHERE user_id = $2"
+    } else {
+        "UPDATE profiles SET max_versions = $1, updated_at = now() WHERE user_id = $2"
+    };
+    sqlx::query(sql)
         .bind(body.max_versions.map(|n| n as i32))
         .bind(user.user_id)
         .execute(&state.pool)
@@ -348,6 +387,7 @@ pub async fn set_max_versions(
     let pruned = crate::cloud::purge::prune_version_caps(&state, user.user_id).await?;
     Ok(Json(MaxVersionsOut {
         max_versions: body.max_versions,
+        manual: body.manual,
         pruned,
     }))
 }
@@ -827,6 +867,102 @@ pub async fn heartbeat(
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Cuerpo de `POST /v1/me/terms`.
+#[derive(Debug, Deserialize)]
+pub struct AcceptTermsBody {
+    /// La versión que el cliente enseñó al usuario. **No** la damos por buena
+    /// sin mirar: si un binario viejo manda una anterior, guardar eso como
+    /// "aceptó lo vigente" sería fabricar una prueba falsa.
+    pub version: String,
+    /// `desktop` | `web` | `cli`.
+    pub source: String,
+    /// Versión de la app que recogió el clic, cuando el cliente la manda.
+    #[serde(default)]
+    pub app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TermsStatusOut {
+    /// Última versión aceptada, o `null` si no consta ninguna.
+    pub accepted_version: Option<String>,
+    pub accepted_at: Option<String>,
+    /// La vigente hoy.
+    pub current_version: &'static str,
+    /// `true` cuando hay que volver a pedir la casilla.
+    pub needs_acceptance: bool,
+}
+
+/// Fuentes admitidas. Cerrado a propósito: el campo acaba en un registro que
+/// puede leer un juez, y "lo que mandara el cliente" no es una respuesta.
+const TERMS_SOURCES: [&str; 3] = ["desktop", "web", "cli"];
+
+/// POST /v1/me/terms — deja constancia de que esta cuenta aceptó los Términos.
+///
+/// Idempotente por `(user_id, version)`: los clientes lo llaman en cada inicio
+/// de sesión y la primera aceptación es la que vale, así que un `ON CONFLICT
+/// DO NOTHING` conserva la fecha original en vez de irla empujando hacia
+/// delante cada vez que alguien abre la app.
+pub async fn accept_terms(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+    Json(body): Json<AcceptTermsBody>,
+) -> Result<Json<TermsStatusOut>, CloudError> {
+    if body.version != hoard_core::wire::TERMS_VERSION {
+        return Err(CloudError::BadRequest(format!(
+            "terms version mismatch: client sent {}, current is {}",
+            body.version,
+            hoard_core::wire::TERMS_VERSION
+        )));
+    }
+    if !TERMS_SOURCES.contains(&body.source.as_str()) {
+        return Err(CloudError::BadRequest(format!(
+            "unknown terms source: {}",
+            body.source
+        )));
+    }
+
+    sqlx::query(
+        "INSERT INTO terms_acceptances (user_id, version, source, app_version)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, version) DO NOTHING",
+    )
+    .bind(user.user_id)
+    .bind(&body.version)
+    .bind(&body.source)
+    .bind(body.app_version.as_deref())
+    .execute(&state.pool)
+    .await?;
+
+    terms_status(&state, user.user_id).await.map(Json)
+}
+
+/// GET /v1/me/terms — qué aceptó esta cuenta y si hay que volver a preguntar.
+/// El usuario puede pedir este registro por el art. 15 del RGPD, y esto es lo
+/// que se le entrega.
+pub async fn get_terms(
+    State(state): State<CloudState>,
+    Extension(user): Extension<CloudUser>,
+) -> Result<Json<TermsStatusOut>, CloudError> {
+    terms_status(&state, user.user_id).await.map(Json)
+}
+
+async fn terms_status(state: &CloudState, user_id: Uuid) -> Result<TermsStatusOut, CloudError> {
+    let row: Option<(String, OffsetDateTime)> = sqlx::query_as(
+        "SELECT version, accepted_at FROM terms_acceptances
+          WHERE user_id = $1 ORDER BY accepted_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let accepted_version = row.as_ref().map(|r| r.0.clone());
+    Ok(TermsStatusOut {
+        needs_acceptance: accepted_version.as_deref() != Some(hoard_core::wire::TERMS_VERSION),
+        accepted_at: row.map(|r| format_dt(r.1)),
+        accepted_version,
+        current_version: hoard_core::wire::TERMS_VERSION,
+    })
 }
 
 #[derive(Debug, Serialize)]

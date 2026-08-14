@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "Il servizio di sincronizzazione non riesce a leggere la sessione salvata: il portachiavi di sistema non gliela consegna. Accedendo di nuovo viene salvata a suo nome e il problema si risolve definitivamente.",
   "dashboard.service_offline_expired": "La tua sessione è scaduta, quindi i backup sono in pausa. Accedi di nuovo per riprenderli.",
   "dashboard.service_offline_signin": "Accedi di nuovo",
+  "dashboard.max_manual_label": "Max copie manuali",
+  "dashboard.max_manual_hint": "Quota separata per le copie richieste da te (e quella di sicurezza prima di un ripristino). Vuoto = illimitato, così un gioco con salvataggio automatico non le espelle dalla cronologia.",
   "covers.change": "Cambia copertina",
   "covers.restore": "Ripristina la copertina originale",
   "emulators.add_button": "Aggiungi emulatore",

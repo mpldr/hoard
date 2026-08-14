@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "Le service de synchronisation ne peut pas lire ta session enregistrée — le trousseau du système refuse de la donner. Se reconnecter l'enregistre au nom du service et règle le problème définitivement.",
   "dashboard.service_offline_expired": "Ta session a expiré, les sauvegardes sont donc en pause. Reconnecte-toi pour les reprendre.",
   "dashboard.service_offline_signin": "Se reconnecter",
+  "dashboard.max_manual_label": "Max. de copies manuelles",
+  "dashboard.max_manual_hint": "Quota distinct pour les copies que vous demandez (et celle de sécurité avant une restauration). Vide = illimité, pour qu'un jeu à sauvegarde automatique ne les chasse pas de l'historique.",
   "covers.change": "Changer la jaquette",
   "covers.restore": "Restaurer la jaquette d'origine",
   "emulators.add_button": "Ajouter un émulateur",

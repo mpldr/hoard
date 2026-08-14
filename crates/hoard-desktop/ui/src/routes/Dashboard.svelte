@@ -23,6 +23,7 @@
     HardDrive,
     Layers,
     LogOut,
+    Pin,
     Plus,
     RefreshCw,
   } from "@lucide/svelte";
@@ -156,54 +157,72 @@
   let maxVersionsInput = $state<number | null>(null);
   let savingMaxVersions = $state(false);
 
+  // Las copias que el usuario pide a mano llevan su propio cupo, sin límite por
+  // defecto. Con un cupo compartido, una partida que autoguarda cada minuto
+  // llena el historial en una sesión y se lleva por delante justo la copia que
+  // alguien hizo a propósito antes de un jefe.
+  let maxManual = $state<number | null>(null);
+  let maxManualInput = $state<number | null>(null);
+  let savingMaxManual = $state(false);
+
   const maxVersionsDirty = $derived((maxVersionsInput ?? null) !== maxVersions);
+  const maxManualDirty = $derived((maxManualInput ?? null) !== maxManual);
 
   // When applying a cap would delete versions, we stop and ask first. Set to
   // the pending {cap, count} while the confirmation modal is open.
-  let confirmPrune = $state<{ cap: number; count: number } | null>(null);
+  let confirmPrune = $state<{
+    cap: number;
+    count: number;
+    manual: boolean;
+  } | null>(null);
 
-  async function applyMaxVersions() {
-    const next = maxVersionsInput ?? null;
+  async function applyMaxVersions(manual = false) {
+    const next = (manual ? maxManualInput : maxVersionsInput) ?? null;
     if (next != null && (!Number.isInteger(next) || next < 1 || next > 10000)) {
       toastError($_("dashboard.max_versions_invalid"));
       return;
     }
-    savingMaxVersions = true;
+    if (manual) savingMaxManual = true;
+    else savingMaxVersions = true;
     try {
       if (next != null) {
         // Dry-run first: if this cap would prune stored versions, ask before
         // touching anything. Clearing the cap never prunes — no dialog.
-        const count = await api.previewMaxVersions(next);
+        const count = await api.previewMaxVersions(next, manual);
         if (count > 0) {
-          confirmPrune = { cap: next, count };
+          confirmPrune = { cap: next, count, manual };
           return;
         }
       }
-      await commitMaxVersions(next);
+      await commitMaxVersions(next, manual);
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
       savingMaxVersions = false;
+      savingMaxManual = false;
     }
   }
 
   async function confirmPruneAndApply() {
     if (!confirmPrune) return;
-    const cap = confirmPrune.cap;
-    savingMaxVersions = true;
+    const { cap, manual } = confirmPrune;
+    if (manual) savingMaxManual = true;
+    else savingMaxVersions = true;
     try {
-      await commitMaxVersions(cap);
+      await commitMaxVersions(cap, manual);
       confirmPrune = null;
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
       savingMaxVersions = false;
+      savingMaxManual = false;
     }
   }
 
-  async function commitMaxVersions(next: number | null) {
-    await api.setMaxVersions(next);
-    maxVersions = next;
+  async function commitMaxVersions(next: number | null, manual: boolean) {
+    await api.setMaxVersions(next, manual);
+    if (manual) maxManual = next;
+    else maxVersions = next;
     toastSuccess($_("dashboard.max_versions_saved"));
     // Pruning frees server space right away — reflect it on the bar.
     refreshQuota().catch(() => {});
@@ -269,6 +288,13 @@
       .then((n) => {
         maxVersions = n;
         maxVersionsInput = n;
+      })
+      .catch(() => {});
+    api
+      .getMaxVersions(true)
+      .then((n) => {
+        maxManual = n;
+        maxManualInput = n;
       })
       .catch(() => {});
     void hydrateGameNames();
@@ -516,8 +542,37 @@
           <Button
             variant="secondary"
             class="!px-2.5 !py-1.5 !text-xs"
-            onclick={applyMaxVersions}
+            onclick={() => applyMaxVersions(false)}
             loading={savingMaxVersions}
+          >
+            {$_("dashboard.max_versions_apply")}
+          </Button>
+        {/if}
+      </label>
+
+      <!-- Cupo aparte para las copias que pide el usuario. Sin límite por
+           defecto: son pocas y son las que se quieren conservar. -->
+      <label
+        class="flex items-center gap-2 text-xs text-zinc-400"
+        title={$_("dashboard.max_manual_hint")}
+      >
+        <Pin size={13} class="text-zinc-500" />
+        <span class="text-zinc-500">{$_("dashboard.max_manual_label")}</span>
+        <input
+          type="number"
+          min="1"
+          max="10000"
+          placeholder="∞"
+          bind:value={maxManualInput}
+          disabled={savingMaxManual}
+          class="w-16 rounded-md border border-white/[0.08] bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200 [appearance:textfield] focus:border-emerald-500/40 focus:outline-none disabled:opacity-50 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        />
+        {#if maxManualDirty}
+          <Button
+            variant="secondary"
+            class="!px-2.5 !py-1.5 !text-xs"
+            onclick={() => applyMaxVersions(true)}
+            loading={savingMaxManual}
           >
             {$_("dashboard.max_versions_apply")}
           </Button>

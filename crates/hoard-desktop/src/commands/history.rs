@@ -243,13 +243,18 @@ pub async fn delete_snapshot(
 }
 
 /// Current per-user "max versions per save" cap. `None` = unlimited.
+///
+/// `manual` elige el cupo: el de las copias que pidió el usuario (y la de
+/// seguridad previa a un restore) o el de las automáticas. Se cuentan aparte
+/// para que una ráfaga de autoguardados no eche del historial la deliberada.
 #[tauri::command]
 pub async fn get_max_versions(
     app: AppHandle,
+    manual: bool,
     state: State<'_, AppState>,
 ) -> Result<Option<i64>, String> {
     let client = current_client(&app, &state).await?;
-    client.get_max_versions().await.map_err(pretty_error)
+    client.get_max_versions(manual).await.map_err(pretty_error)
 }
 
 /// Dry-run: how many stored versions a cap of `max_versions` would delete
@@ -259,11 +264,12 @@ pub async fn get_max_versions(
 pub async fn preview_max_versions(
     app: AppHandle,
     max_versions: i64,
+    manual: bool,
     state: State<'_, AppState>,
 ) -> Result<i64, String> {
     let client = current_client(&app, &state).await?;
     client
-        .preview_max_versions(max_versions)
+        .preview_max_versions(max_versions, manual)
         .await
         .map_err(pretty_error)
 }
@@ -275,11 +281,12 @@ pub async fn preview_max_versions(
 pub async fn set_max_versions(
     app: AppHandle,
     max_versions: Option<i64>,
+    manual: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let client = current_client(&app, &state).await?;
     client
-        .set_max_versions(max_versions)
+        .set_max_versions(max_versions, manual)
         .await
         .map_err(pretty_error)
 }
@@ -472,6 +479,10 @@ pub async fn restore_snapshot(
                 // seguridad tiene que existir como versión propia antes de pisar
                 // la carpeta, aunque su contenido coincida con la cabeza.
                 None,
+                // La copia de seguridad previa a un restore es la red que
+                // permite deshacerlo. Va etiquetada como deliberada para que
+                // ninguna ráfaga automática pueda echarla del historial.
+                hoard_core::wire::VersionOrigin::PreRestore,
                 move |uploaded, total| {
                     let _ = app_for_progress.emit(
                         "restore://progress",

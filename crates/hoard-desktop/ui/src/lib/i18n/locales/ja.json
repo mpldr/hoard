@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "同期サービスが保存済みのセッションを読み取れません。システムのキーチェーンが渡してくれない状態です。もう一度サインインするとサービス名義で保存され、恒久的に解決します。",
   "dashboard.service_offline_expired": "セッションの有効期限が切れたため、バックアップは停止しています。もう一度サインインすると再開します。",
   "dashboard.service_offline_signin": "サインインし直す",
+  "dashboard.max_manual_label": "手動コピーの最大数",
+  "dashboard.max_manual_hint": "自分で作ったコピー（および復元前の安全コピー）専用の上限。空欄 = 無制限。自動保存の多いゲームに履歴から押し出されなくなります。",
   "covers.change": "カバーを変更",
   "covers.restore": "元のカバーに戻す",
   "emulators.add_button": "エミュレーターを追加",

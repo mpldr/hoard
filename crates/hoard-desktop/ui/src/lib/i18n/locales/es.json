@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "El servicio de sincronización no puede leer tu sesión guardada: el llavero del sistema no se la ha dado. Al volver a iniciar sesión queda guardada a su nombre y se arregla para siempre.",
   "dashboard.service_offline_expired": "Tu sesión ha caducado, así que no se harán copias. Vuelve a iniciar sesión para reanudarlas.",
   "dashboard.service_offline_signin": "Iniciar sesión de nuevo",
+  "dashboard.max_manual_label": "Máx. copias manuales",
+  "dashboard.max_manual_hint": "Cupo aparte para las copias que pides tú (y la de seguridad que se hace antes de restaurar). Vacío = sin límite, para que un juego que autoguarda no las eche del historial.",
   "covers.change": "Cambiar carátula",
   "covers.restore": "Restaurar la carátula original",
   "emulators.add_button": "Añadir emulador",

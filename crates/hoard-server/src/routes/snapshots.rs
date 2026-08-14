@@ -1441,18 +1441,22 @@ pub(crate) async fn count_over_version_cap(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     cap: i64,
+    manual: bool,
 ) -> anyhow::Result<u64> {
     let cap = cap.max(1);
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM snapshots s
           JOIN saves sv ON sv.id = s.save_id
          WHERE sv.user_id = ?1 AND s.deleted_at IS NULL AND s.is_pinned = 0
+           AND (COALESCE(s.notes,'') IN ('manual','pre-restore')) = ?3
            AND (SELECT COUNT(*) FROM snapshots w
                  WHERE w.save_id = s.save_id AND w.deleted_at IS NULL
+                   AND (COALESCE(w.notes,'') IN ('manual','pre-restore')) = ?3
                    AND w.version_num > s.version_num) >= ?2",
     )
     .bind(user_id)
     .bind(cap)
+    .bind(manual)
     .fetch_one(pool)
     .await?;
     Ok(n.max(0) as u64)
@@ -1471,13 +1475,20 @@ pub(crate) async fn prune_over_version_cap(
     user_id: &str,
     only_save: Option<&str>,
 ) -> anyhow::Result<u64> {
-    let cap: Option<i64> = sqlx::query("SELECT max_versions FROM users WHERE id = ?")
+    let caps = sqlx::query("SELECT max_versions, max_manual_versions FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(pool)
-        .await?
-        .and_then(|r| r.get::<Option<i64>, _>("max_versions"));
-    let Some(cap) = cap else { return Ok(0) };
-    let cap = cap.max(1);
+        .await?;
+    let Some(row) = caps else { return Ok(0) };
+    let auto_cap: Option<i64> = row.get("max_versions");
+    let manual_cap: Option<i64> = row.get("max_manual_versions");
+    if auto_cap.is_none() && manual_cap.is_none() {
+        return Ok(0);
+    }
+    // Cupo sin poner = sin límite. Se traduce a un número inalcanzable para que
+    // la consulta siga siendo una sola en vez de ramificar.
+    let auto_cap = auto_cap.map_or(i64::MAX, |c| c.max(1));
+    let manual_cap = manual_cap.map_or(i64::MAX, |c| c.max(1));
 
     let save_ids: Vec<String> = match only_save {
         Some(id) => vec![id.to_string()],
@@ -1493,19 +1504,31 @@ pub(crate) async fn prune_over_version_cap(
     let mut pruned = 0u64;
     for save_id in save_ids {
         // Victims: live, not pinned, and not among the newest `cap` live
-        // snapshots (the latest is always inside that window, so it never
-        // gets trashed here).
+        // snapshots **de su misma clase** (el más reciente siempre cae dentro
+        // de esa ventana, así que nunca acaba en la papelera por aquí).
+        //
+        // Dos ventanas separadas, una por clase: si compartieran cupo, una
+        // sesión de autoguardados se llevaría por delante la copia que el
+        // usuario hizo a mano, que es justo la que quería conservar.
         let victims: Vec<String> = sqlx::query(
             "SELECT id FROM snapshots
              WHERE save_id = ?1 AND deleted_at IS NULL AND is_pinned = 0
                AND version_num NOT IN (
                    SELECT version_num FROM snapshots
                    WHERE save_id = ?1 AND deleted_at IS NULL
+                     AND COALESCE(notes,'') NOT IN ('manual','pre-restore')
                    ORDER BY version_num DESC LIMIT ?2
+               )
+               AND version_num NOT IN (
+                   SELECT version_num FROM snapshots
+                   WHERE save_id = ?1 AND deleted_at IS NULL
+                     AND COALESCE(notes,'') IN ('manual','pre-restore')
+                   ORDER BY version_num DESC LIMIT ?3
                )",
         )
         .bind(&save_id)
-        .bind(cap)
+        .bind(auto_cap)
+        .bind(manual_cap)
         .fetch_all(pool)
         .await?
         .iter()

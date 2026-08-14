@@ -151,6 +151,8 @@
   "dashboard.service_offline_keyring": "同步服务无法读取已保存的会话：系统钥匙串拒绝提供。重新登录会将其保存在服务名下，从根本上解决问题。",
   "dashboard.service_offline_expired": "登录会话已过期，备份已暂停。请重新登录以继续。",
   "dashboard.service_offline_signin": "重新登录",
+  "dashboard.max_manual_label": "手动副本上限",
+  "dashboard.max_manual_hint": "为你手动创建的副本（以及恢复前的安全副本）单列的上限。留空 = 不限，这样频繁自动存档的游戏就不会把它们挤出历史。",
   "covers.change": "更换封面",
   "covers.restore": "恢复原始封面",
   "emulators.add_button": "添加模拟器",

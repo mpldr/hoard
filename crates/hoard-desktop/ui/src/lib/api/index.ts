@@ -1001,21 +1001,32 @@ export function undeleteSnapshot(
   return invoke<void>("undelete_snapshot", { saveId, version });
 }
 
-/** Per-user cap on stored versions per save. `null` = unlimited. */
-export function getMaxVersions(): Promise<number | null> {
-  return invoke<number | null>("get_max_versions");
+/** Per-user cap on stored versions per save. `null` = unlimited.
+ *
+ *  `manual` picks which budget: the copies the user asked for (and the safety
+ *  copy taken before a restore) or the automatic ones. They are counted
+ *  separately so a game that autosaves every minute can't fill the history and
+ *  evict the copy someone made on purpose before a boss. */
+export function getMaxVersions(manual = false): Promise<number | null> {
+  return invoke<number | null>("get_max_versions", { manual });
 }
 
 /** Dry-run: how many stored versions a cap of `maxVersions` would delete
  *  right now. Nothing is written — used for the confirmation dialog. */
-export function previewMaxVersions(maxVersions: number): Promise<number> {
-  return invoke<number>("preview_max_versions", { maxVersions });
+export function previewMaxVersions(
+  maxVersions: number,
+  manual = false,
+): Promise<number> {
+  return invoke<number>("preview_max_versions", { maxVersions, manual });
 }
 
 /** Set (or clear, with `null`) the max-versions cap. The server prunes the
  *  excess immediately, so refresh History / quota afterwards. */
-export function setMaxVersions(maxVersions: number | null): Promise<void> {
-  return invoke<void>("set_max_versions", { maxVersions });
+export function setMaxVersions(
+  maxVersions: number | null,
+  manual = false,
+): Promise<void> {
+  return invoke<void>("set_max_versions", { maxVersions, manual });
 }
 
 /** What restoring this version will do to the folder, before confirming it.

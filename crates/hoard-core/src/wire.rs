@@ -121,9 +121,19 @@ pub struct Whoami {
     #[serde(default)]
     pub storage_quota_bytes: i64,
     /// Tope de versiones almacenadas por save. `None` = ilimitado (y lo que
-    /// reporta un server sin la feature).
+    /// reporta un server sin la feature). Sólo cuenta las **automáticas**.
     #[serde(default)]
     pub max_versions: Option<i64>,
+    /// Tope de las copias deliberadas (las que pidió el usuario y la red de
+    /// seguridad previa a un restore). `None` = ilimitado, que es el defecto:
+    /// son pocas y son justo las que se quieren conservar. Un server viejo no
+    /// lo manda y se lee como ilimitado, que es como se comportaba.
+    ///
+    /// Se omite cuando no hay tope para que el golden de la release siga
+    /// cuadrando byte a byte; ausente y `null` se leen igual gracias al
+    /// `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_manual_versions: Option<i64>,
 }
 
 /// Cuerpo de `PUT /v1/me/max-versions`.
@@ -131,6 +141,15 @@ pub struct Whoami {
 pub struct MaxVersionsBody {
     /// `null` quita el tope (ilimitado).
     pub max_versions: Option<i64>,
+    /// A qué cupo se refiere: `true` = el de las copias deliberadas, `false`
+    /// (por defecto) = el de las automáticas. Un cliente viejo omite el campo
+    /// y toca el cupo automático, que es lo que tocaba antes de existir esto.
+    ///
+    /// Se omite cuando es `false` — mismo criterio que [`Health::cas`]: el
+    /// golden de la release sigue cuadrando byte a byte, y el server lee la
+    /// ausencia como el cupo automático de siempre.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
     /// En seco: no escribe ni borra nada, sólo cuenta cuántos snapshots
     /// *tiraría* el tope. El cliente lo enseña en la confirmación.
     #[serde(default)]
@@ -141,6 +160,10 @@ pub struct MaxVersionsBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaxVersionsResponse {
     pub max_versions: Option<i64>,
+    /// Eco de qué cupo se ha tocado. Omitido cuando es el automático, por lo
+    /// mismo que en [`MaxVersionsBody::manual`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
     /// Snapshots tirados a la papelera por pasarse del tope nuevo (o, en
     /// `dry_run`, los que se tirarían).
     #[serde(default)]
@@ -228,6 +251,59 @@ pub struct Save {
 // ---------------------------------------------------------------------------
 // /v1/saves/{id}/snapshots
 // ---------------------------------------------------------------------------
+
+/// Quién pidió esta versión.
+///
+/// Importa para la retención. Una partida que autoguarda cada minuto —Elden
+/// Ring, cualquier factory builder— llena el cupo entero en una sesión, y si
+/// todas las versiones compiten por el mismo hueco, esa ráfaga de copias
+/// automáticas se lleva por delante la que el usuario hizo a propósito antes de
+/// un jefe. Que es justo la que quería conservar. Con el origen anotado, cada
+/// clase tiene su presupuesto y una ráfaga automática sólo puede desplazar a
+/// otras automáticas.
+///
+/// Viaja en el campo `notes` del snapshot, que existía sin usarse desde el
+/// principio. `Automatic` no escribe nada: así todas las filas de antes de esto
+/// —que tienen `notes` a nulo— se leen como automáticas, que es lo que son, y
+/// no hace falta migrar nada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionOrigin {
+    /// La hizo el motor solo: el temporizador, el cierre del juego, el barrido.
+    Automatic,
+    /// La pidió el usuario ("copia ahora").
+    Manual,
+    /// Red de seguridad antes de sobrescribir la carpeta al restaurar. Cuenta
+    /// como manual: es la copia que permite deshacer un restore equivocado, y
+    /// perderla es perder exactamente lo que la hacía valiosa.
+    PreRestore,
+}
+
+impl VersionOrigin {
+    /// Lo que se guarda en `notes`. `None` para las automáticas.
+    pub fn as_note(self) -> Option<&'static str> {
+        match self {
+            Self::Automatic => None,
+            Self::Manual => Some("manual"),
+            Self::PreRestore => Some("pre-restore"),
+        }
+    }
+
+    /// Lee el origen de un `notes`. Cualquier cosa que no reconozca es
+    /// automática: es lo que eran las filas viejas y lo que debe ser una nota
+    /// escrita por una versión futura que este cliente no entiende.
+    pub fn from_note(note: Option<&str>) -> Self {
+        match note.map(str::trim) {
+            Some("manual") => Self::Manual,
+            Some("pre-restore") => Self::PreRestore,
+            _ => Self::Automatic,
+        }
+    }
+
+    /// ¿Cuenta contra el presupuesto de las que el usuario hizo a propósito?
+    pub fn is_deliberate(self) -> bool {
+        matches!(self, Self::Manual | Self::PreRestore)
+    }
+}
 
 /// Resumen de un snapshot (una versión de un save).
 #[derive(Debug, Clone, Serialize, Deserialize)]

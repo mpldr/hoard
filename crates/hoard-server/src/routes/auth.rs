@@ -31,8 +31,9 @@ pub async fn whoami(
     }
     // Runtime query (not the `query!` macro) so the new max_versions column
     // can be selected without regenerating the offline sqlx cache.
-    let row: (i64, i64, Option<i64>) = sqlx::query_as(
-        "SELECT storage_used_bytes, storage_quota_bytes, max_versions FROM users WHERE id = ?",
+    let row: (i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT storage_used_bytes, storage_quota_bytes, max_versions, max_manual_versions \
+         FROM users WHERE id = ?",
     )
     .bind(&user_id)
     .fetch_one(&state.pool)
@@ -53,6 +54,7 @@ pub async fn whoami(
         storage_used_bytes: row.0,
         storage_quota_bytes: row.1,
         max_versions: row.2,
+        max_manual_versions: row.3,
     }))
 }
 
@@ -86,18 +88,30 @@ pub async fn set_max_versions(
         // Clearing the cap never prunes, so the preview is only meaningful
         // for a concrete number.
         let pruned = match body.max_versions {
-            Some(n) => crate::routes::snapshots::count_over_version_cap(&state.pool, &user_id, n)
-                .await
-                .map_err(|e| internal(e, "version-cap count"))?,
+            Some(n) => crate::routes::snapshots::count_over_version_cap(
+                &state.pool,
+                &user_id,
+                n,
+                body.manual,
+            )
+            .await
+            .map_err(|e| internal(e, "version-cap count"))?,
             None => 0,
         };
         return Ok(Json(MaxVersionsResponse {
             max_versions: body.max_versions,
+        manual: body.manual,
             pruned,
         }));
     }
 
-    sqlx::query("UPDATE users SET max_versions = ? WHERE id = ?")
+    // Columna elegida por el flag, no interpolada dentro del SQL.
+    let sql = if body.manual {
+        "UPDATE users SET max_manual_versions = ? WHERE id = ?"
+    } else {
+        "UPDATE users SET max_versions = ? WHERE id = ?"
+    };
+    sqlx::query(sql)
         .bind(body.max_versions)
         .bind(&user_id)
         .execute(&state.pool)
@@ -110,6 +124,7 @@ pub async fn set_max_versions(
 
     Ok(Json(MaxVersionsResponse {
         max_versions: body.max_versions,
+        manual: body.manual,
         pruned,
     }))
 }

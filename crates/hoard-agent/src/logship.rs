@@ -495,10 +495,16 @@ fn current_session() -> Option<(String, String)> {
     Some((creds.url.trim_end_matches('/').to_string(), creds.token))
 }
 
-/// Whether the user has opted in to sharing diagnostic logs. Read fresh from
-/// `prefs.json` each call so toggling the setting takes effect without a
-/// restart. Any error (missing or corrupt prefs) is treated as opted-out — we
-/// never ship without an affirmative flag.
+/// Whether the user is sharing diagnostic logs. Read fresh from `prefs.json`
+/// each call so toggling the setting takes effect without a restart.
+///
+/// It is **opt-out**, not opt-in: `Prefs::default` sets
+/// `anonymous_telemetry: true`, so a fresh install ships until the user says
+/// stop. That is a deliberate product call and it is disclosed in the privacy
+/// policy — but the comment here used to claim the opposite ("we never ship
+/// without an affirmative flag"), which is the kind of thing that reads like a
+/// promise when someone audits this file. The only case treated as off is a
+/// missing or corrupt prefs file, where we cannot know what was chosen.
 fn telemetry_enabled() -> bool {
     crate::prefs::Prefs::load_default()
         .map(|(p, _)| p.anonymous_telemetry)

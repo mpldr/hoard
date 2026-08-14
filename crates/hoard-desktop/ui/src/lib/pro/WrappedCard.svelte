@@ -56,7 +56,7 @@
     type CardData,
     type Cube,
   } from "./cardCanvas";
-  import { coverUrl } from "../stores/covers";
+  import { coverKey, coverUrl } from "../stores/covers";
   import { toastError, toastSuccess } from "../stores/toasts";
 
   let {
@@ -313,14 +313,14 @@
 
   $effect(() => {
     const slug = facts.topSlug;
-    const appId = slug ? (appIdBySlug[slug] ?? null) : null;
+    const key = coverKey(slug ? (appIdBySlug[slug] ?? null) : null, slug);
     let cancelled = false;
     void (async () => {
-      if (appId == null) {
+      if (key == null) {
         if (!cancelled) coverImg = null;
         return;
       }
-      const url = await coverUrl(appId);
+      const url = await coverUrl(key);
       const img = url ? await loadImage(url) : null;
       if (!cancelled) coverImg = img;
     })();

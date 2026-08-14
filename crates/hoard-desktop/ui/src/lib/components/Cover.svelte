@@ -1,13 +1,16 @@
 <script lang="ts">
   /**
-   * Game cover thumbnail. Shows the Steam art (served from the on-device
+   * Game cover thumbnail. Shows the downloaded art (served from the on-device
    * cache) when one exists, otherwise a tinted box with the game's initial.
-   * The image is loaded lazily via the `covers` store so the same app id is
+   * The image is loaded lazily via the `covers` store so the same game is
    * fetched at most once per session.
    *
    * Users can override the cover with a custom local image. On hover a pencil
    * icon appears; clicking it opens a file picker. If a custom cover is set,
-   * the pencil changes to a "restore" icon to revert to the Steam art.
+   * the pencil changes to a "restore" icon to revert to the downloaded art.
+   * The pencil is offered for **every** game, including the ones no CDN has
+   * art for — that is the only way a game like Minecraft Java ever gets a
+   * cover, and it used to be the one case where the button never appeared.
    *
    * Two knobs for how the image meets its frame:
    *
@@ -24,8 +27,8 @@
   import { Pencil, RotateCcw } from "@lucide/svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
+    coverKey,
     coverUrl,
-    steamIdForSlug,
     hasCustomCover,
     setCustomCover,
     removeCustomCover,
@@ -34,8 +37,8 @@
 
   let {
     appId = null,
-    /** Game slug, used to recover the Steam app id from the catalog when
-     *  `appId` is null (e.g. a save tracked on another device). */
+    /** Game slug — the primary identity for cover art. Rust resolves it to
+     *  real art through the catalog, our hosted index, or a store search. */
     slug = null,
     name = "",
     /** Tailwind size + radius classes for the outer box. */
@@ -62,7 +65,7 @@
   let url = $state<string | null>(null);
   let hovered = $state(false);
   let isCustom = $state(false);
-  let resolvedAppId = $state<number | null>(null);
+  let resolvedKey = $state<string | null>(null);
 
   // Natural size of the loaded image + measured size of the frame. Both are
   // needed to tell "portrait art in a portrait frame" (fill it) from "landscape
@@ -98,19 +101,16 @@
     url = null;
     imgRatio = null;
     isCustom = false;
-    const directId = appId;
-    const s = slug;
+    // The key is known synchronously — no await, no network. That's what lets
+    // the pencil appear for a game with no art at all: the old code resolved a
+    // Steam app id first and bailed when there wasn't one, so Minecraft Java
+    // couldn't even be given a cover by hand.
+    const key = coverKey(appId, slug);
+    resolvedKey = key;
+    if (key == null) return;
     let alive = true;
     (async () => {
-      // Prefer the id detection already resolved; otherwise recover it from the
-      // catalog by slug so cross-device saves still get a cover.
-      const id = directId ?? (s ? await steamIdForSlug(s) : null);
-      if (id == null || !alive) return;
-      resolvedAppId = id;
-      const [u, custom] = await Promise.all([
-        coverUrl(id),
-        hasCustomCover(id),
-      ]);
+      const [u, custom] = await Promise.all([coverUrl(key), hasCustomCover(key)]);
       if (alive) {
         url = u;
         isCustom = custom;
@@ -123,7 +123,8 @@
 
   async function pickCover(e: MouseEvent) {
     e.stopPropagation();
-    if (resolvedAppId == null) return;
+    const key = resolvedKey;
+    if (key == null) return;
     try {
       const file = await openDialog({
         multiple: false,
@@ -135,12 +136,11 @@
         ],
       });
       if (typeof file === "string" && file.length > 0) {
-        await setCustomCover(resolvedAppId, file);
+        await setCustomCover(key, file);
         // Reload the cover.
         url = null;
         imgRatio = null;
-        const u = await coverUrl(resolvedAppId);
-        url = u;
+        url = await coverUrl(key);
         isCustom = true;
       }
     } catch {
@@ -150,13 +150,13 @@
 
   async function restoreOriginal(e: MouseEvent) {
     e.stopPropagation();
-    if (resolvedAppId == null) return;
-    await removeCustomCover(resolvedAppId);
+    const key = resolvedKey;
+    if (key == null) return;
+    await removeCustomCover(key);
     // Reload the cover.
     url = null;
     imgRatio = null;
-    const u = await coverUrl(resolvedAppId);
-    url = u;
+    url = await coverUrl(key);
     isCustom = false;
   }
 </script>
@@ -199,7 +199,7 @@
     </div>
   {/if}
 
-  {#if resolvedAppId != null && hovered}
+  {#if resolvedKey != null && hovered}
     {@const isRestore = isCustom}
     {@const label = isRestore ? $_("covers.restore") : $_("covers.change")}
     <button

@@ -6,9 +6,10 @@
 //!
 //! El mínimo es WARN y no INFO porque con toda la población enviando, el INFO
 //! operativo llena la tabla de ruido y la poda a 14 días se lleva por delante
-//! justo los casos raros. La excepción es [`TELEMETRY_TARGET`]: las desmentidas
-//! de detección entran sea cual sea su nivel — son la señal que se recoge a
-//! propósito, y filtrarlas por nivel sería recoger todo menos lo que importa.
+//! justo los casos raros. Las excepciones son los `EXEMPT_TARGETS`: las
+//! desmentidas de detección y la telemetría de Hoard Screen entran sea cual sea
+//! su nivel — son la señal que se recoge a propósito, y filtrarlas por nivel
+//! sería recoger todo menos lo que importa.
 //!
 //! The wire shape and batch caps are shared with the self-hosted route
 //! (`crate::routes::logs`). On top of that we resolve `device_id` by matching

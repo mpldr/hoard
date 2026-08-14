@@ -544,6 +544,23 @@ pub struct DeviceListOut {
 /// anuncia. Un `where target = 'hoard::telemetry'` es toda la consulta.
 pub const TELEMETRY_TARGET: &str = "hoard::telemetry";
 
+/// El `target` de la telemetría de **Hoard Screen**: cuándo se abre el overlay,
+/// cuánto se tiene puesto y qué se monta dentro (`hoard_desktop::screen_telemetry`).
+///
+/// Va aparte de [`TELEMETRY_TARGET`] a propósito y no como un `verdict` más: son
+/// dos preguntas distintas —una es "dónde falla la detección", la otra "usa
+/// alguien el overlay"— y mezclarlas obliga a filtrar por `fields` en cada
+/// consulta de las dos. Con un target propio, cada panel es un `where target = …`.
+pub const SCREEN_TARGET: &str = "hoard::screen";
+
+/// Targets que viajan sea cual sea su nivel.
+///
+/// Los dos son INFO y los dos tienen que entrar en Cloud, cuyo mínimo es WARN.
+/// Se listan aquí, en el contrato, para que añadir un tercero no exija tocar el
+/// cliente y el server por separado — que es exactamente cómo se rompió esto la
+/// primera vez.
+pub const EXEMPT_TARGETS: [&str; 2] = [TELEMETRY_TARGET, SCREEN_TARGET];
+
 /// La versión de los Términos que el cliente pide aceptar, tal y como la
 /// enseña la web: una **fecha**, no un semver.
 ///
@@ -636,9 +653,14 @@ pub const CLOUD_MIN_RANK: u8 = 3;
 /// mismo motivo por el que `LogEntry` vive aquí y no duplicado (ADR 0021 C.6).
 ///
 /// La excepción por `target` es el corazón del asunto: las desmentidas de
-/// detección son INFO y tienen que entrar en Cloud, cuyo mínimo es WARN.
+/// detección y la telemetría de Screen son INFO y tienen que entrar en Cloud,
+/// cuyo mínimo es WARN. Ver [`EXEMPT_TARGETS`].
 pub fn ships_at(entry: &LogEntry, min_rank: u8) -> bool {
-    entry.target.as_deref() == Some(TELEMETRY_TARGET) || level_rank(&entry.level) >= min_rank
+    entry
+        .target
+        .as_deref()
+        .is_some_and(|t| EXEMPT_TARGETS.contains(&t))
+        || level_rank(&entry.level) >= min_rank
 }
 
 #[cfg(test)]
@@ -676,6 +698,13 @@ mod tests {
         assert!(ships_at(&entry("info", TELEMETRY_TARGET), CLOUD_MIN_RANK));
         // …y hasta un DEBUG con ese target, por si algún día baja de nivel.
         assert!(ships_at(&entry("debug", TELEMETRY_TARGET), CLOUD_MIN_RANK));
+        // Lo mismo para Screen, y por el mismo motivo: si su INFO no entra en
+        // Cloud, el panel del overlay se queda a cero sin que nada falle.
+        for level in ["info", "debug", "trace"] {
+            assert!(ships_at(&entry(level, SCREEN_TARGET), CLOUD_MIN_RANK));
+        }
+        // Un target parecido pero que no es el nuestro no se cuela.
+        assert!(!ships_at(&entry("info", "hoard::screenshot"), CLOUD_MIN_RANK));
         // Self-hosted (DEBUG) se queda con casi todo, pero no con TRACE.
         assert!(ships_at(&entry("debug", "hoard_agent::agent"), 1));
         assert!(!ships_at(&entry("trace", "hoard_agent::agent"), 1));

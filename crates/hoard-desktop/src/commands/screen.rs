@@ -22,6 +22,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
+use crate::screen_telemetry::{EndReason, ScreenTelemetry};
+
 /// The sidecar name, matching the `externalBin` entry and the capability scope.
 ///
 /// Must be a bare basename (no `binaries/` prefix): the bundler flattens the
@@ -37,8 +39,17 @@ const SIDECAR: &str = "hoard-screen";
 pub struct ScreenProc(pub Mutex<Option<CommandChild>>);
 
 /// Launch the overlay if it isn't already running. Idempotent.
+///
+/// `monitors` es cuántas pantallas ha enumerado la UI justo antes de abrir; va
+/// sólo a la telemetría (¿se usa esto en multi-monitor?). Opcional para que un
+/// front que no lo mande siga abriendo el overlay igual.
 #[tauri::command]
-pub async fn screen_open(app: AppHandle, proc: State<'_, ScreenProc>) -> Result<(), String> {
+pub async fn screen_open(
+    app: AppHandle,
+    proc: State<'_, ScreenProc>,
+    tel: State<'_, ScreenTelemetry>,
+    monitors: Option<u32>,
+) -> Result<(), String> {
     if proc.0.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -67,6 +78,17 @@ pub async fn screen_open(app: AppHandle, proc: State<'_, ScreenProc>) -> Result<
                     let s = String::from_utf8_lossy(&line);
                     let s = s.trim();
                     if s.starts_with('{') {
+                        // Única excepción a lo de arriba, y a propósito: el
+                        // cronómetro del modo edición se lleva aquí y no en la
+                        // UI porque la página de Screen se desmonta al navegar
+                        // a otra pestaña con el overlay puesto, y ahí ya no
+                        // habría quien escuchara. Se mira un solo campo de un
+                        // mensaje de dos, no el esquema de la escena.
+                        if let Some(on) = editor_flag(s) {
+                            if let Some(tel) = app2.try_state::<ScreenTelemetry>() {
+                                tel.editor(on);
+                            }
+                        }
                         let _ = app2.emit("screen://event", s.to_string());
                     } else if !s.is_empty() {
                         tracing::debug!(target: "hoard_screen", "{s}");
@@ -77,6 +99,13 @@ pub async fn screen_open(app: AppHandle, proc: State<'_, ScreenProc>) -> Result<
                     if let Some(state) = app2.try_state::<ScreenProc>() {
                         *state.0.lock().unwrap() = None;
                     }
+                    // No-op si el usuario ya cerró: `closed` es idempotente.
+                    // Este camino es el que recoge las salidas por su cuenta y
+                    // las caídas, que son las que no hay que contar como
+                    // desinterés.
+                    if let Some(tel) = app2.try_state::<ScreenTelemetry>() {
+                        tel.closed(EndReason::from_exit_code(payload.code));
+                    }
                     break;
                 }
                 _ => {}
@@ -85,7 +114,22 @@ pub async fn screen_open(app: AppHandle, proc: State<'_, ScreenProc>) -> Result<
     });
 
     *proc.0.lock().unwrap() = Some(child);
+    tel.opened(monitors.unwrap_or(0));
     Ok(())
+}
+
+/// ¿Es esta línea el `{"type":"mode","editor":…}` del overlay? Devuelve el
+/// valor de `editor`, o `None` para cualquier otro mensaje.
+///
+/// A mano y sin `serde_json::from_str` a una struct: el resto de mensajes son
+/// la escena entera, y no quiero que el backend adquiera opinión sobre su
+/// esquema sólo para leer un booleano.
+fn editor_flag(line: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "mode" {
+        return None;
+    }
+    v.get("editor")?.as_bool()
 }
 
 /// Forward one opaque JSON line to the overlay's stdin (e.g. `set_scene`,
@@ -105,13 +149,27 @@ pub async fn screen_send(proc: State<'_, ScreenProc>, line: String) -> Result<()
 
 /// Ask the overlay to quit and drop the handle.
 #[tauri::command]
-pub async fn screen_close(proc: State<'_, ScreenProc>) -> Result<(), String> {
+pub async fn screen_close(
+    proc: State<'_, ScreenProc>,
+    tel: State<'_, ScreenTelemetry>,
+) -> Result<(), String> {
     let child = proc.0.lock().unwrap().take();
     if let Some(mut child) = child {
         let _ = child.write(b"{\"type\":\"quit\"}\n");
         let _ = child.kill();
     }
+    tel.closed(EndReason::User);
     Ok(())
+}
+
+/// Anota un acto del usuario dentro del overlay para la telemetría de Screen.
+///
+/// Lo llama la UI porque es la que tiene el vocabulario: el backend ve procesos
+/// y líneas JSON, no sabe qué es una mirilla. Ver `screen_telemetry` para qué
+/// se manda y, sobre todo, qué no.
+#[tauri::command]
+pub fn screen_note(tel: State<'_, ScreenTelemetry>, action: String, kind: Option<String>) {
+    tel.action(&action, kind.as_deref());
 }
 
 /// True while the overlay process is running.

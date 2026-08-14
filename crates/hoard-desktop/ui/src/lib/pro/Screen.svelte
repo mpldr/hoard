@@ -330,9 +330,19 @@
   // overlay no la pisa (el push ya la lleva; el poll re-sincroniza al calmarse).
   let lastPush = 0;
 
+  // Telemetría de Screen: qué se monta aquí dentro, para saber si esto se usa.
+  // El backend cronometra la sesión y el modo edición por su cuenta; lo que le
+  // falta es el vocabulario (qué es una mirilla, qué es un visor), y eso es lo
+  // único que sube por aquí. Nunca un título de ventana ni un nombre de app.
+  // Es best-effort: si falla, no se le cuenta al usuario como un error.
+  function note(action: string, kind?: string) {
+    invoke("screen_note", { action, kind: kind ?? null }).catch(() => {});
+  }
+
   async function pushScene() {
     if (!open) return;
     lastPush = Date.now();
+    note("edit");
     try {
       await invoke("screen_send", {
         line: JSON.stringify({ type: "set_scene", scene: sceneJson() }),
@@ -488,7 +498,7 @@
     error = null;
     try {
       await loadMonitors();
-      await invoke("screen_open");
+      await invoke("screen_open", { monitors: monitors.length });
       // Start in Game mode (click-through); the user flips to Edit when ready.
       editing = false;
       await invoke("screen_send", {
@@ -553,6 +563,7 @@
       mirror: false,
     });
     selectedId = id;
+    note("panel_add", "window");
     pushScene();
   }
 
@@ -582,6 +593,7 @@
       mirror: false,
     });
     selectedId = id;
+    note("panel_add", "crosshair");
     pushScene();
   }
 
@@ -606,6 +618,9 @@
     bindingFor = null;
     if (!p) return;
     p.sc.activation.binding = b;
+    // El modo (toggle/hold/timed) dice para qué lo quieren; el botón concreto
+    // que hayan elegido no le importa a nadie y no sube.
+    if (b) note("binding", p.sc.activation.mode);
     pushScene();
   }
 
@@ -669,6 +684,7 @@
       mirror: false,
     });
     selectedId = id;
+    note("panel_add", "scope");
     pushScene();
   }
 
@@ -718,8 +734,10 @@
   }
 
   function removePanel(id: string) {
+    const kind = panels.find((p) => p.id === id)?.kind;
     panels = panels.filter((p) => p.id !== id);
     if (selectedId === id) selectedId = null;
+    if (kind) note("panel_remove", kind);
     pushScene();
   }
 

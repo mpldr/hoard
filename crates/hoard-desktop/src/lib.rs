@@ -6,6 +6,7 @@
 
 mod commands;
 mod daemon;
+mod screen_telemetry;
 mod state;
 mod tray;
 
@@ -231,6 +232,7 @@ pub fn run() {
         .manage(commands::cloud_feed::CloudFeed::default())
         .manage(commands::selfhosted_events::SelfHostedEventsScheduler::default())
         .manage(commands::screen::ScreenProc::default())
+        .manage(screen_telemetry::ScreenTelemetry::default())
         // La ventana nace oculta (`"visible": false`) y este flag decide si
         // llega a mostrarse: en un arranque silencioso, no.
         .manage(commands::window::StartHidden::default())
@@ -362,6 +364,7 @@ pub fn run() {
             commands::screen::screen_is_open,
             commands::screen::screen_list_windows,
             commands::screen::screen_list_monitors,
+            commands::screen::screen_note,
         ])
         .setup(|app| {
             // Build the tray as soon as we have an AppHandle. Failures here

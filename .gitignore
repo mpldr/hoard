@@ -105,6 +105,10 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # perdió una mañana de servicio aprendiéndolo: despliegue desde un worktree,
 # `VersionMissing(30)`, y la API abajo hasta el rollback.
 /crates/hoard-server/migrations/postgres/0039_admin_metrics_v2.sql
+# Screen's own admin metrics: a separate function so that touching them never
+# means rewriting the 706-line body of `admin_metrics()`, but the same embedded
+# uid and therefore the same rule — ignored here, applied by hand in prod.
+/crates/hoard-server/migrations/postgres/0044_admin_metrics_screen.sql
 
 # Visión del rediseño del CLI. Doc de trabajo local.
 /HOARD-CLI.local.md

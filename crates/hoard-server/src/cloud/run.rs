@@ -91,6 +91,16 @@ pub async fn run(cfg: Config) -> Result<()> {
     // 4c. Client-log retention. Diagnostic logs are kept 14 days; an hourly
     //     sweep deletes anything older. Detached task: failures `warn!` and
     //     the next tick retries.
+    //
+    //     Los `EXEMPT_TARGETS` viven 180 días y no 14. No son diagnóstico: son
+    //     las dos señales que se recogen a propósito —desmentidas de detección
+    //     y uso de Hoard Screen— y las dos preguntas que contestan son
+    //     longitudinales ("¿mejora la detección?", "¿crece el uso del
+    //     overlay?"). Con la poda corta, el panel enseñaba una ventana móvil de
+    //     dos semanas haciéndola pasar por el total, que es la peor forma de
+    //     equivocarse: sin error, sin hueco, y con la tendencia borrada. El
+    //     volumen no es problema — un par de filas por sesión, frente a las
+    //     ~15.000 de log corriente.
     {
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -99,8 +109,11 @@ pub async fn run(cfg: Config) -> Result<()> {
             loop {
                 tick.tick().await;
                 let res = sqlx::query(
-                    "DELETE FROM client_logs WHERE received_at < now() - interval '14 days'",
+                    "DELETE FROM client_logs
+                      WHERE received_at < now() - interval '14 days'
+                        AND NOT (target = ANY($1) AND received_at > now() - interval '180 days')",
                 )
+                .bind(hoard_core::wire::EXEMPT_TARGETS)
                 .execute(&pool)
                 .await;
                 match res {
@@ -442,7 +455,8 @@ struct HealthBody {
     version: &'static str,
     mode: &'static str,
     /// Minimum log level cloud accepts for client-log ingest — WARN. The
-    /// client reads this on connect and filters at source. Las desmentidas de
-    /// detección (`TELEMETRY_TARGET`) van exentas en los dos lados.
+    /// client reads this on connect and filters at source. Los
+    /// `EXEMPT_TARGETS` —desmentidas de detección y telemetría de Screen— van
+    /// exentos en los dos lados.
     log_min_level: &'static str,
 }

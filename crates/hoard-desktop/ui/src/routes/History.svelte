@@ -37,6 +37,7 @@
     FolderOpen,
     Snowflake,
     RotateCw,
+    SlidersHorizontal,
   } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
@@ -74,12 +75,12 @@
   // Modal state
   let restoreTarget = $state<SnapshotEntry | null>(null);
   let backupFirst = $state(true);
-  // Escribir también la config del snapshot encima de la de esta máquina.
-  // Apagado por defecto: lleva la resolución, el GPU y las rutas del PC que
-  // subió la copia, y es lo que hace que el juego reviente. Cada restore
-  // vuelve a preguntar… salvo que el juego lo tenga decidido en sus ajustes
-  // (`allow_device_local`), que es justo para los juegos donde la config y la
-  // partida son el mismo fichero y responder "no" cada vez restaura a medias.
+  // Write the snapshot's config over this machine's as well. Off by default:
+  // it carries the resolution, the GPU and the paths of the PC that uploaded
+  // the copy, and it is what makes the game blow up. Every restore asks again —
+  // unless the game has it settled in its settings (`allow_device_local`),
+  // which is exactly for the games where the config and the save are the same
+  // file and answering "no" every time restores half of it.
   let allowConfig = $state(false);
   let restoring = $state(false);
   let restoreProgress = $state<RestoreProgress | null>(null);
@@ -93,11 +94,11 @@
 
   function openRestore(snap: SnapshotEntry) {
     restoreTarget = snap;
-    // Cada restore arranca del ajuste del juego (apagado si no lo tiene
-    // decidido): la elección de UN restore no se recuerda. Se pone ANTES de
-    // pedir la previsualización, y por eso abrir y recargar son dos funciones
-    // — el interruptor recarga sin resetearse, que si no se apagaba solo en
-    // cuanto lo tocabas.
+    // Every restore starts from the game's setting (off when undecided): the
+    // choice made for ONE restore is not remembered. Set BEFORE asking for the
+    // preview, which is why opening and reloading are two functions — the
+    // switch reloads without resetting itself, or it turned itself off the
+    // moment you touched it.
     allowConfig = save?.allow_device_local ?? false;
     loadPreview(snap);
   }
@@ -474,9 +475,12 @@
 
   let savingAllowConfig = $state(false);
 
-  /** Deja decidido, para este juego, si un restore le escribe la config. El
-   *  diálogo de restore arranca de aquí y los restores automáticos lo
-   *  respetan, que es lo que hace útil el ajuste. */
+  /** Settle, for this game, whether a restore writes its config back. The
+   *  restore dialog starts from here and automatic restores honour it, which is
+   *  what makes the setting worth having.
+   *
+   *  It belongs to the GAME, not the folder: the backend applies it to every
+   *  tracked folder of the title at once (see `set_allow_device_local`). */
   async function changeAllowConfig(allow: boolean) {
     if (!save) return;
     savingAllowConfig = true;
@@ -679,20 +683,38 @@
             </select>
           </label>
         {/if}
-        <label class="flex items-center gap-2 text-xs text-zinc-400">
-          <input
-            type="checkbox"
-            class="h-3.5 w-3.5 rounded border-white/20 bg-zinc-900 accent-emerald-600 disabled:opacity-50"
-            disabled={savingAllowConfig}
-            checked={save.allow_device_local ?? false}
-            onchange={(e) =>
-              changeAllowConfig((e.currentTarget as HTMLInputElement).checked)}
-          />
-          <span class="text-zinc-500">{$_("history.allow_config_game")}</span>
-        </label>
+        <!-- A cloud-only row (`orphan`) has no `state.json` entry on this
+             machine, so there is nowhere to store the decision: the backend
+             answered a raw "That save isn't tracked on this machine". Disable
+             the button and say why, rather than letting them press something
+             that cannot work. -->
+        <Button
+          variant="secondary"
+          disabled={save.orphan || !save.local_path}
+          onclick={() => changeAllowConfig(!(save?.allow_device_local ?? false))}
+          loading={savingAllowConfig}
+          title={save.orphan || !save.local_path
+            ? $_("history.allow_config_game_orphan")
+            : save.allow_device_local
+              ? $_("history.allow_config_game_hint_on")
+              : $_("history.allow_config_game_hint_off")}
+        >
+          <SlidersHorizontal size={14} />
+          {#if save.allow_device_local}
+            {$_("history.allow_config_game_off")}
+          {:else}
+            {$_("history.allow_config_game_on")}
+          {/if}
+        </Button>
       </div>
       <p class="mt-2 text-xs text-zinc-500">
-        {$_("history.allow_config_game_hint")}
+        {#if save.orphan || !save.local_path}
+          {$_("history.allow_config_game_orphan")}
+        {:else if save.allow_device_local}
+          {$_("history.allow_config_game_hint_on")}
+        {:else}
+          {$_("history.allow_config_game_hint_off")}
+        {/if}
       </p>
       {#if save.preset}
         <p class="mt-2 text-xs text-zinc-500">

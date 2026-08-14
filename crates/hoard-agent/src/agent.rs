@@ -2690,12 +2690,11 @@ async fn run_auto_restore(
             // from R2, and the merge below treats them exactly like downloaded
             // ones (ADR 0021 D.13).
             reuse_from: Some(save.local_path.clone()),
-            // Auto-restore: la puerta cerrada salvo que el usuario la haya
-            // abierto para este juego. Escribir sin que nadie mire la config
-            // del PC que subió el snapshot encima de éste es justo el crash
-            // que se quiere evitar, así que el default sigue siendo no; pero
-            // hay juegos donde la config y la partida son el mismo fichero, y
-            // ahí cerrarla siempre restaura una partida a medias.
+            // Auto-restore: gate shut unless the user opened it for this game.
+            // Writing the config of the PC that uploaded the snapshot over this
+            // one with nobody watching is exactly the crash to avoid, so the
+            // default stays no; but in some games the config and the save are
+            // the same file, and there keeping it shut restores half a save.
             gate: hoard_core::kernel::fileclass::RestoreGate {
                 shields: crate::savefilter::shields_for_slug(&save.game_slug),
                 allow_device_local: save.allow_device_local.unwrap_or(false),

@@ -604,14 +604,13 @@ pub async fn set_save_preset(
     Ok(())
 }
 
-/// Decide, para este juego, si un restore le escribe la config (`.ini`,
-/// `.cfg`, ajustes: lo que `fileclass` clasifica como `DeviceLocal`) o la deja
-/// pasar. `null` vuelve a "sin decidir": no se escribe, y el diálogo de restore
-/// sigue preguntando cada vez.
+/// Decide, for this game, whether a restore writes its config (`.ini`, `.cfg`,
+/// settings: whatever `fileclass` calls `DeviceLocal`) or skips it. `null` goes
+/// back to undecided: not written, and the restore dialog keeps asking.
 ///
-/// Es por juego porque la respuesta lo es: en unos la config y la partida son
-/// el mismo fichero y hay que escribirla, en otros lleva dentro la resolución
-/// de este monitor y escribirla arranca el juego en negro.
+/// Per game because the answer is: in some the config and the save are the same
+/// file and it has to be written, in others it carries this monitor's
+/// resolution and writing it boots the game to a black screen.
 #[tauri::command]
 pub async fn set_save_allow_config(
     save_id: String,

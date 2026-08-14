@@ -35,8 +35,8 @@ deploy/config.toml
 # must never reach the public repo.
 /SECURITY-AUDIT.md
 
-# Private context for Claude Code sessions. Workstation-specific,
-# may reference local paths or tokens — never committed.
+# Private working notes. Workstation-specific, may reference local paths
+# or tokens — never committed.
 CLAUDE.md
 .claude/
 
@@ -133,6 +133,18 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 
 # Plan de SEO/GEO: dónde colocarse para que un LLM recupere Hoard. Nota local.
 /6-8-seo.local.md
+
+# Ficha de SaaSHub para copiar y pegar (datos del formulario). Nota local.
+/saashub-listing.local.md
+
+# Reparto de trabajo para opencode: qué está rojo hoy y con qué prompt se
+# delega. Nota de trabajo local.
+/TAREAS-OPENCODE.local.md
+
+# Encargos de investigación larga (prompts) y lo que devuelven. Datos en bruto
+# con fuentes; se destila a mano antes de que nada de esto toque el repo.
+/INVESTIGACION.local.md
+/investigacion/
 
 # El config del stack de Docker es del usuario, no del repo: versionarlo hacía
 # que un `git pull` le pisara su configuración (y con ella el `data_dir`), que

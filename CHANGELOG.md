@@ -8,6 +8,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A game can have more than one folder now.** Factorio keeps saves in one
+  folder and settings in another; a Paradox game splits saves and mods; an
+  emulator separates memory cards from BIOS files. Hoard tracked one folder per
+  game, so you had to choose — and pointing at the second one left the real save
+  folder out of sight. Each game now holds a numbered list instead. Folder 1 is
+  always the saved games: it's what a new machine restores on its own and what
+  "this game is synced" means. From 2 up it's everything else, backed up just
+  the same but never written over unless you press restore yourself, because one
+  machine's config folder has no business landing on another's. The number is
+  what pairs a folder with the same folder on your other computers, so you pick
+  it once and both machines agree. Rows added before this keep their old labels
+  and keep working.
+- **Emulators are detected, per game.** An emulator has no store page, no
+  install folder Hoard can look up and no catalogue entry, so its saves were
+  yours to find by hand. There's now a curated list of the common emulators and
+  where they save, including the copy you unzipped onto another drive that keeps
+  its saves next to the executable. Where a console's save folder holds one
+  subfolder per game, Hoard can split it and track the games separately instead
+  of the whole tree — which also fixes the playtime: ten titles from one
+  emulator share an executable, and starting it used to mark all ten as being
+  played at once.
+- **Copies you made on purpose have their own budget.** The cap on stored
+  versions counted every version together, so a game that autosaves every minute
+  filled it in a single session and pushed out the copy you took by hand before
+  a boss fight. Manual copies — and the safety copy Hoard takes before a
+  restore — now count against a separate cap that has no limit by default, so an
+  autosave burst can only displace other autosaves.
+- **Cover art for games that aren't on Steam.** Covers were looked up by Steam
+  app id, which meant a tenth of the catalogue — Minecraft Java, every emulated
+  title, anything from another launcher — had no cover and no way to be given
+  one. Any game Hoard tracks can have one now, either from a small index we
+  publish or one you pick yourself.
+- **A word when your plan changes.** Paying for Pro and cancelling it both
+  happen in the browser, and the app never acknowledged either. There's now a
+  one-time thank-you after an upgrade, and after a cancellation a screen that
+  says plainly what you keep — the devices you already paired stay paired — and
+  what changes.
+- **Legal notice, sub-processor list and a security policy.** Who runs the
+  service, which providers touch your data and since when, and where to send a
+  vulnerability report. The Terms and the Privacy Policy have been rewritten
+  around what the service actually does, and both the app and the website now
+  record which version of them you accepted.
+- **Hoard updates itself now.** Until now an update was a button: the app
+  checked GitHub, painted an amber badge, and waited. Anyone who didn't press
+  it stayed on their version indefinitely — and because `hoard`, `hoardd` and
+  the app are replaced together or not at all, "indefinitely" meant a bug fixed
+  three releases ago was still live on machines that had been running for
+  months. The sync service now owns the update, for the same reason it owns the
+  sync engine: it's the only piece that's always there. It checks hourly,
+  downloads and signature-verifies the new version in the background, and
+  installs it when the machine is idle — no game running, no backup in flight.
+  Most people will never see any of it; they'll just notice the version number
+  changed.
+
+  Where it can't be silent, it says so instead of pretending. Whether an update
+  can install unattended isn't a preference — it's decided by how the app got
+  onto the machine. An AppImage or a per-user Windows installer writes inside
+  your home directory and nobody needs to be asked; a `.deb`, an `.rpm` or a
+  `.dmg` needs a privilege prompt or a hand. Those get one native notification
+  when the update is downloaded and ready, and install the moment you open Hoard
+  and approve — the window is the only place where a permission dialog has
+  somebody to ask.
+
+  And there's a deadline. Two days after a release first appears, an update
+  stops being optional: `hoard upgrade` and the app both push it through, and if
+  it still needs approval the app asks for it on a screen you can't dismiss.
+  Two things the deadline never overrides: a backup or restore in flight always
+  finishes first, and nothing is installed behind a running game unless you ask
+  for it yourself. `hoard` and `hoard sync` show what's happening — downloading,
+  waiting for you to close the game, waiting for approval — instead of a badge
+  that says "update available" about something already underway.
+- **Hoard Screen now reports whether anyone actually uses it.** The overlay
+  shipped with no way of telling a feature nobody wants from a feature nobody
+  finds — the two need opposite fixes, and polishing the wrong one is the most
+  expensive work there is. The desktop now times each overlay session (how long
+  it was up, how much of that was spent in edit mode, how it ended) and records
+  what gets built inside it: how many panels, and whether they're mirrored
+  windows, crosshairs or scopes. It rides the existing opt-in telemetry channel
+  and it is deliberately blind to content — no window titles, no application
+  names, no captures, only the *kind* of panel and how many. A new Screen tab in
+  the admin dashboard turns that into the one number worth having: of everyone
+  who has had Pro, how many opened the overlay, and how many came back a second
+  day.
 - **Self-hosted backups only upload what changed.** Your server has always
   stored each file once and let versions share the bytes — but every backup still
   sent the whole folder and the server threw away the part it already had. A 3 GB
@@ -31,6 +114,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   them, and one that goes months without appearing is forgotten.
 
 ### Fixed
+- **Settings files: one answer per game, not one per restore.** Whether a
+  restore should write a game's `.ini` and `.cfg` files back is a question with
+  no answer that's right twice — in one game the settings and the save live in
+  the same file, in another they carry the resolution of the machine that
+  uploaded them. The switch existed but only for one restore at a time, so a
+  game that needs its settings written asked again every single time, and never
+  got asked at all on automatic restores. You can now settle it for a game and
+  Hoard remembers, automatic restores included.
+- **The account-full warning stays on screen.** It was a row in the activity
+  feed — a scrolling log you can hide — so the one fact that stops Hoard from
+  backing anything up scrolled away, or never appeared if you'd closed the
+  panel. It's now a card that stays for as long as the account is over its
+  limit and clears itself when there's room.
+- **A machine stuck in a loop no longer burns your bandwidth.** A client bug
+  could have one machine download the same version over and over — one account
+  pulled 10,6 GB of the same 2,83 MB save in a week — and nothing on the server
+  side counted it. Stopping it meant noticing by hand and switching that save to
+  backup-only, which hid the user's own cloud copy from their own machine. The
+  server now recognises the repetition and asks the client to slow down, which
+  every released version already knows how to obey.
+- **Two games at once look like two games.** The Eye panel and `hoard devices`
+  showed only the first game a machine was playing, and showed its slug rather
+  than the name you gave it.
 - **Save folders are no longer synced whole, junk and all.** A game's save
   folder rarely holds only saves: sitting next to your world files there are
   engine logs, crash telemetry, the analytics queue with the GUID that

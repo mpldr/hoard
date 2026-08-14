@@ -9,8 +9,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use hoard_manifest::ludusavi;
 use hoard_core::kernel::slots;
+use hoard_manifest::ludusavi;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -1038,7 +1038,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 orphan: false,
                 local_size_bytes: None,
                 preset: preset_name,
-            allow_device_local: None,
+                allow_device_local: None,
             },
             watched,
         });
@@ -1596,7 +1596,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: false,
                 local_size_bytes: None,
                 preset: st.preset.clone(),
-            allow_device_local: st.allow_device_local,
+                allow_device_local: st.allow_device_local,
             });
         }
 
@@ -1621,7 +1621,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: true,
                 local_size_bytes: None,
                 preset: None,
-            allow_device_local: None,
+                allow_device_local: None,
             });
         }
         fill_local_sizes(&mut out);
@@ -1672,7 +1672,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: false,
                 local_size_bytes: None,
                 preset: st.preset.clone(),
-            allow_device_local: st.allow_device_local,
+                allow_device_local: st.allow_device_local,
             }),
             None => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
@@ -1688,7 +1688,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 orphan: true,
                 local_size_bytes: None,
                 preset: None,
-            allow_device_local: None,
+                allow_device_local: None,
             }),
         }
     }
@@ -1998,8 +1998,8 @@ mod tests {
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in,
         local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
         reconcile_plan, resolve_processes, row_for_same_folder, rows_unknown_to_server,
-        spread_allow_device_local, superseded_rows, AutoTrack, ERR_SLOT_OCCUPIED,
-        CachedDetection, ServerRow,
+        spread_allow_device_local, superseded_rows, AutoTrack, CachedDetection, ServerRow,
+        ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
@@ -2043,7 +2043,10 @@ mod tests {
             .expect_err("slot 1 is held by another folder");
         let msg = err.to_string();
         assert!(msg.starts_with(ERR_SLOT_OCCUPIED), "{msg}");
-        assert!(msg.ends_with(real), "carries the folder that is there now: {msg}");
+        assert!(
+            msg.ends_with(real),
+            "carries the folder that is there now: {msg}"
+        );
         assert!(msg.contains(":2:"), "offers the lowest free number: {msg}");
 
         // Saying yes to the move is what makes it go through.
@@ -2498,9 +2501,10 @@ mod tests {
     #[test]
     fn allowing_config_covers_every_folder_of_that_game_only() {
         let mut state = CliState::default();
-        state
-            .saves
-            .insert("a".into(), save_state("factorio", "/home/u/.factorio/saves"));
+        state.saves.insert(
+            "a".into(),
+            save_state("factorio", "/home/u/.factorio/saves"),
+        );
         state
             .saves
             .insert("b".into(), save_state("factorio", "/home/u/Desktop/saves"));
@@ -2511,8 +2515,15 @@ mod tests {
         let live = spread_allow_device_local(&mut state, "factorio", Some(true));
 
         assert_eq!(state.saves["a"].allow_device_local, Some(true));
-        assert_eq!(state.saves["b"].allow_device_local, Some(true), "la otra carpeta del mismo juego");
-        assert_eq!(state.saves["c"].allow_device_local, None, "otro juego, intacto");
+        assert_eq!(
+            state.saves["b"].allow_device_local,
+            Some(true),
+            "la otra carpeta del mismo juego"
+        );
+        assert_eq!(
+            state.saves["c"].allow_device_local, None,
+            "otro juego, intacto"
+        );
         let (id, _) = live.expect("hay filas vivas que reasentar");
         assert!(id == "a" || id == "b");
     }
@@ -2526,9 +2537,10 @@ mod tests {
         let mut paused = save_state("factorio", "/home/u/.factorio/saves");
         paused.paused = true;
         state.saves.insert("paused".into(), paused);
-        state
-            .saves
-            .insert("live".into(), save_state("factorio", "/home/u/Desktop/saves"));
+        state.saves.insert(
+            "live".into(),
+            save_state("factorio", "/home/u/Desktop/saves"),
+        );
 
         let live = spread_allow_device_local(&mut state, "factorio", Some(true));
 

@@ -704,7 +704,10 @@ mod tests {
             assert!(ships_at(&entry(level, SCREEN_TARGET), CLOUD_MIN_RANK));
         }
         // Un target parecido pero que no es el nuestro no se cuela.
-        assert!(!ships_at(&entry("info", "hoard::screenshot"), CLOUD_MIN_RANK));
+        assert!(!ships_at(
+            &entry("info", "hoard::screenshot"),
+            CLOUD_MIN_RANK
+        ));
         // Self-hosted (DEBUG) se queda con casi todo, pero no con TRACE.
         assert!(ships_at(&entry("debug", "hoard_agent::agent"), 1));
         assert!(!ships_at(&entry("trace", "hoard_agent::agent"), 1));

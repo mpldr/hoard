@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::StreamReader;
 
-use hoard_core::kernel::fileclass::RestoreGate;
 use crate::api::{ApiClient, SnapshotDetail, SnapshotFile};
 use hoard_core::ids::Sha256 as Sha256Hex;
+use hoard_core::kernel::fileclass::RestoreGate;
 
 /// Tunables for the restore flow.
 #[derive(Debug, Clone, Default)]
@@ -523,7 +523,8 @@ async fn build_reuse_index(
     }
     // `walk_source` is the same walk the backup side uses: sorted by relative
     // path, symlinks and transient game locks already filtered out.
-    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir, shields) {
+    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir, shields)
+    {
         Ok(files) => files
             .into_iter()
             .filter(|f| wanted_sizes.contains(&f.size_bytes))
@@ -1065,7 +1066,11 @@ where
                 .with_context(|| format!("creating parent {}", parent.display()))?;
         }
 
-        if !single_file && !options.gate.allows(&safe_rel.to_string_lossy().replace('\\', "/")) {
+        if !single_file
+            && !options
+                .gate
+                .allows(&safe_rel.to_string_lossy().replace('\\', "/"))
+        {
             tracing::debug!(path = %safe_rel.display(), "restore: skipping device-local file");
             continue;
         }
@@ -1445,7 +1450,8 @@ mod tests {
 
         seed(dir.path(), "save.dat", &local);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote)), &[]).await;
+        let index =
+            build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote)), &[]).await;
         let plan = plan_byte_sources(&[sha_of(&remote)], &index);
 
         assert_eq!(plan, vec![ByteSource::Download]);
@@ -1484,7 +1490,8 @@ mod tests {
         let blob = vec![7u8; 8192];
         seed(dir.path(), "nested/old-name.zip", &blob);
 
-        let index = build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob)), &[]).await;
+        let index =
+            build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob)), &[]).await;
         let plan = plan_byte_sources(&[sha_of(&blob)], &index);
 
         assert_eq!(

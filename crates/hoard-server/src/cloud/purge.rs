@@ -318,12 +318,11 @@ pub async fn count_version_cap_excess(
 /// `notes`; nulo = automática, que es lo que son todas las filas anteriores a
 /// esto (ver [`VersionOrigin`]).
 pub async fn prune_version_caps(state: &CloudState, user_id: Uuid) -> Result<usize, CloudError> {
-    let caps: Option<(Option<i32>, Option<i32>)> = sqlx::query_as(
-        "SELECT max_versions, max_manual_versions FROM profiles WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let caps: Option<(Option<i32>, Option<i32>)> =
+        sqlx::query_as("SELECT max_versions, max_manual_versions FROM profiles WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
     let Some((auto_cap, manual_cap)) = caps else {
         return Ok(0);
     };

@@ -111,7 +111,8 @@ impl CoverKey {
 fn stems_for(cover: &CoverKey) -> Vec<String> {
     let mut stems = vec![cover.stem()];
     if let CoverKey::Slug(slug) = cover {
-        if let Some(id) = hoard_manifest::ludusavi::find_by_slug(slug).and_then(|e| e.steam_app_id) {
+        if let Some(id) = hoard_manifest::ludusavi::find_by_slug(slug).and_then(|e| e.steam_app_id)
+        {
             stems.push((id as u32).to_string());
         }
     }
@@ -883,7 +884,10 @@ mod tests {
             super::index_lookup("minecraft-java-edition", dir.path()).await,
             Some("https://example.test/mc.png".to_string())
         );
-        assert_eq!(super::index_lookup("not-in-the-list", dir.path()).await, None);
+        assert_eq!(
+            super::index_lookup("not-in-the-list", dir.path()).await,
+            None
+        );
     }
 
     #[tokio::test]

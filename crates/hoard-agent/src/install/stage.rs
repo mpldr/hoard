@@ -65,7 +65,10 @@ fn wanted(version: &str, manifest: &Manifest) -> Result<(bool, Option<Delivery>)
             .delivery
             .context("the manifest says there's an app here but not how it got here")?;
         if !d.is_ours() {
-            bail!("this install is managed by your package manager ({})", d.as_str());
+            bail!(
+                "this install is managed by your package manager ({})",
+                d.as_str()
+            );
         }
         Some(d)
     } else {
@@ -101,7 +104,9 @@ pub fn already_staged(version: &str, manifest: &Manifest) -> Option<Staged> {
         Some(_) => {
             // No se sabe el nombre exacto del bundle sin listar la release, así
             // que se acepta el único fichero que no sea el tarball del núcleo.
-            let core_name = core.as_ref().and_then(|p| p.file_name().map(|s| s.to_owned()));
+            let core_name = core
+                .as_ref()
+                .and_then(|p| p.file_name().map(|s| s.to_owned()));
             let mut others = std::fs::read_dir(&dir)
                 .ok()?
                 .filter_map(|e| e.ok())
@@ -163,7 +168,10 @@ pub async fn stage(version: &str, manifest: &Manifest) -> Result<Staged> {
     let desktop = match want_desktop {
         Some(delivery) => {
             let asset = fetch::asset_for(delivery, &assets).with_context(|| {
-                format!("release {version} publishes no {} package", delivery.as_str())
+                format!(
+                    "release {version} publishes no {} package",
+                    delivery.as_str()
+                )
             })?;
             Some(fetch::download_verified(asset, &assets, &dir).await?)
         }
@@ -312,7 +320,10 @@ mod tests {
         let a = dir("1.1.0").unwrap();
         let b = dir("v1.1.0").unwrap();
         assert_eq!(a, b);
-        assert!(a.ends_with("staged/1.1.0") || a.ends_with(r"staged\1.1.0"), "{a:?}");
+        assert!(
+            a.ends_with("staged/1.1.0") || a.ends_with(r"staged\1.1.0"),
+            "{a:?}"
+        );
         assert_ne!(a, dir("1.1.1").unwrap());
     }
 

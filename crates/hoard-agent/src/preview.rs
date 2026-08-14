@@ -359,7 +359,9 @@ mod tests {
             r("nuevo.sav", 7, Some("cc")),
         ];
 
-        let out = against_disk(&remote, dir.path(), &RestoreGate::permissive()).await.unwrap();
+        let out = against_disk(&remote, dir.path(), &RestoreGate::permissive())
+            .await
+            .unwrap();
         assert_eq!(out.unchanged, 1);
         assert_eq!(out.modified, vec!["distinto.sav"]);
         assert_eq!(out.added, vec!["nuevo.sav"]);

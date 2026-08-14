@@ -100,7 +100,7 @@ pub async fn set_max_versions(
         };
         return Ok(Json(MaxVersionsResponse {
             max_versions: body.max_versions,
-        manual: body.manual,
+            manual: body.manual,
             pruned,
         }));
     }

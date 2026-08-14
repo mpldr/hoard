@@ -376,13 +376,8 @@ pub async fn set_max_versions(
         // Clearing the cap never prunes; only a concrete number needs a count.
         let pruned = match body.max_versions {
             Some(n) => {
-                crate::cloud::purge::count_version_cap_excess(
-                    &state,
-                    user.user_id,
-                    n,
-                    body.manual,
-                )
-                .await?
+                crate::cloud::purge::count_version_cap_excess(&state, user.user_id, n, body.manual)
+                    .await?
             }
             None => 0,
         };

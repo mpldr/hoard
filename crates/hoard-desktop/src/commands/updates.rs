@@ -144,14 +144,10 @@ pub async fn apply_staged_update(
     state: State<'_, AppState>,
     version: Option<String>,
 ) -> Result<hoard_core::ipc::UpdateState, AppError> {
-    state
-        .daemon
-        .apply_update(version)
-        .await
-        .map_err(|err| {
-            AppError::new("updates.error.title", "updates.error.unknown")
-                .with_detail(format!("{err:#}"))
-        })
+    state.daemon.apply_update(version).await.map_err(|err| {
+        AppError::new("updates.error.title", "updates.error.unknown")
+            .with_detail(format!("{err:#}"))
+    })
 }
 
 /// "Ahora no", durante `hours`. No mueve la fecha límite: posponer retrasa la
@@ -162,14 +158,10 @@ pub async fn snooze_update(
     state: State<'_, AppState>,
     hours: u32,
 ) -> Result<hoard_core::ipc::UpdateState, AppError> {
-    state
-        .daemon
-        .snooze_update(hours)
-        .await
-        .map_err(|err| {
-            AppError::new("updates.error.title", "updates.error.unknown")
-                .with_detail(format!("{err:#}"))
-        })
+    state.daemon.snooze_update(hours).await.map_err(|err| {
+        AppError::new("updates.error.title", "updates.error.unknown")
+            .with_detail(format!("{err:#}"))
+    })
 }
 
 /// Cierra esta ventana y abre la copia recién instalada.

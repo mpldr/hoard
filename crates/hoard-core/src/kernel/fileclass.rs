@@ -105,8 +105,14 @@ const JUNK_NAMES: &[&str] = &[
 /// Extensiones que nunca son dato de partida.
 const JUNK_EXTS: &[&str] = &[
     // Volcados de crash.
-    "dmp", "mdmp", "stackdump", // Escrituras a medias y temporales de editores/descargas.
-    "tmp", "temp", "part", "crdownload", "swp",
+    "dmp",
+    "mdmp",
+    "stackdump", // Escrituras a medias y temporales de editores/descargas.
+    "tmp",
+    "temp",
+    "part",
+    "crdownload",
+    "swp",
 ];
 
 /// Un segmento de ruta con este nombre cuelga de telemetría del motor, no de la

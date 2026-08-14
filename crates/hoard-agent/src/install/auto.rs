@@ -588,7 +588,12 @@ mod tests {
         for d in [Delivery::AppImage, Delivery::Nsis] {
             assert!(d.applies_unattended(), "{d:?} should be silent");
         }
-        for d in [Delivery::Deb, Delivery::Rpm, Delivery::Dmg, Delivery::Managed] {
+        for d in [
+            Delivery::Deb,
+            Delivery::Rpm,
+            Delivery::Dmg,
+            Delivery::Managed,
+        ] {
             assert!(!d.applies_unattended(), "{d:?} should not be silent");
         }
     }

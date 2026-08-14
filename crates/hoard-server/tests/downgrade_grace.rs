@@ -423,7 +423,11 @@ async fn an_ex_pro_account_keeps_its_devices_after_dropping_to_free() {
         .await
         .expect("load")
         .expect("profile");
-    assert_eq!(limits.storage_bytes, 2 * GB as u64, "the storage does go back");
+    assert_eq!(
+        limits.storage_bytes,
+        2 * GB as u64,
+        "the storage does go back"
+    );
     assert_eq!(
         limits.devices,
         Plan::Pro.limits().devices,

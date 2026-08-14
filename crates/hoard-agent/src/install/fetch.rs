@@ -415,7 +415,6 @@ fn write_desktop_entry(home: &Path, exe: &Path) -> Result<()> {
     Ok(())
 }
 
-
 // =======================================================================
 // El núcleo: `hoardd` + `hoard`, sin instalador de shell
 // =======================================================================
@@ -485,8 +484,7 @@ pub async fn apply_core(tarball: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
     for (name, temp) in staged {
         let dest = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        replace_binary(&temp, &dest)
-            .with_context(|| format!("replacing {}", dest.display()))?;
+        replace_binary(&temp, &dest).with_context(|| format!("replacing {}", dest.display()))?;
         written.push(dest);
     }
     Ok(written)
@@ -508,7 +506,10 @@ async fn extract_core(tarball: &[u8], dir: &Path) -> Result<Vec<(&'static str, P
     let mut found: Vec<(&'static str, PathBuf)> = Vec::new();
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("reading a tarball entry")?;
-        let path = entry.path().context("a tarball entry has no path")?.into_owned();
+        let path = entry
+            .path()
+            .context("a tarball entry has no path")?
+            .into_owned();
         // El tarball trae un directorio raíz (`hoard-<ver>-<plataforma>/`), pero
         // no se da por hecho: se mira sólo el último componente, así que un
         // cambio de empaquetado no rompe la actualización en silencio.
@@ -599,9 +600,8 @@ fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
             })?;
         }
     }
-    std::fs::rename(src, dest).with_context(|| {
-        format!("moving {} into place as {}", src.display(), dest.display())
-    })?;
+    std::fs::rename(src, dest)
+        .with_context(|| format!("moving {} into place as {}", src.display(), dest.display()))?;
     Ok(())
 }
 
@@ -819,7 +819,10 @@ mod tests {
         let tarball = core_tarball(&[("hoard-9.9.9-linux-x86_64/hoard", b"new-cli")]).await;
         let err = extract_core(&tarball, &dir).await.unwrap_err();
         assert!(err.to_string().contains("hoardd"), "{err}");
-        assert!(!dir.join(".hoard.new").exists(), "the partial write was kept");
+        assert!(
+            !dir.join(".hoard.new").exists(),
+            "the partial write was kept"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

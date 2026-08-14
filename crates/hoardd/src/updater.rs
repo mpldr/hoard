@@ -454,14 +454,16 @@ async fn apply(
                 live.mandatory = false;
                 live.last_error = None;
             }
-            tracing::info!(version, "hoardd: update applied — relaunching on the new binary");
+            tracing::info!(
+                version,
+                "hoardd: update applied — relaunching on the new binary"
+            );
             // El relevo no se hace aquí: hay un motor que parar y un socket que
             // soltar, y de eso es dueño `run`. Si el canal está lleno o cerrado
             // es que ya hay un relevo en marcha.
-            let _ = relaunch
-                .try_send(Relaunch {
-                    version: version.to_string(),
-                });
+            let _ = relaunch.try_send(Relaunch {
+                version: version.to_string(),
+            });
             Cadence::Normal
         }
         Err(err) => {

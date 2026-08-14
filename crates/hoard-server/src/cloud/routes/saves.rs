@@ -906,9 +906,7 @@ pub async fn cas_commit(
                 tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
             }
         }
-        return Ok(
-            paced_quota_reject(&state, user.user_id, &save_id, None, new_bytes, resp).await,
-        );
+        return Ok(paced_quota_reject(&state, user.user_id, &save_id, None, new_bytes, resp).await);
     }
 
     // Claim + finalize atomically. The guarded update fences concurrent commits

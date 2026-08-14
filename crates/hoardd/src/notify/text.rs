@@ -224,7 +224,8 @@ const ZH: Strings = Strings {
     too_large_body: "{name}：{size} 超过套餐中每个存档 {limit} 的上限。",
     too_large_body_generic: "{name} 超过套餐中每个存档的上限。",
     stuck_title: "云端恢复持续失败",
-    stuck_body: "{name} — 连续失败：{count} 次。Hoard 会继续重试，频率逐渐降低。",    update_ready_title: "有一个更新在等待",
+    stuck_body: "{name} — 连续失败：{count} 次。Hoard 会继续重试，频率逐渐降低。",
+    update_ready_title: "有一个更新在等待",
     update_ready_body: "Hoard {version} 已下载。打开 Hoard 安装它——系统会请求权限。",
 };
 

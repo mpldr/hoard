@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 
 use hoard_agent::api::ApiClient;
 use hoard_agent::backup::upload_directory;
-use hoard_core::wire::VersionOrigin;
 use hoard_agent::restore::{download_snapshot, RestoreOptions, RestoreOutcome};
+use hoard_core::wire::VersionOrigin;
 
 use crate::fixture::{self, Mutation, Shape};
 use crate::report::{fmt_bytes, fmt_ms, Failure, Report, Sample, Step};

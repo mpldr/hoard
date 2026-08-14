@@ -2726,14 +2726,13 @@ async fn run_auto_restore(
         root.join(&save.save_id).join(ts)
     });
 
-    let copy_result =
-        restore_files_into(
-            &save.local_path,
-            &staging,
-            conflict_backup_dir.as_deref(),
-            &crate::savefilter::shields_for_slug(&save.game_slug),
-        )
-        .await;
+    let copy_result = restore_files_into(
+        &save.local_path,
+        &staging,
+        conflict_backup_dir.as_deref(),
+        &crate::savefilter::shields_for_slug(&save.game_slug),
+    )
+    .await;
     cleanup_staging(&staging).await;
 
     // Best-effort TTL sweep regardless of the per-file outcome — we want
@@ -2765,7 +2764,7 @@ async fn run_auto_restore(
         &crate::savefilter::shields_for_slug(&save.game_slug),
     )
     .ok()
-        .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
+    .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
 
     Ok(Some(AutoRestoreOutcome {
         version_num: version,

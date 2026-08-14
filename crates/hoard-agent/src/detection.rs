@@ -3614,7 +3614,10 @@ mod tests {
 
         let g = &by_slug["stellaris"];
         assert_eq!(g.found_paths, vec![b, a]);
-        assert_eq!(g.path_confidences, vec![Confidence::High, Confidence::Medium]);
+        assert_eq!(
+            g.path_confidences,
+            vec![Confidence::High, Confidence::Medium]
+        );
     }
 
     /// Manual override for a slug the heuristic never produced: the catalog

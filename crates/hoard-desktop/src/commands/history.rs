@@ -399,7 +399,7 @@ pub async fn restore_snapshot(
         let entry = cli_state.saves.entry(save_id.clone()).or_insert_with(|| {
             // Defaults that get patched below from the server response.
             hoard_agent::state::SaveState {
-            allow_device_local: None,
+                allow_device_local: None,
                 local_path: p.clone(),
                 game_slug: String::new(),
                 label: String::new(),

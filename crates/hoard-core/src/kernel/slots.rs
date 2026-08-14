@@ -76,7 +76,10 @@ pub fn label_for(slot: u32) -> String {
 /// text; they just have no number until someone gives them one.
 pub fn slot_of(label: &str) -> Option<u32> {
     let t = label.trim();
-    if LEGACY_SAVES_LABELS.iter().any(|l| t.eq_ignore_ascii_case(l)) {
+    if LEGACY_SAVES_LABELS
+        .iter()
+        .any(|l| t.eq_ignore_ascii_case(l))
+    {
         return Some(SAVES);
     }
     // Digits only, and it has to fit: `"01"` and `"1"` are the same slot, but

@@ -15,7 +15,7 @@ use crate::cloud::{
 use crate::config::Config;
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderValue, Method},
     middleware,
     routing::{get, post},
@@ -343,7 +343,31 @@ pub async fn run(cfg: Config) -> Result<()> {
         .merge(public)
         .merge(authed_always)
         .merge(authed)
-        .with_state(state.clone());
+        .with_state(state.clone())
+        // The self-hosted router has always set this (`main.rs`, derived from
+        // `max_snapshot_size_mb`); the cloud one never did, so it ran on axum's
+        // 2 MB default. That is not a limit on save *bytes* — those go straight
+        // to R2 over a presigned PUT and never cross this process — but on the
+        // `cas/init` manifest, which carries one JSON entry per file: path, its
+        // 64-char sha256, size, mtime. At roughly 170 bytes an entry, 2 MB runs
+        // out at ~12k files.
+        //
+        // A save that trips it can never land, and the failure reads as
+        // anything but the truth: the extractor's 413 has a plain-text body, so
+        // a client that expects Hoard's JSON parses zeros out of it and reports
+        // "exceeds the server's per-save size limit" — a per-save cap that
+        // never ran, on a plan that was never consulted. Our first Pro user
+        // spent a day watching Project Zomboid (one file per map chunk, tens of
+        // thousands of them) retry hourly against that, upgrading mid-way in
+        // the belief that a bigger plan would clear it.
+        //
+        // 32 MB is ~200k files, well past any real save, and stays under
+        // Cloudflare's 100 MB request ceiling on the way in. Not higher: the
+        // whole body is buffered and deserialized into owned Strings on a
+        // 512 MB machine, so the headroom above is memory, not generosity.
+        // `/v1/cloud/logs` keeps its own smaller cap — a route-level limit is
+        // applied inside this one and wins.
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024));
 
     // Per-IP rate limiting. SmartIpKeyExtractor keys off X-Forwarded-For
     // (Fly/CDN set it), falling back to the connection peer — which the

@@ -50,9 +50,21 @@
 //! ## Licensing
 //!
 //! The manifest data is sourced from [PCGamingWiki][2] and is licensed
-//! CC-BY-NC-SA-3.0. We embed it for personal-use detection. Distributors
-//! who want to ship Hoard commercially should remove the JSON before
-//! bundling and rely on the AGPL-clean hand-curated TOMLs only.
+//! **CC BY-NC-SA 3.0**. Three obligations come with it and all three are
+//! ours: attribution (see `NOTICE`, the Terms page and the app's About
+//! screen), share-alike on anything derived from it, and **NonCommercial**.
+//!
+//! That last one is the load-bearing part. "Primarily intended for or
+//! directed toward commercial advantage" is not obviously satisfied by a
+//! build distributed next to a paid subscription, whoever is doing the
+//! distributing — the old note here told *other* distributors to strip the
+//! JSON, which quietly assumed this one wasn't commercial.
+//!
+//! The `bundled-catalog` feature (on by default) is the lever: turn it off
+//! and the binary ships with no catalogue at all, fetching one at first run
+//! into the user's own cache via [`save_runtime_override`]. That is the
+//! honest build to ship the day the NC clause has to be respected rather
+//! than argued about.
 //!
 //! [1]: https://github.com/mtkennerly/ludusavi-manifest
 //! [2]: https://www.pcgamingwiki.com/
@@ -66,6 +78,7 @@ use serde::{Deserialize, Serialize};
 /// Compact JSON produced by the `regenerate_embedded_catalog` generator,
 /// zstd-compressed: ~10 MB of JSON becomes ~1 MB of binary. Decompressed
 /// once, lazily, on the first [`catalog`] call.
+#[cfg(feature = "bundled-catalog")]
 const CATALOG_ZST: &[u8] = include_bytes!("../data/ludusavi-catalog.json.zst");
 
 /// Default upstream URL the desktop fetches before calling
@@ -83,6 +96,7 @@ const TITLES_OVERRIDE_REL: &str = "hoard/ludusavi-titles.json";
 
 /// Compact `name / appid / exes` index for the manifest games that carry no
 /// save path. Names processes and appids; never used to detect a save.
+#[cfg(feature = "bundled-catalog")]
 const TITLES_ZST: &[u8] = include_bytes!("../data/ludusavi-titles.json.zst");
 
 /// Los dos ficheros de datos, atados a la misma generación. Ver
@@ -347,6 +361,11 @@ fn load_catalog() -> Vec<LudusaviEntry> {
     if let Some(override_) = load_runtime_override() {
         return override_;
     }
+    embedded_catalog()
+}
+
+#[cfg(feature = "bundled-catalog")]
+fn embedded_catalog() -> Vec<LudusaviEntry> {
     // The embedded blob was emitted by our own generator; a decode
     // failure is a build-time invariant violation, not user-facing.
     let json = zstd::decode_all(CATALOG_ZST)
@@ -357,10 +376,28 @@ fn load_catalog() -> Vec<LudusaviEntry> {
     })
 }
 
+/// Sin catálogo empotrado no hay nada que cargar hasta que alguien baje uno:
+/// se devuelve vacío y **no** se entra en pánico. Un catálogo vacío degrada
+/// la detección a lo que el propio sistema sepa deducir (Steam, procesos,
+/// carpetas señaladas a mano), que es poco pero funciona; abortar el arranque
+/// convertiría una decisión de licencia en una app que no abre.
+#[cfg(not(feature = "bundled-catalog"))]
+fn embedded_catalog() -> Vec<LudusaviEntry> {
+    tracing::warn!(
+        "built without the bundled catalogue: detection stays thin until one is downloaded"
+    );
+    Vec::new()
+}
+
 fn load_titles() -> Vec<TitleEntry> {
     if let Some(override_) = load_titles_override() {
         return override_;
     }
+    embedded_titles()
+}
+
+#[cfg(feature = "bundled-catalog")]
+fn embedded_titles() -> Vec<TitleEntry> {
     // Softer failure than the catalog: without the title index we
     // fall back to naming things after the process, which is worse
     // but not broken.
@@ -371,6 +408,11 @@ fn load_titles() -> Vec<TitleEntry> {
             tracing::error!("embedded Ludusavi title index unreadable");
             Vec::new()
         })
+}
+
+#[cfg(not(feature = "bundled-catalog"))]
+fn embedded_titles() -> Vec<TitleEntry> {
+    Vec::new()
 }
 
 /// Number of games in the (currently-loaded) catalog. Useful for progress

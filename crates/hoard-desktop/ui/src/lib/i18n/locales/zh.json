@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "查看代理活动日志。便于错误报告。",
   "settings.about_line_1": "Hoard {version} — 自托管存档同步。",
   "settings.about_line_2": "你的服务器，你的数据。源码与文档见 hoard.dev。",
+  "settings.about_catalog_credit": "存档路径目录来自 PCGamingWiki（经由 Ludusavi 清单），采用 CC BY-NC-SA 3.0 许可。",
   "logs.back_to_settings": "返回设置",
   "logs.title": "日志",
   "logs.subtitle": "最新代理日志的尾部。便于错误报告 — 点击「复制」将可见行复制到剪贴板。",

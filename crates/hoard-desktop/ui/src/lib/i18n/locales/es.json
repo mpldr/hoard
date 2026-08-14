@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "Inspecciona el registro de actividad del agente. Útil para informes de errores.",
   "settings.about_line_1": "Hoard {version} — sincronización autohospedada.",
   "settings.about_line_2": "Tu servidor, tus datos. Código fuente y documentación en hoard.dev.",
+  "settings.about_catalog_credit": "Catálogo de rutas de guardado de PCGamingWiki a través del manifiesto de Ludusavi, con licencia CC BY-NC-SA 3.0.",
   "logs.back_to_settings": "Volver a Configuración",
   "logs.title": "Registros",
   "logs.subtitle": "Final del registro más reciente del agente. Útil para informes de errores — pulsa \"Copiar\" para llevar las líneas visibles al portapapeles.",

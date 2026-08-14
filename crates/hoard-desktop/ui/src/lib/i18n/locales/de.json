@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "Aktivitätsprotokoll des Agenten ansehen. Hilfreich für Bugreports.",
   "settings.about_line_1": "Hoard {version} — selbst gehostete Save-Sync.",
   "settings.about_line_2": "Dein Server, deine Daten. Quellcode & Doku unter hoard.dev.",
+  "settings.about_catalog_credit": "Speicherpfad-Katalog von PCGamingWiki über das Ludusavi-Manifest, lizenziert unter CC BY-NC-SA 3.0.",
   "logs.back_to_settings": "Zurück zu Einstellungen",
   "logs.title": "Protokolle",
   "logs.subtitle": "Ende des aktuellen Agentenprotokolls. Nützlich für Bugreports — klicke \"Kopieren\", um die sichtbaren Zeilen in die Zwischenablage zu legen.",

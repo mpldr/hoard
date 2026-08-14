@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "Inspectez l'activité de l'agent. Pratique pour les rapports de bug.",
   "settings.about_line_1": "Hoard {version} — sync auto-hébergée.",
   "settings.about_line_2": "Votre serveur, vos données. Code source et docs sur hoard.dev.",
+  "settings.about_catalog_credit": "Catalogue des chemins de sauvegarde issu de PCGamingWiki via le manifeste Ludusavi, sous licence CC BY-NC-SA 3.0.",
   "logs.back_to_settings": "Retour aux Paramètres",
   "logs.title": "Journaux",
   "logs.subtitle": "Fin du journal le plus récent. Pratique pour les rapports de bug — cliquez sur \"Copier\" pour mettre les lignes visibles dans le presse-papiers.",

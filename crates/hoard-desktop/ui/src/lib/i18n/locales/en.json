@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "Inspect the agent's activity log. Handy for bug reports.",
   "settings.about_line_1": "Hoard {version} — self-hosted save sync.",
   "settings.about_line_2": "Your server, your data. Source code & docs at hoard.dev.",
+  "settings.about_catalog_credit": "Save-path catalogue from PCGamingWiki via the Ludusavi manifest, licensed CC BY-NC-SA 3.0.",
   "logs.back_to_settings": "Back to Settings",
   "logs.title": "Logs",
   "logs.subtitle": "Tail of the most recent agent log. Useful for bug reports — hit \"Copy\" to get the visible lines on your clipboard.",

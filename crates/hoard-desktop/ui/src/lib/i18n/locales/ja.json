@@ -444,6 +444,7 @@
   "settings.view_logs_desc": "エージェントの活動ログを確認。バグ報告に便利。",
   "settings.about_line_1": "Hoard {version} — セルフホスト型セーブ同期。",
   "settings.about_line_2": "あなたのサーバー、あなたのデータ。ソース・ドキュメントは hoard.dev。",
+  "settings.about_catalog_credit": "セーブパスのカタログは Ludusavi マニフェスト経由の PCGamingWiki 提供（CC BY-NC-SA 3.0）。",
   "logs.back_to_settings": "設定へ戻る",
   "logs.title": "ログ",
   "logs.subtitle": "エージェントの最新ログの末尾。バグ報告に便利 — 「コピー」で表示行をクリップボードへ。",

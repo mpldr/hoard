@@ -14,8 +14,11 @@
 //! ## Licensing
 //!
 //! Ludusavi data is sourced from [PCGamingWiki][2] and is licensed
-//! CC-BY-NC-SA-3.0. Distributors who want to ship Hoard commercially
-//! should remove `data/ludusavi-catalog.json` before bundling.
+//! **CC BY-NC-SA 3.0** — attribution, share-alike and NonCommercial. Build
+//! with `--no-default-features` (feature `bundled-catalog` off) for a binary
+//! that carries no catalogue and downloads one at first run; see the module
+//! docs of [`ludusavi`] and the root `NOTICE` for why that lever exists and
+//! when it has to be pulled.
 //!
 //! [1]: https://github.com/mtkennerly/ludusavi-manifest
 //! [2]: https://www.pcgamingwiki.com/

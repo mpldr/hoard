@@ -1398,6 +1398,12 @@
               <p class="mt-1 text-xs text-zinc-500">
                 {$_("settings.about_line_2")}
               </p>
+              <!-- Attribution for the save-path catalogue. CC BY-NC-SA 3.0
+                   requires crediting the source wherever the data is used, and
+                   the app is where it is actually used. -->
+              <p class="mt-2 text-xs text-zinc-600">
+                {$_("settings.about_catalog_credit")}
+              </p>
             </div>
           </div>
         </Card>

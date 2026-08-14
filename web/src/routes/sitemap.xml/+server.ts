@@ -14,7 +14,9 @@ const PATHS = [
   '/guides',
   ...guideSlugs().map((slug) => `/guides/${slug}`),
   '/legal/terms',
-  '/legal/privacy'
+  '/legal/privacy',
+  '/legal/subprocessors',
+  '/legal/notice'
 ];
 
 const loc = (path: string, lang: (typeof LOCALES)[number]) =>

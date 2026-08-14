@@ -1,0 +1,44 @@
+Hoard
+Copyright (C) 2026 Raimundo León Oliva
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License version 3, as published by
+the Free Software Foundation. See LICENSE for the full text.
+
+--------------------------------------------------------------------------
+Third-party content bundled with this software
+--------------------------------------------------------------------------
+
+1. Save-path catalogue (crates/hoard-manifest/data/)
+
+   Files: ludusavi-catalog.json.zst, ludusavi-titles.json.zst
+
+   Derived from the Ludusavi manifest (https://github.com/mtkennerly/
+   ludusavi-manifest) by mtkennerly. The manifest tooling is MIT-licensed;
+   the underlying save-path data is sourced from PCGamingWiki
+   (https://www.pcgamingwiki.com/) and is licensed
+   CC BY-NC-SA 3.0 (https://creativecommons.org/licenses/by-nc-sa/3.0/).
+
+   Attribution: PCGamingWiki contributors, via the Ludusavi manifest.
+
+   IMPORTANT — the NonCommercial clause. CC BY-NC-SA 3.0 forbids use
+   "primarily intended for or directed toward commercial advantage or private
+   monetary compensation". Shipping this data inside a build that is
+   distributed alongside a paid subscription is not clearly permitted by that
+   licence.
+
+   Build the crate with `--no-default-features` (feature `bundled-catalog`
+   off) to produce a binary that carries no catalogue and downloads it at
+   first run instead. See crates/hoard-manifest/data/README.md.
+
+2. Rust and JavaScript dependencies
+
+   Their licences (MIT, Apache-2.0, BSD, ISC and others) are those declared
+   in Cargo.toml / package.json and reproduced in the vendored crates and
+   node_modules trees.
+
+3. Game cover art
+
+   Fetched at runtime from third-party providers and cached locally on the
+   user's machine. Not redistributed with this software; each image remains
+   the property of its rights holder.

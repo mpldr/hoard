@@ -6,7 +6,12 @@
   const year = new Date().getFullYear();
 </script>
 
-<footer class="mt-auto border-t border-line">
+<!-- preload-code="viewport" warms the route chunks of every footer link as the
+     footer scrolls into view — code only, so no `load` runs and no locale is
+     switched (the layout's preload-data="hover" still decides when data is
+     fetched). Cheap here because the footer is always below the fold; the nav
+     is not, and "viewport" there would just mean "eager". -->
+<footer class="mt-auto border-t border-line" data-sveltekit-preload-code="viewport">
   <div class="mx-auto grid max-w-6xl gap-10 px-4 py-14 sm:px-6 grid-cols-2 md:grid-cols-4">
     <div class="col-span-2 md:col-span-1">
       <div class="flex items-center gap-2.5">
@@ -79,6 +84,8 @@
       <ul class="mt-3 space-y-2 text-sm text-ink-soft">
         <li><a class="link-underline hover:text-ink" href={$localeHref('/legal/terms')}>{$_('footer.terms')}</a></li>
         <li><a class="link-underline hover:text-ink" href={$localeHref('/legal/privacy')}>{$_('footer.privacy')}</a></li>
+        <li><a class="link-underline hover:text-ink" href={$localeHref('/legal/subprocessors')}>{$_('footer.subprocessors')}</a></li>
+        <li><a class="link-underline hover:text-ink" href={$localeHref('/legal/notice')}>{$_('footer.notice')}</a></li>
       </ul>
     </div>
   </div>

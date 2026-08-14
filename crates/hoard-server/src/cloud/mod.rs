@@ -28,6 +28,7 @@ pub mod email;
 pub mod entitlements;
 pub mod errors;
 pub mod export;
+pub mod loopguard;
 pub mod plans;
 pub mod polar;
 pub mod pollguard;

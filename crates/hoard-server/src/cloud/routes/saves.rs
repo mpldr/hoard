@@ -3,6 +3,7 @@
 use crate::cloud::auth::CloudUser;
 use crate::cloud::bandwidth;
 use crate::cloud::errors::CloudError;
+use crate::cloud::loopguard;
 use crate::cloud::plans::Plan;
 use crate::cloud::quota;
 use crate::cloud::r2;
@@ -152,16 +153,15 @@ pub async fn init_upload(
     let info = match quota::check_storage(&state, user.user_id, body.size_bytes).await {
         Ok(i) => i,
         Err(resp) => {
-            log_sync_block(
+            return Ok(paced_quota_reject(
                 &state,
                 user.user_id,
-                "quota_block",
                 &body.save_id,
                 Some(&body.game_slug),
                 body.size_bytes,
+                resp,
             )
-            .await;
-            return Ok(resp);
+            .await);
         }
     };
 
@@ -365,8 +365,15 @@ pub async fn commit_upload(
             }
             .into_response());
         }
-        log_sync_block(&state, user.user_id, "quota_block", &save_id, None, real).await;
-        return Ok(quota::quota_response(&info, real, upgrade_url()).into_response());
+        return Ok(paced_quota_reject(
+            &state,
+            user.user_id,
+            &save_id,
+            None,
+            real,
+            quota::quota_response(&info, real, upgrade_url()).into_response(),
+        )
+        .await);
     }
 
     // Atomically finalize: stamp sha256, bump the parent save's latest_version_num.
@@ -594,16 +601,15 @@ pub async fn cas_init(
                 new_bytes,
                 "cas_init: rejected by storage quota"
             );
-            log_sync_block(
+            return Ok(paced_quota_reject(
                 &state,
                 user.user_id,
-                "quota_block",
                 &body.save_id,
                 Some(&body.game_slug),
                 new_bytes,
+                resp,
             )
-            .await;
-            return Ok(resp);
+            .await);
         }
     };
 
@@ -900,16 +906,9 @@ pub async fn cas_commit(
                 tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
             }
         }
-        log_sync_block(
-            &state,
-            user.user_id,
-            "quota_block",
-            &save_id,
-            None,
-            new_bytes,
-        )
-        .await;
-        return Ok(resp);
+        return Ok(
+            paced_quota_reject(&state, user.user_id, &save_id, None, new_bytes, resp).await,
+        );
     }
 
     // Claim + finalize atomically. The guarded update fences concurrent commits
@@ -1113,6 +1112,32 @@ pub async fn version_manifest(
         .into_response());
     }
 
+    // Before anything expensive: is this the same version, again, for the
+    // umpteenth time today? The brake goes here rather than next to the
+    // `sync_log` insert below so a paced client costs one SELECT instead of a
+    // bandwidth debit, a blob lookup and one presigned URL per file.
+    if let Some(pace) = loopguard::download_brake(&state, user.user_id, &save_id, version).await {
+        tracing::warn!(
+            user_id = %user.user_id,
+            %save_id,
+            %game_slug,
+            version_num = version,
+            downloads_24h = pace.seen,
+            retry_after_secs = pace.retry_after_secs,
+            "cloud: pacing repeated downloads of the same save version (cas manifest)"
+        );
+        log_sync_block(
+            &state,
+            user.user_id,
+            "restore_paced",
+            &save_id,
+            Some(&game_slug),
+            0,
+        )
+        .await;
+        return Ok(loopguard::restore_loop_response(pace));
+    }
+
     // Presign path: charge bandwidth for the unique bytes downloaded, then mint
     // one GET per distinct blob and map it back onto every file that uses it.
     let mut unique_size: BTreeMap<String, i64> = BTreeMap::new();
@@ -1258,6 +1283,31 @@ pub async fn download(
         return Err(CloudError::BadRequest(
             "version is content-addressed — use the manifest endpoint".into(),
         ));
+    }
+
+    // Same brake as the manifest path: a legacy archive pulled in a loop is
+    // the more expensive of the two, since every retry is the whole save
+    // rather than the blobs that changed.
+    if let Some(pace) = loopguard::download_brake(&state, user.user_id, &save_id, version).await {
+        tracing::warn!(
+            user_id = %user.user_id,
+            %save_id,
+            %game_slug,
+            version_num = version,
+            downloads_24h = pace.seen,
+            retry_after_secs = pace.retry_after_secs,
+            "cloud: pacing repeated downloads of the same save version (archive)"
+        );
+        log_sync_block(
+            &state,
+            user.user_id,
+            "restore_paced",
+            &save_id,
+            Some(&game_slug),
+            0,
+        )
+        .await;
+        return Ok(loopguard::restore_loop_response(pace));
     }
 
     // Bandwidth gate. Downloads count against the same window as uploads
@@ -1739,6 +1789,59 @@ async fn log_sync_block(
     }
 }
 
+/// A quota refusal, plus a wait once the account has been refused often enough
+/// this hour to prove that nobody on the other end is listening.
+///
+/// The plain 402 stays the default, and it is the honest answer: an account
+/// that fills up earns one refusal per tracked save on the sweep that
+/// discovers it, and a dozen refusals in ten seconds is a library, not a loop.
+/// What stops being honest is answering the same 402 to the same client 342
+/// times in three hours — ago-2026, one account; 148 in a day, another. Every
+/// client shipped up to v1.1.2 reads that 402 as a failure of *this* save and
+/// comes straight back with the next one. Those same clients do understand a
+/// 429, so past the threshold that is what they get.
+///
+/// The quota figures are reloaded for the paced body rather than pulled out of
+/// `plain` — by then it is a serialised `Response` and there is nothing left to
+/// read — because a window that says "slow down" without saying "you are full"
+/// sends the user looking for a network problem they don't have.
+async fn paced_quota_reject(
+    state: &CloudState,
+    user_id: Uuid,
+    save_id: &str,
+    game_slug: Option<&str>,
+    requested: u64,
+    plain: Response,
+) -> Response {
+    log_sync_block(state, user_id, "quota_block", save_id, game_slug, requested).await;
+    let Some(pace) = loopguard::quota_brake(state, user_id).await else {
+        return plain;
+    };
+    tracing::warn!(
+        %user_id,
+        %save_id,
+        blocks_last_hour = pace.seen,
+        retry_after_secs = pace.retry_after_secs,
+        "cloud: pacing a full account that keeps retrying"
+    );
+    let detail = match quota::load(&state.pool, user_id).await {
+        Ok(Some((_, info))) => serde_json::json!({
+            "plan": info.plan,
+            "used_bytes": info.used_bytes,
+            "limit_bytes": info.limit_bytes,
+            "requested_bytes": requested,
+            "upgrade_url": state
+                .config
+                .cloud
+                .as_ref()
+                .map(|c| c.upgrade_url.clone())
+                .unwrap_or_else(|| "https://hoard.services/upgrade".to_string()),
+        }),
+        _ => serde_json::json!({ "requested_bytes": requested }),
+    };
+    loopguard::quota_paced_response(pace, detail)
+}
+
 /// How many downloads of the *same* (user, save, version) inside 24h stop
 /// looking like a user and start looking like a loop.
 ///
@@ -1761,10 +1864,13 @@ const REPEAT_DOWNLOAD_WARN_THRESHOLD: i64 = 5;
 /// Emit an operator signal when the same save version is downloaded over and
 /// over by the same user inside 24h.
 ///
-/// Deliberately *only* a log line: no 429, no block. A user may legitimately
-/// re-restore, and the failure mode we're guarding against (a client stuck in a
-/// retry loop) is the client's bug to fix — the server's job here is to stop it
-/// being invisible. Logs are the operator's alerting surface today.
+/// Only a log line — the *first* of two thresholds on the same signal. This one
+/// is allowed to cry wolf at five, because all it costs is a WARN and its job is
+/// to stop the loop being invisible (it was found by chance, eight days and
+/// 10,6 GB in). The one that changes what the client gets lives in
+/// [`crate::cloud::loopguard`] and sits higher up, at eight, where no benign
+/// reading survives. Keep them in that order: a signal that only ever fires
+/// together with the brake tells an operator nothing they can act on early.
 ///
 /// Best-effort by construction: if the count query hiccups we log at debug and
 /// move on. Failing a paid download because an observability query timed out

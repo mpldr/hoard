@@ -56,7 +56,7 @@ use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
 use hoard_core::ipc::{
     AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, EngineDownReason, IpcError, Payload,
-    Request, ServerSession,
+    Request, ServerSession, UpdateState,
 };
 use hoardd::client::{Client, Push};
 use hoardd::endpoint::Endpoint;
@@ -357,6 +357,40 @@ impl DaemonLink {
         match self.request(Request::Status).await? {
             Payload::Status(status) => Ok(status),
             other => Err(anyhow!("unexpected answer to status: {other:?}")),
+        }
+    }
+
+    /// Cómo va la actualización, según el servicio.
+    ///
+    /// La ventana no mira GitHub para esto: **el updater es del servicio** (es
+    /// lo único que está siempre, así que es lo único que puede actualizar una
+    /// máquina cuya app lleva dos semanas cerrada). Aquí sólo se lee lo que ya
+    /// sabe y se pinta.
+    pub async fn update_state(&self) -> Result<UpdateState> {
+        match self.request(Request::UpdateStatus).await? {
+            Payload::Update(state) => Ok(state),
+            other => Err(anyhow!("unexpected answer to update status: {other:?}")),
+        }
+    }
+
+    /// Dile al servicio que aplique ya lo que tenga bajado.
+    ///
+    /// Lo pide la ventana porque **hay alguien delante**, y esa es toda la
+    /// diferencia: con un humano al teclado el servicio puede abrir el diálogo
+    /// de privilegios que su ciclo de fondo no puede abrir. Vuelve enseguida;
+    /// aplicar sigue en marcha y se sigue con `update_state`.
+    pub async fn apply_update(&self, version: Option<String>) -> Result<UpdateState> {
+        match self.request(Request::ApplyUpdate { version }).await? {
+            Payload::Update(state) => Ok(state),
+            other => Err(anyhow!("unexpected answer to apply update: {other:?}")),
+        }
+    }
+
+    /// "Ahora no", durante `hours`. No mueve la fecha límite.
+    pub async fn snooze_update(&self, hours: u32) -> Result<UpdateState> {
+        match self.request(Request::SnoozeUpdate { hours }).await? {
+            Payload::Update(state) => Ok(state),
+            other => Err(anyhow!("unexpected answer to snooze update: {other:?}")),
         }
     }
 

@@ -64,13 +64,59 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let outcome = runtime.block_on(hoardd::run(options))?;
-    if outcome == hoardd::Outcome::AlreadyRunning {
-        // Salida 0 a propósito: "ya había servicio" es el resultado correcto de
-        // un arranque idempotente, no un fallo que deba manchar el log del
-        // gestor de servicios ni asustar al cliente que nos lanzó.
-        eprintln!("hoardd: another instance already owns the socket; nothing to do");
+    match outcome {
+        hoardd::Outcome::Served => {}
+        hoardd::Outcome::AlreadyRunning => {
+            // Salida 0 a propósito: "ya había servicio" es el resultado correcto de
+            // un arranque idempotente, no un fallo que deba manchar el log del
+            // gestor de servicios ni asustar al cliente que nos lanzó.
+            eprintln!("hoardd: another instance already owns the socket; nothing to do");
+        }
+        hoardd::Outcome::Relaunching { version } => {
+            runtime.block_on(relaunch(&version));
+        }
     }
     Ok(())
+}
+
+/// Código de salida con el que se pide el relevo. Cualquier valor distinto de 0
+/// vale: lo único que hace falta es que systemd lo vea como un fallo y aplique
+/// su `Restart=on-failure`. Se elige uno improbable para que en un log ponga
+/// "actualización", no "se murió".
+const EXIT_RELAUNCH: i32 = 75;
+
+/// Se acaba de sustituir nuestro propio binario en disco. Alguien tiene que
+/// arrancar el nuevo, y **quién** depende de dónde vivimos:
+///
+/// - **Bajo un gestor de servicios en Unix** salimos con [`EXIT_RELAUNCH`] y nos
+///   levanta él (systemd por `Restart=on-failure`, launchd por `KeepAlive`).
+///   Lanzar nosotros un hijo aquí no serviría: systemd mata el cgroup entero de
+///   la unidad al pararla, así que el hijo moriría con nosotros por muy
+///   `setsid` que llevara.
+/// - **En cualquier otro caso** —Windows, o un daemon que levantó un cliente sin
+///   servicio instalado— no hay nadie que nos vuelva a arrancar, así que
+///   arrancamos nosotros la copia nueva y salimos. Sin cgroup de por medio, el
+///   hijo sobrevive.
+async fn relaunch(version: &str) {
+    let managed = cfg!(unix) && hoardd::autostart::installed().await;
+    if managed {
+        tracing::info!(
+            version,
+            "hoardd: exiting so the service manager starts the new binary"
+        );
+        // El guard del log se va con el proceso; se le da un respiro para que la
+        // última línea llegue al fichero.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::process::exit(EXIT_RELAUNCH);
+    }
+    match hoardd::client::respawn_service() {
+        Ok(pid) => tracing::info!(version, pid, "hoardd: started the new binary"),
+        Err(err) => tracing::error!(
+            version,
+            error = %format!("{err:#}"),
+            "hoardd: the update is installed but nothing could start the new binary —              it will come up the next time a client needs it"
+        ),
+    }
 }
 
 /// Log a stderr (que el gestor de servicios captura en Linux/macOS) **y** a

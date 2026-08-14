@@ -415,6 +415,196 @@ fn write_desktop_entry(home: &Path, exe: &Path) -> Result<()> {
     Ok(())
 }
 
+
+// =======================================================================
+// El núcleo: `hoardd` + `hoard`, sin instalador de shell
+// =======================================================================
+//
+// `hoard upgrade` relevaba el núcleo tubando `curl … | sh` a un intérprete.
+// Vale para una persona escribiendo en una terminal y no vale para nada más: el
+// servicio no tiene terminal, un `curl` que no está instalado convierte "actualiza
+// solo" en "no actualiza y no lo dice", y el script termina llamando a `hoard
+// install`, o sea a un proceso que acabamos de sustituir en disco. Lo que sigue
+// es la misma operación escrita donde se puede supervisar: bajar el tarball,
+// comprobar su firma, y sustituir los dos binarios.
+//
+// Nada de esto pide privilegios **cuando el núcleo está donde lo deja el
+// instalador** (`~/.local/bin`, `%LOCALAPPDATA%`). Si está en `/usr/bin` es que
+// lo puso un paquete, y entonces no es nuestro: lo releva el instalador de la
+// app y aquí no se toca (`Manifest::core_from_bundle`).
+
+/// Cómo nombra una release al tarball del núcleo de **esta** máquina.
+///
+/// El nombre lo fija CI y lo resuelven también `install.sh` e `install.ps1`; se
+/// escribe aquí una tercera vez porque la alternativa —adivinar por sufijo, como
+/// hace [`asset_for`]— no distingue el tarball de Linux del de Windows: los dos
+/// acaban en `.tar.gz`.
+pub fn core_asset_name(version: &str) -> Option<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    Some(format!(
+        "hoard-{}-{os}-{arch}.tar.gz",
+        version.trim_start_matches('v')
+    ))
+}
+
+/// El tarball del núcleo dentro de una release ya listada.
+pub fn core_asset_for<'a>(version: &str, assets: &'a [Asset]) -> Option<&'a Asset> {
+    let want = core_asset_name(version)?;
+    assets.iter().find(|a| a.name == want)
+}
+
+/// Los dos binarios que forman el núcleo. El orden no importa aquí; lo que
+/// importa es que estén **los dos** antes de tocar nada (ver [`apply_core`]).
+const CORE_BINARIES: [&str; 2] = ["hoard", "hoardd"];
+
+/// Saca `hoard` y `hoardd` del tarball ya verificado y los deja en `dir`,
+/// sustituyendo los que hubiera.
+///
+/// Devuelve las rutas escritas.
+///
+/// **Todo o nada**: primero se extraen los dos a ficheros de al lado, y sólo
+/// cuando los dos están enteros en disco se renombran encima. Media
+/// actualización —un `hoard` nuevo hablándole a un `hoardd` viejo— es peor que
+/// ninguna, porque el handshake la tolera y el desajuste no avisa.
+pub async fn apply_core(tarball: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    let bytes = tokio::fs::read(tarball)
+        .await
+        .with_context(|| format!("reading {}", tarball.display()))?;
+    let staged = extract_core(&bytes, dir).await?;
+
+    let mut written = Vec::new();
+    for (name, temp) in staged {
+        let dest = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        replace_binary(&temp, &dest)
+            .with_context(|| format!("replacing {}", dest.display()))?;
+        written.push(dest);
+    }
+    Ok(written)
+}
+
+/// Extrae los dos binarios a `<dir>/.<nombre>.new`. Falla si falta cualquiera,
+/// y limpia lo que hubiera escrito antes de fallar.
+async fn extract_core(tarball: &[u8], dir: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
+    use async_compression::tokio::bufread::GzipDecoder;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let decoder = GzipDecoder::new(tokio::io::BufReader::new(std::io::Cursor::new(tarball)));
+    let mut archive = tokio_tar::Archive::new(decoder);
+    let mut entries = archive.entries().context("reading the core tarball")?;
+
+    let mut found: Vec<(&'static str, PathBuf)> = Vec::new();
+    while let Some(entry) = entries.next().await {
+        let mut entry = entry.context("reading a tarball entry")?;
+        let path = entry.path().context("a tarball entry has no path")?.into_owned();
+        // El tarball trae un directorio raíz (`hoard-<ver>-<plataforma>/`), pero
+        // no se da por hecho: se mira sólo el último componente, así que un
+        // cambio de empaquetado no rompe la actualización en silencio.
+        let stem = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_end_matches(".exe"));
+        let Some(name) = CORE_BINARIES.iter().find(|w| Some(**w) == stem) else {
+            continue;
+        };
+        if found.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry
+            .read_to_end(&mut buf)
+            .await
+            .with_context(|| format!("reading {name} out of the tarball"))?;
+
+        let temp = dir.join(format!(".{name}.new"));
+        let _ = std::fs::remove_file(&temp);
+        let mut out = tokio::fs::File::create(&temp)
+            .await
+            .with_context(|| format!("creating {}", temp.display()))?;
+        out.write_all(&buf).await?;
+        out.flush().await?;
+        drop(out);
+        make_executable(&temp)?;
+        found.push((name, temp));
+    }
+
+    if found.len() != CORE_BINARIES.len() {
+        for (_, temp) in &found {
+            let _ = std::fs::remove_file(temp);
+        }
+        let missing: Vec<&str> = CORE_BINARIES
+            .iter()
+            .copied()
+            .filter(|w| !found.iter().any(|(n, _)| n == w))
+            .collect();
+        bail!(
+            "the release tarball is missing {} — refusing to install half of the core",
+            missing.join(" and ")
+        );
+    }
+    Ok(found)
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod +x {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Pone `src` donde estaba `dest`, **con `dest` en marcha**.
+///
+/// Es el único sitio donde esto se puede hacer bien, y cada sistema lo hace por
+/// un motivo distinto:
+///
+/// - **Unix**: `rename` encima del ejecutable de un proceso vivo es legal. El
+///   proceso conserva su inode (sigue corriendo el binario viejo hasta que
+///   reinicie) y el nombre pasa a apuntar al nuevo. Escribir *dentro* del
+///   fichero no lo es: el kernel contesta `ETXTBSY`, que es lo que rompía una
+///   copia directa.
+/// - **Windows**: no se puede sustituir un `.exe` abierto, pero **sí se puede
+///   renombrar**. Así que el viejo se aparta y el nuevo ocupa su nombre; el
+///   apartado se borra en la siguiente pasada, cuando ya no lo tiene abierto
+///   nadie.
+fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Barrido del intento anterior. Best-effort: si el proceso viejo sigue
+        // vivo seguirá sin poder borrarse, y no pasa nada.
+        let parked = dest.with_extension("old");
+        let _ = std::fs::remove_file(&parked);
+        if dest.exists() {
+            std::fs::rename(dest, &parked).with_context(|| {
+                format!(
+                    "parking the running {} — is another copy still starting?",
+                    dest.display()
+                )
+            })?;
+        }
+    }
+    std::fs::rename(src, dest).with_context(|| {
+        format!("moving {} into place as {}", src.display(), dest.display())
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +758,110 @@ mod tests {
     #[test]
     fn a_bogus_signature_does_not_verify() {
         assert!(verify(b"payload", "untrusted comment: nope\nnot-a-signature\n").is_err());
+    }
+
+    #[test]
+    fn the_core_tarball_is_named_after_this_machine() {
+        let name = core_asset_name("1.1.2").expect("this target should be supported");
+        assert!(name.starts_with("hoard-1.1.2-"), "{name}");
+        assert!(name.ends_with(".tar.gz"), "{name}");
+        assert!(name.contains(std::env::consts::ARCH), "{name}");
+        // El `v` del tag no viaja en el nombre del fichero.
+        assert_eq!(core_asset_name("v1.1.2"), Some(name));
+    }
+
+    /// Un tarball con el mismo reparto que publica CI: un directorio raíz y los
+    /// dos binarios dentro. Se arma con las mismas piezas que lo lee
+    /// ([`tokio_tar`] + gzip de `async-compression`), así que la prueba no
+    /// depende de un empaquetador distinto del que vamos a encontrarnos.
+    async fn core_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt;
+
+        let mut tar = tokio_tar::Builder::new(Vec::new());
+        for (name, body) in entries {
+            let mut header = tokio_tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, name, *body).await.unwrap();
+        }
+        let raw = tar.into_inner().await.unwrap();
+
+        let mut gz = GzipEncoder::new(Vec::new());
+        gz.write_all(&raw).await.unwrap();
+        gz.shutdown().await.unwrap();
+        gz.into_inner()
+    }
+
+    #[tokio::test]
+    async fn extracting_the_core_writes_both_halves_next_to_the_old_ones() {
+        let dir = tempdir();
+        let tarball = core_tarball(&[
+            ("hoard-9.9.9-linux-x86_64/hoard", b"new-cli"),
+            ("hoard-9.9.9-linux-x86_64/hoardd", b"new-engine"),
+        ])
+        .await;
+        let staged = extract_core(&tarball, &dir).await.unwrap();
+        assert_eq!(staged.len(), 2);
+        for (name, temp) in &staged {
+            assert!(temp.exists(), "{name} was not written");
+            assert_eq!(temp.file_name().unwrap(), format!(".{name}.new").as_str());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn half_a_core_is_refused_and_leaves_nothing_behind() {
+        let dir = tempdir();
+        // Sólo la terminal: un `hoard` nuevo contra un `hoardd` viejo es el
+        // desajuste mudo que todo este módulo existe para no crear.
+        let tarball = core_tarball(&[("hoard-9.9.9-linux-x86_64/hoard", b"new-cli")]).await;
+        let err = extract_core(&tarball, &dir).await.unwrap_err();
+        assert!(err.to_string().contains("hoardd"), "{err}");
+        assert!(!dir.join(".hoard.new").exists(), "the partial write was kept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn applying_the_core_replaces_what_was_there() {
+        let dir = tempdir();
+        let exe = std::env::consts::EXE_SUFFIX;
+        std::fs::write(dir.join(format!("hoard{exe}")), b"old-cli").unwrap();
+        std::fs::write(dir.join(format!("hoardd{exe}")), b"old-engine").unwrap();
+
+        let tarball = core_tarball(&[
+            ("hoard-9.9.9-linux-x86_64/hoard", b"new-cli"),
+            ("hoard-9.9.9-linux-x86_64/hoardd", b"new-engine"),
+        ])
+        .await;
+        let tar_path = dir.join("core.tar.gz");
+        std::fs::write(&tar_path, &tarball).unwrap();
+
+        let written = apply_core(&tar_path, &dir).await.unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            std::fs::read(dir.join(format!("hoard{exe}"))).unwrap(),
+            b"new-cli"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format!("hoardd{exe}"))).unwrap(),
+            b"new-engine"
+        );
+        // Sin restos: los temporales se consumieron al renombrar.
+        assert!(!dir.join(".hoard.new").exists());
+        assert!(!dir.join(".hoardd.new").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hoard-core-install-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

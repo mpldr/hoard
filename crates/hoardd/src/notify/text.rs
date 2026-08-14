@@ -105,6 +105,13 @@ struct Strings {
     stuck_title: &'static str,
     /// `{name}`, `{count}`
     stuck_body: &'static str,
+    /// Hay versión nueva y esta máquina **no** puede ponérsela sola: hace falta
+    /// que alguien apruebe el diálogo de privilegios. Es el único aviso de
+    /// actualización que se manda, y por eso: en las vías que se aplican solas
+    /// no hay nada que pedirle a nadie, así que avisar sería ruido.
+    update_ready_title: &'static str,
+    /// `{version}`
+    update_ready_body: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -117,7 +124,8 @@ const EN: Strings = Strings {
     too_large_body: "{name}: {size} is over your plan's {limit} per-save limit.",
     too_large_body_generic: "{name} is over your plan's per-save limit.",
     stuck_title: "Cloud restore is failing",
-    stuck_body: "{name} — failures in a row: {count}. Hoard keeps retrying, less and less often.",
+    stuck_body: "{name} — failures in a row: {count}. Hoard keeps retrying, less and less often.",    update_ready_title: "An update is waiting",
+    update_ready_body: "Hoard {version} is downloaded. Open Hoard to install it — your system will ask for permission.",
 };
 
 const ES: Strings = Strings {
@@ -131,7 +139,8 @@ const ES: Strings = Strings {
     too_large_body_generic: "{name} supera el límite por partida de tu plan.",
     stuck_title: "La restauración desde la nube está fallando",
     stuck_body:
-        "{name} — fallos seguidos: {count}. Hoard sigue reintentando, cada vez con menos frecuencia.",
+        "{name} — fallos seguidos: {count}. Hoard sigue reintentando, cada vez con menos frecuencia.",    update_ready_title: "Hay una actualización esperando",
+    update_ready_body: "Hoard {version} está descargada. Abre Hoard para instalarla; tu sistema te pedirá permiso.",
 };
 
 const DE: Strings = Strings {
@@ -144,7 +153,8 @@ const DE: Strings = Strings {
     too_large_body: "{name}: {size} überschreitet das Limit von {limit} pro Spielstand.",
     too_large_body_generic: "{name} überschreitet das Limit deines Tarifs pro Spielstand.",
     stuck_title: "Die Wiederherstellung aus der Cloud schlägt fehl",
-    stuck_body: "{name} — Fehler in Folge: {count}. Hoard versucht es weiter, immer seltener.",
+    stuck_body: "{name} — Fehler in Folge: {count}. Hoard versucht es weiter, immer seltener.",    update_ready_title: "Ein Update wartet",
+    update_ready_body: "Hoard {version} ist heruntergeladen. Öffne Hoard, um es zu installieren — dein System fragt nach der Berechtigung.",
 };
 
 const FR: Strings = Strings {
@@ -157,7 +167,8 @@ const FR: Strings = Strings {
     too_large_body: "{name} : {size} dépasse la limite de {limit} par partie de votre offre.",
     too_large_body_generic: "{name} dépasse la limite par partie de votre offre.",
     stuck_title: "La restauration depuis le cloud échoue",
-    stuck_body: "{name} — échecs consécutifs : {count}. Hoard réessaie, de moins en moins souvent.",
+    stuck_body: "{name} — échecs consécutifs : {count}. Hoard réessaie, de moins en moins souvent.",    update_ready_title: "Une mise à jour attend",
+    update_ready_body: "Hoard {version} est téléchargée. Ouvre Hoard pour l'installer — ton système demandera l'autorisation.",
 };
 
 const IT: Strings = Strings {
@@ -170,7 +181,8 @@ const IT: Strings = Strings {
     too_large_body: "{name}: {size} supera il limite di {limit} per salvataggio del tuo piano.",
     too_large_body_generic: "{name} supera il limite per salvataggio del tuo piano.",
     stuck_title: "Il ripristino dal cloud sta fallendo",
-    stuck_body: "{name} — errori di fila: {count}. Hoard continua a riprovare, sempre più di rado.",
+    stuck_body: "{name} — errori di fila: {count}. Hoard continua a riprovare, sempre più di rado.",    update_ready_title: "C'è un aggiornamento in attesa",
+    update_ready_body: "Hoard {version} è scaricato. Apri Hoard per installarlo: il sistema ti chiederà il permesso.",
 };
 
 const JA: Strings = Strings {
@@ -183,7 +195,8 @@ const JA: Strings = Strings {
     too_large_body: "{name}: {size} はプランのセーブごとの上限 {limit} を超えています。",
     too_large_body_generic: "{name} はプランのセーブごとの上限を超えています。",
     stuck_title: "クラウドからの復元に失敗しています",
-    stuck_body: "{name} — 連続失敗: {count} 回。Hoard は間隔を空けながら再試行を続けます。",
+    stuck_body: "{name} — 連続失敗: {count} 回。Hoard は間隔を空けながら再試行を続けます。",    update_ready_title: "アップデートが待機中です",
+    update_ready_body: "Hoard {version} をダウンロード済みです。Hoard を開いてインストールしてください。システムが許可を求めます。",
 };
 
 const PT: Strings = Strings {
@@ -197,7 +210,8 @@ const PT: Strings = Strings {
     too_large_body_generic: "{name} excede o limite por save do teu plano.",
     stuck_title: "O restauro a partir da nuvem está a falhar",
     stuck_body:
-        "{name} — falhas seguidas: {count}. O Hoard continua a tentar, cada vez menos vezes.",
+        "{name} — falhas seguidas: {count}. O Hoard continua a tentar, cada vez menos vezes.",    update_ready_title: "Há uma atualização à espera",
+    update_ready_body: "O Hoard {version} está descarregado. Abre o Hoard para o instalar — o teu sistema vai pedir permissão.",
 };
 
 const ZH: Strings = Strings {
@@ -210,7 +224,8 @@ const ZH: Strings = Strings {
     too_large_body: "{name}：{size} 超过套餐中每个存档 {limit} 的上限。",
     too_large_body_generic: "{name} 超过套餐中每个存档的上限。",
     stuck_title: "云端恢复持续失败",
-    stuck_body: "{name} — 连续失败：{count} 次。Hoard 会继续重试，频率逐渐降低。",
+    stuck_body: "{name} — 连续失败：{count} 次。Hoard 会继续重试，频率逐渐降低。",    update_ready_title: "有一个更新在等待",
+    update_ready_body: "Hoard {version} 已下载。打开 Hoard 安装它——系统会请求权限。",
 };
 
 /// Escribe el aviso.
@@ -262,6 +277,11 @@ pub fn render(kind: &Kind, name: &str, lang: Lang) -> Note {
                 s.stuck_body,
                 &[("name", name), ("count", &failures.to_string())],
             ),
+        },
+        // No lleva `name`: no habla de una partida, habla de la app.
+        Kind::UpdateReady { version } => Note {
+            title: s.update_ready_title.to_string(),
+            body: fill(s.update_ready_body, &[("version", version)]),
         },
     }
 }

@@ -28,7 +28,7 @@
 //! es que sólo hay un daemon, y de eso responde el bind (`transport::Listener`).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
 use hoard_agent::api::ApiClient;
@@ -57,6 +57,11 @@ const CLOUD_LIVE_CHECK: Duration = Duration::from_secs(15);
 
 /// Margen que se le da al motor para atender su `shutdown` antes de abortarlo.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Pasado esto, una transferencia "en vuelo" se da por muerta. Ver
+/// [`Engine::transfers_in_flight`]: es el seguro contra un descuadre del
+/// contador, no un tiempo de espera de red.
+const TRANSFER_STALE: Duration = Duration::from_secs(30 * 60);
 
 /// Espera máxima a que el motor conteste una consulta de estado. Sin tope, un
 /// motor atascado colgaría al cliente que preguntó (y a la UI detrás).
@@ -107,6 +112,22 @@ struct Inner {
     /// Un cliente pidió levantar el motor de cero (cambió la sesión en disco), y
     /// por qué. Lo atiende el keeper, que es el único dueño del ciclo de vida.
     restart_requested: Option<String>,
+    /// Copias y restauraciones empezadas y todavía sin desenlace.
+    ///
+    /// Lo lleva la bomba de eventos, que es por donde pasan todas, y lo lee el
+    /// updater: relevar los binarios con una subida a medias mata el proceso que
+    /// la estaba haciendo y deja un blob a medio comprometer en el server. Es el
+    /// único freno que ni siquiera el plazo levanta.
+    ///
+    /// Vive aquí y no en el motor porque tiene que **sobrevivir a un reinicio
+    /// del motor**: si se fuera con él, un motor que rebota en mitad de una
+    /// subida dejaría el contador clavado en 1 para siempre y el updater no
+    /// volvería a aplicar nada. Al arrancar un motor nuevo se pone a cero (ver
+    /// [`Engine::transfers_reset`]), que es la verdad: lo que hubiera en vuelo se
+    /// fue con el proceso anterior.
+    in_flight: usize,
+    /// Desde cuándo hay algo en vuelo. Lo que hace caducar el contador.
+    in_flight_since: Option<Instant>,
 }
 
 /// Ranura compartida del motor. Cheap to clone.
@@ -158,6 +179,50 @@ impl Engine {
         self.lock().status.watched = count;
     }
 
+    /// Empieza una transferencia (copia o restauración).
+    pub fn transfer_started(&self) {
+        let mut guard = self.lock();
+        if guard.in_flight == 0 {
+            guard.in_flight_since = Some(Instant::now());
+        }
+        guard.in_flight += 1;
+    }
+
+    /// Termina una transferencia, bien o mal. Satura en 0: un desenlace sin
+    /// comienzo (el motor arrancó con una subida ya en vuelo, D.8.3) no puede
+    /// dejar el contador en negativo y bloquear el updater para siempre.
+    pub fn transfer_finished(&self) {
+        let mut guard = self.lock();
+        guard.in_flight = guard.in_flight.saturating_sub(1);
+        if guard.in_flight == 0 {
+            guard.in_flight_since = None;
+        }
+    }
+
+    /// Olvida lo que hubiera en vuelo. Lo llama el keeper al levantar un motor
+    /// nuevo: lo que estuviera a medias murió con el anterior.
+    pub fn transfers_reset(&self) {
+        let mut guard = self.lock();
+        guard.in_flight = 0;
+        guard.in_flight_since = None;
+    }
+
+    /// ¿Hay algo a medias ahora mismo?
+    ///
+    /// **Caduca.** El contador se lleva emparejando eventos, y emparejar eventos
+    /// es exactamente la clase de cuenta que se descuadra en cuanto alguien
+    /// añade una variante terminal y no la suma aquí. Un descuadre de uno
+    /// bloquearía el updater **para siempre** en silencio —el mismo fallo que el
+    /// gate sin RAII del poller (D.10)—, así que pasado [`TRANSFER_STALE`] se da
+    /// por acabado lo que fuera. Ninguna copia legítima dura tanto.
+    pub fn transfers_in_flight(&self) -> bool {
+        let guard = self.lock();
+        match guard.in_flight_since {
+            Some(since) if guard.in_flight > 0 => since.elapsed() < TRANSFER_STALE,
+            _ => false,
+        }
+    }
+
     /// Marca que no habrá motor y por qué (`--no-engine`). El motivo viaja al
     /// cliente en `EngineDown`: un motor ausente **a propósito** tiene que
     /// distinguirse de uno que no arranca.
@@ -195,6 +260,11 @@ impl Engine {
         // Un motor previo (por ejemplo el que murió y estamos reemplazando) se
         // tira aquí: `Running::aux` aborta sus tareas al soltarse.
         guard.running = Some(running);
+        // Lo que estuviera a medias se fue con el motor anterior. Sin esto, un
+        // motor que rebota en mitad de una subida deja el contador clavado y el
+        // updater no vuelve a aplicar nada.
+        guard.in_flight = 0;
+        guard.in_flight_since = None;
     }
 
     fn note_error(&self, error: String, reason: EngineDownReason) {
@@ -598,6 +668,22 @@ pub async fn pump(
                     p.game_stopped(game_slug.clone());
                 }
             }
+            _ => {}
+        }
+        // Lo que el updater necesita saber para no relevar los binarios en mitad
+        // de una subida. Se cuenta aquí, que es el único sitio por el que pasan
+        // **todas** las transferencias — por el mismo motivo por el que se
+        // notifica aquí y no en cada rama (D.7).
+        match &event {
+            AgentEvent::BackupStarted { .. } => engine.transfer_started(),
+            AgentEvent::BackupSuccess { .. }
+            | AgentEvent::BackupFailed { .. }
+            | AgentEvent::BackupThrottled { .. }
+            | AgentEvent::BackupTooLarge { .. }
+            | AgentEvent::BackupQuotaFull { .. }
+            | AgentEvent::BackupSkippedEmpty { .. }
+            | AgentEvent::SaveAutoRestored { .. }
+            | AgentEvent::SaveAutoRestoreFailed { .. } => engine.transfer_finished(),
             _ => {}
         }
         persist(&event);

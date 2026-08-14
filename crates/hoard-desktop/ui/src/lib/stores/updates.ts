@@ -115,6 +115,120 @@ async function notifyIfNewClientRelease(report: UpdateReport): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// La actualización automática — lo que el servicio está haciendo
+// ---------------------------------------------------------------------------
+//
+// El bloque de abajo (`checkForUpdates` + `applyDesktopUpdate`) es el updater de
+// la ventana: mira GitHub y ofrece un botón. Sigue ahí como red de seguridad
+// —una máquina sin servicio corriendo no tiene quien la actualice—, pero ya no
+// es el camino normal.
+//
+// El normal es éste: **el servicio baja y aplica solo**, y la ventana lee su
+// estado. La diferencia que importa es qué pasa con la app cerrada, que es la
+// mitad del tiempo: un botón que nadie ve no actualiza nada.
+
+/** Por qué está frenada una actualización que ya está bajada. */
+export type UpdateHold = "game_running" | "transfer_in_flight" | "unknown";
+
+/** En qué punto está. Espejo de `hoard_core::ipc::UpdatePhase`. */
+export type UpdatePhase =
+  | { phase: "up_to_date" }
+  | { phase: "downloading" }
+  | { phase: "ready" }
+  | { phase: "waiting"; hold: UpdateHold }
+  | { phase: "applying" }
+  | { phase: "restarting" }
+  | { phase: "failed" }
+  | { phase: "managed" }
+  | { phase: "unknown" };
+
+/** Lo que el servicio sabe. `null` = no hay servicio al que preguntar. */
+export type UpdateState = {
+  /** La versión que corre **el servicio**, que puede ir por delante de esta
+   *  ventana: si el servicio ya se relevó y la app sigue abierta con el
+   *  binario viejo, esto es lo que lo delata. */
+  current: string;
+  latest: string | null;
+  staged: string | null;
+  phase: UpdatePhase;
+  /** ISO-8601. Cuándo deja de ser opcional. */
+  deadline: string | null;
+  /** El plazo venció: la ventana no debe dejar seguir sin actualizar. */
+  mandatory: boolean;
+  /** Esta máquina se releva sola (AppImage / NSIS por-usuario / núcleo en el
+   *  home). `false` = hace falta un humano, y por eso hay algo que enseñar. */
+  unattended: boolean;
+  last_error: string | null;
+};
+
+/** Último estado leído, para que la barra lateral y el gate compartan lectura. */
+export const serviceUpdate: Writable<UpdateState | null> = writable(null);
+
+/** Pregunta al servicio. Nunca lanza: sin servicio devuelve `null`. */
+export async function fetchServiceUpdate(): Promise<UpdateState | null> {
+  try {
+    const s = await invoke<UpdateState | null>("update_status");
+    serviceUpdate.set(s);
+    return s;
+  } catch (e) {
+    console.warn("service update status failed:", e);
+    serviceUpdate.set(null);
+    return null;
+  }
+}
+
+/** Dile al servicio que aplique ya lo que tenga bajado. Vuelve enseguida:
+ *  instalar sigue en marcha y se sigue con `fetchServiceUpdate`. */
+export async function applyStagedUpdate(
+  version?: string,
+): Promise<UpdateState> {
+  const s = await invoke<UpdateState>("apply_staged_update", {
+    version: version ?? null,
+  });
+  serviceUpdate.set(s);
+  return s;
+}
+
+/** "Ahora no", durante `hours`. No mueve la fecha límite. */
+export async function snoozeUpdate(hours: number): Promise<UpdateState> {
+  const s = await invoke<UpdateState>("snooze_update", { hours });
+  serviceUpdate.set(s);
+  return s;
+}
+
+/** ¿Esta ventana se quedó atrás respecto al servicio?
+ *
+ *  Pasa de verdad y es el precio de que el servicio se actualice solo: releva
+ *  los binarios y se reinicia, pero a la ventana ya abierta no la puede tocar.
+ *  Sin esto el usuario se queda en la versión vieja hasta que cierre la app por
+ *  su cuenta — que es exactamente el "se queda tan pancho" que veníamos a
+ *  arreglar, sólo que un escalón más arriba. */
+export function windowIsBehind(
+  state: UpdateState | null,
+  windowVersion: string,
+): boolean {
+  if (!state) return false;
+  return semverIsNewer(state.current, windowVersion);
+}
+
+/** Compara `a > b` como semver, tolerando la `v` del tag y un sufijo de
+ *  pre-release. Ilegible → `false`: nunca se avisa por algo que no se sabe
+ *  comparar. */
+export function semverIsNewer(a: string, b: string): boolean {
+  const parse = (v: string): [number, number, number] | null => {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return false;
+  for (let i = 0; i < 3; i++) {
+    if (x[i] !== y[i]) return x[i] > y[i];
+  }
+  return false;
+}
+
 /**
  * Result of `apply_desktop_update`. `installer_launched` means we spawned the
  * platform installer (pkexec / msiexec / open); `downloaded` means we got the

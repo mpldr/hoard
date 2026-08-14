@@ -36,7 +36,9 @@
 //! derecho propio, en ruta estable, el AppImage se queda de cara gráfica y el
 //! motor arranca en boot igual que con un paquete nativo.
 
+pub mod auto;
 pub mod fetch;
+pub mod stage;
 
 use std::path::{Path, PathBuf};
 

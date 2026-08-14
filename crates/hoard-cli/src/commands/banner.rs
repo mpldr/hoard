@@ -79,18 +79,69 @@ fn component(label: &str, ver: &str, on: bool, status: &str, color: bool) -> Str
     format!("{label:<8} {ver:<9} {} {status}", dot(on, color))
 }
 
-/// The `cli` row. Green ● + "in use" normally; amber ● + "update available →
-/// vX.Y.Z" when a newer release exists (`latest` is `Some`).
-fn cli_component(ver: &str, latest: Option<&str>, color: bool) -> String {
-    match latest {
-        Some(v) => format!(
-            "{:<8} {:<9} {} update available → v{v}",
-            "cli",
-            ver,
-            amber("●", color)
-        ),
+/// The `cli` row. Green ● + "in use" normally; amber ● + what the update is
+/// doing when there's a newer release.
+///
+/// Desde que el servicio actualiza solo, "update available" era una media
+/// verdad que invitaba a hacer algo que ya está pasando. Lo que se dice ahora es
+/// **en qué punto está**: bajándose, esperando a que cierres el juego, o
+/// esperando a alguien que apruebe el diálogo de privilegios — que es el único
+/// caso en el que hay algo que teclear.
+fn cli_component(ver: &str, update: Option<&UpdateLine>, color: bool) -> String {
+    match update {
+        Some(u) => format!("{:<8} {:<9} {} {}", "cli", ver, amber("●", color), u.text),
         None => component("cli", ver, true, "in use", color),
     }
+}
+
+/// Lo que la fila `cli` tiene que decir sobre la actualización.
+struct UpdateLine {
+    text: String,
+}
+
+/// Traduce el estado del servicio a una línea. Sin servicio se cae a la
+/// comprobación local de siempre, que es lo que ve quien tiene sólo la terminal
+/// instalada y el servicio parado.
+async fn update_line() -> Option<UpdateLine> {
+    use hoard_core::ipc::{UpdateHold, UpdatePhase};
+
+    let Some(state) = crate::commands::link::update_state().await else {
+        let latest = hoard_agent::update::available_update().await?;
+        return Some(UpdateLine {
+            text: format!("update available → v{latest} (run `hoard upgrade`)"),
+        });
+    };
+    let latest = state.latest.as_deref()?;
+    if !hoard_agent::update::is_newer(latest, env!("CARGO_PKG_VERSION")) {
+        return None;
+    }
+    let text = match state.phase {
+        UpdatePhase::Downloading => format!("v{latest} — downloading"),
+        UpdatePhase::Waiting {
+            hold: UpdateHold::GameRunning,
+        } => format!("v{latest} — installs when you close the game"),
+        UpdatePhase::Waiting {
+            hold: UpdateHold::TransferInFlight,
+        } => format!("v{latest} — installs when the current backup finishes"),
+        // Un motivo que este binario no conoce: lo manda un servicio más nuevo,
+        // y durante el relevo eso es lo normal.
+        UpdatePhase::Waiting {
+            hold: UpdateHold::Unknown,
+        } => format!("v{latest} — waiting for the right moment"),
+        UpdatePhase::Applying => format!("v{latest} — installing"),
+        UpdatePhase::Restarting => format!("v{latest} — installed, restarting"),
+        UpdatePhase::Managed => format!("v{latest} out — your package manager owns this install"),
+        UpdatePhase::Failed => match state.last_error.as_deref() {
+            Some(err) => format!("v{latest} — last attempt failed: {err}"),
+            None => format!("v{latest} — last attempt failed"),
+        },
+        // Bajado y a la espera. Que haga falta teclear algo o no lo decide si
+        // esta máquina puede relevarse sola.
+        UpdatePhase::Ready if state.unattended => format!("v{latest} — ready, installing shortly"),
+        UpdatePhase::Ready => format!("v{latest} — ready (run `hoard upgrade` to install it)"),
+        UpdatePhase::UpToDate | UpdatePhase::Unknown => format!("v{latest} available"),
+    };
+    Some(UpdateLine { text })
 }
 
 /// One cheat-sheet line: `cmd` (green) at fixed width + description.
@@ -219,9 +270,10 @@ pub async fn show(full: bool) -> Result<()> {
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let cli_ver = format!("v{}", env!("CARGO_PKG_VERSION"));
 
-    // Is a newer CLI out? Cached (6h) so this is instant on repeated runs and
-    // best-effort — a failed check just leaves the dot green.
-    let cli_update = hoard_agent::update::available_update().await;
+    // ¿Hay algo más nuevo, y qué está pasando con ello? Se le pregunta al
+    // servicio (que es quien lo está haciendo) y se cae a la comprobación local
+    // cacheada si no hay servicio. Best-effort: un fallo deja el punto verde.
+    let cli_update = update_line().await;
 
     // Session: Cloud wins over self-host (same as when resolving). Best-effort,
     // no network.
@@ -273,7 +325,7 @@ pub async fn show(full: bool) -> Result<()> {
         bold_emerald("hoard", color),
         dim("game save sync", color),
         String::new(),
-        cli_component(&cli_ver, cli_update.as_deref(), color),
+        cli_component(&cli_ver, cli_update.as_ref(), color),
         component(
             "desktop",
             "—",

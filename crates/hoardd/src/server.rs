@@ -63,6 +63,10 @@ pub struct Daemon {
     /// recibiría un saludo normal, daría por buena la despedida anterior y
     /// relanzaría el servicio al perder el socket: el bug entero otra vez.
     said: std::sync::OnceLock<String>,
+    /// La actualización automática. El daemon no la conduce —eso es
+    /// [`crate::updater::watch`]—, sólo la enseña y le pasa lo que piden los
+    /// clientes.
+    pub updater: crate::updater::Updater,
 }
 
 impl Daemon {
@@ -77,6 +81,7 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             farewell: broadcast::channel(FAREWELL_CHANNEL).0,
             said: std::sync::OnceLock::new(),
+            updater: crate::updater::Updater::new(),
         }
     }
 
@@ -349,6 +354,33 @@ impl Daemon {
                 self.with_engine(|h| async move { h.set_global_sync(enabled).await })
                     .await
             }
+            // Cómo va la actualización. No pasa por el motor: el updater es del
+            // daemon, y un motor caído —que suele ser justo el caso en que
+            // actualizar arregla algo— no puede dejar a nadie sin saberlo.
+            Request::UpdateStatus => Reply::Ok(Payload::Update(self.updater.state())),
+            // Aplicar **ahora**. Vuelve al momento con el estado de este
+            // instante: aplicar puede tardar (un instalador nativo, un diálogo
+            // de polkit esperando a un humano) y dejar una petición IPC colgada
+            // todo ese rato bloquearía las demás de ese cliente. Quien pregunta
+            // vuelve a preguntar por `UpdateStatus` y ve la fase avanzar.
+            Request::ApplyUpdate { version } => {
+                tracing::info!(
+                    version = version.as_deref().unwrap_or("latest"),
+                    "hoardd: a client asked to apply the update now"
+                );
+                self.updater.apply_now(version);
+                Reply::Ok(Payload::Update(self.updater.state()))
+            }
+            Request::SnoozeUpdate { hours } => {
+                self.updater.snooze(hours);
+                Reply::Ok(Payload::Update(self.updater.state()))
+            }
+            // Una petición de un cliente más nuevo que este servicio. Se
+            // contesta, no se tira la conexión: el cliente acaba de
+            // actualizarse y a nosotros nos queda un relevo de segundos.
+            Request::Unknown => Reply::Error(IpcError::Unsupported {
+                op: "an operation this version of the Hoard service doesn't know".to_string(),
+            }),
             // Las dos que no llegan aquí.
             Request::Subscribe { .. } | Request::Shutdown => Reply::Error(IpcError::Internal {
                 message: "handled by the connection loop".to_string(),

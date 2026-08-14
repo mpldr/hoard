@@ -337,6 +337,41 @@ pub enum Request {
     /// (`hoard sync stop`), no un efecto de cerrar un cliente: cerrar la app
     /// nunca puede matar el sync, que es el punto de todo el slice.
     Shutdown,
+    /// **¿Cómo va la actualización?** El servicio es el dueño del updater —es
+    /// el único que está siempre—, así que los clientes no miran GitHub: se lo
+    /// preguntan a él. Responde [`Payload::Update`].
+    UpdateStatus,
+    /// **Aplica ya lo que haya bajado.** Lo pide un cliente cuando hay alguien
+    /// delante: el botón de Ajustes, `hoard upgrade`, o la ventana al abrirse.
+    ///
+    /// La diferencia con esperar al ciclo de fondo no es la prisa, es el
+    /// permiso: con un humano delante, el servicio puede lanzar un `pkexec` y
+    /// que el diálogo de polkit tenga a quién preguntarle. En el ciclo de fondo
+    /// no puede, y por eso un `.deb` no se actualiza solo.
+    ///
+    /// `version` es la que el cliente creía estar aplicando. Si entretanto
+    /// salió otra, el servicio contesta con su estado nuevo en vez de instalar
+    /// a sabiendas algo que ya no es lo último.
+    ApplyUpdate {
+        #[serde(default)]
+        version: Option<String>,
+    },
+    /// **Ahora no.** Calla lo que se puede posponer durante `hours`. No mueve
+    /// la fecha límite: posponer retrasa la pregunta, no el plazo.
+    SnoozeUpdate {
+        hours: u32,
+    },
+    /// Petición que este daemon no conoce: la manda un cliente más nuevo.
+    ///
+    /// Sin esta variante, la primera petición desconocida sería un error de
+    /// **encuadre**, y el encuadre roto tira la conexión — un cliente recién
+    /// actualizado hablándole al servicio viejo de hace treinta segundos se
+    /// quedaría sin servicio en vez de recibir un "eso no lo sé hacer". Con
+    /// ella la respuesta es [`IpcError::Unsupported`] y la conexión sigue viva,
+    /// que es lo que permite añadir peticiones sin subir la versión del
+    /// protocolo (C.6).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Respuesta a una petición.
@@ -363,6 +398,83 @@ pub enum Payload {
     CloudToken(CloudToken),
     /// La sesión self-hosted prestada (respuesta a [`Request::ServerToken`]).
     ServerSession(ServerSession),
+    /// Cómo va la actualización (respuesta a [`Request::UpdateStatus`] y a
+    /// [`Request::ApplyUpdate`]).
+    Update(UpdateState),
+}
+
+/// **Lo que el servicio sabe de la actualización**, que es todo: qué corre, qué
+/// hay publicado, qué está bajado y cuándo deja de ser opcional.
+///
+/// Es lo único que un cliente necesita para pintar la actualización, y a
+/// propósito no incluye nada que un cliente pudiera *decidir*. La política vive
+/// en `hoard_agent::install::auto` y la ejecuta el servicio; esto es la vista.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateState {
+    /// La versión que corre en el servicio.
+    pub current: String,
+    /// La última publicada, si se ha podido preguntar.
+    #[serde(default)]
+    pub latest: Option<String>,
+    /// La que está bajada y verificada, lista para aplicarse en lo que tarda un
+    /// `rename`.
+    #[serde(default)]
+    pub staged: Option<String>,
+    pub phase: UpdatePhase,
+    /// Cuándo deja de ser opcional. `None` = no hay nada pendiente.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub deadline: Option<OffsetDateTime>,
+    /// El plazo venció: la ventana no debe dejar seguir sin actualizar.
+    #[serde(default)]
+    pub mandatory: bool,
+    /// Esta máquina se releva sola (AppImage, NSIS por-usuario, núcleo en el
+    /// home). `false` significa que hace falta un humano —un `.deb` quiere
+    /// polkit, un `.dmg` quiere una mano—, y es lo que decide si el cliente
+    /// tiene que enseñar algo o puede callarse.
+    #[serde(default)]
+    pub unattended: bool,
+    /// Qué falló en el último intento, si falló.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// En qué punto está.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum UpdatePhase {
+    /// No hay nada más nuevo.
+    UpToDate,
+    /// Bajando y verificando.
+    Downloading,
+    /// Bajado. Esperando el momento, o a que alguien diga que sí.
+    Ready,
+    /// Bajado y frenado, con motivo.
+    Waiting { hold: UpdateHold },
+    /// Aplicándose ahora mismo.
+    Applying,
+    /// Aplicado. El servicio se está relevando con el binario nuevo.
+    Restarting,
+    /// El último intento falló (el motivo va en `last_error`).
+    Failed,
+    /// Aquí no actualizamos nada: lo mantiene un tercero (el gestor de paquetes
+    /// de la distro, Flatpak, un `nix`).
+    Managed,
+    /// Fase que este cliente no conoce, de un daemon más nuevo.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Por qué está frenada una actualización que ya está bajada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateHold {
+    /// Hay una copia o una restauración a medias. Frena siempre, plazo o no.
+    TransferInFlight,
+    /// Hay un juego abierto. Frena lo silencioso, no lo obligatorio.
+    GameRunning,
+    /// Motivo que este cliente no conoce.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Una sesión Cloud que un cliente **entrega** al daemon

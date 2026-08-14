@@ -37,6 +37,7 @@
 //! - [`engine`] — arranque, supervisión y bomba de eventos del motor.
 //! - [`server`] — handshake y despacho.
 //! - [`client`] — cliente + "spawn if absent" (lo que usan el desktop y la CLI).
+//! - [`updater`] — la actualización automática: mirar, bajar, aplicar, relevarse.
 //!
 //! La sesión (resolución, refresher y préstamo del token) vive en
 //! `hoard_agent::session`: el Slice 4a la tenía duplicada aquí para no tocar la
@@ -51,6 +52,7 @@ pub mod journal;
 pub mod notify;
 pub mod server;
 pub mod transport;
+pub mod updater;
 
 #[cfg(windows)]
 pub mod winsec;
@@ -105,7 +107,16 @@ pub enum Outcome {
     /// Ya había un daemon: no hacía falta este proceso. **No es un error** — es
     /// la mitad "el que pierde el bind" de "spawn if absent".
     AlreadyRunning,
+    /// Se aplicó una actualización y hay que arrancar con el binario nuevo. El
+    /// proceso ya soltó el motor y el socket; a quien llama le toca decidir
+    /// **quién** vuelve a arrancarlo (ver `main`).
+    Relaunching { version: String },
 }
+
+/// Cola del relevo. Uno basta: dos actualizaciones aplicadas antes de que el
+/// proceso se entere de la primera no existen — el bucle para al pedir la
+/// primera.
+const RELAUNCH_CHANNEL: usize = 1;
 
 /// Arranca el servicio y sirve hasta que se pida el apagado (por IPC o señal).
 pub async fn run(options: Options) -> Result<Outcome> {
@@ -183,6 +194,26 @@ pub async fn run(options: Options) -> Result<Outcome> {
         })
     }));
 
+    // La actualización automática. Va supervisada como todo lo demás: un pánico
+    // aquí dejaría la máquina sin actualizarse nunca y sin decirlo, que es
+    // exactamente el fallo que este bucle viene a matar.
+    let (relaunch_tx, mut relaunch_rx) = mpsc::channel::<updater::Relaunch>(RELAUNCH_CHANNEL);
+    tasks.push(tokio::spawn({
+        let updater = daemon.updater.clone();
+        let engine = engine.clone();
+        let notifier = notifier.clone();
+        let relaunch_tx = relaunch_tx.clone();
+        supervisor::supervise("hoardd updater", move || {
+            updater::watch(
+                updater.clone(),
+                engine.clone(),
+                notifier.clone(),
+                relaunch_tx.clone(),
+            )
+        })
+    }));
+
+    let mut relaunching: Option<String> = None;
     tokio::select! {
         _ = daemon.wait_for_shutdown() => {
             tracing::info!("hoardd: stopping on request");
@@ -191,6 +222,16 @@ pub async fn run(options: Options) -> Result<Outcome> {
         _ = shutdown_signal() => {
             tracing::info!("hoardd: stopping on signal");
             daemon.say_goodbye("the service manager stopped it");
+        }
+        Some(r) = relaunch_rx.recv() => {
+            tracing::info!(version = %r.version, "hoardd: stopping to relaunch on the new binary");
+            // **Aquí no hay despedida, y es deliberado.** La despedida significa
+            // "me han parado a propósito, no me relances" (D.17), y esto es lo
+            // contrario: queremos que todo el mundo nos vuelva a levantar. Un
+            // cliente enganchado ve el socket cerrarse sin adiós, lo trata como
+            // una caída y hace "spawn if absent" — que con el binario ya
+            // sustituido en disco arranca la versión nueva.
+            relaunching = Some(r.version);
         }
     }
     // Las dos vías son deliberadas, así que las dos se despiden: un cliente
@@ -211,8 +252,13 @@ pub async fn run(options: Options) -> Result<Outcome> {
         let _ = task.await;
     }
     // Suelta el socket y el lock: el fichero no queda para que el siguiente
-    // arranque tenga que barrerlo.
+    // arranque tenga que barrerlo. Con un relevo pendiente esto además es
+    // **condición para que funcione**: el proceso nuevo tiene que poder ganar el
+    // bind, y el árbitro es la propiedad del socket.
     drop(listener);
+    if let Some(version) = relaunching {
+        return Ok(Outcome::Relaunching { version });
+    }
     Ok(Outcome::Served)
 }
 

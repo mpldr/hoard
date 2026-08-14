@@ -90,6 +90,109 @@ enum SigCheck {
     Unsigned,
 }
 
+// ---------------------------------------------------------------------------
+// La actualización automática — la ventana es una vista, no la dueña
+// ---------------------------------------------------------------------------
+//
+// Quien mira, baja y aplica es el servicio (`hoardd::updater`), por lo mismo
+// que es el dueño del motor: es lo único que está siempre. Una máquina cuya app
+// lleva dos semanas cerrada tiene que actualizarse igual, y una ventana no
+// puede prometer eso.
+//
+// Lo que se queda aquí son las dos cosas que sólo puede hacer una ventana:
+//
+// 1. **Enseñar** en qué punto está, incluido el caso feo — el paquete nativo
+//    que necesita un diálogo de privilegios que el ciclo de fondo no abre.
+// 2. **Estar delante.** `apply_staged_update` es el permiso: cuando lo pide la
+//    ventana, hay un humano al teclado y polkit tiene a quién preguntarle.
+//
+// Y de ahí sale "se actualiza al abrirse": al arrancar, la app pregunta el
+// estado y, si hay algo bajado, lo aplica antes de dejar seguir. Al abrir ya no
+// queda descarga — queda un `rename`.
+
+/// Cómo va la actualización, tal cual la cuenta el servicio.
+///
+/// Se reenvía la forma de `hoard_core::ipc::UpdateState` en vez de traducirla:
+/// el cable ya está pensado para que lo lea una interfaz (fases con nombre,
+/// motivos tipados, la fecha límite), y una segunda forma sería un sitio más
+/// donde quedarse atrás.
+#[tauri::command]
+pub async fn update_status(
+    state: State<'_, AppState>,
+) -> Result<Option<hoard_core::ipc::UpdateState>, String> {
+    match state.daemon.update_state().await {
+        Ok(state) => Ok(Some(state)),
+        Err(err) => {
+            // Sin servicio (o con uno más viejo que esta ventana, que dura lo
+            // que tarda su relevo) no hay estado que enseñar. `None` y no un
+            // error: la app arranca igual, y el updater viejo de esta misma
+            // pantalla sigue de red de seguridad.
+            tracing::debug!(error = %format!("{err:#}"), "updates: the service didn't report its update state");
+            Ok(None)
+        }
+    }
+}
+
+/// Aplica ya lo que el servicio tenga bajado. **Éste es el camino con humano
+/// delante**: es el único por el que un `.deb` o un `.rpm` llegan a instalarse,
+/// porque es el único en el que el diálogo de polkit tiene a quién preguntar.
+///
+/// Vuelve enseguida con el estado del momento; instalar sigue en marcha y se
+/// sigue con [`update_status`].
+#[tauri::command]
+pub async fn apply_staged_update(
+    state: State<'_, AppState>,
+    version: Option<String>,
+) -> Result<hoard_core::ipc::UpdateState, AppError> {
+    state
+        .daemon
+        .apply_update(version)
+        .await
+        .map_err(|err| {
+            AppError::new("updates.error.title", "updates.error.unknown")
+                .with_detail(format!("{err:#}"))
+        })
+}
+
+/// "Ahora no", durante `hours`. No mueve la fecha límite: posponer retrasa la
+/// pregunta, no el plazo — que es justo lo que hace que el plazo signifique
+/// algo.
+#[tauri::command]
+pub async fn snooze_update(
+    state: State<'_, AppState>,
+    hours: u32,
+) -> Result<hoard_core::ipc::UpdateState, AppError> {
+    state
+        .daemon
+        .snooze_update(hours)
+        .await
+        .map_err(|err| {
+            AppError::new("updates.error.title", "updates.error.unknown")
+                .with_detail(format!("{err:#}"))
+        })
+}
+
+/// Cierra esta ventana y abre la copia recién instalada.
+///
+/// Lo pide la pantalla de actualización cuando **el servicio ya se relevó y la
+/// ventana se quedó atrás**: el binario nuevo está en disco desde hace un rato,
+/// pero un proceso vivo no cambia de ejecutable. Reutiliza el mismo relevo que
+/// el updater de la propia ventana ([`relaunch_then_exit`]), con el mismo
+/// cuidado con el `" (deleted)"` que el kernel cuelga de `/proc/self/exe`
+/// cuando el fichero que estamos ejecutando ya fue sustituido — que es
+/// exactamente el caso aquí.
+#[tauri::command]
+pub async fn restart_app(app: AppHandle) {
+    let exe_before = std::env::current_exe().ok().map(sanitize_exe_path);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Un respiro para que la respuesta del comando llegue al WebView antes
+        // de cortarle el proceso por debajo.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        relaunch_then_exit(&app2, exe_before);
+    });
+}
+
 /// Tauri command. Pulls the latest GitHub release in parallel with the
 /// server health probe (when logged in). Returns both halves so the UI
 /// can render two badges side-by-side.

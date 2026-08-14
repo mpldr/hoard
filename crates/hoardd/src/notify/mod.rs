@@ -83,6 +83,16 @@ pub enum Kind {
     RestoreStuck {
         failures: u32,
     },
+    /// Hay una actualización bajada que **esta máquina no puede ponerse sola**
+    /// (un paquete nativo que quiere polkit, un `.dmg` que quiere una mano).
+    ///
+    /// No sale de la bomba de eventos: lo manda [`crate::updater`], que es el
+    /// único que lo sabe. Y es el único aviso de actualización que existe, a
+    /// propósito: donde se aplica sola no hay nada que pedir, así que avisar
+    /// sería contarle al usuario un trabajo que ya está hecho.
+    UpdateReady {
+        version: String,
+    },
 }
 
 /// Qué avisar por este evento, o nada.
@@ -244,6 +254,26 @@ impl Notifier {
             &name,
             Lang::for_user(prefs.language.as_deref()),
         );
+        self.send(note).await;
+    }
+
+    /// Avisa de algo que no sale de un evento del motor. Hoy sólo el updater
+    /// ([`Kind::UpdateReady`]): no hay `save_id` del que sacar un nombre ni
+    /// preferencia por save que consultar, así que no pasa por
+    /// [`Self::consider`].
+    ///
+    /// La puerta de las prefs sí se respeta, con la misma que gobierna los
+    /// avisos de problema: quien apagó las notificaciones de fallo no quiere
+    /// que le hablemos de nada que necesite su intervención.
+    pub async fn announce(&self, kind: Kind) {
+        if self.sink.is_none() {
+            return;
+        }
+        let prefs = load_prefs();
+        if !prefs.notify_on_failure {
+            return;
+        }
+        let note = text::render(&kind, "", Lang::for_user(prefs.language.as_deref()));
         self.send(note).await;
     }
 

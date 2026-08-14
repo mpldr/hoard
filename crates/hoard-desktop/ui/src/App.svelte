@@ -70,6 +70,7 @@ import { tilt } from "./lib/actions/tilt";
   import { tourActive } from "./lib/stores/tour";
   import UpdateConfirmModal from "./lib/components/UpdateConfirmModal.svelte";
   import ErrorDialog from "./lib/components/ErrorDialog.svelte";
+  import UpdateGate from "./lib/components/UpdateGate.svelte";
   import QuotaMini from "./lib/components/QuotaMini.svelte";
   import Logo from "./lib/components/Logo.svelte";
   import ActivityFeed from "./lib/components/ActivityFeed.svelte";
@@ -1179,6 +1180,11 @@ import { tilt } from "./lib/actions/tilt";
 
 <ErrorDialog error={$errorDialog} onClose={dismissError} />
 
+<!-- Por encima de todo lo demás, y montado siempre: es quien pregunta al
+     servicio en qué punto va la actualización y quien tapa la pantalla cuando
+     ya no hay nada útil que hacer debajo (plazo vencido, instalación en curso,
+     o una ventana que se quedó atrás del servicio que ya se relevó). -->
+<UpdateGate />
 <!-- "Liberar espacio" lives at the shell level, not inside Account: it's needed
      the moment an upload bounces off a full account, and that happens while the
      user is on Library, Dashboard or nowhere at all. -->

@@ -82,6 +82,40 @@ pub async fn ask(client: &mut Client, request: Request) -> Result<Payload> {
         })?
 }
 
+/// Lo que el servicio sabe de la actualización, si hay servicio. Nunca lo
+/// arranca — preguntar cómo va una actualización no puede convertir la máquina
+/// en una que sincroniza.
+///
+/// `None` cubre dos cosas a propósito: no hay servicio, y hay uno **más viejo
+/// que este binario**, que no conoce la petición. El segundo dura lo que tarda
+/// el relevo (segundos) y no merece un error en pantalla.
+pub async fn update_state() -> Option<hoard_core::ipc::UpdateState> {
+    let mut client = attached("updates").await?;
+    match ask(&mut client, Request::UpdateStatus).await {
+        Ok(Payload::Update(state)) => Some(state),
+        Ok(other) => {
+            tracing::debug!("cli: unexpected answer to UpdateStatus: {other:?}");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "cli: the service didn't report update status");
+            None
+        }
+    }
+}
+
+/// Pide al servicio que aplique ya lo que tenga bajado. Devuelve el estado del
+/// momento; aplicar sigue en marcha después de contestar.
+pub async fn apply_update(version: Option<String>) -> Result<hoard_core::ipc::UpdateState> {
+    let mut client = attached("upgrade")
+        .await
+        .context("the Hoard service isn't running, so there's nobody to apply the update")?;
+    match ask(&mut client, Request::ApplyUpdate { version }).await? {
+        Payload::Update(state) => Ok(state),
+        other => anyhow::bail!("the service answered a {other:?} to an update request"),
+    }
+}
+
 /// Estado del servicio, o `None` si no hay ninguno. Para pintar (`hoard`,
 /// `hoard sync`): no arranca nada.
 pub async fn status() -> Option<DaemonStatus> {

@@ -427,6 +427,36 @@ fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
     Ok(())
 }
 
+/// Arranca **nuestro relevo** tras una actualización que sustituyó este binario.
+///
+/// Es `spawn_daemon` sin el endpoint por entorno: quien se releva es el propio
+/// servicio, y el endpoint que le toca es el mismo que resuelve por su cuenta
+/// —heredamos `HOARDD_SOCKET` si lo había, así que un daemon con socket propio
+/// se releva en su socket—. Devuelve el pid del hijo, que es lo único que se
+/// puede afirmar aquí: si el binario nuevo estuviera roto, quien lo dice es el
+/// log del hijo, no nosotros.
+///
+/// Quien llama tiene que haber **soltado el socket** antes: el árbitro es su
+/// propiedad, y un hijo que llega y lo encuentra ocupado sale con 0 sin servir
+/// nada (`Outcome::AlreadyRunning`).
+pub fn respawn_service() -> Result<u32> {
+    // `own_daemon_binary` y no `daemon_binary`: lo que hay que arrancar es el
+    // binario que acabamos de sustituir en **nuestro** sitio. `daemon_binary`
+    // prefiere el `ExecStart` de la unidad instalada, que en una máquina con dos
+    // instalaciones apuntaría a la otra.
+    let binary = own_daemon_binary();
+    let mut command = std::process::Command::new(&binary);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach(&mut command);
+    let child = command
+        .spawn()
+        .with_context(|| format!("starting the updated daemon ({})", binary.display()))?;
+    Ok(child.id())
+}
+
 /// El servicio tiene que sobrevivir a quien lo arrancó — es el punto de todo el
 /// slice: cerrar la app (o Ctrl-C en la CLI) no puede matar el sync.
 #[cfg(unix)]

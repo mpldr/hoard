@@ -19,6 +19,11 @@
     title: string;
     description?: string;
     dismissible?: boolean;
+    /** Deja quieta la cabecera y el pie y hace rodar sólo el cuerpo. Para
+     *  diálogos altos en los que las salidas del pie tienen que estar
+     *  siempre a la vista: por defecto rueda la tarjeta entera y el pie se va
+     *  abajo del todo, fuera de la pantalla. */
+    scrollBody?: boolean;
     onClose: () => void;
     children: Snippet;
     footer?: Snippet;
@@ -29,6 +34,7 @@
     title,
     description,
     dismissible = true,
+    scrollBody = false,
     onClose,
     children,
     footer,
@@ -63,11 +69,13 @@
       aria-modal="true"
       aria-labelledby="modal-title"
       tabindex="-1"
-      class="pop mx-4 max-h-[85vh] w-full max-w-lg overflow-y-auto"
+      class="pop mx-4 max-h-[85vh] w-full max-w-lg {scrollBody
+        ? 'flex flex-col overflow-hidden'
+        : 'overflow-y-auto'}"
       onclick={(e) => e.stopPropagation()}
     >
       <header
-        class="flex items-start justify-between gap-4 border-b border-[var(--edge)] px-5 py-4"
+        class="flex shrink-0 items-start justify-between gap-4 border-b border-[var(--edge)] px-5 py-4"
       >
         <div class="min-w-0">
           <h2 id="modal-title" class="text-base font-semibold tracking-tight text-zinc-100">
@@ -89,13 +97,13 @@
         {/if}
       </header>
 
-      <div class="px-5 py-4">
+      <div class="px-5 py-4 {scrollBody ? 'min-h-0 flex-1 overflow-y-auto' : ''}">
         {@render children()}
       </div>
 
       {#if footer}
         <footer
-          class="flex items-center justify-end gap-2 border-t border-[var(--edge)] px-5 py-3"
+          class="flex shrink-0 items-center justify-end gap-2 border-t border-[var(--edge)] px-5 py-3"
         >
           {@render footer()}
         </footer>

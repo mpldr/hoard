@@ -17,6 +17,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { bootAgent, shutdownAgent } from "./agent";
 import { auth } from "./auth";
 import { noteStorageStatus } from "./live";
+import { notePlanSnapshot } from "./planEvents";
 
 export type CloudAccount = {
   user_id: string;
@@ -51,6 +52,11 @@ export type CloudAccount = {
   renews_at: string | null;
   /** RFC3339 — populated only when the user has scheduled a cancellation. */
   cancel_at: string | null;
+  /** RFC3339 — the first time this account was ever Pro, `null` if never.
+   *  One-way: a downgrade doesn't clear it. It's why an account on Free can
+   *  legitimately report an unlimited `devices_limit`, and what lets the
+   *  farewell dialog say which of the Pro perks survive the cancellation. */
+  first_pro_at?: string | null;
   /** Storage pressure: `"ok"` (green), `"purging"` (orange — old versions are
    *  being auto-deleted to free room), `"full"` (red — at the hard limit, sync
    *  stopped) or `"grace"` (blue — a downgrade is scheduled; the account still
@@ -105,7 +111,16 @@ export async function hydrateCloud(): Promise<void> {
   try {
     const account = await invoke<CloudAccount | null>("cloud_current_account");
     internal.set({ account, hydrated: true, loading: false });
-    noteStorageStatus(account?.storage_status);
+    noteStorageStatus(
+      account?.storage_status,
+      account?.storage_used_bytes,
+      account?.storage_limit_bytes,
+    );
+    // Con el snapshot cacheado, que puede ser de hace semanas: si el plan
+    // cambió mientras la aplicación estaba cerrada, el `refreshCloud` de dos
+    // líneas más abajo es quien lo nota. Este pase sólo mantiene el marcador
+    // al día para que aquél tenga con qué comparar.
+    void notePlanSnapshot(account);
     // If we have an account, refresh once in the background so the bar
     // tracks reality instead of whatever was on disk at last sign-in.
     if (account) {
@@ -135,7 +150,14 @@ export async function refreshCloud(): Promise<CloudAccount> {
   try {
     const account = await invoke<CloudAccount>("cloud_refresh_account");
     internal.set({ account, hydrated: true, loading: false });
-    noteStorageStatus(account.storage_status);
+    noteStorageStatus(
+      account.storage_status,
+      account.storage_used_bytes,
+      account.storage_limit_bytes,
+    );
+    // Aquí es donde se entera de un pago o una cancelación hechos fuera: es el
+    // único punto que habla con el servidor de verdad.
+    void notePlanSnapshot(account);
     return account;
   } catch (e) {
     internal.update(($s) => ({ ...$s, loading: false }));
@@ -174,12 +196,20 @@ export async function completeCloudLogin(
       callbackState,
     });
     internal.set({ account, hydrated: true, loading: false });
+    // Primer contacto con el plan de esta cuenta. Si la máquina nunca la había
+    // visto, el marcador se siembra y calla: quien acaba de entrar ya sabe con
+    // qué plan lo hace. Si sí la conocía, la diferencia cuenta igual — pagar en
+    // la web y volver aquí a iniciar sesión es una forma legítima de llegar.
+    void notePlanSnapshot(account);
     // Leave a record of the acceptance the user gave on the onboarding screen.
+    // It has to happen here and not there: the checkbox is ticked before the
     // OAuth round-trip, when there is no account yet to attach it to.
+    // Best-effort on purpose — a signed-in user must not be bounced back out
     // because a bookkeeping call failed, and the server is idempotent, so the
     // next launch writes it.
     invoke("cloud_accept_terms").catch((e) =>
       console.warn("terms acceptance not recorded:", e),
+    );
     // Boot the live agent for the freshly signed-in account so watching starts
     // immediately — same as `signIn` does for self-hosted. Rust already pointed
     // `CliState` at this account's context inside `cloud_complete_login`, so the
@@ -349,7 +379,11 @@ export async function deleteCloudAccount(): Promise<void> {
 export async function reactivateCloudAccount(): Promise<CloudAccount> {
   const account = await invoke<CloudAccount>("cloud_reactivate_account");
   internal.set({ account, hydrated: true, loading: false });
-  noteStorageStatus(account.storage_status);
+  noteStorageStatus(
+    account.storage_status,
+    account.storage_used_bytes,
+    account.storage_limit_bytes,
+  );
   return account;
 }
 

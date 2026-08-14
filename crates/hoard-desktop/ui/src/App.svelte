@@ -74,6 +74,7 @@ import { tilt } from "./lib/actions/tilt";
   import QuotaMini from "./lib/components/QuotaMini.svelte";
   import Logo from "./lib/components/Logo.svelte";
   import ActivityFeed from "./lib/components/ActivityFeed.svelte";
+  import StorageFullBanner from "./lib/components/StorageFullBanner.svelte";
   import {
     subscribeLive,
     unsubscribeLive,
@@ -96,6 +97,9 @@ import { tilt } from "./lib/actions/tilt";
     closeLiberate,
   } from "./lib/stores/liberate";
   import LiberateStorageModal from "./lib/components/LiberateStorageModal.svelte";
+  import { planEvent, dismissPlanEvent } from "./lib/stores/planEvents";
+  import ProThanksModal from "./lib/components/ProThanksModal.svelte";
+  import ProFarewellModal from "./lib/components/ProFarewellModal.svelte";
   import {
     automaticState,
     initAutomaticListener,
@@ -1185,6 +1189,7 @@ import { tilt } from "./lib/actions/tilt";
      ya no hay nada útil que hacer debajo (plazo vencido, instalación en curso,
      o una ventana que se quedó atrás del servicio que ya se relevó). -->
 <UpdateGate />
+
 <!-- "Liberar espacio" lives at the shell level, not inside Account: it's needed
      the moment an upload bounces off a full account, and that happens while the
      user is on Library, Dashboard or nowhere at all. -->
@@ -1195,8 +1200,30 @@ import { tilt } from "./lib/actions/tilt";
   onDone={() => void refreshCloud()}
 />
 
-{#if isAppRoute && ($prefs?.live_activity_visible ?? true)}
-  <ActivityFeed onClose={() => toggleActivityFeed()} />
+<!-- Los dos diálogos de plan: el agradecimiento al pagar Pro y la despedida al
+     cancelarlo. Cada uno se ve UNA vez (el marcador vive en disco, por cuenta:
+     `stores/planEvents.ts`) y en mitad de la aplicación, porque lo que los
+     dispara pasa fuera —en el navegador, en Polar— y aquí sólo llega en el
+     siguiente `/v1/me`. Sólo sobre las rutas de la aplicación: en mitad del
+     asistente de alta no hay dónde volver, y con la cuenta congelada por
+     borrado manda su pantalla. -->
+{#if isAppRoute && !$cloud.account?.deleted_at}
+  <ProThanksModal open={$planEvent === "thanks"} onClose={dismissPlanEvent} />
+  <ProFarewellModal open={$planEvent === "farewell"} onClose={dismissPlanEvent} />
+{/if}
+
+<!-- Bottom-right stack. The storage banner rides above the activity panel and
+     survives it being closed: a full account is the one state that has to stay
+     on screen, since nothing gets backed up until it clears. -->
+{#if isAppRoute}
+  <div
+    class="pointer-events-none fixed bottom-4 right-4 z-40 flex w-[min(22rem,calc(100vw-2rem))] flex-col items-stretch gap-2"
+  >
+    <StorageFullBanner />
+    {#if $prefs?.live_activity_visible ?? true}
+      <ActivityFeed onClose={() => toggleActivityFeed()} />
+    {/if}
+  </div>
 {/if}
 
 <Toaster />

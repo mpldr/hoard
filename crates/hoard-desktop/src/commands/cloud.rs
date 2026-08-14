@@ -131,6 +131,20 @@ pub struct CloudAccount {
     /// (`deleted_at` + 30 days). `None` for a live account.
     #[serde(default)]
     pub purges_at: Option<String>,
+    /// RFC3339 — la primera vez que esta cuenta fue Pro, o `None` si nunca lo
+    /// fue. Marcador de un solo sentido: una bajada de plan no lo borra. Es lo
+    /// que hace legítimo que una cuenta en Free tenga dispositivos ilimitados,
+    /// y lo que deja a la despedida de Pro decir qué se conserva y qué no.
+    #[serde(default)]
+    pub first_pro_at: Option<String>,
+    /// Límite al que caerá el almacenamiento cuando venza la ventana de gracia
+    /// de una bajada ya programada. Mientras tanto la cuenta conserva el
+    /// grande y no se borra nada. `None` = no hay bajada pendiente.
+    #[serde(default)]
+    pub pending_storage_limit_bytes: Option<i64>,
+    /// RFC3339 — cuándo se aplica esa bajada (fin de la ventana de gracia).
+    #[serde(default)]
+    pub storage_limit_change_at: Option<String>,
 }
 
 fn default_forever() -> bool {

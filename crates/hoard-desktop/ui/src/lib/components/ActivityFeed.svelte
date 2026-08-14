@@ -147,8 +147,11 @@
   const _tickRef = $derived(tick); // touched in summary() via relativeTime call below
 </script>
 
+<!-- Positioning belongs to the bottom-right stack in App.svelte, not here: the
+     storage banner shares that corner and the two must not sit on top of each
+     other. This is just the card. -->
 <aside
-  class="pointer-events-auto fixed bottom-4 right-4 z-40 flex w-[min(22rem,calc(100vw-2rem))] flex-col rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-xl backdrop-blur"
+  class="pointer-events-auto flex w-full flex-col rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-xl backdrop-blur"
   aria-label={$_("activity.panel_label")}
   transition:fly={{ y: 12, duration: 180 }}
 >

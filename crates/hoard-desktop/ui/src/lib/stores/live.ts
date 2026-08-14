@@ -129,6 +129,21 @@ export const cloudLoop: Writable<CloudState> = writable({
 
 export const activityFeed: Writable<FeedEntry[]> = writable([]);
 
+/** "The account is out of storage and uploads are parked" — the same fact the
+ *  `backup_quota_full` feed row reports, kept as *state* instead of a scrolling
+ *  event so a surface that must be visible at all times can read it without the
+ *  activity panel being open (see `StorageFullBanner.svelte`).
+ *
+ *  `null` = uploads are flowing. Non-null carries the figures for the message.
+ *  Two writers, on purpose:
+ *   - the engine's 402 (`agent://backup-quota-full`) — instant, fires the moment
+ *     an upload actually bounces;
+ *   - the account refresh (`noteStorageStatus`) — authoritative, and the only
+ *     thing that ever *clears* the flag, so a stale latch can't outlive the
+ *     problem it describes. */
+export type StorageBlock = { used: number; limit: number };
+export const storageBlock: Writable<StorageBlock | null> = writable(null);
+
 /** Compact "everything green / something off" colour for the header dot.
  *  - `ok`     watcher armed + cloud online (or no cloud session).
  *  - `warn`   throttled or only one half off.
@@ -538,6 +553,9 @@ export async function subscribeLive() {
     await listen<AgentEvent>("agent://backup-quota-full", (e) => {
       const p = e.payload;
       if (p.type !== "backup_quota_full") return;
+      // Don't wait for the next /v1/me poll to raise the banner: the upload
+      // already bounced, so the account is full *now*.
+      storageBlock.set({ used: p.used_bytes, limit: p.limit_bytes });
       pushEntry({
         kind: "backup_quota_full",
         save_id: p.save_id,
@@ -610,8 +628,25 @@ let lastStorageStatus: string | null = null;
 /** Called by the cloud store whenever the account is (re)loaded. Pushes a
  *  single amber (`purging`) / red (`full`) feed row on entering that state,
  *  and resets silently when it recovers to `ok`. */
-export function noteStorageStatus(status: string | undefined | null) {
+export function noteStorageStatus(
+  status: string | undefined | null,
+  usedBytes?: number,
+  limitBytes?: number,
+) {
   const s = status ?? "ok";
+  // Banner state first, and *outside* the dedupe below: a re-poll that still
+  // says "full" must keep refreshing the figures (the used total moves as the
+  // engine keeps trying), even though it must not push a second feed row.
+  // `used >= limit` is the fallback for older servers that send no status. A
+  // "full" with no usable figures (limit <= 0, which the server never sends)
+  // leaves the store alone rather than overwriting a real latch with zeroes.
+  const used = usedBytes ?? 0;
+  const limit = limitBytes ?? 0;
+  if (limit > 0 && (s === "full" || used >= limit)) {
+    storageBlock.set({ used, limit });
+  } else if (s !== "full") {
+    storageBlock.set(null);
+  }
   if (s === lastStorageStatus) return;
   lastStorageStatus = s;
   if (s === "purging") pushEntry({ kind: "storage_purging" });
@@ -654,6 +689,7 @@ export function resetLive() {
   watcher.set({ armed: false, count: 0 });
   cloudLoop.set({ status: "unknown", last_ok_at: null, retry_in: null });
   activityFeed.set([]);
+  storageBlock.set(null);
   lastStorageStatus = null;
   lastGateState = null;
 }

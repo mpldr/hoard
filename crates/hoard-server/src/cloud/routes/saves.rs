@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     Extension,
 };
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -784,6 +785,11 @@ pub async fn cas_init(
 /// refcounts (storage is charged on a blob's first reference), stamps the
 /// version's manifest digest and advances the save head. Idempotent and
 /// race-safe: the commit is claimed with a guarded `sha256 = ''` update.
+/// R2 round trips kept in flight while a commit verifies and cleans up its
+/// blobs. Each one is a bodyless request, so the ceiling here is R2's appetite
+/// for concurrent connections rather than this machine's 512 MB.
+const BLOB_CONCURRENCY: usize = 32;
+
 pub async fn cas_commit(
     State(state): State<CloudState>,
     Extension(user): Extension<CloudUser>,
@@ -881,16 +887,55 @@ pub async fn cas_commit(
     // quota check, then PUT arbitrarily large objects to the presigned URLs
     // (which carry no content-length limit). The real footprint is whatever
     // bytes actually landed, so that's what we charge and re-check below.
+    //
+    // Fanned out rather than awaited one at a time. This is one HTTP round trip
+    // per new blob, and a save is not always a handful of files: the version
+    // that found this carried 35,143 files over 24,784 distinct blobs, because
+    // the game writes one file per map chunk. In sequence that verification
+    // alone ran for tens of minutes, the client's request timed out long before
+    // the commit could finalize, and the hourly sweep then re-uploaded the same
+    // 398 MB for a version that could never land — every hour, indefinitely.
     let mut new_bytes: u64 = 0;
     let mut actual_size: BTreeMap<String, i64> = BTreeMap::new();
+    //
+    // The futures are built eagerly into a Vec of owned values rather than
+    // mapped straight off `unique.keys()`: a closure holding a borrow inside
+    // the stream trips rustc's "FnOnce is not general enough" false positive
+    // once the handler is wrapped by the router. Same shape, and the same
+    // reason, as the upload fan-out in `hoard-agent::backup`.
+    let mut verify = Vec::with_capacity(unique.len());
+    for sha in unique
+        .keys()
+        .filter(|sha| !existing.contains(*sha))
+        .cloned()
+    {
+        let r2 = state.r2.clone();
+        let uid = user.user_id;
+        verify.push(async move {
+            let size = r2.head(&r2::key_for_blob(uid, &sha)).await?;
+            Ok::<_, anyhow::Error>((sha, size))
+        });
+    }
+    let landed: Vec<(String, Option<i64>)> = futures::stream::iter(verify)
+        .buffer_unordered(BLOB_CONCURRENCY)
+        .try_collect()
+        .await
+        .map_err(CloudError::Internal)?;
+    let landed: BTreeMap<String, i64> = landed
+        .into_iter()
+        .filter_map(|(sha, size)| size.map(|s| (sha, s)))
+        .collect();
+
+    // Walked in manifest order, not in completion order: a half-finished upload
+    // has to name the same missing blob on every attempt, or the same failure
+    // reads as a different one each time it is retried.
     for sha in unique.keys() {
         if existing.contains(sha) {
             continue;
         }
-        let key = r2::key_for_blob(user.user_id, sha);
-        let landed = state.r2.head(&key).await.map_err(CloudError::Internal)?;
-        let size =
-            landed.ok_or_else(|| CloudError::BadRequest(format!("blob {sha} was not uploaded")))?;
+        let size = *landed
+            .get(sha)
+            .ok_or_else(|| CloudError::BadRequest(format!("blob {sha} was not uploaded")))?;
         new_bytes += size.max(0) as u64;
         actual_size.insert(sha.clone(), size);
     }
@@ -900,12 +945,21 @@ pub async fn cas_commit(
     // reference (and charge) the blobs. On reject, best-effort delete the
     // orphaned blobs so a refused commit can't squat un-accounted R2 storage.
     if let Err(resp) = quota::check_storage(&state, user.user_id, new_bytes).await {
+        let mut cleanup = Vec::with_capacity(actual_size.len());
         for sha in actual_size.keys() {
-            let key = r2::key_for_blob(user.user_id, sha);
-            if let Err(e) = state.r2.delete_object(&key).await {
-                tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
-            }
+            let r2 = state.r2.clone();
+            let uid = user.user_id;
+            let sha = sha.clone();
+            cleanup.push(async move {
+                if let Err(e) = r2.delete_object(&r2::key_for_blob(uid, &sha)).await {
+                    tracing::warn!(error = %e, sha = %sha, "cas_commit: orphan blob cleanup after quota reject failed");
+                }
+            });
         }
+        futures::stream::iter(cleanup)
+            .buffer_unordered(BLOB_CONCURRENCY)
+            .for_each(|()| async {})
+            .await;
         return Ok(paced_quota_reject(&state, user.user_id, &save_id, None, new_bytes, resp).await);
     }
 
@@ -941,24 +995,36 @@ pub async fn cas_commit(
     // `purge_after = NULL` un-trashes a blob that archiving had frozen: if the
     // user re-uploads a file whose blob is sitting in the 7-day archive grace
     // window, this revives it and the expiry cron must no longer sweep it.
-    for (sha, declared) in &unique {
-        let key = r2::key_for_blob(user.user_id, sha);
-        let size = actual_size.get(sha).copied().unwrap_or(*declared);
-        sqlx::query(
-            r#"
-            INSERT INTO cloud_blobs (user_id, sha256, size_bytes, r2_key, refcount)
-            VALUES ($1, $2, $3, $4, 1)
-            ON CONFLICT (user_id, sha256)
-            DO UPDATE SET refcount = cloud_blobs.refcount + 1, purge_after = NULL
-            "#,
-        )
-        .bind(user.user_id)
-        .bind(sha)
-        .bind(size)
-        .bind(&key)
-        .execute(&mut *tx)
-        .await?;
-    }
+    //
+    // One statement, not one per blob. Row by row this held a write transaction
+    // open for a round trip per blob against the pooler, which on a 24,784-blob
+    // version is the second half of the same stall. `unique` is keyed by sha, so
+    // no key repeats within the arrays — `ON CONFLICT DO UPDATE` would reject
+    // the whole statement if one did, since it cannot touch a row twice.
+    let blob_shas: Vec<String> = unique.keys().cloned().collect();
+    let blob_sizes: Vec<i64> = unique
+        .iter()
+        .map(|(sha, declared)| actual_size.get(sha).copied().unwrap_or(*declared))
+        .collect();
+    let blob_keys: Vec<String> = blob_shas
+        .iter()
+        .map(|sha| r2::key_for_blob(user.user_id, sha))
+        .collect();
+    sqlx::query(
+        r#"
+        INSERT INTO cloud_blobs (user_id, sha256, size_bytes, r2_key, refcount)
+        SELECT $1, s, z, k, 1
+          FROM UNNEST($2::text[], $3::bigint[], $4::text[]) AS t(s, z, k)
+        ON CONFLICT (user_id, sha256)
+        DO UPDATE SET refcount = cloud_blobs.refcount + 1, purge_after = NULL
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(&blob_shas)
+    .bind(&blob_sizes)
+    .bind(&blob_keys)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query(
         "UPDATE saves SET latest_version_num = $1, updated_at = now()

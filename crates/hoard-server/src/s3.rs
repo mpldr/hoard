@@ -444,6 +444,47 @@ impl S3 {
         }
     }
 
+    /// Every key under `prefix`, mapped to its size.
+    ///
+    /// One request per 1000 keys instead of one per key. `head` is the right
+    /// call for a single object and the wrong one for a whole manifest: a
+    /// version with 24,784 blobs is 24,784 round trips even fanned out, and
+    /// `cas_commit` has to answer inside the client's 60 s timeout. The same
+    /// answer arrives here in ~26.
+    ///
+    /// Pagination is sequential because each page's continuation token is only
+    /// known once the previous page lands. That is the whole cost: ~26 serial
+    /// round trips rather than tens of thousands.
+    pub async fn list_sizes(&self, prefix: &str) -> Result<std::collections::HashMap<String, i64>> {
+        let mut out = std::collections::HashMap::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.context("s3 list_objects_v2")?;
+            for obj in page.contents() {
+                if let (Some(k), Some(sz)) = (obj.key(), obj.size()) {
+                    out.insert(k.to_string(), sz);
+                }
+            }
+            if page.is_truncated() == Some(true) {
+                token = page.next_continuation_token().map(|t| t.to_string());
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete an object. Missing is success: S3 itself answers 204 for a key
     /// that was never there, but several compatibles (gofakes3 behind `rclone
     /// serve s3`, some gateways) answer 404 instead. GC and upload rollback

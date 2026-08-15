@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::presigning::PresigningConfig;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::s3::{S3Params, S3};
@@ -89,6 +90,21 @@ impl R2Store {
     /// Returns `Some(size)` if the object exists, `None` if it doesn't.
     pub async fn head(&self, key: &str) -> Result<Option<i64>> {
         self.inner.head(key).await
+    }
+
+    /// Sizes of every blob this user has in the bucket, keyed by sha256.
+    ///
+    /// Keys are `blobs/<user>/<shard>/<sha>`, so the last path segment is the
+    /// hash and one listing of the user's prefix answers a whole manifest.
+    pub async fn blob_sizes(&self, user_id: uuid::Uuid) -> Result<HashMap<String, i64>> {
+        let by_key = self.inner.list_sizes(&format!("blobs/{user_id}/")).await?;
+        Ok(by_key
+            .into_iter()
+            .filter_map(|(k, size)| {
+                let sha = k.rsplit('/').next()?;
+                is_valid_sha256(sha).then(|| (sha.to_string(), size))
+            })
+            .collect())
     }
 
     pub async fn presign_put(&self, key: &str, ttl: Option<Duration>) -> Result<PresignedUrl> {

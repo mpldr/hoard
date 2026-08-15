@@ -888,43 +888,57 @@ pub async fn cas_commit(
     // (which carry no content-length limit). The real footprint is whatever
     // bytes actually landed, so that's what we charge and re-check below.
     //
-    // Fanned out rather than awaited one at a time. This is one HTTP round trip
-    // per new blob, and a save is not always a handful of files: the version
-    // that found this carried 35,143 files over 24,784 distinct blobs, because
-    // the game writes one file per map chunk. In sequence that verification
-    // alone ran for tens of minutes, the client's request timed out long before
-    // the commit could finalize, and the hourly sweep then re-uploaded the same
-    // 398 MB for a version that could never land — every hour, indefinitely.
+    // Asked as one listing of the user's blob prefix rather than one HEAD per
+    // blob. The difference is not a micro-optimisation: `cas_commit` has to
+    // answer inside the client's fixed 60 s timeout, and the version that found
+    // this carried 35,143 files over 24,784 distinct blobs because the game
+    // writes one file per map chunk. Per-blob that is 24,784 round trips — tens
+    // of minutes in sequence, still tens of seconds fanned out — and every
+    // timeout sent the client back to re-upload the same 398 MB, hourly, for a
+    // version that could never land. A listing answers all of them in ~26.
     let mut new_bytes: u64 = 0;
     let mut actual_size: BTreeMap<String, i64> = BTreeMap::new();
+    let mut landed = state
+        .r2
+        .blob_sizes(user.user_id)
+        .await
+        .map_err(CloudError::Internal)?;
+
+    // A listing is the bulk answer, not the authority: an object PUT moments
+    // ago may not be in it yet. So anything it doesn't show is asked for
+    // directly before we are willing to call it missing — normally nothing, and
+    // a handful at worst, which is what keeps this off the per-blob path.
     //
     // The futures are built eagerly into a Vec of owned values rather than
-    // mapped straight off `unique.keys()`: a closure holding a borrow inside
-    // the stream trips rustc's "FnOnce is not general enough" false positive
-    // once the handler is wrapped by the router. Same shape, and the same
-    // reason, as the upload fan-out in `hoard-agent::backup`.
-    let mut verify = Vec::with_capacity(unique.len());
+    // mapped straight off the iterator: a closure holding a borrow inside the
+    // stream trips rustc's "FnOnce is not general enough" false positive once
+    // the handler is wrapped by the router. Same shape, and the same reason, as
+    // the upload fan-out in `hoard-agent::backup`.
+    let mut probes = Vec::new();
     for sha in unique
         .keys()
-        .filter(|sha| !existing.contains(*sha))
+        .filter(|sha| !existing.contains(*sha) && !landed.contains_key(*sha))
         .cloned()
     {
         let r2 = state.r2.clone();
         let uid = user.user_id;
-        verify.push(async move {
+        probes.push(async move {
             let size = r2.head(&r2::key_for_blob(uid, &sha)).await?;
             Ok::<_, anyhow::Error>((sha, size))
         });
     }
-    let landed: Vec<(String, Option<i64>)> = futures::stream::iter(verify)
-        .buffer_unordered(BLOB_CONCURRENCY)
-        .try_collect()
-        .await
-        .map_err(CloudError::Internal)?;
-    let landed: BTreeMap<String, i64> = landed
-        .into_iter()
-        .filter_map(|(sha, size)| size.map(|s| (sha, s)))
-        .collect();
+    if !probes.is_empty() {
+        let probed: Vec<(String, Option<i64>)> = futures::stream::iter(probes)
+            .buffer_unordered(BLOB_CONCURRENCY)
+            .try_collect()
+            .await
+            .map_err(CloudError::Internal)?;
+        for (sha, size) in probed {
+            if let Some(size) = size {
+                landed.insert(sha, size);
+            }
+        }
+    }
 
     // Walked in manifest order, not in completion order: a half-finished upload
     // has to name the same missing blob on every attempt, or the same failure

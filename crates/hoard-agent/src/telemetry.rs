@@ -118,9 +118,47 @@ pub fn rejected_root(slug: &str, path: &Path, reason: &str) {
     );
 }
 
+/// A game we found no cover art for, down every path we know.
+///
+/// The only verdict here that doesn't come from detection, and it lives in this
+/// module for the same reasons the others do: same target, same dedupe, same
+/// query. It is emitted by the desktop (`commands::covers`), not by the engine.
+///
+/// What makes the row actionable is the `slug` — it is the key of `covers.json`,
+/// so a row that arrives is a line to fill in. `source` says why there is
+/// nothing: `none` is a game that is neither on Steam nor in our index (fixed by
+/// adding it), `steam` is one that *is* on Steam yet whose CDN served neither
+/// the vertical capsule nor the header, which is rare enough to be worth telling
+/// apart.
+///
+/// Once per process and game, and upstream only on a fresh verdict: the desktop
+/// writes an on-disk marker that stops it asking again for 30 days. One row per
+/// machine per month, at the very most.
+pub fn no_cover(slug: &str, source: &str) {
+    if !first_time(format!("no_cover|{slug}")) {
+        return;
+    }
+    tracing::info!(
+        target: TELEMETRY_TARGET,
+        verdict = "no_cover",
+        slug = %slug,
+        source = %source,
+        "telemetry: no cover art for this game anywhere"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::first_time;
+
+    #[test]
+    fn a_missing_cover_is_reported_once_per_run() {
+        // The desktop asks for the cover on every Library repaint; without
+        // this, opening and closing the tab would fill the table with the same
+        // game over and over.
+        assert!(super::first_time("no_cover|minecraft-java-edition".into()));
+        assert!(!super::first_time("no_cover|minecraft-java-edition".into()));
+    }
 
     #[test]
     fn the_engine_verdicts_only_count_once_per_run() {

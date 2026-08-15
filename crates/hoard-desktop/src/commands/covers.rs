@@ -232,6 +232,12 @@ pub async fn cover_bytes(app: tauri::AppHandle, key: String) -> Result<Response,
                 None => {
                     let _ = tokio::fs::create_dir_all(&dir).await;
                     let _ = tokio::fs::write(&marker, LOOKUP_STRATEGY.to_string()).await;
+                    // The one row that turns into work: this slug is what goes
+                    // in `covers.json`. Reported here and not at the top of the
+                    // function because only here do we know every source came
+                    // back empty — and it rides the marker, so a game already
+                    // known to be artless is not re-reported for 30 days.
+                    hoard_agent::telemetry::no_cover(&slug, "none");
                     return Err(format!("cover {slug}: no art anywhere"));
                 }
             }
@@ -285,12 +291,22 @@ pub async fn cover_bytes(app: tauri::AppHandle, key: String) -> Result<Response,
         // 404s. Ask Steam's appdetails API for the real header image and fetch
         // that instead.
         None => {
-            let url = appdetails_header_url(app_id)
-                .await
-                .ok_or_else(|| format!("steam cover {app_id}: no header image"))?;
-            fetch_image(&url)
-                .await
-                .ok_or_else(|| format!("steam cover {app_id}: header fetch failed"))?
+            let url = match appdetails_header_url(app_id).await {
+                Some(url) => url,
+                None => {
+                    // On Steam and still nothing to show: neither the vertical
+                    // capsule nor the header. Rare enough to be worth telling
+                    // apart from the games that simply aren't on Steam.
+                    report_no_cover(&cover, "steam");
+                    return Err(format!("steam cover {app_id}: no header image"));
+                }
+            };
+            match fetch_image(&url).await {
+                Some(bytes) => bytes,
+                // A dead URL from a live manifest is a fetch failure, not
+                // "this game has no art" — don't file it as one.
+                None => return Err(format!("steam cover {app_id}: header fetch failed")),
+            }
         }
     };
 
@@ -339,6 +355,16 @@ async fn marker_still_stands(marker: &std::path::Path) -> bool {
         .and_then(|m| m.modified())
         .map(|t| t.elapsed().map(|age| age < MARKER_TTL).unwrap_or(true))
         .unwrap_or(false)
+}
+
+/// Report a game we found no art for, if we know it by slug.
+///
+/// A bare Steam app id is skipped on purpose: the index is keyed by slug, so a
+/// row we can't name is a row nobody can act on.
+fn report_no_cover(cover: &CoverKey, source: &str) {
+    if let CoverKey::Slug(slug) = cover {
+        hoard_agent::telemetry::no_cover(slug, source);
+    }
 }
 
 /// Where the `slug -> cover URL` index lives. Static file on the marketing

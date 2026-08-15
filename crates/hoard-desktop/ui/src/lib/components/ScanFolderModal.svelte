@@ -174,10 +174,23 @@
     target ? results.filter((g) => g.slug !== target.slug) : [],
   );
 
-  /** True when the scanned folder is itself among the results — then the
-   *  "use the folder as-is" escape hatch would be a duplicate row. */
+  /** True when the scanned folder is itself among the results **for the game we
+   *  were sent here for** — only then does its row already hand the folder over
+   *  (`usePath`), and only then is the "use the folder as-is" escape hatch a
+   *  duplicate.
+   *
+   *  A row for a DIFFERENT game is not a duplicate, and treating it as one is
+   *  how a second folder ended up tracked as its own game: point the picker at
+   *  `Desktop\saves` for Factorio, attribution names that exact folder after
+   *  something else, the escape hatch disappears, and the only thing left to
+   *  click tracks it under the foreign slug. The row and the escape hatch do
+   *  opposite things — track it as its own game, or give it to the target —
+   *  so one can never stand in for the other. */
   const folderInResults = $derived(
-    results.some((g) => g.found_paths[0] === folder.trim()),
+    results.some(
+      (g) =>
+        g.found_paths[0] === folder.trim() && (!target || g.slug === target.slug),
+    ),
   );
 
   function confidenceClass(c: Confidence): string {

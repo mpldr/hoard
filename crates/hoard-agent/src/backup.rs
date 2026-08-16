@@ -1189,6 +1189,23 @@ fn verify_sent(
 ///    so the next cycle hits the fast path again instead of re-hashing.
 /// 3. Bytes actually moved → upload and return [`BackupResult::Uploaded`].
 ///
+/// **Both gates are skipped for a deliberate copy** ([`VersionOrigin::is_deliberate`]:
+/// the user's own "back up now" and the safety net taken before a restore
+/// overwrites the folder). A copy the user
+/// asked for is a marker they placed — "right here, before the boss" — and
+/// whether the bytes happen to match the last autosave is beside the point. It
+/// used to fall through the same gate as a watcher no-op, so pressing the button
+/// with nothing changed did nothing at all: no version, no message, just an INFO
+/// line in a log file the user never opens (ago-2026). The rest of the design
+/// already assumes a deliberate copy is worth keeping on its own terms — manual
+/// versions have their own budget precisely so an autosave burst can't evict
+/// them.
+///
+/// It cannot loop: the gates exist to stop the watcher re-cutting identical
+/// snapshots on a timer, and this path only runs when a person presses a button.
+/// It costs no transfer either — the content is addressed, so the blobs are
+/// already there and the commit only adds a version row.
+///
 /// The signature persisted by the caller is `"<cheap>:<content>"`.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_directory_checked<F, G>(
@@ -1239,7 +1256,11 @@ where
     }
     let (prev_cheap, prev_content) = split_signature(prev_signature);
     let cheap = compute_set_signature(&files);
-    if prev_cheap == Some(cheap.as_str()) {
+    // `is_deliberate` y no `== Manual`: la red de seguridad previa a un restore
+    // cuenta igual, y ahí saltársela es peor — es la copia que permite deshacer
+    // un restore equivocado.
+    let deliberate = origin.is_deliberate();
+    if !deliberate && prev_cheap == Some(cheap.as_str()) {
         // Fast path: the cheap (path, size, mtime) signature is unchanged, so
         // the bytes can't have moved either — skip without reading any file.
         return Ok(BackupResult::Skipped);
@@ -1248,7 +1269,7 @@ where
     // background daemon rewriting save files on a timer), so confirm whether
     // the actual bytes changed before cutting a snapshot.
     let content = compute_content_signature(&files).await?;
-    if prev_content == Some(content.as_str()) {
+    if !deliberate && prev_content == Some(content.as_str()) {
         return Ok(BackupResult::Unchanged {
             signature: join_signature(&cheap, &content),
         });

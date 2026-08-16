@@ -108,12 +108,19 @@ pub fn notice_for(event: &AgentEvent, prefs: &Prefs) -> Option<Notice> {
             version_num,
             total_bytes,
             already_landed,
+            deliberate,
             ..
         } => {
             // `already_landed` es un no-op: el contenido ya estaba arriba y no
             // viajó un byte. Avisar de una copia que no ha ocurrido es la misma
             // mentira que sonar al reproducir el journal (ADR 0021 D.18).
-            if !prefs.notify_on_success || *already_landed {
+            //
+            // `deliberate` se salta la preferencia: está apagada por defecto
+            // porque el motor narrando cada autoguardado es ruido de fondo, y
+            // eso no es lo mismo que tragarse la respuesta a un botón. Pulsar
+            // "copiar ahora" y no recibir señal ninguna deja al usuario sin
+            // saber si se hizo (ago-2026).
+            if (!prefs.notify_on_success && !*deliberate) || *already_landed {
                 return None;
             }
             Some(Notice {
@@ -438,12 +445,17 @@ mod tests {
     }
 
     fn success(already_landed: bool) -> AgentEvent {
+        success_with(already_landed, false)
+    }
+
+    fn success_with(already_landed: bool, deliberate: bool) -> AgentEvent {
         AgentEvent::BackupSuccess {
             save_id: "abcdef0123456789".into(),
             version_num: 12,
             total_bytes: 2048,
             set_hash: None,
             already_landed,
+            deliberate,
         }
     }
 
@@ -513,6 +525,24 @@ mod tests {
             assert!(!notifiable(&event), "{event:?} shouldn't be notifiable");
             assert!(notice_for(&event, &prefs(true, true)).is_none());
         }
+    }
+
+    /// Con `notify_on_success` apagado —que es el default— una copia automática
+    /// calla y una que pidió el usuario avisa igual. La preferencia existe para
+    /// que el motor no narre cada autoguardado, no para dejar sin respuesta a
+    /// quien pulsa un botón.
+    #[test]
+    fn a_copy_the_user_asked_for_confirms_even_with_success_notices_off() {
+        let prefs = Prefs {
+            notify_on_success: false,
+            notify_on_failure: true,
+            ..Prefs::default()
+        };
+        assert!(notice_for(&success_with(false, false), &prefs).is_none());
+        assert!(notice_for(&success_with(false, true), &prefs).is_some());
+        // Salvo que no haya ocurrido nada: el contenido ya era la cabeza del
+        // server, así que no hay copia de la que avisar.
+        assert!(notice_for(&success_with(true, true), &prefs).is_none());
     }
 
     /// `notifiable` es el atajo que evita leer `prefs.json` por cada tick, así

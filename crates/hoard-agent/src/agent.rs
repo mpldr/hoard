@@ -3464,6 +3464,7 @@ async fn run_backup_with_retry(
                         total_bytes: 0,
                         set_hash: Some(signature.clone()),
                         already_landed: true,
+                        deliberate: origin.is_deliberate(),
                     })
                     .await;
                 let _ = done_tx.try_send(BackupDone {
@@ -3489,6 +3490,7 @@ async fn run_backup_with_retry(
                         total_bytes: o.total_bytes,
                         set_hash: Some(signature.clone()),
                         already_landed: false,
+                        deliberate: origin.is_deliberate(),
                     })
                     .await;
                 // Partial upload: the save was over the plan's per-save cap so

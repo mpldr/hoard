@@ -93,6 +93,19 @@ pub enum AgentEvent {
         /// anterior lo lee como `false` (ADR 0021 C.6: append-only).
         #[serde(default)]
         already_landed: bool,
+        /// La pidió una persona: el botón "copiar ahora" o la red de seguridad
+        /// previa a un restore ([`hoard_core::wire::VersionOrigin::is_deliberate`]).
+        ///
+        /// Existe para el aviso: `notify_on_success` está apagado por defecto a
+        /// propósito, porque el motor narrando cada autoguardado es ruido — pero
+        /// esa preferencia nunca quiso decir "no contestes cuando pulse un
+        /// botón". Sin esto, pulsar "copiar ahora" no daba señal ninguna: ni
+        /// aviso, ni error, sólo una fila en el feed que hay que ir a mirar.
+        ///
+        /// Campo nuevo con `default`, así que un cliente anterior lo lee como
+        /// `false` y se comporta como hasta ahora (ADR 0021 C.6: append-only).
+        #[serde(default)]
+        deliberate: bool,
     },
     BackupFailed {
         save_id: String,

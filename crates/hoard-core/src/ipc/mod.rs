@@ -752,6 +752,7 @@ mod tests {
             total_bytes: 1024,
             set_hash: Some("cheap:content".into()),
             already_landed: false,
+            deliberate: true,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "backup_success");
@@ -765,10 +766,14 @@ mod tests {
             r#"{"type":"backup_success","save_id":"s1","version_num":7,"total_bytes":10,"set_hash":null}"#,
         )
         .unwrap();
+        assert_eq!(json["deliberate"], true);
         assert!(matches!(
             legacy,
             AgentEvent::BackupSuccess {
                 already_landed: false,
+                // Igual que `already_landed`: un daemon anterior no lo manda y
+                // se lee como "automática", que es como se comportaba.
+                deliberate: false,
                 ..
             }
         ));

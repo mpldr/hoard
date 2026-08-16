@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-08-16
+
 ### Added
+- **Name your folders, not just number them.** A game with three tracked
+  folders was a list of integers. Each one can carry a name next to its number
+  now — "2 · Mods" — and the number keeps doing the pairing with the same folder
+  on your other machines. Renaming and renumbering are separate on purpose, so
+  naming a folder here can never repoint one over there. And every folder now
+  restores like the first: backing one up and then refusing to put it back was
+  half a backup, not a safety feature.
 - **A game can have more than one folder now.** Factorio keeps saves in one
   folder and settings in another; a Paradox game splits saves and mods; an
   emulator separates memory cards from BIOS files. Hoard tracked one folder per
@@ -114,6 +123,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   them, and one that goes months without appearing is forgotten.
 
 ### Fixed
+- **Hoard noticed your saves in two seconds and then sat on them.** A slider
+  that stopped being shown in June kept setting the minimum wait between two
+  uploads of the same save, at whatever value you had last left it — on one
+  machine ten minutes, with nothing in the app able to show or change it. Worse,
+  restores skipped that wait, so changes arriving from your other computer
+  synced instantly while your own waited, which made the two look like unrelated
+  problems. The wait is gone; the `data_saver` preset still paces a game you
+  choose it for.
+- **Updating on Windows could fail forever on the machine that needed it most.**
+  The installer stopped the sync service to replace it, the app noticed the
+  service was missing two seconds later and started the old copy again, and the
+  installer then failed on a file back in use — then retried an hour later and
+  lost the same race. Nothing launches the service while its binaries are being
+  replaced now.
+- **An upload could overwrite a newer version from another machine.** A computer
+  that had never synced a save — or whose local state had been rebuilt — sent no
+  starting point, and that was the one case the server let through without
+  checking. The older folder became the current one. Nothing was lost from the
+  history, but the save read as "it stopped syncing". That upload is now checked
+  like every other.
+- **A save renamed on one machine broke uploads from the other**, with a plain
+  server error and no way to tell what was wrong. Saves are matched by identity
+  first now, so a rename elsewhere, a reinstall or a rebuilt server no longer
+  strands the copy you are uploading.
 - **Settings files: one answer per game, not one per restore.** Whether a
   restore should write a game's `.ini` and `.cfg` files back is a question with
   no answer that's right twice — in one game the settings and the save live in

@@ -144,6 +144,17 @@ fn collect_entries(rx: &Receiver<Seen>, wanted: usize) -> (Vec<Seen>, Vec<LogEnt
     (posts, entries)
 }
 
+/// A redacted path as this platform spells it.
+///
+/// The fixtures build their paths with `Path::join`, so the separator between
+/// the home and the tail is whatever the OS uses: redaction rewrites the home
+/// prefix and leaves the rest exactly as it was produced. Hardcoding `/` in the
+/// expectation asserted on Linux and failed on Windows for a reason that has
+/// nothing to do with what this test checks.
+fn under_home(tail: &str) -> String {
+    format!("/home/<user>{}{}", std::path::MAIN_SEPARATOR, tail)
+}
+
 /// Los campos de una desmentida, por veredicto.
 fn verdict<'a>(entries: &'a [LogEntry], name: &str) -> &'a serde_json::Value {
     entries
@@ -199,15 +210,21 @@ fn a_batch_actually_reaches_the_server_redacted() {
     // 2. Un INFO operativo: por debajo del mínimo de Cloud, no debe viajar.
     tracing::info!(target: "hoard_agent::agent", "agent: backup committed");
     // 3. Las cinco desmentidas: son INFO, pero viajan por su `target`.
+    // Rutas de un layout Linux escritas enteras, sin `join`: en Windows el
+    // separador nativo es `\\`, así que unir un literal Unix produce
+    // `/home/angel\\.local/share/Furi` y el test acabaría comprobando por qué
+    // ruta pasó el runner en vez de qué hizo la redacción con ella. La forma
+    // Windows tiene su propio caso, unas líneas más arriba.
     let home = std::path::Path::new("/home/angel");
+    let p = |tail: &str| std::path::PathBuf::from(format!("/home/angel/{tail}"));
     hoard_agent::telemetry::repointed(
         "furi",
-        &home.join(".local/share/Furi"),
-        &home.join(".steam/steam/steamapps/compatdata/1052500"),
+        &p(".local/share/Furi"),
+        &p(".steam/steam/steamapps/compatdata/1052500"),
     );
-    hoard_agent::telemetry::manual_path("planet-s", &home.join("Saved Games/Planet S"));
-    hoard_agent::telemetry::untracked("dispatch", &home.join(".local/share/Dispatch"));
-    hoard_agent::telemetry::no_snapshots("v-rising", &home.join(".local/share/VRising"));
+    hoard_agent::telemetry::manual_path("planet-s", &p("Saved Games/Planet S"));
+    hoard_agent::telemetry::untracked("dispatch", &p(".local/share/Dispatch"));
+    hoard_agent::telemetry::no_snapshots("v-rising", &p(".local/share/VRising"));
     hoard_agent::telemetry::rejected_root("stellaris", home, "the user profile root");
 
     // 1 WARN + 5 desmentidas; el INFO operativo no debe aparecer.
@@ -248,15 +265,15 @@ fn a_batch_actually_reaches_the_server_redacted() {
     // columna acaba enseñando el dato bueno donde dice "ruta mala".
     let repointed = verdict(&entries, "repointed");
     assert_eq!(repointed["slug"], "furi");
-    assert_eq!(repointed["path"], "/home/<user>/.local/share/Furi");
+    assert_eq!(repointed["path"], under_home(".local/share/Furi"));
     assert_eq!(
         repointed["to"],
-        "/home/<user>/.steam/steam/steamapps/compatdata/1052500"
+        under_home(".steam/steam/steamapps/compatdata/1052500")
     );
 
     let manual = verdict(&entries, "manual_path");
     assert_eq!(manual["slug"], "planet-s");
-    assert_eq!(manual["to"], "/home/<user>/Saved Games/Planet S");
+    assert_eq!(manual["to"], under_home("Saved Games/Planet S"));
     assert!(
         manual.get("path").is_none(),
         "la carpeta que el usuario eligió es el destino, no la ruta mala: {manual}"
@@ -264,11 +281,11 @@ fn a_batch_actually_reaches_the_server_redacted() {
 
     let untracked = verdict(&entries, "untracked");
     assert_eq!(untracked["slug"], "dispatch");
-    assert_eq!(untracked["path"], "/home/<user>/.local/share/Dispatch");
+    assert_eq!(untracked["path"], under_home(".local/share/Dispatch"));
 
     let never = verdict(&entries, "no_snapshots");
     assert_eq!(never["slug"], "v-rising");
-    assert_eq!(never["path"], "/home/<user>/.local/share/VRising");
+    assert_eq!(never["path"], under_home(".local/share/VRising"));
 
     let rejected = verdict(&entries, "rejected_root");
     assert_eq!(rejected["slug"], "stellaris");

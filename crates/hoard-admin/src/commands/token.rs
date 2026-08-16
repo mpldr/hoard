@@ -70,10 +70,14 @@ pub async fn run(cmd: TokenCommand, cfg: &Config) -> Result<()> {
 
             println!("\n⚠  Save this token NOW — it cannot be recovered later!\n");
             println!("Token: {}", token);
-            println!(
-                "\nSet it in your CLI: hoard config set server <url> && hoard login --token {}",
-                token
-            );
+            // Two lines, and the real key name. This hint used to print
+            // `hoard config set server <url> && hoard login --token …`: the key
+            // is `server.url`, so the first half errored out, and `&&` is not a
+            // separator in Windows PowerShell, so the second half never ran at
+            // all. It is the first thing a new self-hoster copies.
+            println!("\nSet it in your CLI:");
+            println!("  hoard config set server.url <url>");
+            println!("  hoard login --token {}", token);
         }
         TokenCommand::List { username } => {
             let rows = sqlx::query(

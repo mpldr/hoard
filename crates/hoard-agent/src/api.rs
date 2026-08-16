@@ -409,7 +409,11 @@ impl ApiClient {
             .read_timeout(STREAM_STALL_TIMEOUT)
             .build()?;
         Ok(Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            // Strips a `user@` the caller may still have on disk from before
+            // this was normalised on the way in. Left alone it silently becomes
+            // an HTTP Basic header that shadows the bearer token — see
+            // `serverclass::normalize_server_url`.
+            base_url: crate::serverclass::normalize_server_url(&base_url.into()),
             token: Arc::new(RwLock::new(token.into())),
             http,
             upload_http,

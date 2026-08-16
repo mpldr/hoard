@@ -58,7 +58,7 @@ pub struct UserInfo {
 /// before they paste a token.
 #[tauri::command]
 pub async fn health_check(url: String) -> Result<HealthInfo, String> {
-    let url = url.trim().to_string();
+    let url = hoard_agent::serverclass::normalize_server_url(&url);
     validate_url(&url)?;
 
     // The token field is unused by `/v1/health`, but `ApiClient::new` requires
@@ -81,7 +81,7 @@ pub async fn login(
     token: String,
     state: State<'_, AppState>,
 ) -> Result<UserInfo, String> {
-    let url = url.trim().to_string();
+    let url = hoard_agent::serverclass::normalize_server_url(&url);
     validate_url(&url)?;
 
     if !credentials::is_valid_token(&token) {

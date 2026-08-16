@@ -56,7 +56,47 @@ pub fn is_cloud_host(url: &str) -> bool {
 
 /// Extrae el host en minúsculas de una URL `http(s)://host[:port][/path]`.
 /// `None` si no reconoce el esquema.
+/// Drop a `user@` (or `user:pass@`) prefix from a server URL, and any trailing
+/// slash.
+///
+/// Nothing in Hoard's API uses HTTP Basic auth — the access key travels as a
+/// bearer token — but reqwest turns URL credentials into a `basic_auth` call on
+/// **every** request it builds, and its `header()` *appends*, so the request
+/// goes out with two `Authorization` headers: `Basic` first, then our `Bearer`.
+/// The server reads the first one, sees no bearer token, and answers 401.
+///
+/// The result is a login that can never succeed and blames the one thing that
+/// is fine: "token rejected by server (401)", for a token that works from curl.
+/// A user pasted `http://insider@ubserver:12421` (ago-2026) and neither the CLI
+/// nor the app could tell them why.
+///
+/// So the credentials are stripped rather than rejected: they are meaningless
+/// to this API, and `ssh`-shaped addresses are a habit, not a mistake worth an
+/// error message.
+pub fn normalize_server_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let Some(scheme_len) = ["https://", "http://"]
+        .iter()
+        .find(|p| trimmed.starts_with(**p))
+        .map(|p| p.len())
+    else {
+        return trimmed.to_string();
+    };
+    let (scheme, rest) = trimmed.split_at(scheme_len);
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    // The **last** `@`: a percent-encoded password may carry one of its own.
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    format!("{scheme}{authority}{path}")
+}
+
 fn host_of(url: &str) -> Option<String> {
+    let url = normalize_server_url(url);
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
@@ -74,7 +114,40 @@ fn host_of(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cloud_host, is_local_server};
+    use super::{is_cloud_host, is_local_server, normalize_server_url};
+
+    /// A `user@` in the address made every request carry two `Authorization`
+    /// headers (reqwest's, from the URL credentials, plus ours) and the server
+    /// read the wrong one — a permanent 401 with a perfectly good token.
+    #[test]
+    fn credentials_never_survive_into_the_url() {
+        assert_eq!(
+            normalize_server_url("http://insider@ubserver:12421"),
+            "http://ubserver:12421"
+        );
+        assert_eq!(
+            normalize_server_url("https://me:secret@hoard.example.com/"),
+            "https://hoard.example.com"
+        );
+        assert_eq!(
+            normalize_server_url("http://ubserver:12421/"),
+            "http://ubserver:12421"
+        );
+        // The `@` belongs to the path here, not to any credentials.
+        assert_eq!(
+            normalize_server_url("http://ubserver:12421/a@b"),
+            "http://ubserver:12421/a@b"
+        );
+        // Not a URL we recognise: hand it back untouched rather than mangle it.
+        assert_eq!(normalize_server_url("ubserver:12421"), "ubserver:12421");
+    }
+
+    /// The classification runs on the real host, not on `insider@ubserver`.
+    #[test]
+    fn a_username_doesnt_confuse_the_classifier() {
+        assert!(is_local_server("http://insider@ubserver:12421"));
+        assert!(is_cloud_host("https://someone@api.hoard.services"));
+    }
 
     #[test]
     fn localhost_and_loopback_are_local() {

@@ -33,7 +33,9 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
                 );
             }
             let cfg = CliConfig {
-                server: hoard_agent::config::ServerSection { url: server },
+                server: hoard_agent::config::ServerSection {
+                    url: hoard_agent::serverclass::normalize_server_url(&server),
+                },
                 auth: Default::default(),
             };
             cfg.save(&path)?;
@@ -48,7 +50,13 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
             let path = CliConfig::default_path()?;
             let mut cfg = CliConfig::load(&path)?;
             match key.as_str() {
-                "server.url" => cfg.server.url = value,
+                // A `user@` here would end up as an HTTP Basic header that
+                // shadows the access key on every request — a 401 that blames
+                // the token. Clean it on the way in, so what lands in
+                // config.toml is what the client will actually talk to.
+                "server.url" => {
+                    cfg.server.url = hoard_agent::serverclass::normalize_server_url(&value)
+                }
                 other => bail!("unknown key: {other} (supported: server.url)"),
             }
             cfg.save(&path)?;

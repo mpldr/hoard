@@ -80,7 +80,7 @@ use crate::auth::AuthUser;
 use crate::routes::health::ServerState;
 use crate::routes::snapshots::{
     blob_in_db, chunk_in_db, err, internal, internal_logged, is_safe_relative_path,
-    ownership_check, prune_over_version_cap, snapshot_too_large,
+    ownership_check, prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
 };
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -239,8 +239,10 @@ pub async fn init(
     if logical > max_per_snapshot {
         // Aquí sí se sabe el tamaño real (lo declara el manifiesto), a
         // diferencia del multipart, que aborta a media transmisión y sólo puede
-        // decir hasta dónde llegó.
-        return Err(snapshot_too_large(max_per_snapshot, logical));
+        // decir hasta dónde llegó. Va como `actual_bytes` justamente por eso: de
+        // aquí no ha salido ni un byte todavía, así que darlo como "recibido"
+        // hacía que el cliente dijera "3,6 GB enviados antes de parar".
+        return Err(snapshot_too_large_declared(max_per_snapshot, logical));
     }
 
     // Rechazar el non-fast-forward **antes** de mover un byte. En el multipart

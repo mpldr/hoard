@@ -39,6 +39,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use hoard_agent::agent::AgentEvent;
 use hoard_agent::config::CliConfig;
+use hoard_core::ipc::events::TooLargeKind;
 use hoard_core::ipc::{DaemonStatus, Payload, Request};
 use hoardd::client::Push;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
@@ -351,9 +352,22 @@ fn render(ev: &AgentEvent) -> Option<String> {
             retry_after_secs,
             ..
         } => format!("⏱  {game_slug} waiting {retry_after_secs}s (bandwidth limit)"),
-        BackupTooLarge { game_slug, .. } => {
-            format!("✗  {game_slug} exceeds your plan's limit")
-        }
+        BackupTooLarge {
+            game_slug, kind, ..
+        } => match kind {
+            // Naming the wrong limit costs the user a search: a self-hoster's
+            // knob is `storage.max_snapshot_size_mb`, and a proxy's body limit
+            // isn't Hoard's at all.
+            TooLargeKind::ServerLimit => format!(
+                "✗  {game_slug} exceeds your server's per-snapshot limit \
+                 (storage.max_snapshot_size_mb)"
+            ),
+            TooLargeKind::Proxy => format!(
+                "✗  {game_slug} was refused as too large by something in front \
+                 of your server (a reverse proxy or tunnel body-size limit)"
+            ),
+            TooLargeKind::PlanCap => format!("✗  {game_slug} exceeds your plan's limit"),
+        },
         SaveAutoRestored {
             game_slug,
             version_num,

@@ -87,6 +87,24 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
     case "online":
       return $_("activity.online");
     case "backup_too_large":
+      // Which sentence depends on who refused it, because the fix is in a
+      // different place each time. The feed used to say "Upgrade to Pro" no
+      // matter what — including to self-hosters, whose server had simply hit
+      // `max_snapshot_size_mb`, and with `{size}` rendered as "0 B" because
+      // only Cloud knows the save's real size up front.
+      if (e.too_large_kind === "server_limit" && (e.limit_bytes ?? 0) > 0) {
+        return $_("library.backup_too_large_server_toast", {
+          values: { name, limit: formatBytes(e.limit_bytes ?? 0) },
+        });
+      }
+      if (e.too_large_kind === "proxy") {
+        return $_("library.backup_too_large_proxy_toast", { values: { name } });
+      }
+      if ((e.limit_bytes ?? 0) === 0 || (e.bytes ?? 0) === 0) {
+        return $_("library.backup_too_large_generic_toast", {
+          values: { name },
+        });
+      }
       return $_("activity.backup_too_large", {
         values: {
           name,

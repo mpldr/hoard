@@ -186,18 +186,25 @@ impl SaveTooLarge {
                 .into();
         }
         if self.code == "snapshot_too_large" && self.limit_bytes > 0 {
+            // Two different figures can come back and they do not mean the same
+            // thing. `actual_bytes` is the size the manifest declared, known
+            // before anything moves; `received_bytes` is how far a mid-stream
+            // abort got. Wording them alike had the client announce "3.6 GB sent
+            // before it stopped" about an upload that never sent a byte.
+            let tail = if self.actual_bytes > 0 {
+                format!(" — the save is {}", fmt_bytes(self.actual_bytes))
+            } else if self.received_bytes > 0 {
+                format!(
+                    " — {} sent before it stopped",
+                    fmt_bytes(self.received_bytes)
+                )
+            } else {
+                String::new()
+            };
             return format!(
                 "snapshot too large: over this server's limit of {} per snapshot \
-                 (raise storage.max_snapshot_size_mb in its config.toml){}",
+                 (raise storage.max_snapshot_size_mb in its config.toml){tail}",
                 fmt_bytes(self.limit_bytes),
-                if self.received_bytes > 0 {
-                    format!(
-                        " — {} sent before it stopped",
-                        fmt_bytes(self.received_bytes)
-                    )
-                } else {
-                    String::new()
-                },
             );
         }
         if self.limit_bytes == 0 {

@@ -85,24 +85,59 @@ pub(crate) fn internal_logged<E: std::fmt::Display>(
 /// so all we know is how far we got before bailing. Reporting that as the
 /// snapshot's size would be a lie that reads as precision. The client words it
 /// as a floor.
-pub(crate) fn snapshot_too_large(
+///
+/// Use [`snapshot_too_large_declared`] where the size **is** known.
+pub fn snapshot_too_large(
     limit_bytes: i64,
     received_bytes: i64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    too_large_body(limit_bytes, Some(received_bytes), None, "stream")
+}
+
+/// The same 413 for the content-addressed path, where the manifest declares the
+/// version's size up front and nothing has been transmitted yet.
+///
+/// It exists because sending that figure as `received_bytes` made the client
+/// tell a self-hoster "3.6 GB sent before it stopped" for an upload that moved
+/// **zero** bytes — the rejection happens at `cas_init`, before a single blob
+/// travels (ago-2026). Same number, opposite meaning: one is a floor of what
+/// arrived, the other is exactly how big the save is.
+pub fn snapshot_too_large_declared(
+    limit_bytes: i64,
+    actual_bytes: i64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    too_large_body(limit_bytes, None, Some(actual_bytes), "cas_init")
+}
+
+/// `route` goes in the log because the `target` cannot: this helper lives in
+/// `routes::snapshots`, so every rejection it emits is stamped with that module
+/// even when `routes::cas` is the one refusing. An operator reading their own
+/// logs was pointed at the wrong half of the server.
+fn too_large_body(
+    limit_bytes: i64,
+    received_bytes: Option<i64>,
+    actual_bytes: Option<i64>,
+    route: &'static str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     tracing::warn!(
         limit_bytes,
         received_bytes,
+        actual_bytes,
+        route,
         "snapshot rejected: over the per-snapshot size limit (storage.max_snapshot_size_mb)"
     );
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Json(serde_json::json!({
-            "error": "snapshot exceeds size limit",
-            "code": "snapshot_too_large",
-            "limit_bytes": limit_bytes.max(0),
-            "received_bytes": received_bytes.max(0),
-        })),
-    )
+    let mut body = serde_json::json!({
+        "error": "snapshot exceeds size limit",
+        "code": "snapshot_too_large",
+        "limit_bytes": limit_bytes.max(0),
+    });
+    if let Some(n) = received_bytes {
+        body["received_bytes"] = serde_json::json!(n.max(0));
+    }
+    if let Some(n) = actual_bytes {
+        body["actual_bytes"] = serde_json::json!(n.max(0));
+    }
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
 }
 
 /// Is this whole-file blob already stored for the user? The `blobs` table is

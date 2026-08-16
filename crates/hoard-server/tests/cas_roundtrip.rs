@@ -468,10 +468,15 @@ async fn the_snapshot_cap_is_answered_before_any_byte_moves() {
     let body = serde_json::to_value(&err.1 .0).unwrap();
     assert_eq!(body["code"], "snapshot_too_large");
     assert_eq!(body["limit_bytes"], 64 * 1024 * 1024);
-    assert_eq!(
-        body["received_bytes"],
-        200 * 1024 * 1024,
-        "el tamaño real, no hasta dónde llegó la transmisión"
+    // El tamaño real, y por eso va en `actual_bytes`: `received_bytes` significa
+    // "hasta dónde llegó la transmisión antes de cortar", y aquí no se ha
+    // transmitido nada todavía. Mandarlo con ese nombre hacía que el cliente le
+    // dijera al usuario "3,6 GB enviados antes de parar" de una subida que no
+    // envió ni un byte (ago-2026).
+    assert_eq!(body["actual_bytes"], 200 * 1024 * 1024);
+    assert!(
+        body.get("received_bytes").is_none(),
+        "un rechazo antes de mover bytes no puede hablar de bytes recibidos: {body}"
     );
 }
 

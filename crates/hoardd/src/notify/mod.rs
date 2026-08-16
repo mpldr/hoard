@@ -35,6 +35,7 @@ use std::sync::Arc;
 use hoard_agent::agent::AgentEvent;
 use hoard_agent::prefs::Prefs;
 use hoard_agent::state::CliState;
+use hoard_core::ipc::events::TooLargeKind;
 
 use crate::notify::text::{Lang, Note};
 
@@ -73,8 +74,12 @@ pub enum Kind {
         error: String,
         retrying: bool,
     },
-    /// La partida no cabe en el plan: no es transitorio, no se reintenta.
+    /// La partida no cabe: no es transitorio, no se reintenta. `kind` dice
+    /// **quién** la rechazó (el plan, el servidor del propio usuario, o un proxy
+    /// delante de él), que es lo que decide la frase — y por tanto adónde se
+    /// manda al usuario a arreglarlo.
     BackupTooLarge {
+        kind: TooLargeKind,
         limit_bytes: u64,
         actual_bytes: u64,
     },
@@ -149,6 +154,7 @@ pub fn notice_for(event: &AgentEvent, prefs: &Prefs) -> Option<Notice> {
             save_id,
             game_slug,
             label,
+            kind,
             limit_bytes,
             actual_bytes,
             ..
@@ -156,6 +162,7 @@ pub fn notice_for(event: &AgentEvent, prefs: &Prefs) -> Option<Notice> {
             name: Some(pick_name(label, game_slug)),
             save_id: save_id.clone(),
             kind: Kind::BackupTooLarge {
+                kind: *kind,
                 limit_bytes: *limit_bytes,
                 actual_bytes: *actual_bytes,
             },

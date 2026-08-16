@@ -353,3 +353,29 @@ async fn signing_in_is_enough_to_appear() {
     assert_eq!(seen[0].os.as_deref(), Some("macos"));
     assert!(seen[0].online);
 }
+
+/// El 413 del camino direccionado por contenido dice el tamaño **exacto** (el
+/// manifiesto lo declara antes de mover un byte), y por eso viaja como
+/// `actual_bytes` y no como `received_bytes`. Con el nombre equivocado el
+/// cliente le contaba a un self-hoster "3,6 GB enviados antes de parar" sobre una
+/// subida que no envió ninguno.
+#[test]
+fn a_declared_rejection_reports_the_size_not_bytes_received() {
+    let (status, body) = hoard_server::routes::snapshots::snapshot_too_large_declared(
+        1024 * 1024 * 1024,
+        3_827_416_709,
+    );
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body.0["code"], "snapshot_too_large");
+    assert_eq!(body.0["actual_bytes"], 3_827_416_709i64);
+    assert!(
+        body.0.get("received_bytes").is_none(),
+        "un rechazo antes de transmitir no puede hablar de bytes recibidos: {}",
+        body.0
+    );
+
+    // Y el de la transmisión abortada, al revés: un suelo, nunca el tamaño.
+    let (_, streamed) = hoard_server::routes::snapshots::snapshot_too_large(1024, 1030);
+    assert_eq!(streamed.0["received_bytes"], 1030i64);
+    assert!(streamed.0.get("actual_bytes").is_none());
+}

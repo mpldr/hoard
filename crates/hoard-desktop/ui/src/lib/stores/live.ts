@@ -93,6 +93,11 @@ export type FeedEntry = {
   error?: string;
   /** Per-save cap in bytes, for the `backup_too_large` row. */
   limit_bytes?: number;
+  /** Who refused the upload, for the `backup_too_large` row. The row's sentence
+   *  follows this: a plan cap, the user's own server's `max_snapshot_size_mb`,
+   *  or a proxy in front of it — three different fixes. Absent on rows written
+   *  before this existed, which render as the plan cap they used to assume. */
+  too_large_kind?: "plan_cap" | "server_limit" | "proxy";
   /** Consecutive failures, for the `auto_restore_stuck` row. */
   failures?: number;
   /** i18n key for the cause of a `gate_locked`/`gate_unlocked` row. */
@@ -244,6 +249,7 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         game_slug: p.game_slug,
         bytes: p.actual_bytes,
         limit_bytes: p.limit_bytes,
+        too_large_kind: p.kind,
       };
     case "backup_quota_full":
       return {
@@ -545,6 +551,7 @@ export async function subscribeLive() {
         game_slug: p.game_slug,
         bytes: p.actual_bytes,
         limit_bytes: p.limit_bytes,
+        too_large_kind: p.kind,
       });
     }),
   );

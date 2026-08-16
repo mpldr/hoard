@@ -42,6 +42,12 @@ async fn harness() -> Harness {
 
     // Config mínima pero real: se carga con el mismo `Config::load` del binario,
     // así que un campo que se vuelva obligatorio rompe aquí y no en producción.
+    // `display()` writes the host's separators, and on Windows a `\` inside a
+    // TOML basic string is an escape sequence — `C:\Users\...` fails to parse
+    // before a single test body runs. Forward slashes are accepted by both
+    // Windows APIs and SQLite's URL parser, so normalising here keeps one
+    // fixture correct on every platform.
+    let toml_path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
     std::fs::write(
         &cfg_path,
         format!(
@@ -72,8 +78,8 @@ tmp_cleanup_hours = 24
 level = "warn"
 format = "pretty"
 "#,
-            data = data_dir.display(),
-            db = db_path.display(),
+            data = toml_path(&data_dir),
+            db = toml_path(&db_path),
         ),
     )
     .unwrap();

@@ -29,6 +29,12 @@ async fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     let cfg_path = data_dir.join("config.toml");
+    // `display()` writes the host's separators, and on Windows a `\` inside a
+    // TOML basic string is an escape sequence — `C:\Users\...` fails to parse
+    // before a single test body runs. Forward slashes are accepted by both
+    // Windows APIs and SQLite's URL parser, so normalising here keeps one
+    // fixture correct on every platform.
+    let toml_path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
     std::fs::write(
         &cfg_path,
         format!(
@@ -59,8 +65,8 @@ tmp_cleanup_hours = 24
 level = "warn"
 format = "pretty"
 "#,
-            data = data_dir.display(),
-            db = data_dir.join("hoard.db").display(),
+            data = toml_path(&data_dir),
+            db = toml_path(&data_dir.join("hoard.db")),
         ),
     )
     .unwrap();

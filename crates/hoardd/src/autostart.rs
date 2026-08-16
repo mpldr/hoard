@@ -35,7 +35,9 @@
 //! que haya y esperan a que suelte el socket: es la forma de que el dueño del
 //! proceso pase a ser el gestor de servicios de verdad.
 
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};

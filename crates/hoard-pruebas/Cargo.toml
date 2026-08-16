@@ -27,8 +27,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
-hex = { workspace = true }
-futures = { workspace = true }
 # Cloud no crea el save server-side: el id lo minta el cliente.
 uuid = { workspace = true }
-toml = { workspace = true }

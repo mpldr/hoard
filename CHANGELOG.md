@@ -123,6 +123,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   them, and one that goes months without appearing is forgotten.
 
 ### Fixed
+- **Windows: Hoard looked for your home directory in the wrong place.** If Git
+  was installed, `HOME` was set by its shell to a path that only exists inside
+  that shell, and Hoard preferred it over the account's real profile — so the
+  folders it refuses to treat as a single save (your whole user folder,
+  Documents, Saved Games) were being checked against a directory that isn't
+  there. It asks Windows first now.
 - **Hoard noticed your saves in two seconds and then sat on them.** A slider
   that stopped being shown in June kept setting the minimum wait between two
   uploads of the same save, at whatever value you had last left it — on one

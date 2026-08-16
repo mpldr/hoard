@@ -535,14 +535,23 @@ fn env_dir(name: &str) -> Vec<PathBuf> {
 
 fn home_dir() -> Option<PathBuf> {
     // We call this often enough that going through `directories` would feel
-    // heavy; std + a Windows fallback covers the cases we hit.
-    if let Some(h) = std::env::var_os("HOME") {
-        return Some(PathBuf::from(h));
-    }
+    // heavy; std + a per-platform fallback covers the cases we hit.
+    //
+    // `USERPROFILE` is asked first on Windows, and the order is the whole
+    // point. `HOME` is not a Windows variable — when it is set at all it was
+    // set by something ported from Unix, Git Bash and MSYS above all, and it
+    // frequently holds that shell's idea of the home rather than the account's
+    // (`/c/Users/name`, or a drive that doesn't exist outside the shell).
+    // Preferring it meant every `<home>` template — the blocked roots among
+    // them — resolved somewhere the user's saves have never been, on machines
+    // whose only sin was having Git installed.
     if cfg!(windows) {
         if let Some(h) = std::env::var_os("USERPROFILE") {
             return Some(PathBuf::from(h));
         }
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(h));
     }
     None
 }
@@ -759,10 +768,16 @@ mod tests {
 
     #[test]
     fn expands_home() {
-        with_env(&[("HOME", Some("/home/test"))], || {
-            let out = expand_path("<home>/.savegames/foo", Os::Linux);
-            assert_eq!(out, vec![PathBuf::from("/home/test/.savegames/foo")]);
-        });
+        with_env(
+            &[
+                ("HOME", Some("/home/test")),
+                ("USERPROFILE", Some("/home/test")),
+            ],
+            || {
+                let out = expand_path("<home>/.savegames/foo", Os::Linux);
+                assert_eq!(out, vec![PathBuf::from("/home/test/.savegames/foo")]);
+            },
+        );
     }
 
     #[test]
@@ -819,10 +834,16 @@ mod tests {
 
     #[test]
     fn placeholder_with_no_tail() {
-        with_env(&[("HOME", Some("/home/test"))], || {
-            let out = expand_path("<home>", Os::Linux);
-            assert_eq!(out, vec![PathBuf::from("/home/test")]);
-        });
+        with_env(
+            &[
+                ("HOME", Some("/home/test")),
+                ("USERPROFILE", Some("/home/test")),
+            ],
+            || {
+                let out = expand_path("<home>", Os::Linux);
+                assert_eq!(out, vec![PathBuf::from("/home/test")]);
+            },
+        );
     }
 
     #[test]
@@ -901,12 +922,18 @@ mod tests {
     /// no hay tal convención, así que ahí el token sigue cayendo.
     #[test]
     fn winsavedgames_resolves_under_os_linux_drops_on_mac() {
-        with_env(&[("HOME", Some("/home/test"))], || {
-            let out = expand_path("<winSavedGames>/MyGame", Os::Linux);
-            assert_eq!(out, vec![PathBuf::from("/home/test/Saved Games/MyGame")]);
-            let out = expand_path("<winSavedGames>/MyGame", Os::Mac);
-            assert!(out.is_empty(), "got {out:?}");
-        });
+        with_env(
+            &[
+                ("HOME", Some("/home/test")),
+                ("USERPROFILE", Some("/home/test")),
+            ],
+            || {
+                let out = expand_path("<winSavedGames>/MyGame", Os::Linux);
+                assert_eq!(out, vec![PathBuf::from("/home/test/Saved Games/MyGame")]);
+                let out = expand_path("<winSavedGames>/MyGame", Os::Mac);
+                assert!(out.is_empty(), "got {out:?}");
+            },
+        );
     }
 
     /// When the caller asks for `<winSavedGames>` under `Os::Windows`
@@ -1018,11 +1045,17 @@ mod tests {
     #[test]
     fn glob_no_wildcard_delegates_to_expand_path() {
         // No glob -> identical to expand_path, no FS access.
-        with_env(&[("HOME", Some("/home/test"))], || {
-            let a = expand_path("<home>/Saves/foo", Os::Linux);
-            let b = expand_path_globbed("<home>/Saves/foo", Os::Linux);
-            assert_eq!(a, b);
-        });
+        with_env(
+            &[
+                ("HOME", Some("/home/test")),
+                ("USERPROFILE", Some("/home/test")),
+            ],
+            || {
+                let a = expand_path("<home>/Saves/foo", Os::Linux);
+                let b = expand_path_globbed("<home>/Saves/foo", Os::Linux);
+                assert_eq!(a, b);
+            },
+        );
     }
 
     /// Reads a value the test itself writes to HKCU. Marked `#[ignore]`
@@ -1134,11 +1167,21 @@ mod tests {
 
     #[test]
     fn scoped_expansion_falls_through_for_ordinary_placeholders() {
-        with_env(&[("HOME", Some("/home/tester"))], || {
-            assert_eq!(
-                expand_path_scoped("<home>/.local/share/Game", Os::Linux, &PathScope::default()),
-                vec![PathBuf::from("/home/tester/.local/share/Game")]
-            );
-        });
+        with_env(
+            &[
+                ("HOME", Some("/home/tester")),
+                ("USERPROFILE", Some("/home/tester")),
+            ],
+            || {
+                assert_eq!(
+                    expand_path_scoped(
+                        "<home>/.local/share/Game",
+                        Os::Linux,
+                        &PathScope::default()
+                    ),
+                    vec![PathBuf::from("/home/tester/.local/share/Game")]
+                );
+            },
+        );
     }
 }

@@ -362,3 +362,78 @@ fn fuzzy_match_resolves_steam_app_with_typo() {
         );
     });
 }
+
+/// La búsqueda por nombre en las raíces estándar, que corre **antes** de bajar a
+/// barrer el directorio de instalación.
+///
+/// El caso real: un juego de Windows bajo Proton cuya ruta de catálogo no
+/// resuelve. Sus saves están en `LocalLow/<Estudio>/<Juego>` **dentro del
+/// prefijo** — el `$HOME` de la máquina no tiene nada que ver — y hasta ahora
+/// nadie miraba ahí para un juego con entrada de catálogo: se barría la
+/// instalación y se ofrecía una carpeta de 3,6 GB.
+#[test]
+fn the_name_lookup_finds_a_proton_game_in_locallow() {
+    with_isolated_linux_env(|home| {
+        let prefix = home.join("SteamLibrary/steamapps/compatdata/3372060/pfx");
+        let locallow = prefix.join("drive_c/users/steamuser/AppData/LocalLow");
+        let real = locallow.join("AstralShift/Hell Maiden");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("slot0.json"), b"{\"hp\":3}").unwrap();
+
+        let index = hoard_agent::detection::NamedDirs::scan(
+            &hoard_agent::roots::prefix_user_roots(&prefix),
+        );
+        let hits = hoard_agent::detection::discover_by_name(&index, "Hell Maiden", &[], &[]);
+        let paths: Vec<_> = hits.iter().map(|h| h.path.clone()).collect();
+        assert!(
+            paths.contains(&real),
+            "no encontró la carpeta real: {paths:?}"
+        );
+    });
+}
+
+/// El filtro que hace que lo de arriba se pueda creer: Unity crea
+/// `LocalLow/<Estudio>/<Juego>` para **todos** sus juegos, guarden ahí o no, y
+/// dentro deja `Player.log` y su telemetría. Casar sólo por nombre recomendaría
+/// con toda seguridad una carpeta de logs — que es exactamente la que un usuario
+/// eligió a mano cuando le dejamos adivinar, para después no poder copiar nada.
+#[test]
+fn a_folder_with_only_engine_logs_is_not_offered() {
+    with_isolated_linux_env(|home| {
+        let prefix = home.join("pfx");
+        let logs_only = prefix
+            .join("drive_c/users/steamuser/AppData/LocalLow")
+            .join("AstralShift/Hell Maiden");
+        std::fs::create_dir_all(logs_only.join("Unity/abc-123/Analytics")).unwrap();
+        std::fs::write(logs_only.join("Player.log"), b"boot").unwrap();
+        std::fs::write(logs_only.join("Player-prev.log"), b"boot").unwrap();
+        std::fs::write(logs_only.join("Unity/abc-123/Analytics/events.bin"), b"x").unwrap();
+
+        let index = hoard_agent::detection::NamedDirs::scan(
+            &hoard_agent::roots::prefix_user_roots(&prefix),
+        );
+        let hits = hoard_agent::detection::discover_by_name(&index, "Hell Maiden", &[], &[]);
+        assert!(
+            hits.is_empty(),
+            "ofreció una carpeta que sólo tiene logs del motor: {hits:?}"
+        );
+    });
+}
+
+/// Un nombre corto no puede pescar en el resto del árbol: con dos letras casa
+/// cualquier cosa, y una recomendación equivocada cuesta más que no recomendar.
+#[test]
+fn a_two_letter_name_never_matches() {
+    with_isolated_linux_env(|home| {
+        let prefix = home.join("pfx");
+        let dir = prefix.join("drive_c/users/steamuser/AppData/LocalLow/Go");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("save.dat"), b"x").unwrap();
+
+        let index = hoard_agent::detection::NamedDirs::scan(
+            &hoard_agent::roots::prefix_user_roots(&prefix),
+        );
+        let hits = hoard_agent::detection::discover_by_name(&index, "Go", &[], &[]);
+        assert!(hits.is_empty(), "{hits:?}");
+    });
+}

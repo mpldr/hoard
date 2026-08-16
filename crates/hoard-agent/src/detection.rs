@@ -53,6 +53,7 @@ use crate::state::CliState;
 use crate::steam::{self, SteamApp};
 use crate::wine_prefixes::{self, PrefixKind};
 use crate::wrappers;
+use hoard_core::kernel::fileclass;
 
 /// How sure we are that the game is actually installed locally.
 ///
@@ -771,6 +772,10 @@ where
         .filter(|(_, g)| g.found_paths.is_empty())
         .map(|(s, _)| s.clone())
         .collect();
+    // Una pasada por las raíces estándar para todo el bucle: el tope de tiempo
+    // pasa a ser por pasada y no por juego.
+    let host_dirs = NamedDirs::scan(&roots::user_save_roots(os));
+    let mut prefix_indexes: HashMap<PathBuf, NamedDirs> = HashMap::new();
     for slug in unresolved_slugs {
         let (install_dir, prefix_root, display_name) = {
             let g = &by_slug[&slug];
@@ -778,18 +783,57 @@ where
             let prefix_root = prefix_root_by_slug.get(&slug).cloned();
             (install_dir, prefix_root, g.display_name.clone())
         };
-        if install_dir.is_none() && prefix_root.is_none() {
-            continue;
+        // Primero por nombre en las raíces donde de verdad viven los saves, y
+        // sólo si ahí no aparece se baja a barrer el directorio de instalación.
+        // El orden es el arreglo: al revés, un juego cuya ruta de catálogo no
+        // resuelve acababa ofreciendo una carpeta de dentro de la instalación
+        // —3,6 GB en el caso que destapó esto— teniendo la buena a un `read_dir`
+        // de distancia en `LocalLow`.
+        //
+        // Se hace aunque no haya `install_dir` ni prefijo: un juego que no es de
+        // Steam no tiene ninguno de los dos y hasta ahora se quedaba sin fallback
+        // ninguno (el `continue` de abajo lo descartaba antes de mirar nada).
+        let shields = crate::savefilter::shields_for_slug(&slug);
+        let extra_names: Vec<String> = install_dir
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|n| vec![n.to_string()])
+            .unwrap_or_default();
+        // Las raíces del host se indexan una vez; las del prefijo, una vez por
+        // prefijo — varios juegos comparten el mismo y no hay que reescanearlo.
+        let index = match prefix_root.as_deref() {
+            Some(prefix) => prefix_indexes
+                .entry(prefix.to_path_buf())
+                .or_insert_with(|| {
+                    let mut idx = NamedDirs::scan(&roots::prefix_user_roots(prefix));
+                    idx.absorb(&host_dirs);
+                    idx
+                }),
+            None => &host_dirs,
+        };
+        let mut discoveries = discover_by_name(index, &display_name, &extra_names, &shields);
+        if !discoveries.is_empty() {
+            tracing::debug!(
+                slug = %slug,
+                hits = discoveries.len(),
+                "detection: found the save folder by name in a standard root"
+            );
         }
-        let discoveries = aggressive_discover_with(
-            &slug,
-            &display_name,
-            install_dir.as_deref(),
-            prefix_root.as_deref(),
-            AGGRESSIVE_WALK_TIMEOUT,
-            AGGRESSIVE_WALK_MAX_DEPTH,
-            &corr_store,
-        );
+        if discoveries.is_empty() {
+            if install_dir.is_none() && prefix_root.is_none() {
+                continue;
+            }
+            discoveries = aggressive_discover_with(
+                &slug,
+                &display_name,
+                install_dir.as_deref(),
+                prefix_root.as_deref(),
+                AGGRESSIVE_WALK_TIMEOUT,
+                AGGRESSIVE_WALK_MAX_DEPTH,
+                &corr_store,
+            );
+        }
         if discoveries.is_empty() {
             continue;
         }
@@ -2322,6 +2366,219 @@ pub struct DiscoveredSavePath {
     pub path: PathBuf,
     pub confidence: Confidence,
     pub reason: String,
+}
+
+/// How long the name lookup may spend on a single root, and how many
+/// directories it may look at there. It reads one level and one level below it,
+/// so the ceiling matters mostly in `LocalLow`, where a busy machine has a few
+/// dozen publisher folders.
+const NAME_LOOKUP_TIMEOUT: Duration = Duration::from_millis(400);
+const NAME_LOOKUP_MAX_DIRS: usize = 400;
+
+/// Normalise a folder or game name for comparison: lowercase, and drop
+/// everything that is not a letter or a digit.
+///
+/// `Hell Maiden`, `HellMaiden` and `hell-maiden` all have to compare equal —
+/// studios name the folder however they please, and the catalogue's
+/// `display_name` is the only thing we can hold it against.
+fn name_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Does this directory hold anything a player would miss?
+///
+/// The gate that makes the name lookup safe to trust. `AppData/LocalLow/<Studio>/<Game>`
+/// exists for **every** Unity game whether or not it saves there — the engine
+/// drops `Player.log` and `Unity/<guid>/Analytics/` in it regardless — so
+/// matching on the name alone would confidently recommend a folder of logs. It
+/// is exactly the folder a user picked by hand when Hoard left them to guess,
+/// and then "nothing to back up" was all they got (ago-2026).
+///
+/// `fileclass` already knows the difference and is the same judgement the
+/// backup itself makes, so a folder that passes here cannot produce an empty
+/// snapshot. Bounded: two levels and a handful of entries is enough to tell a
+/// save folder from a log folder.
+fn holds_player_data(dir: &Path, shields: &[String]) -> bool {
+    fn scan(dir: &Path, shields: &[String], depth: usize, budget: &mut usize) -> bool {
+        if depth > 2 || *budget == 0 {
+            return false;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in read.flatten() {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                subdirs.push(path);
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if fileclass::classify(name, shields).is_backed_up() {
+                return true;
+            }
+        }
+        subdirs.iter().any(|d| scan(d, shields, depth + 1, budget))
+    }
+    let mut budget = 200usize;
+    scan(dir, shields, 0, &mut budget)
+}
+
+/// The directories of the standard save roots, indexed by normalised name.
+///
+/// Built **once per detection pass** and shared by every unresolved slug. The
+/// first cut re-scanned the roots per slug: each one is capped at
+/// [`NAME_LOOKUP_TIMEOUT`], so thirty unresolved games across seven roots put a
+/// theoretical minute and a half of cold-disk scanning on the critical path.
+/// Scanned once, the cap is a per-pass ceiling instead of a per-game one.
+///
+/// Two levels are indexed, which is what covers the overwhelming majority:
+///   - `<root>/<Game>` — the game's own folder;
+///   - `<root>/<Studio>/<Game>` — the Unity convention, and what a good many
+///     others copy.
+///
+/// A third level is not guessing territory we want to be in.
+#[derive(Debug, Default)]
+pub struct NamedDirs {
+    by_key: HashMap<String, Vec<PathBuf>>,
+}
+
+impl NamedDirs {
+    pub fn scan(roots: &[PathBuf]) -> Self {
+        let mut by_key: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for root in roots {
+            let start = Instant::now();
+            let mut looked = 0usize;
+            let Ok(read) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                if looked >= NAME_LOOKUP_MAX_DIRS || start.elapsed() >= NAME_LOOKUP_TIMEOUT {
+                    break;
+                }
+                looked += 1;
+                let Ok(ft) = entry.file_type() else { continue };
+                if !ft.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                by_key.entry(name_key(name)).or_default().push(path.clone());
+
+                let Ok(inner) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                for sub in inner.flatten() {
+                    if looked >= NAME_LOOKUP_MAX_DIRS {
+                        break;
+                    }
+                    looked += 1;
+                    let Ok(ft) = sub.file_type() else { continue };
+                    if !ft.is_dir() {
+                        continue;
+                    }
+                    let sub_name = sub.file_name();
+                    let Some(sub_name) = sub_name.to_str() else {
+                        continue;
+                    };
+                    by_key
+                        .entry(name_key(sub_name))
+                        .or_default()
+                        .push(sub.path());
+                }
+            }
+        }
+        Self { by_key }
+    }
+
+    /// Añade las entradas de otro índice. Un juego bajo Proton puede guardar
+    /// dentro del prefijo **o** en el `$HOME` real (los nativos multiplataforma
+    /// lo hacen), así que su índice mira en los dos sitios.
+    fn absorb(&mut self, other: &NamedDirs) {
+        for (k, paths) in &other.by_key {
+            let slot = self.by_key.entry(k.clone()).or_default();
+            for p in paths {
+                if !slot.contains(p) {
+                    slot.push(p.clone());
+                }
+            }
+        }
+    }
+
+    fn paths_for(&self, keys: &[String]) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for k in keys {
+            if let Some(hits) = self.by_key.get(k) {
+                for p in hits {
+                    if !out.contains(p) {
+                        out.push(p.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Look for a game's save folder **by name** among the directories of the roots
+/// where save folders actually live, before resorting to walking its install
+/// directory.
+///
+/// This is the gap that pointed a self-hoster's client at a 3.6 GB folder: when
+/// a catalogued game's declared path does not resolve — the game saves somewhere
+/// else, or the entry is stale — the only fallback was to walk the install dir
+/// and offer whatever looked save-shaped inside it. The standard roots were
+/// never consulted for a game that *had* a catalogue entry, even though
+/// [`roots::user_save_roots`] already lists the very place most of them save
+/// (`LocalLow` is in there, labelled Unity's `persistentDataPath`).
+///
+/// Proton prefixes matter more here than the host's own roots for a Windows game
+/// on Linux: the real `LocalLow` is inside `pfx/drive_c/users/steamuser/`, and
+/// the home directory of the person running the game has nothing to do with it.
+/// The caller passes an index covering both.
+///
+/// Every hit must pass [`holds_player_data`], so a folder that only holds engine
+/// logs is not offered — which is precisely what a name-only match gets wrong.
+pub fn discover_by_name(
+    index: &NamedDirs,
+    display_name: &str,
+    extra_names: &[String],
+    shields: &[String],
+) -> Vec<DiscoveredSavePath> {
+    let mut wanted: Vec<String> = vec![name_key(display_name)];
+    for n in extra_names {
+        let k = name_key(n);
+        if !k.is_empty() && !wanted.contains(&k) {
+            wanted.push(k);
+        }
+    }
+    // Un nombre de dos letras casa con cualquier cosa, y recomendar la carpeta
+    // equivocada cuesta más que no recomendar ninguna.
+    wanted.retain(|k| k.len() >= 3);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    index
+        .paths_for(&wanted)
+        .into_iter()
+        .filter(|p| holds_player_data(p, shields))
+        .map(|path| DiscoveredSavePath {
+            path,
+            confidence: Confidence::High,
+            reason: "folder named after the game in a standard save root".to_string(),
+        })
+        .collect()
 }
 
 /// Aggressive filesystem walker for slugs that finished the main pipeline

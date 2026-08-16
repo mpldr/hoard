@@ -144,15 +144,16 @@ fn collect_entries(rx: &Receiver<Seen>, wanted: usize) -> (Vec<Seen>, Vec<LogEnt
     (posts, entries)
 }
 
-/// A redacted path as this platform spells it.
+/// A redacted Linux path, home segment replaced.
 ///
-/// The fixtures build their paths with `Path::join`, so the separator between
-/// the home and the tail is whatever the OS uses: redaction rewrites the home
-/// prefix and leaves the rest exactly as it was produced. Hardcoding `/` in the
-/// expectation asserted on Linux and failed on Windows for a reason that has
-/// nothing to do with what this test checks.
+/// The fixtures spell these out whole rather than building them with
+/// `Path::join`, so the separators are `/` on every platform and the
+/// expectation can be too — the redaction only rewrites the profile segment
+/// and leaves the rest of the string alone. Deriving the separator from the
+/// host here would put a `\` in the middle of a path the fixture never wrote
+/// that way, and fail on Windows.
 fn under_home(tail: &str) -> String {
-    format!("/home/<user>{}{}", std::path::MAIN_SEPARATOR, tail)
+    format!("/home/<user>/{tail}")
 }
 
 /// Los campos de una desmentida, por veredicto.

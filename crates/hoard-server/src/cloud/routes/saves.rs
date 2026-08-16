@@ -171,39 +171,43 @@ pub async fn init_upload(
     //    `backup_only` is captured per-save: a row toggled to backup_only=true
     //    on a later upload stays out of the manifest until explicitly
     //    re-enabled by the client.
-    let label = body.label.clone().unwrap_or_else(|| "default".to_string());
-    let save_row: (String, i64) = sqlx::query_as(
-        r#"
-        INSERT INTO saves (id, user_id, game_slug, label, latest_version_num, backup_only)
-        VALUES ($1, $2, $3, $4, 0, $5)
-        ON CONFLICT (user_id, game_slug, label)
-        DO UPDATE SET updated_at = now(), backup_only = EXCLUDED.backup_only
-        RETURNING id, latest_version_num
-        "#,
+    let mut conn = state.pool.acquire().await?;
+    let save_row = resolve_save_row(
+        &mut conn,
+        &body.save_id,
+        user.user_id,
+        &body.game_slug,
+        &body.label,
+        body.backup_only,
     )
-    .bind(&body.save_id)
-    .bind(user.user_id)
-    .bind(&body.game_slug)
-    .bind(&label)
-    .bind(body.backup_only)
-    .fetch_one(&state.pool)
     .await?;
 
     let head = save_row.1;
 
     // Fast-forward check (the DAG's enforcement). A base that no longer matches
     // the head means another device pushed since the client last synced.
-    if let Some(base) = body.base_version {
-        if base != head {
-            return Ok(NonFastForwardResponse {
-                error:
-                    "non-fast-forward: another device advanced this save since your base version",
-                code: "non_fast_forward",
-                head_version: head,
-                base_version: base,
-            }
-            .into_response());
+    //
+    // No base at all used to skip the check entirely, and that is the hole: a
+    // client sends no base when its local cursor is null — a machine that has
+    // never synced this save, or one whose state was rebuilt. Against a save
+    // with history that is the *least* trustworthy upload there is, and it was
+    // the only one allowed through unchecked. In aug-2026 a device with a null
+    // cursor pushed its folder over a head ten versions ahead: the other
+    // machine's copy stayed in history, but the head became a folder that had
+    // never seen it, which reads exactly like "it stopped syncing".
+    //
+    // Treated as base 0: fine against an empty save (the first upload), a
+    // non-fast-forward against anything else. The client already knows this
+    // answer — it reconciles and pulls before retrying.
+    let base = body.base_version.unwrap_or(0);
+    if base != head {
+        return Ok(NonFastForwardResponse {
+            error: "non-fast-forward: another device advanced this save since your base version",
+            code: "non_fast_forward",
+            head_version: head,
+            base_version: base,
         }
+        .into_response());
     }
 
     let next_version = head + 1;
@@ -616,29 +620,22 @@ pub async fn cas_init(
 
     // Ensure the saves row exists (same UPSERT semantics as the archive path).
     //
-    // Everything from here to the manifest insert runs in one transaction.
-    // The UPSERT's row lock on the saves row is held until commit, which
-    // serializes concurrent cas_inits for the same save — without it, two
-    // requests read the same head and the second INSERT into save_versions
-    // dies on the (save_id, version_num) unique constraint (the "db_error"
-    // bursts when several devices/sweeps fire at once).
+    // Everything from here to the manifest insert runs in one transaction, and
+    // `resolve_save_row` has to run *inside* it: its UPDATE takes the row lock
+    // on the saves row, held until commit, and that is what serializes
+    // concurrent cas_inits for the same save. Without the lock two requests read
+    // the same head and the second INSERT into save_versions dies on the
+    // (save_id, version_num) unique constraint — the "db_error" bursts when
+    // several devices or sweeps fire at once.
     let mut tx = state.pool.begin().await?;
-    let label = body.label.clone().unwrap_or_else(|| "default".to_string());
-    let save_row: (String, i64) = sqlx::query_as(
-        r#"
-        INSERT INTO saves (id, user_id, game_slug, label, latest_version_num, backup_only)
-        VALUES ($1, $2, $3, $4, 0, $5)
-        ON CONFLICT (user_id, game_slug, label)
-        DO UPDATE SET updated_at = now(), backup_only = EXCLUDED.backup_only
-        RETURNING id, latest_version_num
-        "#,
+    let save_row = resolve_save_row(
+        &mut tx,
+        &body.save_id,
+        user.user_id,
+        &body.game_slug,
+        &body.label,
+        body.backup_only,
     )
-    .bind(&body.save_id)
-    .bind(user.user_id)
-    .bind(&body.game_slug)
-    .bind(&label)
-    .bind(body.backup_only)
-    .fetch_one(&mut *tx)
     .await?;
     let head = save_row.1;
 
@@ -651,7 +648,7 @@ pub async fn cas_init(
             requested_save_id = %body.save_id,
             canonical_save_id = %save_row.0,
             game_slug = %body.game_slug,
-            label = %label,
+            client_label = body.label.as_deref().unwrap_or("default"),
             head_version = head,
             "cas_init: save id divergence — client save_id resolved to a different cloud save (cross-device collision)"
         );
@@ -670,24 +667,27 @@ pub async fn cas_init(
         "cas_init: request"
     );
 
-    if let Some(base) = body.base_version {
-        if base != head {
-            tracing::warn!(
-                save_id = %save_row.0,
-                requested_save_id = %body.save_id,
-                head_version = head,
-                base_version = base,
-                "cas_init: rejected non_fast_forward"
-            );
-            return Ok(NonFastForwardResponse {
-                error:
-                    "non-fast-forward: another device advanced this save since your base version",
-                code: "non_fast_forward",
-                head_version: head,
-                base_version: base,
-            }
-            .into_response());
+    // No base means a null local cursor, which against a save with history is
+    // the least trustworthy upload there is — see the same check on the archive
+    // path for the incident. Treated as base 0: fine on a first upload, a
+    // non-fast-forward against anything else.
+    let base = body.base_version.unwrap_or(0);
+    if base != head {
+        tracing::warn!(
+            save_id = %save_row.0,
+            requested_save_id = %body.save_id,
+            head_version = head,
+            base_version = base,
+            had_base = body.base_version.is_some(),
+            "cas_init: rejected non_fast_forward"
+        );
+        return Ok(NonFastForwardResponse {
+            error: "non-fast-forward: another device advanced this save since your base version",
+            code: "non_fast_forward",
+            head_version: head,
+            base_version: base,
         }
+        .into_response());
     }
 
     let next_version = head + 1;
@@ -1710,6 +1710,91 @@ pub struct SaveSummary {
 
 /// `PATCH /v1/cloud/saves/:save_id` ??? rename a cloud save's label. The cloud
 /// analogue of the self-hosted `PATCH /v1/saves/:id`. Enforces
+/// The saves row an upload belongs to: `(id, head_version)`, creating it when
+/// this really is a new save.
+///
+/// Two ways a client can be out of step with the row, and the upsert this
+/// replaces could only survive one of them at a time:
+///
+/// * **The label is stale.** Another machine renamed the save; this one still
+///   uploads under the name it last saw. Conflicting on
+///   `(user_id, game_slug, label)` matched nothing, so Postgres tried a real
+///   insert of an `id` that already existed and raised a unique violation on the
+///   primary key — surfacing as `cloud cas init: server error (500)` on a save
+///   whose only sin was being renamed elsewhere.
+/// * **The id is stale.** The client minted its own `save_id` and the row in the
+///   cloud has a different one (a re-install, a state wipe, a self-hosted server
+///   rebuilt). Conflicting on `id` alone would insert a second row for a
+///   `(user, game, label)` that is already taken, and die on *that* constraint
+///   instead. One real account had both at once: the desktop's `main` row for a
+///   game carried an id the cloud had never heard of, and had been quietly
+///   riding the label conflict for months.
+///
+/// So neither key alone is enough and Postgres takes one conflict target per
+/// statement. Resolve first, in the order identity actually runs: the `id` names
+/// the row, the label only names a slot within a game.
+///
+/// The row's label wins over the client's on purpose — adopting the incoming one
+/// would silently undo the rename made on the other machine.
+async fn resolve_save_row(
+    conn: &mut sqlx::PgConnection,
+    save_id: &str,
+    user_id: uuid::Uuid,
+    game_slug: &str,
+    label: &Option<String>,
+    backup_only: bool,
+) -> Result<(String, i64), CloudError> {
+    let by_id: Option<(String, i64)> = sqlx::query_as(
+        "UPDATE saves SET updated_at = now(), backup_only = $3
+         WHERE id = $1 AND user_id = $2
+         RETURNING id, latest_version_num",
+    )
+    .bind(save_id)
+    .bind(user_id)
+    .bind(backup_only)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(row) = by_id {
+        return Ok(row);
+    }
+
+    let label = label.clone().unwrap_or_else(|| "default".to_string());
+    let by_label: Option<(String, i64)> = sqlx::query_as(
+        "UPDATE saves SET updated_at = now(), backup_only = $4
+         WHERE user_id = $1 AND game_slug = $2 AND label = $3
+         RETURNING id, latest_version_num",
+    )
+    .bind(user_id)
+    .bind(game_slug)
+    .bind(&label)
+    .bind(backup_only)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(row) = by_label {
+        return Ok(row);
+    }
+
+    // Genuinely new. The conflict target still matters: two devices can race the
+    // first upload of the same save, and the loser has to find the winner's row
+    // rather than fail.
+    Ok(sqlx::query_as(
+        r#"
+        INSERT INTO saves (id, user_id, game_slug, label, latest_version_num, backup_only)
+        VALUES ($1, $2, $3, $4, 0, $5)
+        ON CONFLICT (user_id, game_slug, label)
+        DO UPDATE SET updated_at = now(), backup_only = EXCLUDED.backup_only
+        RETURNING id, latest_version_num
+        "#,
+    )
+    .bind(save_id)
+    .bind(user_id)
+    .bind(game_slug)
+    .bind(&label)
+    .bind(backup_only)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// `UNIQUE(user_id, game_slug, label)` -> 409 on collision. R2 keys are keyed
 /// by `save_id` + version (not by label), so no blob rename is needed ??? just
 /// the DB row.

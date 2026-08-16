@@ -490,6 +490,100 @@ impl Manifest {
 }
 
 // =======================================================================
+// The swap window — "don't start me right now"
+// =======================================================================
+
+/// How long a swap marker is believed before it's treated as debris.
+///
+/// It has to outlive the slowest installer we drive (an NSIS `-setup.exe /S`
+/// unpacking ~90 MB onto a cold disk) and still be short enough that a machine
+/// which crashed mid-swap isn't left unable to start its own service. Three
+/// minutes is both.
+const SWAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+
+/// **The binaries are being replaced right now, so don't launch one.**
+///
+/// The client rule since Slice 4 is "spawn if absent" (`Client::ensure_running`
+/// in `hoardd`): lose the socket, start a service. That rule and an installer
+/// are a deadlock on Windows. The NSIS hook stops `hoardd.exe` before it can
+/// overwrite it, the desktop notices the socket is gone two seconds later and
+/// starts it again from the *old* binary, and NSIS then hits a file that's back
+/// in use — "Error opening file for writing", update aborted, and the same
+/// thing an hour later. The kill order in `installer-hooks.nsh` narrows that
+/// window; this closes it, and covers the clients the hook can't kill by name
+/// (a `hoard` invocation from a terminal, a second desktop session).
+///
+/// It's a file and not a flag in memory because the process that must not spawn
+/// a daemon is usually not the process that started the install.
+///
+/// Held for the length of [`stage::apply`] and dropped with the guard. Being
+/// killed mid-swap is the normal Windows path, so a marker that outlives its
+/// process is expected: it expires on its own after [`SWAP_WINDOW`], and any
+/// `hoardd` that manages to start clears it — a live service *is* the proof the
+/// swap is over.
+pub struct Swap {
+    path: Option<PathBuf>,
+}
+
+impl Swap {
+    fn path() -> Result<PathBuf> {
+        Ok(crate::config::CliConfig::state_dir()?.join("swapping-binaries"))
+    }
+
+    /// Mark the swap as started. Best-effort: a machine where we can't write
+    /// this still gets updated, it just keeps the old race.
+    pub fn begin() -> Self {
+        let path = Self::path().ok().filter(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(path, b"").is_ok()
+        });
+        if path.is_none() {
+            tracing::debug!(
+                "install: couldn't write the swap marker; clients may respawn mid-swap"
+            );
+        }
+        Self { path }
+    }
+
+    /// Is someone replacing the binaries right now?
+    pub fn in_progress() -> bool {
+        let Ok(path) = Self::path() else {
+            return false;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return false;
+        };
+        match meta.modified().map(|at| at.elapsed()) {
+            // A marker from the future (clock jump, a copied home directory) is
+            // still a marker: the safe reading is "wait", because the worst case
+            // is a client that waits three minutes for a service it could have
+            // started, against a corrupted install.
+            Ok(Err(_)) | Err(_) => true,
+            Ok(Ok(age)) => age < SWAP_WINDOW,
+        }
+    }
+
+    /// Drop the marker without holding a guard. This is what a starting
+    /// `hoardd` calls: if it's running, the swap it would have blocked already
+    /// finished (or never got past the installer that killed its predecessor).
+    pub fn forget() {
+        if let Ok(path) = Self::path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for Swap {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+// =======================================================================
 // Que la terminal se pueda escribir
 // =======================================================================
 

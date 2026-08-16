@@ -133,6 +133,15 @@ impl Client {
                  start it again with `hoard sync start`"
             );
         }
+        // An update is replacing the binaries right now. Starting one here is
+        // how a Windows update used to fail: the installer stops `hoardd.exe`,
+        // this reconnect brings it back from the old binary two seconds later,
+        // and NSIS then can't write the file it just made room for. Whoever
+        // finishes the swap starts the service (the NSIS post-install hook, or
+        // `relaunch` on the way out), so waiting is not waiting forever.
+        if hoard_agent::install::Swap::in_progress() {
+            bail!("Hoard is being updated right now; the service will be back in a moment");
+        }
         spawn_daemon(endpoint)?;
         let stream = transport::connect_with_deadline(endpoint, Instant::now() + SPAWN_TIMEOUT)
             .await

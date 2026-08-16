@@ -203,6 +203,12 @@ pub async fn apply(staged: &Staged, manifest: &mut Manifest, noninteractive: boo
         bail!("there is nothing staged for {}", staged.version);
     }
 
+    // From here to the end of this function the binaries on disk are in motion,
+    // and a client that starts a service off them would either run half an
+    // update or —on Windows— hold open the very file the installer is trying to
+    // write. The guard is what tells those clients to sit still.
+    let _swap = super::Swap::begin();
+
     if let Some(tarball) = &staged.core {
         let dir = manifest
             .core_dir

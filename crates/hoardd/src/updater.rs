@@ -260,6 +260,23 @@ async fn tick(
     let unattended = manifest.applies_unattended();
     let mut ledger = Ledger::load();
 
+    // What we staged is what we're running: the update landed, whoever got to
+    // see it. This is the only place that can close the book on Windows, where
+    // the installer kills the daemon that launched it — the process that
+    // applied the update is never the process that returns from applying it, so
+    // without this the deadline, the staged copy and the attempt counter all
+    // survive an update that worked.
+    let current = hoard_agent::update::current();
+    if ledger.staged.as_deref() == Some(current) {
+        tracing::info!(
+            version = current,
+            "hoardd: started on the version it had staged"
+        );
+        ledger.applied(current);
+        let _ = ledger.save();
+        stage::sweep(current);
+    }
+
     // Freno de mano tras varios fallos seguidos: se sigue mirando, pero al ritmo
     // largo, no al corto.
     let burnt = ledger.failures >= MAX_FAILURES;
@@ -442,6 +459,18 @@ async fn apply(
     updater.set_phase(Phase::Applying);
     tracing::info!(version, noninteractive, "hoardd: applying the update");
 
+    // The attempt is written down *before* it happens, which is backwards
+    // everywhere except here: on Windows there is no after. The NSIS installer
+    // stops `hoardd.exe` before overwriting it, so the run that applies an
+    // update is killed while it waits for that installer and never reaches
+    // either arm below. Left uncounted, an install that keeps failing is
+    // retried every hour forever — and every retry force-closes the app the
+    // user is looking at. A cycle that sees what we staged is what we're now
+    // running clears this again.
+    ledger.failures += 1;
+    ledger.last_error = Some(format!("applying {version} never reported back"));
+    let _ = ledger.save();
+
     let mut manifest = manifest.clone();
     match stage::apply(&staged, &mut manifest, noninteractive).await {
         Ok(()) => {
@@ -469,7 +498,8 @@ async fn apply(
         Err(err) => {
             let message = format!("{err:#}");
             tracing::warn!(version, error = %message, "hoardd: couldn't apply the update");
-            ledger.failures += 1;
+            // Already counted above; this only puts the real reason in place of
+            // the placeholder.
             ledger.last_error = Some(message.clone());
             let _ = ledger.save();
             updater.fail(message);

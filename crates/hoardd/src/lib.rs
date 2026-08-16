@@ -141,6 +141,10 @@ pub async fn run(options: Options) -> Result<Outcome> {
         "hoardd: listening"
     );
     sweep_legacy_pidfile();
+    // We're serving, so nobody is halfway through replacing the binaries — and
+    // on Windows the installer kills the daemon that set the marker, so the
+    // guard's `Drop` never runs and only a fresh service can say it's over.
+    hoard_agent::install::Swap::forget();
 
     let log = Arc::new(EventLog::new());
     let engine = Engine::new();

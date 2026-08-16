@@ -151,3 +151,7 @@ crates/hoard-desktop/ui/src/routes/Map.svelte
 # fue como un self-hoster perdió de vista su base en ago-2026. La guía ya dice
 # `cp deploy/config.toml.example deploy/docker/config/config.toml`.
 deploy/docker/config/config.toml
+
+# Prompt general para delegar trabajo de UI a otro modelo. Nota de trabajo
+# local, con nombres de fichero y trampas que no son doc pública.
+/PROMPT-UI.local.md

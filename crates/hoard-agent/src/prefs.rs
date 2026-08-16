@@ -204,6 +204,13 @@ pub struct Prefs {
     /// (eje A, vía `agent::min_snapshot_interval_for`) y la `RetentionPolicy`
     /// del server (eje B). Default `0.3` — un poco de ahorro de fábrica
     /// porque "guardar todo" sorprende mal al usuario (caso OpenTTD).
+    ///
+    /// El eje A ya **no** se aplica: `hoardd::engine` dejó de derivar el suelo
+    /// de aquí cuando se vio lo que costaba un ajuste sin interfaz. El slider
+    /// salió de Ajustes el 2026-06-14 y el valor que cada uno tuviera escrito se
+    /// quedó mandando para siempre; en una máquina eran 1.0, diez minutos de
+    /// espera entre subidas que nada podía enseñar ni cambiar. Si vuelve el
+    /// control, vuelve el eje A con él — no antes.
     #[serde(default = "default_data_saving")]
     pub data_saving: f64,
 }

@@ -567,7 +567,22 @@ fn engine_config() -> AgentConfig {
         auto_restore: prefs.auto_restore || headless,
         global_sync: prefs.global_sync || headless,
         conflict_retention_days: prefs.conflict_retention_days,
-        min_snapshot_interval_secs: agent::min_snapshot_interval_for(prefs.data_saving),
+        // `data_saving` deliberately does NOT feed the floor any more. Its
+        // slider left the UI on 2026-06-14 ("el backend mantiene sus defaults"),
+        // but the pref already written to disk stayed at whatever the user had
+        // last dragged it to — and the engine kept honouring it. On one machine
+        // that was 1.0, a ten-minute floor between uploads that nothing could
+        // show or change: edits were picked up in two seconds and then sat in
+        // the queue, which reads as "it doesn't detect my changes". Worse, a
+        // restore marks the next backup urgent and skips the floor, so changes
+        // arriving from the other machine synced instantly while your own
+        // waited — the two halves looked unrelated.
+        //
+        // Per-save pacing is still reachable where it is visible: the
+        // `data_saver` preset sets its own 600s floor through
+        // `SavePolicy::min_snapshot_interval_secs`, and that one the user picks
+        // per game and can see.
+        min_snapshot_interval_secs: 0,
         // Aparca la copia local antes de dejar que una remota más nueva la pise
         // (nunca destruye datos en silencio).
         conflict_root: CliConfig::state_dir().ok().map(|d| d.join("conflicts")),

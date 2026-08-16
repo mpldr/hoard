@@ -292,25 +292,83 @@ fn decide_backup(
     // actualización cross-device espera un intervalo entero (hasta 10 min en el
     // preset `data_saver`) antes de poder aterrizar.
     if !urgent && backup_floor(next).is_some_and(|t| now < t) {
-        return Some(hold("backup min-interval"));
+        // Dos motivos distintos a propósito: uno es el ritmo que el usuario
+        // eligió, el otro es el que le pusimos nosotros por cómo se comporta su
+        // juego. En un log valen lo mismo hasta que hay que explicarle a alguien
+        // por qué su partida "tarda" — y entonces valen cosas muy distintas.
+        return Some(hold(if next.min_backup_interval_secs > 0 {
+            "backup min-interval"
+        } else {
+            "backup autosave burst"
+        }));
     }
     next.in_flight = Some(Op::Backup);
     Some(Decision::Act(Action::Backup))
 }
 
+/// Ventana en la que se cuentan los commits de un save para decidir si el juego
+/// está reescribiendo su autoguardado en bucle.
+pub const BURST_WINDOW_SECS: i64 = 600;
+/// Commits dentro de esa ventana a partir de los cuales se impone el suelo. Tres
+/// en diez minutos ya es más de lo que ningún historial aprovecha.
+pub const BURST_THRESHOLD: u32 = 3;
+/// El suelo que se impone entonces, y el **único** escalón que hay: no escala
+/// con la frecuencia. Un juego que autoguarda cada seis segundos pasa de una
+/// versión cada seis segundos a una por minuto, y ahí se queda.
+pub const BURST_FLOOR_SECS: u64 = 60;
+
+/// El suelo que rige de verdad para este save.
+///
+/// Un intervalo explícito manda siempre: lo puso un preset que el usuario ve y
+/// eligió (`short_session` 30 s para un juego que se borra la carpeta entre
+/// rondas, `data_saver` 600 s), y subírselo por su cuenta traicionaría justo lo
+/// que se pidió. El adaptativo sólo rellena el hueco de "sin suelo ninguno", que
+/// es el default y hasta ahora significaba literalmente ninguno: un save llegó a
+/// 2.233 versiones en un día, 1.027 subidas en cuatro horas y media, porque el
+/// juego reescribía `auto.sav` cada pocos segundos y cada reescritura era una
+/// versión en la nube (ago-2026).
+fn effective_min_interval(state: &State) -> u64 {
+    if state.min_backup_interval_secs > 0 {
+        return state.min_backup_interval_secs;
+    }
+    if state.burst_backups >= BURST_THRESHOLD {
+        BURST_FLOOR_SECS
+    } else {
+        0
+    }
+}
+
 /// El suelo de min-interval, **derivado** de `last_backup_at +
-/// min_backup_interval_secs` en vez de almacenado en `next_backup_at`. Separarlo
-/// del backoff es lo que permite distinguir "pacing de ahorro" (saltable por un
-/// flush cross-device) de "backoff de error" (jamás), y de paso hace del ancla
-/// —`last_backup_at`, que sólo avanza con un commit real— la única memoria del
-/// suelo: un no-op no puede empujarlo (regresión R.E.P.O., D.8.2).
+/// [`effective_min_interval`]` en vez de almacenado en `next_backup_at`.
+/// Separarlo del backoff es lo que permite distinguir "pacing de ahorro"
+/// (saltable por un flush cross-device) de "backoff de error" (jamás), y de paso
+/// hace del ancla —`last_backup_at`, que sólo avanza con un commit real— la
+/// única memoria del suelo: un no-op no puede empujarlo (regresión R.E.P.O.,
+/// D.8.2).
 fn backup_floor(state: &State) -> Option<OffsetDateTime> {
-    if state.min_backup_interval_secs == 0 {
+    let secs = effective_min_interval(state);
+    if secs == 0 {
         return None;
     }
     state
         .last_backup_at
-        .map(|t| t + Duration::seconds(state.min_backup_interval_secs as i64))
+        .map(|t| t + Duration::seconds(secs as i64))
+}
+
+/// Cuenta este commit en la ventana de ráfaga, abriéndola de cero si la anterior
+/// ya venció. Se llama **sólo** con un commit real, por lo mismo que
+/// `last_backup_at`: un no-op no es actividad del juego y no puede empujar a un
+/// save tranquilo al suelo adaptativo.
+fn count_burst(state: &mut State, now: OffsetDateTime) {
+    let open = state
+        .burst_since
+        .is_some_and(|t| now - t <= Duration::seconds(BURST_WINDOW_SECS));
+    if open {
+        state.burst_backups = state.burst_backups.saturating_add(1);
+    } else {
+        state.burst_since = Some(now);
+        state.burst_backups = 1;
+    }
 }
 
 /// Suelta la escalada de fallos de restore cuando la nube publica una versión
@@ -453,6 +511,7 @@ fn ingest_op_result(
                         // falta —ni conviene— escribirlo en `next_backup_at`, que
                         // es el carril de los backoffs de error.
                         next.last_backup_at = Some(now);
+                        count_burst(next, now);
                     } else {
                         // No-op (skip por firma, vacío, archived, too-large, el
                         // 409 asentado a la cabeza, o la subida que ya había
@@ -1159,6 +1218,84 @@ mod tests {
     /// vaciándose por restore, el ancla avanzaba sobre backups fantasma y una
     /// sesión corta nunca volcaba su progreso).
     #[test]
+    fn a_calm_save_never_waits() {
+        // Lo que se rompió en junio y no se puede volver a romper: sin preset y
+        // sin ráfaga, una copia sale en cuanto el debounce asienta. Un suelo que
+        // nadie ve ni puede cambiar se lee como "no detecta mis cambios".
+        let state = State {
+            min_backup_interval_secs: 0,
+            burst_since: Some(at(0)),
+            burst_backups: BURST_THRESHOLD - 1,
+            last_backup_at: Some(at(0)),
+            ..State::default()
+        };
+        assert_eq!(backup_floor(&state), None);
+    }
+
+    /// Un juego que reescribe su autoguardado cada pocos segundos: al tercer
+    /// commit dentro de la ventana entra el suelo, y se queda en 60 s por muchos
+    /// más que haga. Ghost of Tsushima hizo 1.027 subidas en 4½ h sin esto.
+    #[test]
+    fn an_autosave_burst_gets_one_minute_and_no_more() {
+        let mut state = State {
+            min_backup_interval_secs: 0,
+            ..State::default()
+        };
+        for i in 0..3 {
+            count_burst(&mut state, at(i * 6));
+        }
+        assert_eq!(state.burst_backups, 3);
+        assert_eq!(effective_min_interval(&state), BURST_FLOOR_SECS);
+
+        // Diez commits más no lo suben ni un segundo: un solo escalón.
+        for i in 3..13 {
+            count_burst(&mut state, at(i * 6));
+        }
+        assert_eq!(effective_min_interval(&state), BURST_FLOOR_SECS);
+    }
+
+    /// Al pasar la ventana sin actividad la cuenta se abre de cero, así que el
+    /// save vuelve a subir inmediato: el suelo dura lo que dura la ráfaga.
+    #[test]
+    fn the_burst_forgets_itself_once_the_game_calms_down() {
+        let mut state = State {
+            min_backup_interval_secs: 0,
+            ..State::default()
+        };
+        for i in 0..5 {
+            count_burst(&mut state, at(i * 6));
+        }
+        assert_eq!(effective_min_interval(&state), BURST_FLOOR_SECS);
+
+        count_burst(&mut state, at(BURST_WINDOW_SECS + 60));
+        assert_eq!(state.burst_backups, 1);
+        assert_eq!(effective_min_interval(&state), 0);
+    }
+
+    /// El preset que el usuario eligió manda sobre el adaptativo, en los dos
+    /// sentidos: `short_session` mantiene sus 30 s aunque el juego esté en plena
+    /// ráfaga (es un juego que se borra la carpeta entre rondas y perder una es
+    /// perder la partida), y `data_saver` mantiene sus 600 s.
+    #[test]
+    fn an_explicit_preset_wins_over_the_adaptive_floor() {
+        let mut short = State {
+            min_backup_interval_secs: 30,
+            ..State::default()
+        };
+        for i in 0..10 {
+            count_burst(&mut short, at(i * 6));
+        }
+        assert_eq!(effective_min_interval(&short), 30);
+
+        let saver = State {
+            min_backup_interval_secs: 600,
+            burst_backups: 0,
+            ..State::default()
+        };
+        assert_eq!(effective_min_interval(&saver), 600);
+    }
+
+    #[test]
     fn d8_no_op_backup_does_not_anchor_the_min_interval() {
         let state = State {
             in_flight: Some(Op::Backup),
@@ -1680,6 +1817,11 @@ mod tests {
             pull_pending in any::<bool>(),
             deferred_notified in any::<bool>(),
             min_interval in 0u64..120,
+            // La ráfaga entra en el generador y no como default: el suelo
+            // adaptativo cambia cuándo se puede subir, así que los invariantes
+            // (idempotencia, convergencia) tienen que aguantarlo también.
+            burst_since in prop::option::of(-1200i64..0),
+            burst_backups in 0u32..8,
             failures in arb_failures(),
         ) -> State {
             State {
@@ -1699,6 +1841,8 @@ mod tests {
                 pull_pending,
                 deferred_notified,
                 min_backup_interval_secs: min_interval,
+                burst_since: burst_since.map(at),
+                burst_backups,
                 restore_failures: failures,
             }
         }

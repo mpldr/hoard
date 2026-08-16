@@ -191,6 +191,16 @@ pub struct State {
     /// mueve un `OpResult::Ok { wrote: true }` — un no-op moviéndolo empujaría la
     /// siguiente subida real un intervalo entero (regresión R.E.P.O.).
     pub last_backup_at: Option<OffsetDateTime>,
+    /// Comienzo de la ventana en la que se cuentan los commits de este save, y
+    /// cuántos van dentro. Es la memoria del suelo adaptativo: sin preset que
+    /// fije un intervalo, un save tranquilo sube en cuanto asienta el debounce,
+    /// y uno cuyo juego reescribe el autoguardado cada pocos segundos se agrupa.
+    ///
+    /// Existe porque un suelo fijo para todos ya se probó y hubo que quitarlo:
+    /// era invisible y se leía como "no detecta mis cambios". Éste sólo aparece
+    /// cuando el propio save demuestra que hace falta.
+    pub burst_since: Option<OffsetDateTime>,
+    pub burst_backups: u32,
 
     // ---- Operación en curso (anti-relaunch) ----------------------------
     /// Hay un backup/restore en vuelo; el tick no debe relanzarlo. Se limpia al

@@ -677,6 +677,13 @@ struct SaveSlot {
     /// to [`kernel::State::last_backup_at`]); the reductor advances it on a
     /// committed backup.
     last_backup_at: Option<OffsetDateTime>,
+    /// Ventana y cuenta de commits recientes: la memoria del suelo adaptativo
+    /// que agrupa a un juego cuyo autoguardado se reescribe cada pocos segundos.
+    /// Mapean a [`kernel::State::burst_since`] / `burst_backups`, y como todo el
+    /// ritmo, viven sólo en memoria: al arrancar el motor un save empieza sin
+    /// ráfaga y la primera copia sale inmediata.
+    burst_since: Option<OffsetDateTime>,
+    burst_backups: u32,
     /// La operación de IO en curso para este slot (anti-relaunch, ADR 0021
     /// C.1): mientras sea `Some`, el reductor retiene ("operation in flight")
     /// en vez de relanzar una subida/bajada de varios GB. Sustituye al viejo
@@ -857,6 +864,8 @@ fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -
         known_version: slot.known_version,
         synced_fingerprint: slot.synced_fingerprint,
         last_backup_at: slot.last_backup_at,
+        burst_since: slot.burst_since,
+        burst_backups: slot.burst_backups,
         in_flight: slot.in_flight,
         next_backup_at: slot.next_backup_at,
         next_restore_at: slot.next_restore_at,
@@ -876,6 +885,8 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.known_version = next.known_version;
     slot.synced_fingerprint = next.synced_fingerprint;
     slot.last_backup_at = next.last_backup_at;
+    slot.burst_since = next.burst_since;
+    slot.burst_backups = next.burst_backups;
     slot.in_flight = next.in_flight;
     slot.next_backup_at = next.next_backup_at;
     slot.next_restore_at = next.next_restore_at;
@@ -2081,6 +2092,8 @@ fn handle_add(
         save,
         watcher: None,
         pending: None,
+        burst_since: None,
+        burst_backups: 0,
         manual_requested: false,
         is_running: false,
         weak_session: false,
@@ -5034,6 +5047,8 @@ mod tests {
                 save,
                 watcher: None,
                 pending: None,
+                burst_since: None,
+                burst_backups: 0,
                 is_running: false,
                 weak_session: false,
                 last_running_seen: None,

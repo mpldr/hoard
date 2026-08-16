@@ -609,11 +609,24 @@ fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// How the bundlers spell *this* machine's architecture, so the fixture
+    /// below describes a release that actually has a file for the runner. A
+    /// hardcoded `amd64` made these tests assert on x86 and panic on ARM —
+    /// `pick_for_arch` is right to return None when no candidate is ours, and
+    /// macOS CI runs on Apple Silicon.
+    fn arch_token() -> &'static str {
+        match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            _ => "amd64",
+        }
+    }
+
     fn assets() -> Vec<Asset> {
+        let arch = arch_token();
         ["deb", "rpm", "AppImage", "dmg"]
             .iter()
             .flat_map(|ext| {
-                let name = format!("Hoard_1.2.0_amd64.{ext}");
+                let name = format!("Hoard_1.2.0_{arch}.{ext}");
                 [
                     Asset {
                         url: format!("https://example.invalid/{name}"),
@@ -626,7 +639,10 @@ mod tests {
                 ]
             })
             .chain([Asset {
-                name: "Hoard_1.2.0_x64-setup.exe".into(),
+                name: format!(
+                    "Hoard_1.2.0_{}-setup.exe",
+                    if arch == "arm64" { "arm64" } else { "x64" }
+                ),
                 url: "https://example.invalid/setup".into(),
             }])
             .collect()
@@ -642,10 +658,10 @@ mod tests {
             .name
             .ends_with(".AppImage"));
         assert!(asset_for(Delivery::Dmg, &a).unwrap().name.ends_with(".dmg"));
-        assert_eq!(
-            asset_for(Delivery::Nsis, &a).unwrap().name,
-            "Hoard_1.2.0_x64-setup.exe"
-        );
+        assert!(asset_for(Delivery::Nsis, &a)
+            .unwrap()
+            .name
+            .ends_with("-setup.exe"));
     }
 
     /// La firma nunca puede colarse como el propio artefacto: `.deb.minisig`

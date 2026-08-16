@@ -747,6 +747,17 @@ mod tests {
         let _guard = crate::test_lock::ENV
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A test that pins HOME means "the home directory is this", and on
+        // Windows that takes both variables: `home_dir` asks USERPROFILE first
+        // there (see its comment), so leaving it alone would have the test read
+        // the runner's real profile and assert against a path it never chose.
+        let mut pairs = pairs.to_vec();
+        if let Some((_, home)) = pairs.iter().find(|(name, _)| *name == "HOME").copied() {
+            if !pairs.iter().any(|(name, _)| *name == "USERPROFILE") {
+                pairs.push(("USERPROFILE", home));
+            }
+        }
+        let pairs = &pairs[..];
         let prev: Vec<_> = pairs
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -768,16 +779,10 @@ mod tests {
 
     #[test]
     fn expands_home() {
-        with_env(
-            &[
-                ("HOME", Some("/home/test")),
-                ("USERPROFILE", Some("/home/test")),
-            ],
-            || {
-                let out = expand_path("<home>/.savegames/foo", Os::Linux);
-                assert_eq!(out, vec![PathBuf::from("/home/test/.savegames/foo")]);
-            },
-        );
+        with_env(&[("HOME", Some("/home/test"))], || {
+            let out = expand_path("<home>/.savegames/foo", Os::Linux);
+            assert_eq!(out, vec![PathBuf::from("/home/test/.savegames/foo")]);
+        });
     }
 
     #[test]
@@ -834,16 +839,10 @@ mod tests {
 
     #[test]
     fn placeholder_with_no_tail() {
-        with_env(
-            &[
-                ("HOME", Some("/home/test")),
-                ("USERPROFILE", Some("/home/test")),
-            ],
-            || {
-                let out = expand_path("<home>", Os::Linux);
-                assert_eq!(out, vec![PathBuf::from("/home/test")]);
-            },
-        );
+        with_env(&[("HOME", Some("/home/test"))], || {
+            let out = expand_path("<home>", Os::Linux);
+            assert_eq!(out, vec![PathBuf::from("/home/test")]);
+        });
     }
 
     #[test]
@@ -922,18 +921,12 @@ mod tests {
     /// no hay tal convención, así que ahí el token sigue cayendo.
     #[test]
     fn winsavedgames_resolves_under_os_linux_drops_on_mac() {
-        with_env(
-            &[
-                ("HOME", Some("/home/test")),
-                ("USERPROFILE", Some("/home/test")),
-            ],
-            || {
-                let out = expand_path("<winSavedGames>/MyGame", Os::Linux);
-                assert_eq!(out, vec![PathBuf::from("/home/test/Saved Games/MyGame")]);
-                let out = expand_path("<winSavedGames>/MyGame", Os::Mac);
-                assert!(out.is_empty(), "got {out:?}");
-            },
-        );
+        with_env(&[("HOME", Some("/home/test"))], || {
+            let out = expand_path("<winSavedGames>/MyGame", Os::Linux);
+            assert_eq!(out, vec![PathBuf::from("/home/test/Saved Games/MyGame")]);
+            let out = expand_path("<winSavedGames>/MyGame", Os::Mac);
+            assert!(out.is_empty(), "got {out:?}");
+        });
     }
 
     /// When the caller asks for `<winSavedGames>` under `Os::Windows`
@@ -992,7 +985,11 @@ mod tests {
         std::fs::create_dir_all(&save_dir).unwrap();
         std::fs::write(save_dir.join("slot1.savegame"), b"x").unwrap();
         let prev = std::env::var_os("HOME");
+        let prev_profile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", &tmp);
+        // Windows resolves `<home>` from USERPROFILE first, so pinning HOME
+        // alone would leave this reading the runner's real profile.
+        std::env::set_var("USERPROFILE", &tmp);
         let out = expand_path_globbed("<home>/AppData/Nomada/Twelve Minutes/*.savegame", Os::Linux);
         assert_eq!(out, vec![save_dir.clone()]);
         // No matching file -> no hit.
@@ -1003,6 +1000,10 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1024,7 +1025,11 @@ mod tests {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
         let prev = std::env::var_os("HOME");
+        let prev_profile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", &tmp);
+        // Windows resolves `<home>` from USERPROFILE first, so pinning HOME
+        // alone would leave this reading the runner's real profile.
+        std::env::set_var("USERPROFILE", &tmp);
         let out = expand_path_globbed("<home>/Steam/*Saves/slot", Os::Linux);
         assert!(
             out.contains(&tmp.join("Steam/remoteSaves/slot")),
@@ -1039,23 +1044,21 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn glob_no_wildcard_delegates_to_expand_path() {
         // No glob -> identical to expand_path, no FS access.
-        with_env(
-            &[
-                ("HOME", Some("/home/test")),
-                ("USERPROFILE", Some("/home/test")),
-            ],
-            || {
-                let a = expand_path("<home>/Saves/foo", Os::Linux);
-                let b = expand_path_globbed("<home>/Saves/foo", Os::Linux);
-                assert_eq!(a, b);
-            },
-        );
+        with_env(&[("HOME", Some("/home/test"))], || {
+            let a = expand_path("<home>/Saves/foo", Os::Linux);
+            let b = expand_path_globbed("<home>/Saves/foo", Os::Linux);
+            assert_eq!(a, b);
+        });
     }
 
     /// Reads a value the test itself writes to HKCU. Marked `#[ignore]`

@@ -967,7 +967,6 @@
   "update_gate.restart_now": "Reiniciar o Hoard",
   "update_gate.later": "Mais tarde",
   "update_gate.privileges_hint": "O teu sistema vai pedir permissão para a instalar.",
-  "library.slot_other_title": "É copiada como qualquer outra pasta, mas nunca restaurada sozinha — traz-la com o botão de restaurar.",
   "library.add_folder_aria": "Adicionar outra pasta deste jogo",
   "library.slot_pick_title": "Que pasta do jogo é?",
   "library.slot_pick_body": "{path} vai ser copiada dentro de {name}. O número é o que a emparelha com essa mesma pasta nas tuas outras máquinas, por isso escolhe o que já tem lá.",
@@ -979,5 +978,12 @@
   "library.slot_clash_move": "Mudou para lá",
   "library.slot_clash_add": "Adicionar como pasta {n}",
   "library.rename_error_conflict": "Outra pasta deste jogo já usa essa etiqueta.",
-  "library.revert_to_auto": "Voltar à deteção automática"
+  "library.revert_to_auto": "Voltar à deteção automática",
+  "library.open_history": "Versões e restauro",
+  "library.renumber_taken": "O número {n} já é outra pasta deste jogo.",
+  "library.rename_placeholder": "Dá um nome a esta pasta (Mods, Ironman…)",
+  "library.rename_keeps_number": "O número fica como está: é o que emparelha esta pasta entre as tuas máquinas.",
+  "library.slot_number_label": "Número",
+  "library.slot_number_taken": "outra pasta daqui",
+  "library.slot_number_join": "juntar-se à da outra máquina"
 }

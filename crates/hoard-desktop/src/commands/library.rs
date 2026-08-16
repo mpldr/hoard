@@ -329,10 +329,60 @@ pub async fn list_tracked_saves(
     Ok(out)
 }
 
-/// Rename a save's label both on the server and in local state. On a 409
-/// (another save in the same game already uses that label) we surface a
-/// distinguishable error string so the UI can show the localized "label
-/// already exists" message instead of a generic toast.
+/// Name a folder without touching its number. The number is what pairs it with
+/// the same folder on the other machines, so the UI never edits the label whole
+/// — see `hoard_core::kernel::slots`.
+#[tauri::command]
+pub async fn set_save_slot_name(
+    app: AppHandle,
+    save_id: String,
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<TrackedSave, String> {
+    let client = current_client(&app, &state).await?;
+    let (tracked, watched) = library::set_slot_name(&client, &save_id, name.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    reseat_renamed(&state, watched).await;
+    Ok(tracked)
+}
+
+/// Move a folder to another number. A number the cloud already holds comes back
+/// as `slot_taken:<n>` so the UI can offer linking to that row instead, which is
+/// what actually pairs the two machines.
+#[tauri::command]
+pub async fn renumber_save_slot(
+    app: AppHandle,
+    save_id: String,
+    slot: u32,
+    state: State<'_, AppState>,
+) -> Result<TrackedSave, String> {
+    let client = current_client(&app, &state).await?;
+    let (tracked, watched) = library::renumber(&client, &save_id, slot)
+        .await
+        .map_err(|e| e.to_string())?;
+    reseat_renamed(&state, watched).await;
+    Ok(tracked)
+}
+
+/// Re-attach to the running agent so its in-memory `WatchedSave` picks up the
+/// new label: the watcher uses it as part of the upload key, so a stale one
+/// uploads under the old name and forks the row.
+async fn reseat_renamed(
+    state: &State<'_, AppState>,
+    watched: Option<hoard_agent::agent::WatchedSave>,
+) {
+    if let Some(watched) = watched {
+        attach_save_if_running(state, watched).await;
+    }
+}
+
+/// Rename a save's label whole. Only reachable for the free-form labels that
+/// predate slots; anything with a number goes through `set_save_slot_name` or
+/// `renumber_save_slot`, which keep the two halves apart. On a 409 (another save
+/// in the same game already uses that label) we surface a distinguishable error
+/// string so the UI can show the localized "label already exists" message
+/// instead of a generic toast.
 #[tauri::command]
 pub async fn rename_save_label(
     app: AppHandle,

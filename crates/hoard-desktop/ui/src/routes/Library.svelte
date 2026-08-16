@@ -33,7 +33,9 @@
     X,
     PauseCircle,
     Cloud,
+    History,
   } from "@lucide/svelte";
+  import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
 
   import Button from "../lib/components/Button.svelte";
@@ -309,10 +311,9 @@
         game_slug: game.slug,
         local_path: chosen,
         // Which folder of the title this is. 1 is the saved games; from 2 up
-        // it is everything else (config, mods), backed up the same but never
-        // restored on its own. The number is what pairs this folder with the
-        // one on another machine, so it goes in explicitly, not derived from
-        // the path.
+        // it is everything else (config, mods), synced exactly the same way.
+        // The number is what pairs this folder with the one on another machine,
+        // so it goes in explicitly, not derived from the path.
         slot,
         repoint,
         // Pass the catalog metadata so the server can self-heal its games
@@ -474,13 +475,56 @@
     return (opts.find((o) => o.kind === "free") ?? opts[opts.length - 1]).n;
   }
 
-  /** How a slot is labelled: "1 · saved games", "2", or the free-form label of
-   *  the rows that predate any of this. */
+  /** How a slot is labelled: its number, plus the user's name for it when they
+   *  gave it one. Rows from before slots existed show their free-form label. */
   function slotLabel(save: TrackedSave): string {
     if (save.slot === null) return save.label;
-    return save.slot === 1
-      ? $_("library.slot_saves", { values: { n: save.slot } })
-      : $_("library.slot_other", { values: { n: save.slot } });
+    const n =
+      save.slot === 1
+        ? $_("library.slot_saves", { values: { n: save.slot } })
+        : $_("library.slot_other", { values: { n: save.slot } });
+    return save.name ? `${n} · ${save.name}` : n;
+  }
+
+  /** Just the name, for messages that talk about "this folder". */
+  function slotName(save: TrackedSave): string {
+    return save.name ?? slotLabel(save);
+  }
+
+  /** Number picked in the rename dialog, when the user changed it. */
+  let renumberDraft = $state<number | null>(null);
+
+  /** The numbers offered when renaming a folder.
+   *
+   *  Three kinds, and the middle one is the whole point. A number held by
+   *  another folder **on this machine** is disabled: moving onto it would need
+   *  that one out of the way first, and silently swapping two folders' numbers
+   *  is the last thing anybody wants from a rename dialog. A number that exists
+   *  only **in the cloud** is offered, because that is the other machine's copy
+   *  of this same folder and joining it is what the user came here to do — it is
+   *  how a folder that came out 3 on the second machine pairs with the 2 on the
+   *  first. Everything else is free. */
+  function renumberChoices(
+    save: TrackedSave,
+  ): { n: number; kind: "self" | "here" | "cloud" | "free" }[] {
+    return slotMap(save.game_slug).map((o) => ({
+      n: o.n,
+      kind:
+        o.n === save.slot
+          ? "self"
+          : o.kind === "here"
+            ? "here"
+            : o.kind === "cloud"
+              ? "cloud"
+              : "free",
+    }));
+  }
+
+  /** The other machine's copy of this folder under number `n`, if that is what
+   *  the number holds. Changing to it is a join, not a rename. */
+  function cloudRowFor(save: TrackedSave, n: number): TrackedSave | null {
+    const opt = slotMap(save.game_slug).find((o) => o.n === n);
+    return opt?.kind === "cloud" ? (opt.orphan ?? null) : null;
   }
 
   function toggleExpand(slug: string) {
@@ -647,30 +691,62 @@
    *  the current label so the user can tweak rather than retype. */
   function askRename(save: TrackedSave) {
     renameTarget = save;
-    renameDraft = save.label;
+    // Only the name half is editable. The number is what pairs this folder with
+    // the same one on the other machines; typing it as free text is how naming a
+    // slot "2 - Mods" used to drop it out of slot 2 without a word.
+    renameDraft = save.name ?? "";
+    renumberDraft = null;
   }
 
   async function confirmRename() {
     if (!renameTarget) return;
     const target = renameTarget;
     const trimmed = renameDraft.trim();
-    if (!trimmed || trimmed === target.label) {
+    const movingTo =
+      renumberDraft !== null && renumberDraft !== target.slot
+        ? renumberDraft
+        : null;
+    if (trimmed === (target.name ?? "") && movingTo === null) {
       renameTarget = null;
       return;
     }
     renaming = true;
     try {
-      const updated = await api.renameSaveLabel(target.save_id, trimmed);
+      // Name first, number second, against the same row. Renumbering rewrites
+      // the label the name lives in, so the other order would write the name
+      // onto the old number and lose it on the move.
+      let updated =
+        target.slot === null
+          ? await api.renameSaveLabel(target.save_id, trimmed)
+          : await api.setSaveSlotName(target.save_id, trimmed || null);
+      const joining = movingTo === null ? null : cloudRowFor(target, movingTo);
+      if (joining) {
+        // That number is the same folder on another machine. Pairing means
+        // taking over ITS row — where the shared history lives — so this
+        // machine's own row steps aside first. Renaming into it would only
+        // bounce off `UNIQUE(user_id, game_slug, label)`.
+        const path = target.local_path;
+        await api.untrackSave(target.save_id);
+        await adoptOrphan(joining, path);
+        renameTarget = null;
+        return;
+      }
+      if (movingTo !== null) {
+        updated = await api.renumberSaveSlot(target.save_id, movingTo);
+      }
       tracked = tracked.map((t) =>
         t.save_id === updated.save_id ? updated : t,
       );
       toastSuccess(
-        $_("library.rename_success", { values: { label: updated.label } }),
+        $_("library.rename_success", { values: { name: slotName(updated) } }),
       );
       renameTarget = null;
     } catch (e) {
       const msg = typeof e === "string" ? e : (e as Error).message;
-      if (msg === api.LABEL_COLLISION) {
+      const taken = api.slotTaken(e);
+      if (taken !== null) {
+        toastError($_("library.renumber_taken", { values: { n: taken } }));
+      } else if (msg === api.LABEL_COLLISION) {
         toastError($_("library.rename_error_conflict"));
       } else {
         toastError(msg);
@@ -1271,9 +1347,6 @@
                               save.slot === null
                                 ? 'bg-emerald-500/15 text-emerald-300'
                                 : 'bg-zinc-700/40 text-zinc-400'}"
-                              title={save.slot !== null && save.slot > 1
-                                ? $_("library.slot_other_title")
-                                : undefined}
                             >
                               {slotLabel(save)}
                             </span>
@@ -1295,6 +1368,20 @@
                             />
                           </button>
                         {/if}
+                        <!-- Every folder is a full save with its own history,
+                             so every folder needs its own way in. Restore lived
+                             only behind the Dashboard card, which shows one
+                             entry per game: with two folders tracked there was
+                             no route at all to the second one's versions. -->
+                        <button
+                          type="button"
+                          onclick={() => push(`/history/${save.save_id}`)}
+                          aria-label={$_("library.open_history")}
+                          title={$_("library.open_history")}
+                          class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-emerald-300"
+                        >
+                          <History size={11} />
+                        </button>
                         <button
                           type="button"
                           onclick={() => askRename(save)}
@@ -1982,9 +2069,40 @@
     </p>
     <Input
       bind:value={renameDraft}
-      placeholder={$_("library.rename_input_placeholder")}
+      placeholder={$_("library.rename_placeholder")}
       disabled={renaming}
     />
+    <!-- The number is its own control on purpose. It is the identity the two
+         machines match on, so it gets picked from the numbers this title
+         actually has instead of typed into the name — writing "2 - Mods" as one
+         string is what used to drop a folder out of slot 2 without a word. -->
+    {#if renameTarget !== null && renameTarget.slot !== null}
+      <label class="mt-3 flex items-center gap-2 text-xs text-zinc-400">
+        <span class="text-zinc-500">{$_("library.slot_number_label")}</span>
+        <select
+          class="rounded-md border border-white/[0.08] bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200 focus:border-emerald-500/40 focus:outline-none disabled:opacity-50"
+          disabled={renaming}
+          value={String(renumberDraft ?? renameTarget.slot)}
+          onchange={(e) =>
+            (renumberDraft = Number(
+              (e.currentTarget as HTMLSelectElement).value,
+            ))}
+        >
+          {#each renumberChoices(renameTarget) as opt (opt.n)}
+            <option value={String(opt.n)} disabled={opt.kind === "here"}>
+              {opt.n}{opt.kind === "here"
+                ? ` — ${$_("library.slot_number_taken")}`
+                : opt.kind === "cloud"
+                  ? ` — ${$_("library.slot_number_join")}`
+                  : ""}
+            </option>
+          {/each}
+        </select>
+      </label>
+      <p class="mt-1.5 text-xs text-zinc-500">
+        {$_("library.rename_keeps_number")}
+      </p>
+    {/if}
     {#snippet footer()}
       <Button
         variant="ghost"

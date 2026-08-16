@@ -967,7 +967,6 @@
   "update_gate.restart_now": "Hoard neu starten",
   "update_gate.later": "Später",
   "update_gate.privileges_hint": "Dein System fragt nach der Berechtigung zur Installation.",
-  "library.slot_other_title": "Wird wie jeder andere Ordner gesichert, aber nie von allein wiederhergestellt — hol ihn mit der Wiederherstellen-Schaltfläche.",
   "library.add_folder_aria": "Weiteren Ordner für dieses Spiel hinzufügen",
   "library.slot_pick_title": "Welcher Ordner des Spiels ist das?",
   "library.slot_pick_body": "{path} wird unter {name} gesichert. Die Nummer verbindet ihn mit demselben Ordner auf deinen anderen Rechnern — nimm die, die er dort schon hat.",
@@ -979,5 +978,12 @@
   "library.slot_clash_move": "Er wurde dorthin verschoben",
   "library.slot_clash_add": "Als Ordner {n} hinzufügen",
   "library.rename_error_conflict": "Ein anderer Ordner dieses Spiels verwendet dieses Label bereits.",
-  "library.revert_to_auto": "Zurück zur automatischen Erkennung"
+  "library.revert_to_auto": "Zurück zur automatischen Erkennung",
+  "library.open_history": "Versionen und Wiederherstellen",
+  "library.renumber_taken": "Nummer {n} gehört schon einem anderen Ordner dieses Spiels.",
+  "library.rename_placeholder": "Gib dem Ordner einen Namen (Mods, Ironman…)",
+  "library.rename_keeps_number": "Die Nummer bleibt: sie verbindet diesen Ordner über deine Rechner hinweg.",
+  "library.slot_number_label": "Nummer",
+  "library.slot_number_taken": "anderer Ordner hier",
+  "library.slot_number_join": "dem des anderen Rechners beitreten"
 }

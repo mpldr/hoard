@@ -967,7 +967,6 @@
   "update_gate.restart_now": "Redémarrer Hoard",
   "update_gate.later": "Plus tard",
   "update_gate.privileges_hint": "Ton système va demander l'autorisation de l'installer.",
-  "library.slot_other_title": "Sauvegardé comme n'importe quel autre dossier, mais jamais restauré tout seul — récupère-le avec le bouton de restauration.",
   "library.add_folder_aria": "Ajouter un autre dossier pour ce jeu",
   "library.slot_pick_title": "Quel dossier du jeu est-ce ?",
   "library.slot_pick_body": "{path} sera sauvegardé sous {name}. Le numéro est ce qui l'associe au même dossier sur tes autres machines : prends celui qu'il y porte déjà.",
@@ -979,5 +978,12 @@
   "library.slot_clash_move": "Il a été déplacé là",
   "library.slot_clash_add": "L'ajouter comme dossier {n}",
   "library.rename_error_conflict": "Un autre dossier de ce jeu utilise déjà cette étiquette.",
-  "library.revert_to_auto": "Revenir à la détection automatique"
+  "library.revert_to_auto": "Revenir à la détection automatique",
+  "library.open_history": "Versions et restauration",
+  "library.renumber_taken": "Le numéro {n} est déjà un autre dossier de ce jeu.",
+  "library.rename_placeholder": "Nomme ce dossier (Mods, Ironman…)",
+  "library.rename_keeps_number": "Le numéro ne bouge pas : c'est lui qui associe ce dossier entre tes machines.",
+  "library.slot_number_label": "Numéro",
+  "library.slot_number_taken": "un autre dossier ici",
+  "library.slot_number_join": "rejoindre celui de l'autre machine"
 }

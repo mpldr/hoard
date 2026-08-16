@@ -33,6 +33,10 @@ pub struct TrackedSave {
     pub save_id: String,
     pub game_slug: String,
     pub label: String,
+    /// What the user calls this folder, carried in the label next to the
+    /// number. `None` = never named; the UI shows just the number.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Which slot of the title this folder is, derived from `label`
     /// ([`slots::slot_of`]). `None` = one of the older free-form labels, which
     /// renders with its text as-is.
@@ -110,6 +114,11 @@ pub struct AddGameArgs {
     /// [`crate::state::SaveState::shared_processes`].
     #[serde(default)]
     pub shared_processes: bool,
+    /// What the user calls this folder ("Mods", "Ironman"). Goes into the label
+    /// next to the number; `None` leaves the slot unnamed. See
+    /// [`hoard_core::kernel::slots`].
+    #[serde(default)]
+    pub name: Option<String>,
     /// The user has already agreed to **move** this slot to another folder.
     /// Without it, finding the slot held by a different folder is an error (see
     /// [`occupied_slot`]) instead of a silent overwrite.
@@ -412,17 +421,15 @@ pub fn name_matches(steam_name: &str, slug: &str) -> bool {
 /// Política de sync efectiva: el preset fijado por el usuario gana; sin él, cae
 /// al catálogo built-in (R.E.P.O. → short-session). Nombre desconocido ⇒ vacía.
 ///
-/// `label` comes in to apply the slot rule: from 2 up a folder does not restore
-/// on its own ([`slots::restores_automatically`]). Only when nobody said
-/// otherwise — a preset that pins `auto_restore` is an explicit decision by the
-/// user about that save, and it wins.
-pub fn resolve_policy(game_slug: &str, stored_preset: Option<&str>, label: &str) -> SavePolicy {
+/// The slot plays no part here on purpose. Slots 2+ briefly forced
+/// `auto_restore = Some(false)`, which overrode the user's own preference and
+/// left the second machine's folder empty while the first uploaded into it —
+/// the opposite of what attaching several folders is for. Device-local files
+/// are already held back per file by [`hoard_core::kernel::fileclass`]; a
+/// per-slot rule on top of that only broke sync.
+pub fn resolve_policy(game_slug: &str, stored_preset: Option<&str>) -> SavePolicy {
     let name = stored_preset.or_else(|| presets::builtin_preset_for(game_slug));
-    let mut policy = SavePolicy::from_preset(name);
-    if policy.auto_restore.is_none() && !slots::restores_automatically(slots::slot_of(label)) {
-        policy.auto_restore = Some(false);
-    }
-    policy
+    SavePolicy::from_preset(name)
 }
 
 /// Nombres de proceso que marcan "jugando" para este slug.
@@ -630,7 +637,7 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
             steam_install_dir,
             processes,
             shared_processes: s.shared_processes,
-            policy: resolve_policy(&s.game_slug, s.preset.as_deref(), &s.label),
+            policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
             allow_device_local: s.allow_device_local,
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
@@ -665,7 +672,7 @@ pub fn watched_save_from(
     } else {
         processes_override
     };
-    let policy = resolve_policy(&game_slug, preset, &label);
+    let policy = resolve_policy(&game_slug, preset);
     WatchedSave {
         allow_device_local,
         save_id,
@@ -836,9 +843,15 @@ fn superseded_rows(
         .saves
         .iter()
         .filter(|(id, st)| {
-            id.as_str() != keep_id
-                && ((st.game_slug == slug && st.label == label)
-                    || same_folder(&st.local_path, local_path))
+            let same_slot = st.game_slug == slug
+                && match slots::slot_of(label) {
+                    // By slot, for the same reason the cloud dedup above is:
+                    // `"2"` and `"2 · Mods"` are one slot, and comparing the
+                    // text leaves the other one behind as a second row.
+                    Some(n) => slots::slot_of(&st.label) == Some(n),
+                    None => st.label == label,
+                };
+            id.as_str() != keep_id && (same_slot || same_folder(&st.local_path, local_path))
         })
         .map(|(id, _)| id.clone())
         .collect()
@@ -861,6 +874,42 @@ fn rows_unknown_to_server(state: &CliState, known: &HashSet<String>) -> Vec<Stri
         .collect();
     stale.sort();
     stale
+}
+
+/// The cloud's own row for a slot of this game, if it has one.
+///
+/// Best-effort on purpose: a manifest that won't load is not a reason to refuse
+/// tracking a folder. Getting it wrong the safe way means minting an id and
+/// having two rows, which `list_tracked` already prunes down; refusing the add
+/// would leave the user with nothing.
+async fn cloud_row_for_slot(
+    client: &ApiClient,
+    slug: &str,
+    want: Option<u32>,
+    label: &str,
+) -> Option<String> {
+    let manifest = match client.cloud_sync().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the manifest before adding; minting a local id");
+            return None;
+        }
+    };
+    let found = manifest
+        .saves
+        .iter()
+        .find(|e| {
+            e.game_slug == slug
+                && match want {
+                    Some(n) => slots::slot_of(&e.label) == Some(n),
+                    None => e.label == label,
+                }
+        })
+        .map(|e| e.save_id.clone());
+    if let Some(id) = &found {
+        tracing::info!(save_id = %id, slug, "adopting the cloud row that already holds this slot");
+    }
+    found
 }
 
 /// Prefix of the error the UI turns into the "move it or add it?" dialog. The
@@ -892,10 +941,20 @@ fn occupied_slot(
     if repoint {
         return Ok(());
     }
+    // Por número y no por cadena: desde que la etiqueta lleva nombre, `"2"` y
+    // `"2 · Mods"` son la MISMA ranura, y comparar el texto dejaría colar una
+    // segunda carpeta en el 2 sólo por llamarse distinto.
+    let want = slots::slot_of(label);
     let Some(current) = state
         .saves
         .values()
-        .find(|st| st.game_slug == slug && st.label == label)
+        .find(|st| {
+            st.game_slug == slug
+                && match want {
+                    Some(n) => slots::slot_of(&st.label) == Some(n),
+                    None => st.label == label,
+                }
+        })
         .map(|st| st.local_path.clone())
     else {
         return Ok(());
@@ -939,9 +998,9 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     // free-form labels (and for the CLI, which still accepts them).
     let label = args
         .slot
-        .map(slots::label_for)
+        .map(|n| slots::label_for(n, args.name.as_deref()))
         .or_else(|| args.label.clone())
-        .unwrap_or_else(|| slots::label_for(slots::SAVES));
+        .unwrap_or_else(|| slots::label_for(slots::SAVES, args.name.as_deref()));
     let pinned_processes = args.processes.clone().unwrap_or_default();
     let preset_name: Option<String> = args
         .preset
@@ -986,14 +1045,42 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     // save_id local, guarda el path y empieza a vigilar.
     if client.is_cloud().await {
         let (mut cli_state, path) = CliState::load_default()?;
-        // Dedup por (game_slug, label): reusa la fila existente en vez de mintar
-        // otra (re-track / re-onboarding / re-add por detección dejaban dos).
-        let save_id = cli_state
+        // Reuse the row this game already has for the slot instead of minting
+        // another (re-track, re-onboarding and re-add from detection each used
+        // to leave a second one).
+        //
+        // Matched by **slot**, not by the label string. Comparing the text meant
+        // that giving a folder a name minted a brand new save: the local row
+        // said `"2 - shit"`, the add composed `"2 · shit2"`, no string matched,
+        // and out came a fresh uuid and a third cloud row for one folder. Two of
+        // those piled up on one account in aug-2026 before anybody noticed,
+        // because each looked like a normal save until you counted them.
+        let want = slots::slot_of(&label);
+        let local_match = cli_state
             .saves
             .iter()
-            .find(|(_, st)| st.game_slug == args.game_slug && st.label == label)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .find(|(_, st)| {
+                st.game_slug == args.game_slug
+                    && match want {
+                        Some(n) => slots::slot_of(&st.label) == Some(n),
+                        None => st.label == label,
+                    }
+            })
+            .map(|(id, _)| id.clone());
+        // Nothing local, but the cloud may still hold this slot — and if it
+        // does, that row is the save, not a new one. Local state alone is not
+        // enough to answer this: untracking the folder empties it, so the
+        // untrack-then-add-again that people reach for after any error found no
+        // row to match, minted a fresh uuid, and split one folder into a second
+        // cloud save. That happened three times on one account in aug-2026,
+        // each time looking like the sync had simply stopped working, because
+        // the two machines were then uploading to different rows.
+        let save_id = match local_match {
+            Some(id) => id,
+            None => cloud_row_for_slot(client, &args.game_slug, want, &label)
+                .await
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        };
         cli_state.saves.insert(
             save_id.clone(),
             SaveState {
@@ -1027,6 +1114,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             tracked: TrackedSave {
                 save_id,
                 game_slug: args.game_slug,
+                name: slots::name_of(&label).map(str::to_string),
                 slot: slots::slot_of(&label),
                 label,
                 local_path: local_path.to_string_lossy().into_owned(),
@@ -1124,6 +1212,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         tracked: TrackedSave {
             save_id: save.id.into_inner(),
             game_slug: save.game_slug.into_inner(),
+            name: slots::name_of(&save.label).map(str::to_string),
             slot: slots::slot_of(&save.label),
             label: save.label,
             local_path: local_path.to_string_lossy().into_owned(),
@@ -1232,6 +1321,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         tracked: TrackedSave {
             save_id: args.save_id,
             game_slug: args.game_slug,
+            name: slots::name_of(&args.label).map(str::to_string),
             slot: slots::slot_of(&args.label),
             label: args.label,
             local_path: local_path.to_string_lossy().into_owned(),
@@ -1577,12 +1667,36 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             detached = losers;
         }
 
+        // The server's label wins over the local copy. A rename travels through
+        // the row, so a machine that keeps its old copy uploads under the old
+        // label, the server UPSERTs on (user, slug, label) and the save forks in
+        // two — one row per machine, each with half the history. Renaming was
+        // rare enough for this to stay hidden; naming a folder makes it routine.
+        let mut relabelled = false;
+        for (id, st) in cli_state.saves.iter_mut() {
+            let Some(entry) = manifest.saves.iter().find(|e| &e.save_id == id) else {
+                continue;
+            };
+            if st.label != entry.label {
+                tracing::info!(
+                    save_id = %id, from = %st.label, to = %entry.label,
+                    "adopting the server's label for this save"
+                );
+                st.label = entry.label.clone();
+                relabelled = true;
+            }
+        }
+        if relabelled {
+            cli_state.save(&path)?;
+        }
+
         let mut out = Vec::with_capacity(cli_state.saves.len());
         for (id, st) in &cli_state.saves {
             let entry = manifest.saves.iter().find(|e| &e.save_id == id);
             out.push(TrackedSave {
                 save_id: id.clone(),
                 game_slug: st.game_slug.clone(),
+                name: slots::name_of(&st.label).map(str::to_string),
                 slot: slots::slot_of(&st.label),
                 label: st.label.clone(),
                 local_path: st.local_path.to_string_lossy().into_owned(),
@@ -1610,6 +1724,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             out.push(TrackedSave {
                 save_id: entry.save_id.clone(),
                 game_slug: entry.game_slug.clone(),
+                name: slots::name_of(&entry.label).map(str::to_string),
                 slot: slots::slot_of(&entry.label),
                 label: entry.label.clone(),
                 local_path: String::new(),
@@ -1661,6 +1776,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             Some(st) => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
                 game_slug: s.game_slug.into_inner(),
+                name: slots::name_of(&s.label).map(str::to_string),
                 slot: slots::slot_of(&s.label),
                 label: s.label,
                 local_path: st.local_path.to_string_lossy().into_owned(),
@@ -1677,6 +1793,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
             None => out.push(TrackedSave {
                 save_id: s.id.into_inner(),
                 game_slug: s.game_slug.into_inner(),
+                name: slots::name_of(&s.label).map(str::to_string),
                 slot: slots::slot_of(&s.label),
                 label: s.label,
                 local_path: String::new(),
@@ -1701,6 +1818,73 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
 /// el frontend muestre el mensaje localizado. Devuelve la fila + el `WatchedSave`
 /// a re-enganchar (la etiqueta es parte de la clave de upload), o `None` si no
 /// hay path local.
+/// Name (or un-name) a folder without touching its number.
+///
+/// The number is what pairs this folder with the same one on the other
+/// machines, so it is never up for editing as text: this recomposes the label
+/// around the slot the save already has. Letting the user type the whole label
+/// is what made naming a slot `"2 - Mods"` silently drop it out of slot 2.
+pub async fn set_slot_name(
+    client: &ApiClient,
+    save_id: &str,
+    name: Option<&str>,
+) -> Result<(TrackedSave, Option<WatchedSave>)> {
+    let current = local_label(save_id)?;
+    let label = match slots::slot_of(&current) {
+        // A free-form label from before slots existed has no number to preserve;
+        // naming it is still just a rename.
+        None => slots::sanitise_name(name.unwrap_or_default()),
+        Some(slot) => slots::label_for(slot, name),
+    };
+    if label.trim().is_empty() {
+        anyhow::bail!("Name can't be empty on a save that has no slot number.");
+    }
+    rename_label(client, save_id, &label).await
+}
+
+/// Error the UI turns into "that number is already in use". Carries the number
+/// so it can offer linking to it instead — on the machine that owns it, that is
+/// a different folder; in the cloud, it is the folder to pair with.
+pub const ERR_SLOT_TAKEN: &str = "slot_taken";
+
+/// Move a folder to another number, keeping whatever name it has.
+///
+/// Renumbering is how a folder that came out as 3 on the second machine gets
+/// paired with the 2 on the first. It only works while the target number is
+/// free: if the other machine already has a 2, the row for it already exists in
+/// the cloud and *that* row is the one to join — a rename would only collide
+/// with it (409 on `UNIQUE(user_id, game_slug, label)`), and joining it means
+/// adopting its history, not renaming into its name.
+pub async fn renumber(
+    client: &ApiClient,
+    save_id: &str,
+    slot: u32,
+) -> Result<(TrackedSave, Option<WatchedSave>)> {
+    let current = local_label(save_id)?;
+    if slots::slot_of(&current) == Some(slot) {
+        anyhow::bail!("That folder is already number {slot}.");
+    }
+    let label = slots::label_for(slot, slots::name_of(&current));
+    match rename_label(client, save_id, &label).await {
+        Err(e) if is_conflict(&e) => anyhow::bail!("{ERR_SLOT_TAKEN}:{slot}"),
+        other => other,
+    }
+}
+
+fn local_label(save_id: &str) -> Result<String> {
+    let (state, _) = CliState::load_default()?;
+    state
+        .saves
+        .get(save_id)
+        .map(|st| st.label.clone())
+        .context("That save isn't tracked on this machine.")
+}
+
+fn is_conflict(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::api::ApiError>()
+        .is_some_and(|api| matches!(api, crate::api::ApiError::Conflict(_)))
+}
+
 pub async fn rename_label(
     client: &ApiClient,
     save_id: &str,
@@ -1747,6 +1931,7 @@ pub async fn rename_label(
         TrackedSave {
             save_id: updated.id.into_inner(),
             game_slug: updated.game_slug.into_inner(),
+            name: slots::name_of(&updated.label).map(str::to_string),
             slot: slots::slot_of(&updated.label),
             label: updated.label,
             local_path: local_path_string,
@@ -2052,6 +2237,39 @@ mod tests {
         // Saying yes to the move is what makes it go through.
         occupied_slot(&state, "factorio", "main", Path::new(desktop), true)
             .expect("an explicit re-point is still allowed");
+    }
+
+    /// Naming a folder must not mint a second save for it. The local row said
+    /// `"2 - shit"`, the add composed `"2 · shit2"`, and matching on the text
+    /// meant no row matched — so out came a fresh uuid and a third cloud row for
+    /// one folder, aug-2026.
+    #[test]
+    fn a_renamed_slot_is_still_the_same_slot() {
+        let mut state = CliState::default();
+        let mut row = save_state("factorio", "/home/rl261/Desktop/sx");
+        row.label = "2 - shit".into();
+        state.saves.insert("existente".into(), row);
+
+        // Same slot under a different name: no clash, it is that folder.
+        occupied_slot(
+            &state,
+            "factorio",
+            "2 · shit2",
+            Path::new("/home/rl261/Desktop/sx"),
+            false,
+        )
+        .expect("renaming slot 2 is not a second folder");
+
+        // And a genuinely different folder on that slot still gets stopped.
+        let err = occupied_slot(
+            &state,
+            "factorio",
+            "2 · otra",
+            Path::new("/home/rl261/Desktop/otra"),
+            false,
+        )
+        .expect_err("slot 2 is taken by another folder");
+        assert!(err.to_string().starts_with(ERR_SLOT_OCCUPIED));
     }
 
     /// Re-adding the very same folder is a re-track, not a move: it must not

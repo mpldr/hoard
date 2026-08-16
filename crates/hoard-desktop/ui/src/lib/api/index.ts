@@ -176,6 +176,11 @@ export type TrackedSave = {
   save_id: string;
   game_slug: string;
   label: string;
+  /** What the user calls this folder ("Mods", "Ironman"), or `null` if they
+   *  never named it. Travels with the row, so both machines show the same name.
+   *  Edited through {@link setSaveSlotName}, never by typing the label whole —
+   *  the number lives in the same field and free text would wipe it. */
+  name: string | null;
   /** Which numbered folder of the title this is: 1 = saved games, 2+ = the
    *  rest (config, mods…), which Hoard carries but never restores on its own.
    *  `null` for the free-form labels rows had before slots existed — those
@@ -1122,6 +1127,32 @@ export function setSaveAllowConfig(
   allow: boolean | null,
 ): Promise<void> {
   return invoke<void>("set_save_allow_config", { saveId, allow });
+}
+
+/** Name a folder without touching its number. `null` clears the name. */
+export function setSaveSlotName(
+  saveId: string,
+  name: string | null,
+): Promise<TrackedSave> {
+  return invoke<TrackedSave>("set_save_slot_name", { saveId, name });
+}
+
+/** Move a folder to another number, keeping its name. Rejects with
+ *  `slot_taken:<n>` when the cloud already holds that number — see
+ *  {@link slotTaken}. */
+export function renumberSaveSlot(
+  saveId: string,
+  slot: number,
+): Promise<TrackedSave> {
+  return invoke<TrackedSave>("renumber_save_slot", { saveId, slot });
+}
+
+/** The number a renumber asked for, when it is already in use. Linking to that
+ *  row is what pairs the machines; renaming into it would only collide. */
+export function slotTaken(e: unknown): number | null {
+  const msg = typeof e === "string" ? e : ((e as Error)?.message ?? "");
+  const m = /^slot_taken:(\d+)$/.exec(msg);
+  return m ? Number(m[1]) : null;
 }
 
 export function tailLogs(maxLines?: number): Promise<LogLine[]> {

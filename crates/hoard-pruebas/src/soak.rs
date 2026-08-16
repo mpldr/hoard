@@ -90,6 +90,7 @@ pub async fn run(args: SoakArgs) -> Result<()> {
         let outcome = hoard_agent::library::add_to_tracking(
             &active.client,
             hoard_agent::library::AddGameArgs {
+                name: None,
                 slot: None,
                 repoint: false,
                 game_slug: slug.clone(),

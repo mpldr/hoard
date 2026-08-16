@@ -64,6 +64,7 @@ pub async fn run(args: Args) -> Result<()> {
     let outcome = library::add_to_tracking(
         client,
         AddGameArgs {
+            name: None,
             slot: None,
             repoint: false,
             game_slug: target.slug.clone(),

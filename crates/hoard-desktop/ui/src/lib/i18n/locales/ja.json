@@ -967,7 +967,6 @@
   "update_gate.restart_now": "Hoard を再起動",
   "update_gate.later": "あとで",
   "update_gate.privileges_hint": "インストールの許可をシステムが求めます。",
-  "library.slot_other_title": "他のフォルダーと同じようにバックアップされますが、自動では復元されません。復元ボタンから取り出してください。",
   "library.add_folder_aria": "このゲームのフォルダーをもう1つ追加",
   "library.slot_pick_title": "このゲームのどのフォルダーですか？",
   "library.slot_pick_body": "{path} を {name} のバックアップに追加します。番号は他のマシンにある同じフォルダーと結びつけるためのものなので、向こうで使っている番号を選んでください。",
@@ -979,5 +978,12 @@
   "library.slot_clash_move": "そこへ移動した",
   "library.slot_clash_add": "フォルダー {n} として追加",
   "library.rename_error_conflict": "このゲームの別のフォルダーがそのラベルを既に使用しています。",
-  "library.revert_to_auto": "自動検出に戻す"
+  "library.revert_to_auto": "自動検出に戻す",
+  "library.open_history": "バージョンと復元",
+  "library.renumber_taken": "番号 {n} はこのゲームの別のフォルダーが使っています。",
+  "library.rename_placeholder": "このフォルダーに名前を（Mods、Ironman…）",
+  "library.rename_keeps_number": "番号はそのままです。マシン間でこのフォルダーを結びつけているのは番号です。",
+  "library.slot_number_label": "番号",
+  "library.slot_number_taken": "このマシンの別フォルダー",
+  "library.slot_number_join": "別マシンのものに合流"
 }

@@ -967,7 +967,6 @@
   "update_gate.restart_now": "重启 Hoard",
   "update_gate.later": "稍后",
   "update_gate.privileges_hint": "系统会请求安装权限。",
-  "library.slot_other_title": "和其他文件夹一样会被备份，但不会自动还原——用还原按钮取回。",
   "library.add_folder_aria": "为这个游戏再添加一个文件夹",
   "library.slot_pick_title": "这是这个游戏的哪个文件夹？",
   "library.slot_pick_body": "{path} 会作为 {name} 的一部分备份。编号决定它和你其他机器上的哪个文件夹配对，所以请选那边已经在用的号。",
@@ -979,5 +978,12 @@
   "library.slot_clash_move": "它挪到那里了",
   "library.slot_clash_add": "添加为文件夹 {n}",
   "library.rename_error_conflict": "此游戏的另一个文件夹已在使用该标签。",
-  "library.revert_to_auto": "恢复自动检测"
+  "library.revert_to_auto": "恢复自动检测",
+  "library.open_history": "版本与还原",
+  "library.renumber_taken": "编号 {n} 已经是这个游戏的另一个文件夹了。",
+  "library.rename_placeholder": "给这个文件夹起个名字（Mods、Ironman…）",
+  "library.rename_keeps_number": "编号保持不变：它是跨机器配对这个文件夹的依据。",
+  "library.slot_number_label": "编号",
+  "library.slot_number_taken": "本机的另一个文件夹",
+  "library.slot_number_join": "合并到另一台机器的"
 }

@@ -342,6 +342,7 @@ pub async fn run_scan(app: &AppHandle) {
         emit_phase(app, "tracking", Some(done), Some(total));
         done += 1;
         let args = crate::commands::library::AddGameArgs {
+            name: None,
             slot: None,
             repoint: false,
             game_slug: game.slug.clone(),

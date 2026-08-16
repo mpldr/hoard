@@ -51,6 +51,13 @@ pub struct UserInfo {
     /// [`classify_cloud`]. Avoids the `/v1/admin/upgrade` 404 a cloud box
     /// returns (it has no such route).
     pub is_cloud_server: bool,
+    /// The three limits the account page shows for a self-hosted server. All
+    /// `None` until the first `whoami` of the session: the disk cache holds
+    /// identity only, and a server too old to report them reads as "no limit
+    /// known" rather than as zero.
+    pub max_snapshot_size_bytes: Option<i64>,
+    pub max_versions: Option<i64>,
+    pub max_manual_versions: Option<i64>,
 }
 
 /// Probe `/v1/health` without auth. Frontend uses this in the wizard to give
@@ -104,6 +111,9 @@ pub async fn login(
         storage_quota_bytes: who.storage_quota_bytes,
         is_local_server: classify_server(&url),
         is_cloud_server: classify_cloud(&url),
+        max_snapshot_size_bytes: who.max_snapshot_size_bytes,
+        max_versions: who.max_versions,
+        max_manual_versions: who.max_manual_versions,
     };
 
     hand_over(
@@ -304,6 +314,11 @@ pub async fn refresh_quota(app: AppHandle, state: State<'_, AppState>) -> Result
         // Reclassify each poll so a heuristic change — or a server that moved
         // onto a LAN/Tailscale name — takes effect without forcing a re-login.
         is_local_server: classify_server(&url),
+        // The operator can raise any of these and restart; the account page
+        // follows on the next poll instead of until the next sign-in.
+        max_snapshot_size_bytes: who.max_snapshot_size_bytes,
+        max_versions: who.max_versions,
+        max_manual_versions: who.max_manual_versions,
         ..current
     };
     *state.user.lock().unwrap() = Some(updated.clone());

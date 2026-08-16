@@ -134,6 +134,18 @@ pub struct Whoami {
     /// `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_manual_versions: Option<i64>,
+    /// This server's per-snapshot ceiling (`storage.max_snapshot_size_mb`, in
+    /// bytes). `None` on a server old enough not to report it, and always on
+    /// Cloud — there the equivalent is the plan's per-save cap, which
+    /// `/v1/cloud/me` already carries.
+    ///
+    /// It lives here and not in `/v1/health` on purpose: health is anonymous,
+    /// and an operator's ceiling is nobody's business until they authenticate.
+    /// The client shows it so the number is on screen *before* a backup bounces
+    /// off it — a self-hoster whose config still had the old 1 GB example spent
+    /// a support round finding out it existed (ago-2026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_snapshot_size_bytes: Option<i64>,
 }
 
 /// Cuerpo de `PUT /v1/me/max-versions`.

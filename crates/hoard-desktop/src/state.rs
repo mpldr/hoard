@@ -78,9 +78,14 @@ impl AppState {
                     is_local_server: classify_server(&server_url),
                     is_cloud_server: classify_cloud(&server_url),
                     // Quota isn't cached on disk — the UI calls
-                    // `refresh_quota` shortly after boot to fill it in.
+                    // `refresh_quota` shortly after boot to fill it in. Same
+                    // for the server's limits: `None` reads as "not asked yet",
+                    // which is what the account page renders as a dash.
                     storage_used_bytes: 0,
                     storage_quota_bytes: 0,
+                    max_snapshot_size_bytes: None,
+                    max_versions: None,
+                    max_manual_versions: None,
                     server_url,
                 })
             }

@@ -719,13 +719,17 @@ import { tilt } from "./lib/actions/tilt";
     push(`/pro?feature=${feature}`);
   }
 
-  // First entry is the account button: "Iniciar sesión" with no cloud
-  // session, "Inicio" (the read-only account/plan view) once signed in.
+  // First entry is the account button: "Iniciar sesión" with no session at
+  // all, "Inicio" (the account view) once there is one — cloud **or**
+  // self-hosted. Keying it off the cloud session alone left a self-hoster
+  // staring at "Iniciar sesión" forever while their backups were reaching
+  // their own server: the app was asking them to sign up for the one thing
+  // they had deliberately not signed up for.
   // Biblioteca / Panel / Mapa live under the collapsible Hoard-Saves group;
   // Ajustes stays last. The old "Historial" item was removed — it just
   // duplicated the Dashboard.
   const navEntries = $derived<NavEntry[]>([
-    $cloud.account
+    $cloud.account || $auth.user
       ? { kind: "link", labelKey: "nav.home", icon: Home, route: "/account" }
       : { kind: "link", labelKey: "nav.sign_in", icon: LogIn, route: "/account" },
     {

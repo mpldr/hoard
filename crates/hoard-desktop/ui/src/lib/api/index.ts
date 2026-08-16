@@ -32,6 +32,14 @@ export type UserInfo = {
    *  `/v1/admin/upgrade` route, so the UI hides the self-hosted server-upgrade
    *  panel for these connections. */
   is_cloud_server: boolean;
+  /** The server's per-snapshot ceiling (`storage.max_snapshot_size_mb`, in
+   *  bytes). `null` before the first whoami of the session, and on a server too
+   *  old to report it — the account page shows a dash rather than a zero. */
+  max_snapshot_size_bytes: number | null;
+  /** Stored-version caps, `null` meaning unlimited. Automatic snapshots and
+   *  deliberate copies count against separate budgets. */
+  max_versions: number | null;
+  max_manual_versions: number | null;
 };
 
 /** Anonymous probe — used by the wizard to validate the server URL. */

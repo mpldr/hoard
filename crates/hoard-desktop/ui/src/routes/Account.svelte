@@ -14,7 +14,7 @@
   import { onMount, onDestroy } from "svelte";
   import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
-  import { LogOut, ArrowUpRight, Mail, Download, Trash2, RefreshCw, ShieldCheck, AlertTriangle, CreditCard, HardDrive, Layers, Clock, FileArchive, Gauge } from "@lucide/svelte";
+  import { LogOut, ArrowUpRight, Mail, Download, Trash2, RefreshCw, ShieldCheck, AlertTriangle, CreditCard, HardDrive, Layers, Clock, FileArchive, Gauge, Server } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
   import Button from "../lib/components/Button.svelte";
@@ -34,6 +34,9 @@
     planLabel,
     type CloudExportStatus,
   } from "../lib/stores/cloud";
+  import { auth, signOut, refreshQuota } from "../lib/stores/auth";
+  import { remoteDevices, refreshDevices } from "../lib/stores/devices";
+  import { healthCheck, type HealthInfo } from "../lib/api";
   import { toastError, toastInfo } from "../lib/stores/toasts";
   import { clearOnboarding, clearTourSeen } from "../lib/stores/onboarding";
   import { formatBytes } from "../lib/utils/format";
@@ -59,6 +62,8 @@
     }
     if ($cloud.account) {
       await loadExportStatus();
+    } else if ($auth.user) {
+      await probeServer();
     }
   });
 
@@ -207,6 +212,98 @@
 
   const account = $derived($cloud.account);
 
+  /**
+   * The self-hosted session, when this page has no Cloud account to render.
+   *
+   * This page was Cloud-only: someone running their own server got the sign-up
+   * pitch for a service they had deliberately not joined, with no view of the
+   * server they *were* signed in to — and, because the sidebar keys its first
+   * entry off the cloud session too, a permanent "Sign in" while their backups
+   * were reaching their own box just fine.
+   *
+   * Cloud wins when both sessions exist: that's the one with a plan, billing
+   * and an export job behind it. The self-hosted card stays in Settings for it.
+   */
+  const server = $derived(account ? null : $auth.user);
+
+  let serverHealth = $state<HealthInfo | null>(null);
+  let forgetOpen = $state(false);
+  let forgetting = $state(false);
+
+  const serverStorage = $derived.by(() => {
+    if (!server || server.storage_quota_bytes <= 0) return null;
+    const pct = Math.min(
+      100,
+      Math.round((server.storage_used_bytes / server.storage_quota_bytes) * 100),
+    );
+    return {
+      usedLabel: formatBytes(server.storage_used_bytes),
+      capLabel: formatBytes(server.storage_quota_bytes),
+      pct,
+      color:
+        pct >= 90 ? "bg-rose-500" : pct >= 75 ? "bg-amber-500" : "bg-emerald-500",
+    };
+  });
+
+  /** `null` on a server too old to report the limit — a dash, never a zero. */
+  const maxSnapshotLabel = $derived(
+    server?.max_snapshot_size_bytes && server.max_snapshot_size_bytes > 0
+      ? formatBytes(server.max_snapshot_size_bytes)
+      : null,
+  );
+
+  function capLabel(cap: number | null | undefined): string {
+    return cap == null ? $_("account.selfhost_unlimited") : String(cap);
+  }
+
+  function uptimeLabel(secs: number): string {
+    const days = Math.floor(secs / 86400);
+    if (days >= 1) return $_("account.uptime_days", { values: { days } });
+    const hours = Math.floor(secs / 3600);
+    if (hours >= 1) return $_("account.uptime_hours", { values: { hours } });
+    return $_("account.uptime_minutes", {
+      values: { minutes: Math.max(1, Math.floor(secs / 60)) },
+    });
+  }
+
+  /** Version + uptime of the box we're pointed at. Best-effort: an unreachable
+   *  server leaves the tile blank rather than painting an error over a page
+   *  whose other numbers are still valid. */
+  async function probeServer() {
+    if (!server) return;
+    try {
+      serverHealth = await healthCheck(server.server_url);
+    } catch {
+      serverHealth = null;
+    }
+    void refreshDevices();
+  }
+
+  async function handleServerRefresh() {
+    busyAction = "refresh";
+    try {
+      await refreshQuota();
+      await probeServer();
+    } catch (e) {
+      toastError(String(e));
+    } finally {
+      busyAction = null;
+    }
+  }
+
+  async function handleForget() {
+    forgetting = true;
+    try {
+      await signOut();
+      forgetOpen = false;
+      toastInfo($_("account.signed_out"));
+    } catch (e) {
+      toastError(String(e));
+    } finally {
+      forgetting = false;
+    }
+  }
+
   /** Storage progress bar — 0 means "unlimited", which we surface as a
    *  flat emerald bar and a "∞" cap label. */
   const storageView = $derived.by(() => {
@@ -321,6 +418,153 @@
         <RefreshCw size={16} class="animate-spin" />
         <span>{$_("common.loading")}</span>
       </div>
+    </Card>
+  {:else if server}
+    <!-- ───────────── Self-hosted: the server IS the account ──────── -->
+    <Card class="mb-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex min-w-0 items-center gap-3">
+          <span
+            class="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-sky-500/10 text-sky-300 ring-1 ring-sky-500/30"
+          >
+            <Server size={22} />
+          </span>
+          <div class="min-w-0">
+            <p class="text-xs uppercase tracking-wide text-zinc-500">
+              {$_("settings.signed_in_as")}
+            </p>
+            <p class="mt-1 flex items-center gap-2 truncate text-lg font-medium">
+              {server.username}
+              {#if server.is_admin}
+                <span
+                  class="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300"
+                >
+                  {$_("onboarding_done.administrator")}
+                </span>
+              {/if}
+            </p>
+            <p class="truncate text-xs text-zinc-500">{server.server_url}</p>
+          </div>
+        </div>
+        <Button
+          variant="ghost"
+          loading={busyAction === "refresh"}
+          disabled={busyAction !== null}
+          onclick={handleServerRefresh}
+          aria-label={$_("account.refresh")}
+        >
+          <RefreshCw size={14} />
+          {$_("account.refresh")}
+        </Button>
+      </div>
+    </Card>
+
+    <Card class="mb-4">
+      {#if serverStorage}
+        <div class="mb-4">
+          <div class="mb-1 flex items-center justify-between text-sm">
+            <span class="flex items-center gap-2 text-zinc-300">
+              <HardDrive size={14} />
+              {$_("account.storage")}
+            </span>
+            <span class="font-mono text-xs text-zinc-400">
+              {serverStorage.usedLabel} / {serverStorage.capLabel} · {serverStorage.pct}%
+            </span>
+          </div>
+          <div class="h-2 overflow-hidden rounded-full bg-zinc-800">
+            <div
+              class="h-full rounded-full transition-all duration-500 {serverStorage.color}"
+              style={`width: ${serverStorage.pct}%`}
+            ></div>
+          </div>
+        </div>
+      {/if}
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <!-- The ceiling that turns a backup into a 413. It is the operator's
+             own knob, and until it was shown here the only way to learn it
+             existed was to hit it. -->
+        <div class="rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3.5">
+          <p class="flex items-center gap-2 text-xs text-zinc-500">
+            <FileArchive size={12} />
+            {$_("account.selfhost_max_snapshot")}
+          </p>
+          <p class="mt-1 text-sm text-zinc-200">{maxSnapshotLabel ?? "—"}</p>
+          {#if maxSnapshotLabel}
+            <p class="mt-1 text-[11px] leading-snug text-zinc-500">
+              {$_("account.selfhost_max_snapshot_hint")}
+            </p>
+          {/if}
+        </div>
+
+        <div class="rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3.5">
+          <p class="flex items-center gap-2 text-xs text-zinc-500">
+            <Clock size={12} />
+            {$_("account.selfhost_versions")}
+          </p>
+          <p class="mt-1 text-sm text-zinc-200">{capLabel(server.max_versions)}</p>
+          <p class="mt-1 text-[11px] leading-snug text-zinc-500">
+            {$_("account.selfhost_versions_manual", {
+              values: { count: capLabel(server.max_manual_versions) },
+            })}
+          </p>
+        </div>
+
+        <div class="rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3.5">
+          <p class="flex items-center gap-2 text-xs text-zinc-500">
+            <Layers size={12} />
+            {$_("account.devices")}
+          </p>
+          <p class="mt-1 text-sm text-zinc-200">
+            {$remoteDevices.length > 0 ? $remoteDevices.length : "—"}
+          </p>
+        </div>
+
+        <div class="rounded-xl border border-white/[0.08] bg-zinc-950/40 p-3.5 sm:col-span-3">
+          <p class="flex items-center gap-2 text-xs text-zinc-500">
+            <Server size={12} />
+            {$_("account.selfhost_server")}
+          </p>
+          <p class="mt-1 text-sm text-zinc-200">
+            {#if serverHealth}
+              {serverHealth.version} · {uptimeLabel(serverHealth.uptime_secs)}
+            {:else}
+              —
+            {/if}
+          </p>
+        </div>
+      </div>
+    </Card>
+
+    <Card class="mb-4">
+      <h3 class="text-sm font-semibold">{$_("account.selfhost_data_title")}</h3>
+      <p class="mt-1 text-sm text-zinc-400">
+        {$_("account.selfhost_data_body")}
+      </p>
+      <Button variant="danger" class="mt-3" onclick={() => (forgetOpen = true)}>
+        <LogOut size={14} />
+        {$_("settings.forget_server")}
+      </Button>
+      <p class="mt-2 text-xs leading-relaxed text-zinc-500">
+        {$_("settings.forget_server_desc")}
+      </p>
+    </Card>
+
+    <Card>
+      <h3 class="text-sm font-semibold">{$_("account.selfhost_cloud_title")}</h3>
+      <p class="mt-1 text-sm text-zinc-400">
+        {$_("account.selfhost_cloud_body")}
+      </p>
+      <Button
+        variant="secondary"
+        class="mt-3"
+        loading={busyAction === "signin"}
+        disabled={busyAction !== null}
+        onclick={handleSignIn}
+      >
+        <ArrowUpRight size={14} />
+        {$_("account.selfhost_cloud_action")}
+      </Button>
     </Card>
   {:else if !account}
     <!-- ───────────── Signed-out: provider grid + value props ─────── -->
@@ -689,6 +933,27 @@
     </Card>
   {/if}
 </div>
+
+<Modal
+  open={forgetOpen}
+  title={$_("settings.forget_confirm_title")}
+  dismissible={!forgetting}
+  onClose={() => (forgetOpen = false)}
+>
+  <p class="text-sm text-zinc-300">
+    {$_("settings.forget_confirm_body", {
+      values: { url: server?.server_url ?? "—" },
+    })}
+  </p>
+  {#snippet footer()}
+    <Button variant="secondary" disabled={forgetting} onclick={() => (forgetOpen = false)}>
+      {$_("common.cancel")}
+    </Button>
+    <Button variant="danger" loading={forgetting} onclick={handleForget}>
+      {$_("settings.forget_confirm_cta")}
+    </Button>
+  {/snippet}
+</Modal>
 
 <Modal
   open={confirmDeleteOpen}

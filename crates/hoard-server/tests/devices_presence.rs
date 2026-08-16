@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Json;
 use hoard_core::wire::{Heartbeat, PlayingBeat};
 use hoard_server::auth::AuthUser;
-use hoard_server::routes::devices;
 use hoard_server::routes::health::ServerState;
+use hoard_server::routes::{auth as auth_routes, devices};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -352,6 +352,28 @@ async fn signing_in_is_enough_to_appear() {
     assert_eq!(seen[0].device_name, "recien-instalada");
     assert_eq!(seen[0].os.as_deref(), Some("macos"));
     assert!(seen[0].online);
+}
+
+/// The account page reads the per-snapshot ceiling off `whoami`, so the number
+/// on screen has to be this server's own `storage.max_snapshot_size_mb` — not a
+/// plan, not a constant. Before it travelled, the only way to learn the limit
+/// existed was for a backup to bounce off it with a 413.
+///
+/// A server that predates the field omits it, and the client renders a dash;
+/// that's why it's an `Option` and not a `0`.
+#[tokio::test]
+async fn whoami_reports_this_servers_own_snapshot_ceiling() {
+    let h = harness().await;
+    let who = auth_routes::whoami(
+        Extension(h.user.clone()),
+        State(h.state.clone()),
+        HeaderMap::new(),
+    )
+    .await
+    .expect("whoami")
+    .0;
+    // The harness config says 64 MB.
+    assert_eq!(who.max_snapshot_size_bytes, Some(64 * 1024 * 1024));
 }
 
 /// El 413 del camino direccionado por contenido dice el tamaño **exacto** (el

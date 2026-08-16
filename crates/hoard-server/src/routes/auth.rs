@@ -55,6 +55,9 @@ pub async fn whoami(
         storage_quota_bytes: row.1,
         max_versions: row.2,
         max_manual_versions: row.3,
+        max_snapshot_size_bytes: Some(
+            (state.config.storage.max_snapshot_size_mb as i64).saturating_mul(1024 * 1024),
+        ),
     }))
 }
 

@@ -3,7 +3,12 @@
   import Button from '$lib/components/Button.svelte';
   import Seo from '$lib/components/Seo.svelte';
   import HowItWorks from '$lib/components/HowItWorks.svelte';
-  import DownloadCTA from '$lib/components/DownloadCTA.svelte';
+  import WhatsInTheBox from '$lib/components/WhatsInTheBox.svelte';
+  import GamesSection from '$lib/components/GamesSection.svelte';
+  import SelfHostSection from '$lib/components/SelfHostSection.svelte';
+  import CtaSection from '$lib/components/CtaSection.svelte';
+  import SupportSection from '$lib/components/SupportSection.svelte';
+  import SyncDiagram from '$lib/components/SyncDiagram.svelte';
   import { reveal } from '$lib/actions/reveal';
   import { marquee } from '$lib/actions/marquee';
   import { tilt } from '$lib/actions/tilt';
@@ -11,27 +16,8 @@
   import { SITE_URL } from '$lib/i18n/locales';
   import { PLANS } from '$lib/plans';
   import { version } from '$lib/version';
-  import {
-    ArrowRight,
-    RefreshCw,
-    History,
-    Fingerprint,
-    ScanSearch,
-    MonitorSmartphone,
-    FileDown,
-    Check,
-    Heart
-  } from 'lucide-svelte';
+  import { ArrowRight, Check } from 'lucide-svelte';
 
-
-  const features = [
-    { key: 'sync', icon: RefreshCw },
-    { key: 'versioned', icon: History },
-    { key: 'verified', icon: Fingerprint },
-    { key: 'detect', icon: ScanSearch },
-    { key: 'crossplat', icon: MonitorSmartphone },
-    { key: 'export', icon: FileDown }
-  ];
 
   // Twelve facts, all of them checkable in the repo — a marquee with four
   // items announces its own loop every few seconds.
@@ -157,11 +143,7 @@
 <section class="relative">
   <div class="relative mx-auto max-w-[84rem] px-4 pt-14 sm:px-6 2xl:pb-7 2xl:pt-4">
     <div class="flex flex-col items-center gap-8 lg:flex-row lg:items-center lg:justify-center lg:gap-7">
-      <figure
-        class="tilt animate-fade-up relative w-full lg:w-auto"
-        style="animation-delay:0.3s"
-        use:tilt
-      >
+      <figure class="tilt relative w-full lg:w-auto" use:tilt>
         <img
           src="/WEB.png"
           alt={$_('hero.screenshot_alt')}
@@ -173,8 +155,7 @@
         />
       </figure>
       <figure
-        class="tilt animate-fade-up relative w-full max-w-2xl lg:w-auto lg:max-w-none"
-        style="animation-delay:0.42s"
+        class="tilt relative w-full max-w-2xl lg:w-auto lg:max-w-none"
         use:tilt
       >
         <img
@@ -217,8 +198,8 @@
 </section>
 
 <!-- ───────── SYNC ───────── -->
-<section class="relative">
-  <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-24">
+<section class="border-t border-line">
+  <div class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
     <div class="grid items-center gap-12 lg:grid-cols-2">
       <div class="reveal" use:reveal>
         <p class="kicker">{$_('sync.kicker')}</p>
@@ -236,39 +217,14 @@
             </li>
           {/each}
         </ul>
-        <a
-          href={$localeHref('/guides')}
-          class="link-underline mt-6 inline-flex items-center gap-1.5 text-sm font-medium text-accent ring-focus hover:text-emerald-300"
-        >
-          {$_('sync.guides_link')}
-          <ArrowRight class="h-4 w-4" />
-        </a>
       </div>
 
       <div class="reveal" use:reveal={{ delay: 100 }}>
-        <div class="tilt relative rounded-2xl border border-line bg-surface p-6 sm:p-8" use:tilt={{ max: 5 }}>
-          <div class="space-y-3 font-mono text-xs">
-            <div class="flex items-center justify-between rounded-lg border border-line bg-bg px-4 py-3">
-              <span class="text-ink">{$_('sync.demo_desktop')}</span>
-              <span class="rounded-full bg-accent-tint px-2 py-0.5 text-[10px] text-accent">
-                v48 · {$_('sync.demo_uploaded')}
-              </span>
-            </div>
-            <div class="flex justify-center text-ink-faint" aria-hidden="true">
-              <svg width="16" height="24" viewBox="0 0 16 24" fill="none">
-                <path d="M8 0v20m0 0l-5-5m5 5l5-5" stroke="currentColor" stroke-width="1.5" />
-              </svg>
-            </div>
-            <div class="flex items-center justify-between rounded-lg border border-accent bg-accent-tint px-4 py-3">
-              <span class="text-ink">{$_('sync.demo_laptop')}</span>
-              <span class="rounded-full bg-accent-deep px-2 py-0.5 text-[10px] text-white">
-                v48 · {$_('sync.demo_synced')}
-              </span>
-            </div>
-          </div>
-          <p class="mt-5 text-center text-xs leading-relaxed text-ink-faint">
-            {$_('sync.demo_note')}
-          </p>
+        <div
+          class="tilt rounded-2xl border border-line bg-surface p-6 shadow-[0_40px_90px_-40px_rgba(0,0,0,0.9)] sm:p-8"
+          use:tilt
+        >
+          <SyncDiagram />
         </div>
       </div>
     </div>
@@ -278,116 +234,17 @@
 <!-- ───────── HOW IT WORKS ───────── -->
 <HowItWorks />
 
-<!-- ───────── FEATURES ───────── -->
-<section class="border-t border-line">
-  <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-24">
-    <div class="reveal max-w-2xl" use:reveal>
-      <p class="kicker">{$_('features.kicker')}</p>
-      <h2 class="mt-3 text-balance text-3xl font-semibold text-ink sm:text-4xl">
-        {$_('features.title')}
-      </h2>
-      <p class="mt-3 text-pretty text-ink-soft">{$_('features.subtitle')}</p>
-    </div>
+<!-- ───────── WHAT'S IN THE BOX ───────── -->
+<WhatsInTheBox />
 
-    <div
-      class="mt-12 grid overflow-hidden rounded-2xl border border-line bg-surface sm:grid-cols-2 lg:grid-cols-3"
-    >
-      {#each features as f, i (f.key)}
-        <article
-          class="reveal tilt group relative border-t border-line p-7 transition-colors hover:bg-bg max-sm:[&:nth-child(2n)]:border-l sm:[&:nth-child(-n+2)]:border-t-0 sm:[&:nth-child(2n)]:border-l lg:[&:nth-child(-n+3)]:border-t-0 lg:[&:nth-child(3n)]:border-l-0 lg:[&:nth-child(3n+1)]:border-l-0"
-          use:reveal={{ delay: i * 60 }}
-          use:tilt={{ max: 4 }}
-        >
-          <f.icon class="h-5 w-5 text-accent" />
-          <h3 class="mt-4 font-semibold text-ink">{$_(`features.${f.key}.title`)}</h3>
-          <p class="mt-1.5 text-sm leading-relaxed text-ink-soft">
-            {$_(`features.${f.key}.body`)}
-          </p>
-        </article>
-      {/each}
-    </div>
-  </div>
-</section>
+<!-- ───────── SUPPORTED GAMES ───────── -->
+<GamesSection />
 
 <!-- ───────── SELF-HOST ───────── -->
-<section class="border-t border-line">
-  <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6">
-    <div class="reveal overflow-hidden rounded-3xl border border-pine-line bg-pine" use:reveal>
-      <div class="grid items-center gap-10 p-10 sm:p-14 lg:grid-cols-2">
-        <div>
-          <p class="kicker">{$_('selfhost.kicker')}</p>
-          <h2 class="mt-3 text-balance text-3xl font-semibold text-white sm:text-4xl">
-            {$_('selfhost.title')}
-          </h2>
-          <p class="mt-4 text-pretty leading-relaxed text-white/60">
-            {$_('selfhost.body')}
-          </p>
-          <a
-            href="https://github.com/rleeon/hoard#self-host"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="link-underline mt-6 inline-flex items-center gap-1.5 text-sm font-medium text-emerald-400 ring-focus hover:text-emerald-300"
-          >
-            {$_('selfhost.cta')}
-            <ArrowRight class="h-4 w-4" />
-          </a>
-        </div>
-        <pre
-          class="overflow-x-auto rounded-xl border border-pine-line bg-black/30 p-5 font-mono text-[13px] leading-relaxed text-white/80"><code
-            >git clone https://github.com/rleeon/hoard.git
-cd hoard/deploy/docker
-docker compose up -d --build</code
-          ></pre>
-      </div>
-    </div>
-  </div>
-</section>
+<SelfHostSection />
 
-<!-- ───────── FINAL CTA ───────── -->
-<section class="border-t border-line">
-  <div class="mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-24">
-    <div class="reveal mx-auto flex max-w-2xl flex-col items-center text-center" use:reveal>
-      <h2 class="text-balance text-3xl font-semibold text-ink sm:text-4xl">
-        {$_('cta_section.title')}
-      </h2>
-      <p class="mt-3 text-pretty text-ink-soft">{$_('cta_section.body')}</p>
-      <div class="mt-8">
-        <DownloadCTA />
-      </div>
-    </div>
-  </div>
-</section>
+<!-- ───────── FREE AND OPEN SOURCE ───────── -->
+<CtaSection />
 
-<!-- ───────── SUPPORT ───────── -->
-<section class="border-t border-line">
-  <div class="mx-auto max-w-6xl px-4 py-16 sm:px-6">
-    <div
-      class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 rounded-xl border-2 border-red-600 bg-rose-100 px-6 py-10 text-center"
-      use:reveal
-    >
-      <div>
-        <h2
-          class="flex items-center justify-center gap-3 font-display text-2xl font-semibold text-rose-950"
-        >
-          <Heart class="h-5 w-5 shrink-0 text-red-600" aria-hidden="true" />
-          {$_('support.title')}
-          <Heart class="h-5 w-5 shrink-0 text-red-600" aria-hidden="true" />
-        </h2>
-        <p class="mt-2 text-pretty text-sm text-rose-900">{$_('support.body')}</p>
-      </div>
-      <div class="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
-        <Button href="https://github.com/sponsors/rleeon" target="_blank" variant="support">
-          <Heart class="h-4 w-4" />
-          {$_('support.cta')}
-        </Button>
-        <Button
-          href="https://github.com/rleeon/hoard/blob/main/FUNDING.md"
-          target="_blank"
-          variant="support-quiet"
-        >
-          {$_('support.funding')}
-        </Button>
-      </div>
-    </div>
-  </div>
-</section>
+<!-- ───────── SUPPORT HOARD ───────── -->
+<SupportSection />

@@ -10,15 +10,20 @@
 export type MarqueeOptions = {
   /** Scroll speed in CSS pixels per second. */
   speed?: number;
+  /** Scroll right instead of left. */
+  reverse?: boolean;
+  /** Initial horizontal offset in px, to stagger lanes that share a speed. */
+  phase?: number;
 };
 
 export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
   let speed = opts.speed ?? 52;
+  let reverse = opts.reverse ?? false;
 
   if (typeof window === 'undefined') return {};
 
   const container = node.parentElement ?? node;
-  let offset = 0;
+  let offset = -(opts.phase ?? 0);
   let copy = 0; // width of a single copy of the list
   let last = 0;
   let frame = 0;
@@ -36,9 +41,11 @@ export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
 
   const wrap = () => {
     if (copy <= 0) return;
-    // Keep the offset in (-copy, 0]; both ends render identically.
+    // Keep the offset in (-copy, 0] for the left run, [0, copy) for the
+    // right run; both ends render identically.
     offset = ((offset % copy) + copy) % copy;
-    if (offset > 0) offset -= copy;
+    if (!reverse && offset > 0) offset -= copy;
+    if (reverse && offset >= copy) offset -= copy;
   };
 
   const paint = () => {
@@ -50,7 +57,7 @@ export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
     const dt = last ? Math.min((now - last) / 1000, 0.1) : 0;
     last = now;
     if (hovering || dragging || copy <= 0) return;
-    offset -= speed * dt;
+    offset += reverse ? speed * dt : -speed * dt;
     wrap();
     paint();
   };
@@ -107,6 +114,7 @@ export function marquee(node: HTMLElement, opts: MarqueeOptions = {}) {
   return {
     update(next: MarqueeOptions) {
       speed = next.speed ?? 52;
+      reverse = next.reverse ?? false;
     },
     destroy() {
       cancelAnimationFrame(frame);

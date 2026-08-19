@@ -1,12 +1,29 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
+  import { Download } from 'lucide-svelte';
   import { reveal } from '$lib/actions/reveal';
-  import { Download, ScanSearch, RefreshCw } from 'lucide-svelte';
+  import { localeHref } from '$lib/i18n/href';
+  import Button from './Button.svelte';
+
+  // The "How it works" section.
+  //
+  // Content, as the user specified it:
+  //   - Step 01 "Install & sign in": a download button, no image.
+  //   - Step 02 "Detect your library": the real Dashboard screenshot.
+  //   - Step 03 "Sync & history": the real History screenshot, in the same
+  //     16:10 frame as step 02. This one is object-fill, so the smaller
+  //     screenshot fills the box exactly — no bars, nothing cropped — while
+  //     step 02 keeps object-cover.
+  //
+  // Design (the user's pick out of ten layouts): step 01 as a full-width CTA
+  // banner — accent gradient, centered, download button — and steps 02/03 as
+  // two cards below, both screenshots forced into the same 16:10 box so the
+  // history one no longer reads as small next to the dashboard one.
 
   const steps = [
-    { n: '01', icon: Download, title: 'how.s1_title', body: 'how.s1_body' },
-    { n: '02', icon: ScanSearch, title: 'how.s2_title', body: 'how.s2_body' },
-    { n: '03', icon: RefreshCw, title: 'how.s3_title', body: 'how.s3_body' }
+    { n: '01', title: 'how.s1_title', body: 'how.s1_body' },
+    { n: '02', title: 'how.s2_title', body: 'how.s2_body', img: '/dashboard.webp', alt: 'slot.how_library', fit: 'cover' },
+    { n: '03', title: 'how.s3_title', body: 'how.s3_body', img: '/history.webp', alt: 'slot.how_history', fit: 'fill' }
   ];
 </script>
 
@@ -20,23 +37,41 @@
       <p class="mt-3 text-pretty text-ink-soft">{$_('how.subtitle')}</p>
     </div>
 
-    <div
-      class="mt-12 grid overflow-hidden rounded-2xl border border-line bg-surface sm:grid-cols-3"
-    >
+    <div class="mt-12 grid gap-5 lg:grid-cols-2">
       {#each steps as s, i (s.n)}
-        <article
-          class="reveal p-7 {i > 0 ? 'border-t border-line sm:border-l sm:border-t-0' : ''}"
-          use:reveal={{ delay: i * 80 }}
-        >
-          <div class="flex items-center justify-between">
-            <span class="font-mono text-[11px] font-medium tracking-[0.16em] text-accent">
-              {s.n}
-            </span>
-            <s.icon class="h-5 w-5 text-ink-faint" />
-          </div>
-          <h3 class="mt-5 text-lg font-semibold text-ink">{$_(s.title)}</h3>
-          <p class="mt-2 text-sm leading-relaxed text-ink-soft">{$_(s.body)}</p>
-        </article>
+        {#if !s.img}
+          <article
+            class="reveal flex flex-col items-center justify-center gap-6 rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/15 to-transparent p-10 text-center lg:col-span-2"
+            use:reveal
+          >
+            <span class="font-mono text-[11px] font-medium tracking-[0.16em] text-accent">{s.n}</span>
+            <h3 class="text-2xl font-semibold text-ink">{$_(s.title)}</h3>
+            <p class="max-w-md text-sm leading-relaxed text-ink-soft">{$_(s.body)}</p>
+            <div class="w-full max-w-sm">
+              <Button href={$localeHref('/download')} variant="primary" size="lg" full>
+                {$_('hero.cta_start')}
+                <Download class="h-4 w-4" aria-hidden="true" />
+              </Button>
+            </div>
+          </article>
+        {:else}
+          <article class="reveal rounded-2xl border border-line bg-surface p-7" use:reveal={{ delay: i * 80 }}>
+            <span class="font-mono text-[11px] font-medium tracking-[0.16em] text-accent">{s.n}</span>
+            <div class="mt-4 overflow-hidden rounded-xl border border-line">
+              <div class="aspect-[16/10] overflow-hidden">
+                <img
+                  src={s.img}
+                  alt={$_(s.alt)}
+                  loading="lazy"
+                  decoding="async"
+                  class="block h-full w-full {s.fit === 'cover' ? 'object-cover object-top' : 'object-fill'}"
+                />
+              </div>
+            </div>
+            <h3 class="mt-5 text-lg font-semibold text-ink">{$_(s.title)}</h3>
+            <p class="mt-2 text-sm leading-relaxed text-ink-soft">{$_(s.body)}</p>
+          </article>
+        {/if}
       {/each}
     </div>
   </div>

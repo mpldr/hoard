@@ -50,7 +50,7 @@ docker compose up -d --build</code
       </div>
       <div class="px-10 sm:px-14">
         <img
-          src="/selfhost.webp"
+          src="/selfhost.webp?v=1"
           alt={$_('slot.selfhost')}
           loading="lazy"
           decoding="async"

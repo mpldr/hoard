@@ -15,6 +15,11 @@
   //     screenshot fills the box exactly — no bars, nothing cropped — while
   //     step 02 keeps object-cover.
   //
+  // The ?v=1 on the screenshots is a cache key, not a version: the CDN in
+  // front of the site cached a 404 for these paths in the minutes between the
+  // HTML going live and the assets landing, and it holds that for four hours.
+  // A fresh query string sidesteps it; it can go once the cache is purged.
+  //
   // Design (the user's pick out of ten layouts): step 01 as a full-width CTA
   // banner — accent gradient, centered, download button — and steps 02/03 as
   // two cards below, both screenshots forced into the same 16:10 box so the
@@ -22,8 +27,8 @@
 
   const steps = [
     { n: '01', title: 'how.s1_title', body: 'how.s1_body' },
-    { n: '02', title: 'how.s2_title', body: 'how.s2_body', img: '/dashboard.webp', alt: 'slot.how_library', fit: 'cover' },
-    { n: '03', title: 'how.s3_title', body: 'how.s3_body', img: '/history.webp', alt: 'slot.how_history', fit: 'fill' }
+    { n: '02', title: 'how.s2_title', body: 'how.s2_body', img: '/dashboard.webp?v=1', alt: 'slot.how_library', fit: 'cover' },
+    { n: '03', title: 'how.s3_title', body: 'how.s3_body', img: '/history.webp?v=1', alt: 'slot.how_history', fit: 'fill' }
   ];
 </script>
 

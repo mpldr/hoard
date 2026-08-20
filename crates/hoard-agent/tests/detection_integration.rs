@@ -356,7 +356,7 @@ fn proton_prefix_finds_windows_only_game_on_linux() {
 /// "pick folder" alert instead of tracking the bare root.
 #[test]
 fn refine_drops_paradox_root_without_save_games() {
-    with_isolated_linux_env(|_home| {
+    with_isolated_linux_env(|home| {
         let root = first_linux_expansion("stellaris");
         std::fs::create_dir_all(root.join("mod")).unwrap();
         std::fs::create_dir_all(root.join("settings")).unwrap();
@@ -369,12 +369,25 @@ fn refine_drops_paradox_root_without_save_games() {
             .iter()
             .find(|g| g.slug == "stellaris")
             .expect("stellaris should appear with empty found_paths, not be dropped");
+        // Only what the tempdir holds is this test's business. The isolation
+        // covers HOME and the XDG vars, which is everything the Linux paths
+        // resolve through — but on a Windows host the sweep also reads the real
+        // known folders, and a developer who actually plays the game then has a
+        // populated `Documents\Paradox Interactive\Stellaris` answering to this
+        // slug. That path is a correct find; failing on it tests the machine,
+        // not the code.
+        let from_fixture: Vec<_> = game
+            .found_paths
+            .iter()
+            .filter(|p| p.starts_with(home))
+            .collect();
         assert!(
-            game.found_paths.is_empty(),
-            "stellaris should have empty found_paths (UI would show amber); got {:?}",
-            game.found_paths,
+            from_fixture.is_empty(),
+            "stellaris should have empty found_paths (UI would show amber); got {from_fixture:?}",
         );
-        assert_eq!(game.source, DetectionSource::FilesystemHeuristic);
+        if game.found_paths.is_empty() {
+            assert_eq!(game.source, DetectionSource::FilesystemHeuristic);
+        }
     });
 }
 

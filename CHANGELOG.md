@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **A web panel for your own server.** Point a browser at your server and it
+  answers: every game, save and version with its real size, what deduplication
+  saved you, which machine each version came from, your machines and what they
+  are playing, and the log of everything the server did. Any version can be
+  downloaded or trashed from there. Admin accounts also get server-wide storage,
+  users and quotas, and the diagnostic logs the clients upload. It ships inside
+  the binary — nothing to deploy, no build step — translated into the same eight
+  languages as the app, and it can be turned off with `[panel] enabled = false`.
+  It also shows the trash: a deleted version stays listed, struck through, with
+  the way back one click away — the server has always kept those bytes for
+  thirty days and the CLI could already undelete, but nothing said so where you
+  were doing the deleting. And it updates itself while you watch: the push the
+  server has published since 1.1.2 finally has a reader, so a version landing
+  from another machine repaints the page.
+- **The password you set when creating a user finally does something.** It has
+  been stored, hashed, since the first release and read by nothing: the API
+  authenticates with tokens. It is now what you type into the panel, so an
+  account made two years ago can sign in today. Pasting a `hoard_v1_…` token
+  works too, and it is traded for a session instead of being kept in the
+  browser. New: `hoard-admin user passwd`, and `user promote` / `user demote`
+  for the admin flag, which until now needed an UPDATE by hand in SQLite.
+
 ## [1.1.3] - 2026-08-16
 
 ### Added

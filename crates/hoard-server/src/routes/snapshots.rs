@@ -1660,3 +1660,137 @@ mod filename_tests {
         assert!(HeaderValue::from_str(&hv).is_ok());
     }
 }
+
+#[cfg(test)]
+mod version_cap_tests {
+    use super::*;
+
+    async fn mem_pool() -> sqlx::SqlitePool {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .pragma("foreign_keys", "ON");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// `notes = NULL` is an automatic copy; `manual` and `pre-restore` are the
+    /// two the user asked for. Same vocabulary the commit path writes.
+    async fn seed(pool: &sqlx::SqlitePool, notes: &[Option<&str>]) -> String {
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','ana','x')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO games (slug, display_name) VALUES ('g','G')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO saves (id, user_id, game_slug, latest_version_num) \
+             VALUES ('s1','u1','g',?)",
+        )
+        .bind(notes.len() as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+        for (i, note) in notes.iter().enumerate() {
+            sqlx::query("INSERT INTO snapshots (id, save_id, version_num, notes) VALUES (?,?,?,?)")
+                .bind(format!("snap-{i}"))
+                .bind("s1")
+                .bind(i as i64 + 1)
+                .bind(*note)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        "u1".to_string()
+    }
+
+    async fn live_notes(pool: &sqlx::SqlitePool) -> Vec<(i64, Option<String>)> {
+        sqlx::query_as(
+            "SELECT version_num, notes FROM snapshots \
+             WHERE deleted_at IS NULL ORDER BY version_num",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The question "back up now always cuts a version" raises: twenty presses
+    /// in a row must not eat the history the user actually wants. They cannot,
+    /// because the two classes are counted against separate caps — a manual
+    /// copy can only ever displace another manual one.
+    #[tokio::test]
+    async fn twenty_manual_copies_never_evict_automatic_history() {
+        let pool = mem_pool().await;
+        let mut notes: Vec<Option<&str>> = vec![None; 10];
+        notes.extend(std::iter::repeat_n(Some("manual"), 20));
+        let user = seed(&pool, &notes).await;
+
+        sqlx::query("UPDATE users SET max_versions = 10, max_manual_versions = 5 WHERE id = ?")
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pruned = prune_over_version_cap(&pool, &user, None).await.unwrap();
+
+        let live = live_notes(&pool).await;
+        let autos = live.iter().filter(|(_, n)| n.is_none()).count();
+        let manuals = live.iter().filter(|(_, n)| n.is_some()).count();
+        assert_eq!(autos, 10, "an automatic copy was evicted by the button");
+        assert_eq!(manuals, 5, "the manual budget was not applied");
+        assert_eq!(pruned, 15);
+
+        // And the newest manual — the press that just happened, and the save's
+        // head — is still there.
+        assert!(live.iter().any(|(v, _)| *v == 30));
+    }
+
+    /// With no cap set (the default: both columns NULL) nothing is ever
+    /// evicted, however many times the button is pressed.
+    #[tokio::test]
+    async fn without_a_cap_the_button_evicts_nothing() {
+        let pool = mem_pool().await;
+        let mut notes: Vec<Option<&str>> = vec![None; 5];
+        notes.extend(std::iter::repeat_n(Some("manual"), 20));
+        let user = seed(&pool, &notes).await;
+
+        assert_eq!(prune_over_version_cap(&pool, &user, None).await.unwrap(), 0);
+        assert_eq!(live_notes(&pool).await.len(), 25);
+    }
+
+    /// The pre-restore safety copy shares the manual budget, so a run of
+    /// button presses can push it out. That is the trade the split was written
+    /// with — the alternative is a third cap — but it is the one thing in here
+    /// worth knowing: with `max_manual_versions` set low, the copy that lets
+    /// you undo a restore is not guaranteed to outlive twenty presses.
+    #[tokio::test]
+    async fn a_pre_restore_copy_competes_with_the_button() {
+        let pool = mem_pool().await;
+        let mut notes: Vec<Option<&str>> = vec![Some("pre-restore")];
+        notes.extend(std::iter::repeat_n(Some("manual"), 5));
+        let user = seed(&pool, &notes).await;
+
+        sqlx::query("UPDATE users SET max_manual_versions = 3 WHERE id = ?")
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        prune_over_version_cap(&pool, &user, None).await.unwrap();
+
+        let live = live_notes(&pool).await;
+        assert_eq!(live.len(), 3);
+        assert!(
+            !live
+                .iter()
+                .any(|(_, n)| n.as_deref() == Some("pre-restore")),
+            "documented behaviour changed: the safety copy now survives"
+        );
+    }
+}

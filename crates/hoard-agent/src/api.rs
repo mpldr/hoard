@@ -1429,3 +1429,73 @@ pub struct NotificationOut {
 pub struct NotificationListOut {
     pub notifications: Vec<NotificationOut>,
 }
+
+#[cfg(test)]
+mod too_large_tests {
+    use super::*;
+    use hoard_core::ipc::events::TooLargeKind;
+
+    fn parse(body: &str) -> SaveTooLarge {
+        serde_json::from_str::<SaveTooLarge>(body)
+            .ok()
+            .filter(|d| !d.code.is_empty())
+            .unwrap_or_else(SaveTooLarge::from_foreign_body)
+    }
+
+    /// The 413's two size fields mean opposite things and were split apart in a
+    /// release the client ships *ahead* of the server, so for an hour or so a
+    /// new client talks to a server that has never heard of the split. These
+    /// are the three bodies it can get, and each has to name the right limit.
+    #[test]
+    fn every_shipped_413_shape_names_the_right_limit() {
+        // Cloud, as production answers today: a plan cap, and the whole size
+        // known up front. No `received_bytes` field at all.
+        let cloud = parse(
+            r#"{"error":"save exceeds per-save size limit","code":"save_too_large",
+                "plan":"free","limit_bytes":1073741824,"actual_bytes":3865470566,
+                "upgrade_url":"https://hoard.services/upgrade"}"#,
+        );
+        assert_eq!(cloud.kind(), TooLargeKind::PlanCap);
+        let s = cloud.human();
+        assert!(s.contains("free plan limit"), "{s}");
+        assert!(!s.contains("sent before it stopped"), "{s}");
+
+        // A self-hosted server on the old build: aborts mid-stream, so all it
+        // can report is how far it got.
+        let streamed = parse(
+            r#"{"error":"snapshot exceeds size limit","code":"snapshot_too_large",
+                "limit_bytes":1073741824,"received_bytes":1073745920}"#,
+        );
+        assert_eq!(streamed.kind(), TooLargeKind::ServerLimit);
+        let s = streamed.human();
+        assert!(s.contains("max_snapshot_size_mb"), "{s}");
+        assert!(s.contains("sent before it stopped"), "{s}");
+
+        // The new content-addressed rejection: the manifest declared the size
+        // and not a byte has moved. Saying "3.6 GB sent" here was the bug.
+        let declared = parse(
+            r#"{"error":"snapshot exceeds size limit","code":"snapshot_too_large",
+                "limit_bytes":1073741824,"actual_bytes":3865470566}"#,
+        );
+        assert_eq!(declared.kind(), TooLargeKind::ServerLimit);
+        let s = declared.human();
+        assert!(s.contains("max_snapshot_size_mb"), "{s}");
+        assert!(s.contains("the save is 3.6 GB"), "{s}");
+        assert!(!s.contains("sent before it stopped"), "{s}");
+    }
+
+    /// Anything that isn't Hoard's JSON came from whatever sits in front of the
+    /// server, and pointing the user at Hoard's settings costs them days.
+    #[test]
+    fn a_proxys_html_page_is_not_read_as_a_plan_cap() {
+        for body in [
+            "<html><head><title>413 Request Entity Too Large</title></head></html>",
+            "",
+            "{}",
+        ] {
+            let d = parse(body);
+            assert_eq!(d.kind(), TooLargeKind::Proxy, "{body}");
+            assert!(d.human().contains("reverse proxy"), "{body}");
+        }
+    }
+}

@@ -739,6 +739,22 @@ fn validate_folder(local_path: &Path, except_save_ids: &[&str]) -> Result<()> {
     }
     if let Ok((state, _)) = CliState::load_default() {
         if let Some(other) = conflicting_save(&state, local_path, except_save_ids) {
+            // A tracked folder INSIDE the one being added gets its own line.
+            // It is what a game with one folder per save leaves behind — a row
+            // per slot, tracked back when the parent was not on offer — and
+            // "one folder, one game" alone reads like a flat refusal there
+            // instead of the two-step it is: untrack the slots, add the folder
+            // that holds them.
+            if other.local_path != local_path
+                && crate::detection::path_is_inside(&other.local_path, local_path)
+            {
+                anyhow::bail!(
+                    "'{}' already tracks {}, which is inside this folder. \
+                     Untrack it first, then add this one.",
+                    other.game_slug,
+                    other.local_path.display()
+                );
+            }
             anyhow::bail!(
                 "'{}' already tracks {} — one folder, one game.",
                 other.game_slug,

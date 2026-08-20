@@ -1746,6 +1746,37 @@ mod tests {
         assert_eq!(shielded.len(), 1);
     }
 
+    /// Tracking the folder that holds one subfolder per save takes every save
+    /// under it, new ones included — the whole point of pointing Hoard at the
+    /// parent instead of filing each save by hand. Detection is what used to
+    /// stand in the way (see `detection::is_nest_of_save_dirs`); the walk never
+    /// did, and this pins that down so no future depth cap quietly breaks it.
+    #[test]
+    fn tracking_the_parent_takes_every_save_folder_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("Cyberpunk 2077");
+        for slot in ["AutoSave-0", "ManualSave-0", "QuickSave-0"] {
+            let dir = game.join(slot);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("sav.dat"), b"save").unwrap();
+            std::fs::write(dir.join("metadata.9.json"), b"{}").unwrap();
+        }
+
+        let files = walk_source(&game, &[]).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "AutoSave-0/metadata.9.json",
+                "AutoSave-0/sav.dat",
+                "ManualSave-0/metadata.9.json",
+                "ManualSave-0/sav.dat",
+                "QuickSave-0/metadata.9.json",
+                "QuickSave-0/sav.dat",
+            ]
+        );
+    }
+
     /// Un save de fichero suelto se sube aunque su nombre parezca config: el
     /// usuario apuntó a ese fichero, y eso pesa más que cualquier regla.
     #[test]

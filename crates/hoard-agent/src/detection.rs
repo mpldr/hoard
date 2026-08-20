@@ -1441,6 +1441,9 @@ fn merge_fs_hit_graded(
 ///      name matches [`SAVE_PATTERNS`]. Zero matches drops the hit so the
 ///      UI falls back to the amber "pick folder" alert; one or more matches
 ///      replace the hit with the matched subdirs.
+///    * Zero matches but the hit turns out to be a **folder with one
+///      subfolder per save** ([`is_nest_of_save_dirs`]) keeps the hit whole:
+///      there the catalog was already pointing at the right place.
 ///
 /// The read_dir in step 2 adds one IO per ambiguous hit but the work runs
 /// inside the same `FS_PARALLELISM` semaphore as the existing stat() pass,
@@ -1481,14 +1484,25 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
             }
             continue;
         }
-        if segment_matches_save_pattern(&hit) {
+        // Both "keep the hit whole" branches below are gated on this. A
+        // template that resolves to a whole profile root and *also* has "save"
+        // in its last segment — `…/Saved Games` on its own, and inside a Proton
+        // prefix especially, where `is_too_broad` alone is blind — was kept
+        // whole and offered as one game's folder. Refining into its
+        // subdirectories is still fine, and is what the rest of the loop does.
+        let keep_whole = !never_offer_whole(&hit);
+        if keep_whole && segment_matches_save_pattern(&hit) {
             if !refined.contains(&hit) {
                 refined.push(hit);
             }
             continue;
         }
         let subdirs_found = find_save_subdirs(&hit);
-        if subdirs_found.is_empty() && hit_name_suggests_saves(&hit) && !dir_is_empty(&hit) {
+        if keep_whole
+            && subdirs_found.is_empty()
+            && !dir_is_empty(&hit)
+            && (hit_name_suggests_saves(&hit) || is_nest_of_save_dirs(&hit))
+        {
             // El catálogo apuntó AQUÍ y el nombre de la carpeta lo dice
             // ("SavedArksLocal", "SaveData"), pero no es una de las grafías
             // exactas de `SAVE_PATTERNS` y dentro no hay ninguna subcarpeta
@@ -1502,6 +1516,14 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
             // Paradox, `.../Paradox Interactive/Stellaris` con `mod/` y
             // `settings/`) no lo cumple y sigue dando la alerta ámbar, que
             // es lo correcto — ahí no sabemos cuál de las subcarpetas es.
+            //
+            // The other shape kept whole is the NEST: the folder holds no
+            // saves of its own but one subfolder per save
+            // (`.../Cyberpunk 2077/AutoSave-0/sav.dat`). There is no ambiguity
+            // there either — everything inside belongs to the same game — and
+            // dropping it left the game with no path at all even though the
+            // catalog had pointed at exactly the right place. See
+            // [`is_nest_of_save_dirs`].
             if !refined.contains(&hit) {
                 refined.push(hit);
             }
@@ -2843,6 +2865,18 @@ pub fn discover_in_folder(
         if !is_root && dir_name_is_negative(&dir) {
             continue;
         }
+        // One subfolder per save inside (the Cyberpunk 2077 shape): the folder
+        // the user wants tracked is THIS one, not each of the ones inside.
+        // Pointing at it returned seventeen identical rows — one per save, all
+        // named the same — and none of them was the game's folder, so there was
+        // no way to back up the manual saves without filing each one by hand.
+        // Emitted whole, and the walk doesn't descend past it.
+        if is_nest_of_save_dirs(&dir) {
+            if !path_already_known(&dir, known_paths) {
+                push_attributed(&mut out, &dir, store);
+            }
+            continue;
+        }
         if holds_own_data(&dir) {
             if !path_already_known(&dir, known_paths) {
                 push_attributed(&mut out, &dir, store);
@@ -2931,6 +2965,126 @@ fn holds_own_data(dir: &Path) -> bool {
         }
     }
     files > 0 && images < files
+}
+
+/// `true` when the folder keeps its saves not in files of its own but in **one
+/// subfolder per save**: the Cyberpunk 2077 shape
+/// (`…/Cyberpunk 2077/AutoSave-0/sav.dat`, `…/ManualSave-3/sav.dat`), which a
+/// fair number of modern games share.
+///
+/// It exists because that shape slipped through all three paths at once and
+/// left the user with no way to reach the right folder by any of them. The
+/// catalog points straight at the game's folder, but [`find_save_subdirs`]
+/// recognises none of [`SAVE_PATTERNS`] inside it — `AutoSave-0` is not one of
+/// those spellings — so the hit was dropped whole and the game surfaced with
+/// no path. What was left were the loose folders phase 4 rescued one by one: a
+/// separate "game" per save, and only the ones the game had written to lately
+/// (the autosaves), never the manual ones. A player who saves by hand got a
+/// row per slot and had to re-point Hoard after every new save.
+///
+/// Deliberately conservative, because the expensive mistake is the opposite
+/// one — swallowing a whole install directory, or a container of SEVERAL
+/// games, as if it were one save — so every condition has to hold:
+///
+/// * the folder is one nobody may be handed whole ([`never_offer_whole`]:
+///   `Saved Games`, `Documents`, `AppData`, a Proton prefix…);
+/// * it holds **no data of its own**. A folder that does is not a nest, it is
+///   a folder with saves *and* other things in it — an install directory with
+///   `settings_game.cfg` next to `saves/`, say — and the existing paths grade
+///   that correctly already. Swallowing it whole would back up the game;
+/// * at least **two** subfolders hold data of their own
+///   ([`holds_own_data`]);
+/// * **every** subfolder that holds data is named like a save
+///   ([`name_is_save_slot`]). One foreign child with content — `mods`,
+///   `config` — and this stops being a nest: we no longer know what is what,
+///   and the amber "pick a folder" alert is a better answer than a guess;
+/// * and none of them is one of the exact [`SAVE_PATTERNS`] spellings. A child
+///   literally called `saves` means the folder is a *container of saves*, not
+///   one save — `…/common/Planet S` with `saves/` and `saves_migrated/` inside
+///   is an install directory, and the answer there is to descend into `saves`,
+///   which is what refinement and the walk already do. Found by sweeping this
+///   machine's real folders: 129,383 directories, and that install dir was one
+///   of the three the rule fired on.
+fn is_nest_of_save_dirs(dir: &Path) -> bool {
+    if never_offer_whole(dir) || holds_own_data(dir) {
+        return false;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut slots = 0usize;
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if is_skip_dir(name_str) {
+            continue;
+        }
+        if !holds_own_data(&entry.path()) {
+            continue;
+        }
+        if !name_is_save_slot(name_str) || name_matches_save_pattern(name_str) {
+            return false;
+        }
+        slots += 1;
+    }
+    slots >= 2
+}
+
+/// `true` when the name gives the folder away as ONE save inside the game's
+/// folder: `AutoSave-0`, `ManualSave-3`, `QuickSave`, `SaveGame01`, `slot1`,
+/// `profile2`.
+///
+/// Says nothing about a bare `saves` — that is a folder *of* saves, and the
+/// caller has to tell the two apart itself; see [`is_nest_of_save_dirs`].
+fn name_is_save_slot(name: &str) -> bool {
+    junkdirs::looks_like_save_dir_name(name) || name_matches_slot_profile_user(name)
+}
+
+/// A nest ([`is_nest_of_save_dirs`]) graded by the BEST of its children: the
+/// correlation that corroborates `…/Cyberpunk 2077/AutoSave-3` corroborates
+/// the game's folder, which is where the game was writing. Without this the
+/// nest would score as what the scoring sees — a folder without a single file
+/// in it — and phase 4's precision gate would drop it.
+///
+/// `None` when it isn't a nest, or when no child grades save-like: a nest of
+/// folders that aren't saves is not a finding.
+fn classify_nest_as_save_like(dir: &Path, store: &CorrelationStore) -> Option<DiscoveredSavePath> {
+    if !is_nest_of_save_dirs(dir) {
+        return None;
+    }
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<DiscoveredSavePath> = None;
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(graded) = classify_dir_as_save_like(&entry.path(), name_str, store) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|b| confidence_rank(graded.confidence) > confidence_rank(b.confidence))
+        {
+            best = Some(graded);
+        }
+    }
+    let best = best?;
+    Some(DiscoveredSavePath {
+        path: dir.to_path_buf(),
+        confidence: best.confidence,
+        reason: format!("one folder per save inside ({})", best.reason),
+    })
 }
 
 /// `true` si el nombre de la carpeta la delata como config/caché/logs/capturas
@@ -3050,17 +3204,27 @@ fn path_already_known(candidate: &Path, known: &HashSet<PathBuf>) -> bool {
 /// `c:\users\…\saved games` son la MISMA carpeta, y la ruta guardada en el
 /// state y la que sale del walk no siempre coinciden en caja.
 pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+    path_is_inside(a, b) || path_is_inside(b, a)
+}
+
+/// `true` when `inner` IS `outer` or hangs off it. The directed half of
+/// [`paths_overlap`], for when the useful answer isn't "they overlap" but
+/// **which one is inside which** — a save tracked inside the folder being
+/// added is not fixed the same way as one that contains it.
+///
+/// Case-insensitive on Windows, for the same reason as [`paths_overlap`].
+pub fn path_is_inside(inner: &Path, outer: &Path) -> bool {
     if cfg!(windows) {
         // `starts_with` compara por COMPONENTES, así que bajar la cadena
         // entera a minúsculas no altera la semántica (los separadores siguen
         // donde estaban).
-        let (a, b) = (
-            PathBuf::from(a.to_string_lossy().to_lowercase()),
-            PathBuf::from(b.to_string_lossy().to_lowercase()),
+        let (inner, outer) = (
+            PathBuf::from(inner.to_string_lossy().to_lowercase()),
+            PathBuf::from(outer.to_string_lossy().to_lowercase()),
         );
-        a.starts_with(&b) || b.starts_with(&a)
+        inner.starts_with(&outer)
     } else {
-        a.starts_with(b) || b.starts_with(a)
+        inner.starts_with(outer)
     }
 }
 
@@ -3246,6 +3410,19 @@ fn walk_root_collecting(
             if is_internal_or_trash(&path) {
                 continue;
             }
+            // A nest — one subfolder per save — is emitted whole and not
+            // descended into: otherwise every save of the same game entered the
+            // list as its own "game", and between them they ate the root's
+            // whole candidate budget.
+            if let Some(hit) = classify_nest_as_save_like(&path, store) {
+                if seen.insert(path.clone()) {
+                    out.push(hit);
+                    if out.len() - initial >= AGGRESSIVE_WALK_MAX_CANDIDATES {
+                        return;
+                    }
+                }
+                continue;
+            }
             if let Some(hit) = classify_dir_as_save_like(&path, name_str, store) {
                 if seen.insert(path.clone()) {
                     out.push(hit);
@@ -3292,6 +3469,26 @@ fn blocked_roots() -> &'static HashSet<PathBuf> {
 /// exactly right.
 fn is_too_broad(path: &Path) -> bool {
     blocked_roots().contains(path)
+}
+
+/// `true` when this folder must never be handed over as one game's save folder,
+/// whole.
+///
+/// Two guards, because each covers what the other cannot. [`is_too_broad`]
+/// compares against roots resolved for the running OS, so on Linux it knows
+/// nothing about the Windows-shaped profile inside a Proton prefix —
+/// `…/pfx/drive_c/users/steamuser/Saved Games` is not in its set, and that is
+/// where the Windows rules living inside `drive_c` have bitten before.
+/// [`junkdirs::dangerous_sync_root`] is structural: it reads the shape of the
+/// path, recognises a prefix by its tail, and applies the Windows rules from
+/// `drive_c` down.
+///
+/// The pair is what add-to-library and the backup already enforce, so anything
+/// detection offers past this point is something the rest of the app will
+/// accept — offering a folder that `hoard add` then refuses is a dead end the
+/// user has to work out on their own.
+fn never_offer_whole(dir: &Path) -> bool {
+    is_too_broad(dir) || crate::junkdirs::dangerous_sync_root(dir).is_some()
 }
 
 /// True if `path` lives inside Hoard's own state dir (conflict backups,
@@ -3604,6 +3801,207 @@ mod tests {
 
         let refined = refine_save_dir("game-root", vec![root]);
         assert!(refined.is_empty());
+    }
+
+    /// One folder per save inside the game's own: the Cyberpunk 2077 shape,
+    /// where the catalog points at `…/CD Projekt Red/Cyberpunk 2077` and there
+    /// is no `Saves/` inside to refine down to. The hit is kept whole — before,
+    /// the game was left with no path and all that showed up were the loose
+    /// autosaves phase 4 rescued one at a time.
+    fn cyberpunk_shaped(root: &Path) -> PathBuf {
+        let game = root.join("CD Projekt Red").join("Cyberpunk 2077");
+        for slot in [
+            "AutoSave-0",
+            "AutoSave-1",
+            "ManualSave-0",
+            "ManualSave-1",
+            "QuickSave-0",
+        ] {
+            let dir = game.join(slot);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("sav.dat"), b"save").unwrap();
+            std::fs::write(dir.join("metadata.9.json"), b"{}").unwrap();
+            std::fs::write(dir.join("screenshot.png"), b"png").unwrap();
+        }
+        game
+    }
+
+    #[test]
+    fn refine_save_dir_keeps_a_folder_of_per_save_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = cyberpunk_shaped(tmp.path());
+
+        let refined = refine_save_dir("cyberpunk-2077", vec![game.clone()]);
+        assert_eq!(refined, vec![game]);
+    }
+
+    /// The publisher's folder is NOT a nest: its child is the game's folder,
+    /// which holds no files of its own. Without that condition a
+    /// `CD Projekt Red/` with two games inside would be tracked as a single
+    /// save.
+    #[test]
+    fn a_publisher_folder_is_not_a_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = cyberpunk_shaped(tmp.path());
+        let publisher = game.parent().unwrap();
+
+        assert!(is_nest_of_save_dirs(&game));
+        assert!(!is_nest_of_save_dirs(publisher));
+    }
+
+    /// Inside a Proton prefix the Windows rules are the ones that apply, and
+    /// `is_too_broad` cannot see them: it holds the roots resolved for the
+    /// running OS, and on Linux `<winSavedGames>` expands to nothing. So a
+    /// prefix's own `Saved Games` — with a couple of slot-shaped folders in it,
+    /// which is all the nest test asks for — passed as one game's save folder.
+    /// The structural guard is what catches it, by the tail of the path.
+    #[test]
+    fn a_windows_root_inside_a_proton_prefix_is_not_a_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp
+            .path()
+            .join("SteamLibrary/steamapps/compatdata/1091500/pfx/drive_c/users/steamuser");
+
+        for root in ["Saved Games", "Documents", "AppData/LocalLow"] {
+            let dir = profile.join(root);
+            for slot in ["Save1", "Save2", "Save3"] {
+                let slot_dir = dir.join(slot);
+                std::fs::create_dir_all(&slot_dir).unwrap();
+                std::fs::write(slot_dir.join("game.sav"), b"save").unwrap();
+            }
+            assert!(
+                !is_nest_of_save_dirs(&dir),
+                "swallowed a whole {root} inside the prefix"
+            );
+            assert!(
+                !refine_save_dir("some-game", vec![dir.clone()]).contains(&dir),
+                "offered the whole {root} of the prefix as one game's folder"
+            );
+            // One level down IS a game's folder, and still qualifies.
+            let game = dir.join("Some Studio").join("Some Game");
+            for slot in ["Save1", "Save2"] {
+                let slot_dir = game.join(slot);
+                std::fs::create_dir_all(&slot_dir).unwrap();
+                std::fs::write(slot_dir.join("game.sav"), b"save").unwrap();
+            }
+            assert!(is_nest_of_save_dirs(&game), "{root}: lost the real nest");
+        }
+    }
+
+    /// A foreign child WITH content breaks the nest: mixed in with mods we no
+    /// longer know what is a save, and the amber alert beats swallowing the
+    /// whole folder.
+    #[test]
+    fn a_foreign_data_child_disqualifies_the_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = cyberpunk_shaped(tmp.path());
+        assert!(is_nest_of_save_dirs(&game));
+
+        let mods = game.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("cyberware.archive"), b"mod").unwrap();
+
+        assert!(!is_nest_of_save_dirs(&game));
+        assert!(refine_save_dir("cyberpunk-2077", vec![game]).is_empty());
+    }
+
+    /// Pointing at the game's folder returns ONE row — the folder — and not
+    /// one per save. This is the flow a user reaches for when detection misses,
+    /// and it used to return seventeen identical "Cyberpunk 2077" rows.
+    #[test]
+    fn scanning_a_nest_offers_the_folder_itself_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = cyberpunk_shaped(tmp.path());
+        let store = CorrelationStore::default();
+
+        let found = discover_in_folder(&game, &store, &HashSet::new());
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].path, game);
+
+        // And from the publisher's container, the same: one row, the game's
+        // folder — not five save folders.
+        let from_above = discover_in_folder(game.parent().unwrap(), &store, &HashSet::new());
+        assert_eq!(from_above.len(), 1, "{from_above:#?}");
+        assert_eq!(from_above[0].path, game);
+    }
+
+    /// The phase 4 sweep emits the nest, not each loose save: the correlation
+    /// that corroborates a child corroborates the game's folder. Without this
+    /// the Library filled up with a row per autosave — all under the same name
+    /// — and between them they ate the root's candidate budget.
+    #[test]
+    fn phase_four_surfaces_the_nest_and_not_its_slots() {
+        with_isolated_home(|home| {
+            let game = cyberpunk_shaped(&home.join("xdg-data"));
+
+            let mut store = CorrelationStore::default();
+            store.record(
+                &game.join("AutoSave-1"),
+                &[crate::correlation::GameProcess {
+                    name: "cyberpunk2077.exe".into(),
+                    exe: None,
+                }],
+            );
+
+            let found = discover_unattributed(Os::Linux, &store, &HashSet::new());
+            assert!(
+                found.iter().any(|a| a.path == game),
+                "the game's folder must surface: {found:#?}"
+            );
+            assert!(
+                !found
+                    .iter()
+                    .any(|a| a.path.starts_with(&game) && a.path != game),
+                "no loose save may surface on its own: {found:#?}"
+            );
+        });
+    }
+
+    /// An install directory is not a nest. Found by running the rule over this
+    /// machine's real folders: a Steam install with `saves/` and
+    /// `saves_migrated/` inside qualified, so the aggressive walk stopped there
+    /// and offered the game's whole installation instead of descending into
+    /// `saves` the way it did before. Two things rule it out, and either alone
+    /// is enough: the folder holds a file of its own, and one of its children
+    /// is called `saves` — a container of saves, not one save.
+    #[test]
+    fn an_install_dir_with_a_saves_folder_is_not_a_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("steamapps/common/Planet S");
+        for sub in ["saves", "saves_migrated"] {
+            let dir = install.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("world.sav"), b"save").unwrap();
+        }
+        std::fs::write(install.join("settings_game.cfg"), b"cfg").unwrap();
+        assert!(!is_nest_of_save_dirs(&install));
+
+        // Still not one with the loose file gone: `saves` names a folder OF
+        // saves, and descending into it is the right answer.
+        std::fs::remove_file(install.join("settings_game.cfg")).unwrap();
+        assert!(!is_nest_of_save_dirs(&install));
+
+        // And the walk goes back to offering the save folder, not the install.
+        let store = CorrelationStore::default();
+        let found = discover_in_folder(&install, &store, &HashSet::new());
+        assert!(
+            found.iter().any(|f| f.path == install.join("saves")),
+            "lost the real save folder: {found:#?}"
+        );
+    }
+
+    /// The parent of a nest holds nothing of its own — that is what makes
+    /// everything inside it a save. A folder that holds data *and* has
+    /// save-named subfolders is something else, and the ordinary grading
+    /// already handles it.
+    #[test]
+    fn a_folder_with_files_of_its_own_is_not_a_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = cyberpunk_shaped(tmp.path());
+        assert!(is_nest_of_save_dirs(&game));
+
+        std::fs::write(game.join("graphics.ini"), b"[video]").unwrap();
+        assert!(!is_nest_of_save_dirs(&game));
     }
 
     /// Two save-named subdirs (rare, but happens when a game splits cloud

@@ -29,6 +29,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   works too, and it is traded for a session instead of being kept in the
   browser. New: `hoard-admin user passwd`, and `user promote` / `user demote`
   for the admin flag, which until now needed an UPDATE by hand in SQLite.
+- **The account page finally shows your own server.** Running your own box
+  meant a permanent "Sign in" in the sidebar — an invitation to join the
+  service you had deliberately not joined — while your backups were reaching
+  your own disk perfectly well, and the page behind it pitched Pro instead of
+  showing the server you were actually signed in to. It now renders that
+  session: the address it points at, its uptime, the disk in use, and the
+  three limits the operator sets. Those limits had no way of reaching the
+  client at all — the only way to learn `storage.max_snapshot_size_mb` existed
+  was for a backup to bounce off it with a 413. They travel on `whoami` and
+  not on `/v1/health`, because an operator's ceiling is nobody's business
+  until they authenticate, and a server too old to report one shows a dash
+  rather than a zero. Raising a limit and restarting shows up on the next
+  poll. Cloud still wins when both sessions exist, and the self-hosted card
+  stays in Settings for that case.
+- **A game that keeps one folder per save can be tracked by the folder that
+  holds them.** Cyberpunk 2077 writes `AutoSave-0/sav.dat`,
+  `ManualSave-3/sav.dat` — no save files of its own, one subfolder per slot —
+  and that shape slipped through all three detection paths at once. The
+  catalog pointed straight at the game's folder and it was dropped whole,
+  because none of the subfolders inside is spelled like a save directory;
+  what was left were the loose folders rescued one by one, a separate "game"
+  per slot, and only the ones the game had written to lately, so the manual
+  saves could not be backed up at all. The nest is recognised now and kept
+  whole, on all three paths. It is deliberately conservative — at least two
+  subfolders holding data, every one of them named like a save slot, never a
+  profile or system root — because swallowing a container of several games is
+  the expensive mistake. And when slots from before are still tracked one by
+  one, adding the parent names them instead of refusing flatly.
+
+### Fixed
+- **"Back up now" with nothing changed did nothing at all.** The button went
+  through the same two gates the watcher does — cheap signature, then content
+  hash — and both said the bytes match the last autosave, so the engine
+  skipped it: no version, no error, nothing on screen, just an INFO line in a
+  log nobody opens. Those gates exist to stop a watcher re-cutting identical
+  snapshots on a timer, and that is not what a person pressing a button is
+  doing: a deliberate copy is a marker placed on purpose — right here, before
+  the boss — and whether it happens to be byte-identical to the last automatic
+  one is beside the point. It costs no transfer, because storage is
+  content-addressed and the blobs are already up there. The safety copy taken
+  before a restore counts as deliberate too; skipping that one is worse, since
+  it is what lets you undo a restore you didn't want. The notification answers
+  a button press even with "notify on success" off, which was meant to silence
+  the engine narrating every autosave, never to ignore you when you press a
+  button.
+- **A game that rewrites its autosave every few seconds no longer eats its own
+  history.** Without a preset there was no minimum interval at all, so every
+  rewrite became a cloud version: one save reached 2,233 versions in a day,
+  1,027 uploads in four and a half hours, and a history meant to let you go
+  back a week held about four. A fixed floor for everyone was tried before and
+  had to be reverted — it was invisible, and it read as "Hoard isn't picking
+  up my changes" — so this one only appears once the save itself proves it
+  needs it: three commits inside ten minutes, one single step of 60 s, and the
+  count reopens from zero as soon as the burst stops, so the floor lasts
+  exactly as long as the burst does. An explicit interval always wins:
+  `short_session`'s 30 s belongs to a game that wipes its folder between
+  rounds, where losing one copy is losing the run, and `data_saver`'s 600 s is
+  someone paying for bandwidth.
+- **The save folder is looked for by name before the install directory gets
+  walked.** The order was backwards. A game whose catalogue path didn't
+  resolve went straight to the aggressive walk of its installation, and that
+  walk is good at finding *a* folder that looks like saves — so it confidently
+  offered a directory inside the installation (3.6 GB of game data, in the
+  case that exposed this) while the real save folder sat one `read_dir` away
+  in LocalLow. The standard save roots are checked by name first now, and the
+  walk is only the fallback. It also runs for games with neither an install
+  directory nor a Wine prefix, which used to be dropped before anything was
+  looked at — that is every game that doesn't come from Steam.
+- **A refused upload now names who refused it, and quotes a number that
+  exists.** Every client surface read a 413 as "upgrade to Pro", so a
+  self-hoster who hit their own `storage.max_snapshot_size_mb` was told to buy
+  a plan for a service they had chosen not to use, and the sentence quoted a
+  limit of 0 B — the plan cap it was reading does not exist on their server.
+  There are three possible refusers and three different places to go and fix
+  it: the plan, the operator's `config.toml`, or a reverse proxy in front of
+  the server that Hoard has no say over at all. The size was wrong too, in a
+  way that read as precision: a rejection at `cas_init` happens before a
+  single byte has moved, and it was announcing "3.6 GB sent before it
+  stopped". Bytes received and bytes declared are separate fields now, and a
+  413 that arrives before any transmission mentions no bytes at all.
+- **A server URL written with credentials made login impossible.**
+  `http://insider@ubserver:12421` is how people write an address they also
+  reach over ssh. Nothing in this API uses HTTP Basic — the access key is a
+  bearer token — but the HTTP client turns URL credentials into a `basic_auth`
+  call on every request it builds, and headers append rather than replace, so
+  each request went out with two `Authorization` headers: Basic first, then
+  ours. The server read the first, found no bearer token, and answered 401;
+  the client then blamed the one thing that was fine, "token rejected by
+  server (401)". The credentials are stripped rather than rejected — an
+  ssh-shaped address is a habit, not a mistake worth an error — and it happens
+  at every door, so a URL already sitting in a config from before this gets
+  cleaned on the way out too.
+- **The two commands printed after you create a token now run.** `hoard config
+  set server <url>` errors out — the key is `server.url` — and joining the two
+  halves with `&&` is a parse error in Windows PowerShell, so the login half
+  never ran either. Two lines, one command each, and the real key name.
+  `hoard-admin token revoke` also says which prefix it wants now: the one in
+  the `Prefix` column of `token list`, which is the start of the token's hash,
+  not of the token itself, because the plaintext is never stored.
 
 ## [1.1.3] - 2026-08-16
 

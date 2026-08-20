@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-08-20
+
 ### Added
 - **A web panel for your own server.** Point a browser at your server and it
   answers: every game, save and version with its real size, what deduplication
@@ -16,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   users and quotas, and the diagnostic logs the clients upload. It ships inside
   the binary — nothing to deploy, no build step — translated into the same eight
   languages as the app, and it can be turned off with `[panel] enabled = false`.
+  Five wrong passwords shut that account's door, twenty from one origin shut it
+  for every account, and both counters key on the address the request actually
+  came from: `X-Forwarded-For` is believed only from a peer listed in the new
+  `server.trusted_proxies` (default `loopback`, which covers a reverse proxy on
+  the same machine — name your proxy's address there if it reaches the server
+  from a container or another box, and the server prints what it trusts at
+  startup). Without that the counters would be decoration, since anyone can
+  write that header and a fresh value means a fresh counter.
   It also shows the trash: a deleted version stays listed, struck through, with
   the way back one click away — the server has always kept those bytes for
   thirty days and the CLI could already undelete, but nothing said so where you
@@ -52,11 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   what was left were the loose folders rescued one by one, a separate "game"
   per slot, and only the ones the game had written to lately, so the manual
   saves could not be backed up at all. The nest is recognised now and kept
-  whole, on all three paths. It is deliberately conservative — at least two
-  subfolders holding data, every one of them named like a save slot, never a
-  profile or system root — because swallowing a container of several games is
-  the expensive mistake. And when slots from before are still tracked one by
-  one, adding the parent names them instead of refusing flatly.
+  whole, on all three paths. It is deliberately conservative, because the
+  expensive mistake is the opposite one — swallowing an install directory, or a
+  container of several games, as if it were one save. So: at least two
+  subfolders holding data, every one of them named like a save slot, none of
+  them spelled exactly like a save directory (a child called `saves` means the
+  folder is a container of saves and the answer is to go into it), no files of
+  its own alongside them, and never a profile root, a system folder or a whole
+  Proton prefix — checked structurally, so the Windows rules that live under
+  `drive_c` are seen on Linux too. Run over 129,383 real directories on a
+  development machine before shipping, which is how the install-directory case
+  turned up. And when slots from before are still tracked one by one, adding
+  the parent names them instead of refusing flatly.
 
 ### Fixed
 - **"Back up now" with nothing changed did nothing at all.** The button went
@@ -86,7 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exactly as long as the burst does. An explicit interval always wins:
   `short_session`'s 30 s belongs to a game that wipes its folder between
   rounds, where losing one copy is losing the run, and `data_saver`'s 600 s is
-  someone paying for bandwidth.
+  someone paying for bandwidth. And it says so while it waits: the deadline
+  goes into the "next copy in" the overlay and the diagnostics already show,
+  and the activity feed gets one "queued, waiting" row per wait rather than one
+  per tick. Invisible waiting is exactly what earned the first floor its
+  reversal.
 - **The save folder is looked for by name before the install directory gets
   walked.** The order was backwards. A game whose catalogue path didn't
   resolve went straight to the aggressive walk of its installation, and that

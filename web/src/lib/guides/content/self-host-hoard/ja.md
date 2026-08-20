@@ -25,20 +25,20 @@ Hoard はオープンソースでセルフホスト可能です。Hoard Cloud �
 
 ## Docker Compose でインストール
 
-リポジトリをクローンし、サンプルから設定を作成して `public_url` を設定し、スタックを起動します。
+リポジトリをクローンし、サンプルから設定を作成して、スタックを起動します。
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-サーバーが待ち受け状態になったとログに表示されるまで待ちます。データは名前付き Docker ボリューム（`hoard-data`）に保存されるので、他のボリュームと同様にバックアップしてください。コンテナは内部でポート `8080` を待ち受けます。別のホストポートを使うには `HOARD_PORT=9000 docker compose up -d` とします。
+サーバーが待ち受け状態になったとログに表示されるまで待ちます。データは名前付き Docker ボリューム（`hoard-data`）に保存されるので、他のボリュームと同様にバックアップしてください。コンテナは内部でポート `12421` を待ち受けます。別のホストポートを使うには `HOARD_PORT=9000 docker compose up -d` とします。
 
 ## ユーザーと端末トークンを作成
 
@@ -59,7 +59,7 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml \
 
 ## 本番運用
 
-ローカルネットワークを越えて公開する場合は、リバースプロキシ（Caddy、nginx、Traefik）で TLS を終端し、`public_url` を実際の HTTPS アドレスに設定します。ベアメタルがよい場合は、リポジトリに `systemd` インストールスクリプトと、進行中の同期を止めずにバイナリをアトミックに入れ替える `hoard-server upgrade` コマンドも含まれています。
+ローカルネットワークを越えて公開する場合は、リバースプロキシ（Caddy、nginx、Traefik）で TLS を終端します。ベアメタルがよい場合は、リポジトリに `systemd` インストールスクリプトと、進行中の同期を止めずにバイナリをアトミックに入れ替える `hoard-server upgrade` コマンドも含まれています。
 
 ## セルフホストと Hoard Cloud のどちら？
 

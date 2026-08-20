@@ -2,6 +2,7 @@ pub mod auth;
 pub mod blobs;
 pub mod chunking;
 pub mod cleanup;
+pub mod clientip;
 pub mod config;
 pub mod db;
 pub mod ratelimit;

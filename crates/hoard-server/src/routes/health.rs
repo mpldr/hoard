@@ -17,6 +17,11 @@ pub struct ServerState {
     /// event. Empty/unused on the cloud deployment (Supabase Realtime does the
     /// equivalent). See [`crate::routes::events`].
     pub events: crate::routes::events::EventBus,
+    /// Peers whose `X-Forwarded-For` this server believes, resolved from
+    /// `server.trusted_proxies` at boot so a request never re-parses config —
+    /// and so a typo is reported once, on startup, instead of silently
+    /// trusting nobody. See [`crate::clientip`].
+    pub trusted_proxies: crate::clientip::TrustedProxies,
 }
 
 /// Build the body. `log_min_level` is always `"debug"` self-hosted (it keeps

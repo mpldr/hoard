@@ -25,20 +25,20 @@ Hoard 是开源且可自托管的。你可以不使用 Hoard Cloud，而是在�
 
 ## 用 Docker Compose 安装
 
-克隆仓库，从示例创建配置，设置 `public_url`，然后启动整套服务：
+克隆仓库，从示例创建配置，然后启动整套服务：
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-等待日志显示服务器正在监听。数据保存在一个命名的 Docker 卷（`hoard-data`）中——像备份其他卷一样备份它。容器内部监听 `8080` 端口；用 `HOARD_PORT=9000 docker compose up -d` 可映射到其他主机端口。
+等待日志显示服务器正在监听。数据保存在一个命名的 Docker 卷（`hoard-data`）中——像备份其他卷一样备份它。容器内部监听 `12421` 端口；用 `HOARD_PORT=9000 docker compose up -d` 可映射到其他主机端口。
 
 ## 创建用户和设备令牌
 
@@ -59,7 +59,7 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml \
 
 ## 在生产环境中运行
 
-对于任何暴露到本地网络之外的部署，请在反向代理（Caddy、nginx 或 Traefik）上终止 TLS，并把 `public_url` 设为你真实的 HTTPS 地址。更喜欢裸机部署？仓库还提供了 `systemd` 安装脚本，以及一个 `hoard-server upgrade` 命令，它会原子地替换二进制文件而不会中断正在进行的同步。
+对于任何暴露到本地网络之外的部署，请在反向代理（Caddy、nginx 或 Traefik）上终止 TLS。更喜欢裸机部署？仓库还提供了 `systemd` 安装脚本，以及一个 `hoard-server upgrade` 命令，它会原子地替换二进制文件而不会中断正在进行的同步。
 
 ## 自托管还是 Hoard Cloud？
 

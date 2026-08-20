@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en" data-locale="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Hoard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23050706'/%3E%3Crect x='9' y='9' width='14' height='46' rx='6' fill='%2334d399'/%3E%3Crect x='41' y='9' width='14' height='46' rx='6' fill='%2334d399'/%3E%3Crect x='9' y='25' width='46' height='14' rx='5' fill='%2334d399'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/panel/panel.css">
+<script src="/panel/panel.js" defer></script>
+</head>
+<body>
+
+<!-- The mark is inlined once and referenced with <use> so the header and the
+     login screen can't drift apart. -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="mark" viewBox="0 0 64 64">
+    <rect x="9" y="9" width="14" height="46" rx="6"/>
+    <rect x="41" y="9" width="14" height="46" rx="6"/>
+    <rect x="9" y="25" width="46" height="14" rx="5"/>
+  </symbol>
+  <symbol id="eye" viewBox="0 0 24 24">
+    <path d="M1.8 12S5.4 5.5 12 5.5 22.2 12 22.2 12 18.6 18.5 12 18.5 1.8 12 1.8 12Z"
+          fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+    <circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.7"/>
+  </symbol>
+  <symbol id="eye-off" viewBox="0 0 24 24">
+    <path d="M3.5 6.4C2.3 7.7 1.8 12 1.8 12S5.4 18.5 12 18.5c1.9 0 3.5-.5 4.9-1.3M20 15.4c1.5-1.6 2.2-3.4 2.2-3.4S18.6 5.5 12 5.5c-1 0-1.9.1-2.7.4"
+          fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    <path d="M9.9 9.9a3.1 3.1 0 0 0 4.3 4.3" fill="none" stroke="currentColor" stroke-width="1.7"/>
+    <path d="M3 3l18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+  </symbol>
+</svg>
+
+<main id="gate" class="gate" hidden>
+  <div class="gate-inner">
+    <svg class="mark mark-lg" aria-hidden="true"><use href="#mark"></use></svg>
+    <h1 class="gate-title">Hoard</h1>
+    <p class="gate-sub" data-i18n="gate.subtitle"></p>
+
+    <form id="login-form" autocomplete="on">
+      <label class="field">
+        <span data-i18n="gate.username"></span>
+        <input id="f-username" name="username" type="text" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span data-i18n="gate.password"></span>
+        <span class="pw">
+        <input id="f-password" name="password" type="password" autocomplete="current-password" required>
+        <button class="reveal" type="button" data-reveal="f-password" data-i18n-label="a11y.show_password"><svg aria-hidden="true"><use href="#eye"></use></svg></button>
+      </span>
+      </label>
+      <button id="f-submit" class="primary" type="submit" data-i18n="gate.enter"></button>
+    </form>
+
+    <form id="token-form" hidden>
+      <label class="field">
+        <span data-i18n="gate.token"></span>
+        <span class="pw">
+        <input id="f-token" type="password" spellcheck="false" autocomplete="off"
+               data-i18n-placeholder="gate.token_placeholder" required>
+        <button class="reveal" type="button" data-reveal="f-token" data-i18n-label="a11y.show_password"><svg aria-hidden="true"><use href="#eye"></use></svg></button>
+      </span>
+      </label>
+      <p class="hint" data-i18n="gate.token_hint"></p>
+      <button id="t-submit" class="primary" type="submit" data-i18n="gate.enter"></button>
+    </form>
+
+    <p id="gate-error" class="error" role="alert" hidden></p>
+
+    <div class="gate-foot">
+      <button id="toggle-mode" class="link" type="button" data-i18n="gate.use_token"></button>
+      <select id="gate-locale" class="locale" data-i18n-label="a11y.language"></select>
+    </div>
+  </div>
+</main>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" aria-hidden="true"><use href="#mark"></use></svg>
+      <span class="wordmark">Hoard</span>
+      <span id="server-version" class="version"></span>
+    </div>
+    <div class="who">
+      <span id="who-name"></span>
+      <span id="who-admin" class="badge" data-i18n="common.admin" hidden></span>
+      <select id="app-locale" class="locale" data-i18n-label="a11y.language"></select>
+      <button id="btn-password" class="link" type="button" data-i18n="account.password"></button>
+      <button id="btn-logout" class="link" type="button" data-i18n="account.logout"></button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab" data-tab="summary" data-i18n="tab.summary"></button>
+    <button class="tab" data-tab="saves" data-i18n="tab.saves"></button>
+    <button class="tab" data-tab="devices" data-i18n="tab.devices"></button>
+    <button class="tab" data-tab="activity" data-i18n="tab.activity"></button>
+    <button class="tab admin-only" data-tab="server" data-i18n="tab.server" hidden></button>
+    <button class="tab admin-only" data-tab="users" data-i18n="tab.users" hidden></button>
+    <button class="tab admin-only" data-tab="logs" data-i18n="tab.logs" hidden></button>
+  </nav>
+
+  <main class="sheet">
+    <section id="panel-summary" class="panel" hidden>
+      <div id="summary-stats" class="stats"></div>
+      <section class="block">
+        <h2 data-i18n="summary.playtime"></h2>
+        <div id="playtime-strip" class="strip"></div>
+        <p id="playtime-caption" class="caption"></p>
+      </section>
+      <section class="block">
+        <h2 data-i18n="summary.games"></h2>
+        <div id="summary-games"></div>
+      </section>
+      <section class="block">
+        <h2 data-i18n="summary.recent"></h2>
+        <div id="summary-activity"></div>
+      </section>
+    </section>
+
+    <section id="panel-saves" class="panel" hidden>
+      <div class="block">
+        <h2 data-i18n="saves.title"></h2>
+        <p class="caption" data-i18n="saves.caption"></p>
+        <div id="saves-list"></div>
+      </div>
+      <div class="block">
+        <h2 data-i18n="saves.limits"></h2>
+        <p class="caption" data-i18n="saves.limits_caption"></p>
+        <div class="limits">
+          <label class="field inline">
+            <span data-i18n="saves.limit_auto"></span>
+            <input id="f-max-versions" type="number" min="1" step="1"
+                   data-i18n-placeholder="saves.unlimited">
+          </label>
+          <label class="field inline">
+            <span data-i18n="saves.limit_manual"></span>
+            <input id="f-max-manual" type="number" min="1" step="1"
+                   data-i18n-placeholder="saves.unlimited">
+          </label>
+          <button id="btn-limits" class="primary" type="button" data-i18n="common.apply"></button>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-devices" class="panel" hidden>
+      <div class="block">
+        <h2 data-i18n="devices.title"></h2>
+        <p class="caption" data-i18n="devices.caption"></p>
+        <div id="devices-list"></div>
+      </div>
+    </section>
+
+    <section id="panel-activity" class="panel" hidden>
+      <div class="block">
+        <h2 data-i18n="activity.title"></h2>
+        <p class="caption" data-i18n="activity.caption"></p>
+        <div id="activity-list"></div>
+      </div>
+    </section>
+
+    <section id="panel-server" class="panel" hidden>
+      <div id="server-stats" class="stats"></div>
+      <section class="block">
+        <h2 data-i18n="server.storage"></h2>
+        <div id="server-storage"></div>
+      </section>
+      <section class="block">
+        <h2 data-i18n="server.policy"></h2>
+        <div id="server-policy"></div>
+      </section>
+    </section>
+
+    <section id="panel-users" class="panel" hidden>
+      <div class="block">
+        <h2 data-i18n="users.title"></h2>
+        <p class="caption" data-i18n="users.caption"></p>
+        <div id="users-list"></div>
+      </div>
+      <div class="block">
+        <h2 data-i18n="users.tokens"></h2>
+        <p class="caption" data-i18n="users.tokens_caption"></p>
+        <div id="tokens-list"></div>
+      </div>
+    </section>
+
+    <section id="panel-logs" class="panel" hidden>
+      <div class="block">
+        <h2 data-i18n="logs.title"></h2>
+        <p class="caption" data-i18n="logs.caption"></p>
+        <div class="filters">
+          <select id="f-log-level"></select>
+          <input id="f-log-search" type="search" data-i18n-placeholder="logs.search">
+          <button id="btn-logs" class="ghost" type="button" data-i18n="common.refresh"></button>
+        </div>
+        <div id="logs-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span id="foot-note"></span>
+    <button id="btn-refresh" class="link" type="button" data-i18n="common.refresh"></button>
+  </footer>
+</div>
+
+<dialog id="dlg-password">
+  <form id="password-form">
+    <h2 data-i18n="account.password"></h2>
+    <label class="field">
+      <span data-i18n="account.current"></span>
+      <span class="pw">
+        <input id="f-current" type="password" autocomplete="current-password" required>
+        <button class="reveal" type="button" data-reveal="f-current" data-i18n-label="a11y.show_password"><svg aria-hidden="true"><use href="#eye"></use></svg></button>
+      </span>
+    </label>
+    <label class="field">
+      <span data-i18n="account.new"></span>
+      <span class="pw">
+        <input id="f-new" type="password" autocomplete="new-password" minlength="8" required>
+        <button class="reveal" type="button" data-reveal="f-new" data-i18n-label="a11y.show_password"><svg aria-hidden="true"><use href="#eye"></use></svg></button>
+      </span>
+    </label>
+    <p class="hint" data-i18n="account.password_hint"></p>
+    <p id="password-error" class="error" role="alert" hidden></p>
+    <menu>
+      <button id="password-cancel" class="ghost" type="button" data-i18n="common.cancel"></button>
+      <button id="password-ok" class="primary" type="submit" data-i18n="common.save"></button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-confirm">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <menu>
+      <button value="cancel" class="ghost" type="submit" data-i18n="common.cancel"></button>
+      <button id="confirm-ok" value="ok" class="danger" type="submit"></button>
+    </menu>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+</body>
+</html>

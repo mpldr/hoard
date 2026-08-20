@@ -32,13 +32,26 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// Cookie the panel's browser session travels in.
+///
+/// Its value is a plain `api_tokens` row, so everything that already governs a
+/// token governs a browser session too: expiry, `revoked_at`, and
+/// `hoard-admin token list/revoke`. That is why the middleware below needs no
+/// second code path — it looks the cookie up exactly like a Bearer header.
+///
+/// The cookie is minted `SameSite=Strict`, which is what stands in for a CSRF
+/// token: a POST from another origin arrives without it and lands on the
+/// `unauthorized()` branch. Anything mounted here that mutates state depends on
+/// that flag, so don't relax it to `Lax` for a nicer cross-site link.
+pub const SESSION_COOKIE: &str = "hoard_session";
+
 /// Axum middleware: extract Bearer token, validate against DB, inject AuthUser.
 pub async fn require_auth(
     State(pool): State<SqlitePool>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let token = match extract_bearer(&req) {
+    let token = match extract_token(&req) {
         Some(t) => t,
         None => return unauthorized(),
     };
@@ -104,7 +117,66 @@ pub async fn require_auth(
     next.run(req).await
 }
 
+/// A request authenticates with a Bearer header (every client) or with the
+/// panel's session cookie (browsers only). Header first: a client that sends
+/// both is doing so deliberately.
+fn extract_token(req: &Request) -> Option<String> {
+    extract_bearer(req).or_else(|| extract_cookie(req, SESSION_COOKIE))
+}
+
 fn extract_bearer(req: &Request) -> Option<String> {
     let val = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
     val.strip_prefix("Bearer ").map(|s| s.trim().to_string())
+}
+
+/// Pull one cookie out of the `Cookie` header. Hand-rolled instead of pulling
+/// in a cookie crate because we need exactly one name out of a
+/// `; `-separated list — the RFC 6265 machinery worth a dependency (domains,
+/// expiry, the secure flag) all lives on the browser's side of the wire.
+fn extract_cookie(req: &Request, name: &str) -> Option<String> {
+    let raw = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.trim() == name)
+        .map(|(_, v)| v.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request as HttpRequest;
+
+    fn with_cookie(raw: &str) -> Request {
+        HttpRequest::builder()
+            .header(header::COOKIE, raw)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn session_cookie_is_found_among_others() {
+        let req = with_cookie("theme=dark; hoard_session=hoard_v1_abc; lang=es");
+        assert_eq!(
+            extract_cookie(&req, SESSION_COOKIE).as_deref(),
+            Some("hoard_v1_abc")
+        );
+    }
+
+    /// A name that merely *ends* with ours must not match, or a cookie set by
+    /// something else sharing the host could stand in for a session.
+    #[test]
+    fn cookie_names_match_whole() {
+        let req = with_cookie("not_hoard_session=evil");
+        assert!(extract_cookie(&req, SESSION_COOKIE).is_none());
+    }
+
+    #[test]
+    fn bearer_wins_over_cookie() {
+        let req = HttpRequest::builder()
+            .header(header::AUTHORIZATION, "Bearer hoard_v1_header")
+            .header(header::COOKIE, "hoard_session=hoard_v1_cookie")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req).as_deref(), Some("hoard_v1_header"));
+    }
 }

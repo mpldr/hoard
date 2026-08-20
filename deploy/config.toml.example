@@ -10,7 +10,9 @@ host = "0.0.0.0"
 # won't clash with anything you're already running (and below the ephemeral
 # range, so it's safe to bind). Change it only if you must.
 port = 12421
-# Public URL for CORS and self-referencing links.
+# Public URL. The key is required by the config schema, but in self-hosted
+# mode the value is never read — only Hoard Cloud deployments use it (for
+# self-referencing links). Leave it as-is; no need to touch it.
 public_url = "https://hoard.example.com"
 # Allow admins to trigger a self-upgrade from the desktop app via
 # POST /v1/admin/upgrade. The request only drops a marker file; a root
@@ -18,11 +20,30 @@ public_url = "https://hoard.example.com"
 # restart (see ADR 0017). Set to false to disable the remote path entirely.
 allow_remote_upgrade = true
 
+# Whose X-Forwarded-For this server believes. Anyone who can reach the port can
+# write that header, so it is only read when the connection itself comes from
+# one of these; from anybody else the connection's own address is used.
+#
+# Leave it alone if the server is exposed directly, or if your reverse proxy
+# runs on the same machine and connects over 127.0.0.1 (the default covers
+# that). Add your proxy's address if it reaches the server from somewhere else
+# — a container on a Docker network, another box on the LAN — or every client
+# behind it counts as one for the panel's login throttle.
+#
+# Accepts addresses, CIDRs, and the shorthands "loopback", "private" (RFC 1918
+# + CGNAT + IPv6 ULA) and "any" (believe everyone; only for a proxy whose
+# address you cannot pin down). An empty list believes nobody.
+trusted_proxies = ["loopback"]
+# e.g. behind a proxy container on the default Docker bridge network:
+# trusted_proxies = ["loopback", "172.16.0.0/12"]
+
 # Per-IP request rate limiting (token bucket). This is an in-process safety
 # net against accidental request loops and cheap brute force; a production
-# deployment should ALSO rate-limit at the reverse proxy. Behind a proxy the
-# client IP is read from X-Forwarded-For / X-Real-Ip / Forwarded, falling back
-# to the connection peer. Omit this table to keep the defaults below.
+# deployment should ALSO rate-limit at the reverse proxy. Note this limiter
+# still keys off X-Forwarded-For / X-Real-Ip / Forwarded regardless of
+# `trusted_proxies` above, falling back to the connection peer — it is a guard
+# against runaway clients, not against someone deliberately evading it. Omit
+# this table to keep the defaults below.
 [server.rate_limit]
 # Master switch. Set to false to disable entirely.
 enabled = true
@@ -90,6 +111,25 @@ max_connections = 10
 token_lifetime_days = 365
 # Set to false after creating the admin account to prevent open registration.
 allow_registration = true
+
+# Web panel served from this same port at /panel: your saves, versions,
+# machines and activity in a browser, plus a server section for admins.
+# Signing in uses the password from `hoard-admin user create` (or a
+# hoard_v1_ token). Setting enabled = false removes the panel pages AND the
+# password login with them, leaving token-only API access.
+[panel]
+enabled = true
+# How long a browser session lasts. Short on purpose: it is as powerful as a
+# device token, and a browser is a shared, long-lived place.
+session_days = 14
+# Seconds the login door stays shut after five wrong passwords for the same
+# account. Minimum 2 — anything lower is read as 2, because with no pause at
+# all each guess costs the server a full password hash and costs whoever is
+# guessing a single request. Ten is short for a login form and right for a box
+# on your own network: enough that the hashing can't be used as a CPU lever,
+# little enough that fumbling your own password doesn't lock you out. Raise it
+# towards a minute if you expose the panel to the open internet.
+login_throttle_secs = 10
 
 [retention]
 # Days to keep soft-deleted snapshots in trash before permanent deletion.

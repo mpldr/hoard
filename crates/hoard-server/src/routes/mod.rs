@@ -18,8 +18,11 @@ pub mod events;
 pub mod games;
 pub mod health;
 pub mod logs;
+pub mod overview;
+pub mod panel;
 pub mod playtime;
 pub mod saves;
+pub mod session;
 pub mod snapshots;
 
 use hoard_core::ids::{GameSlug, Repair, SaveId, Username};

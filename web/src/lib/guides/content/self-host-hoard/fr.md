@@ -25,20 +25,20 @@ C'est la différence clé avec des outils comme [Ludusavi](/guides/ludusavi-alte
 
 ## Installation avec Docker Compose
 
-Clonez le dépôt, créez une configuration depuis l'exemple, définissez votre `public_url` et démarrez la pile :
+Clonez le dépôt, créez une configuration depuis l'exemple et démarrez la pile :
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-Attendez que les logs indiquent que le serveur écoute. Les données vivent dans un volume Docker nommé (`hoard-data`) — sauvegardez-le comme n'importe quel volume. Le conteneur écoute en interne sur le port `8080` ; choisissez un autre port hôte avec `HOARD_PORT=9000 docker compose up -d`.
+Attendez que les logs indiquent que le serveur écoute. Les données vivent dans un volume Docker nommé (`hoard-data`) — sauvegardez-le comme n'importe quel volume. Le conteneur écoute en interne sur le port `12421` ; choisissez un autre port hôte avec `HOARD_PORT=9000 docker compose up -d`.
 
 ## Créez votre utilisateur et un jeton d'appareil
 
@@ -59,7 +59,7 @@ Installez l'[app de bureau Hoard](/download) sur chaque machine. Dans l'assistan
 
 ## En production
 
-Pour tout ce qui dépasse votre réseau local, terminez le TLS sur un reverse proxy (Caddy, nginx ou Traefik) et réglez `public_url` sur votre vraie adresse HTTPS. Plutôt bare metal ? Le dépôt fournit aussi un script d'installation `systemd` et une commande `hoard-server upgrade` qui remplace le binaire de façon atomique sans interrompre une synchro en cours.
+Pour tout ce qui dépasse votre réseau local, terminez le TLS sur un reverse proxy (Caddy, nginx ou Traefik). Plutôt bare metal ? Le dépôt fournit aussi un script d'installation `systemd` et une commande `hoard-server upgrade` qui remplace le binaire de façon atomique sans interrompre une synchro en cours.
 
 ## Auto-hébergement ou Hoard Cloud ?
 

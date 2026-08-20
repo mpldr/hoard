@@ -19,9 +19,12 @@ pub enum TokenCommand {
         /// Username
         username: String,
     },
-    /// Revoke a token by its prefix
+    /// Revoke a token by the prefix `token list` prints for it.
+    ///
+    /// The prefix is the start of the token's hash, not of the token itself:
+    /// the plaintext is never stored, so there is nothing else to match on.
     Revoke {
-        /// Token prefix (first 16 chars of hoard_v1_...)
+        /// Prefix from the `Prefix` column of `token list`.
         token_prefix: String,
     },
 }
@@ -132,7 +135,14 @@ pub async fn run(cmd: TokenCommand, cfg: &Config) -> Result<()> {
             .await?;
 
             if rows.rows_affected() == 0 {
-                anyhow::bail!("No active token found with prefix '{}'", token_prefix);
+                // The likeliest mistake is pasting the token instead of the
+                // prefix `token list` prints, so say which one is wanted.
+                anyhow::bail!(
+                    "No active token found with prefix '{}'. Use the Prefix column \
+                     from `hoard-admin token list <user>` — it is the start of the \
+                     token's hash, not of the token itself.",
+                    token_prefix
+                );
             }
             println!("Token(s) with prefix '{}' revoked.", token_prefix);
         }

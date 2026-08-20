@@ -85,6 +85,7 @@ format = "pretty"
 
     Harness {
         state: Arc::new(ServerState {
+            trusted_proxies: Default::default(),
             pool,
             config,
             start_time: Instant::now(),

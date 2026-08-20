@@ -25,20 +25,20 @@ Das ist der entscheidende Unterschied zu Tools wie [Ludusavi](/guides/ludusavi-a
 
 ## Installation mit Docker Compose
 
-Klone das Repo, erstelle eine Konfiguration aus dem Beispiel, setze deine `public_url` und starte den Stack:
+Klone das Repo, erstelle eine Konfiguration aus dem Beispiel und starte den Stack:
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-Warte, bis die Logs zeigen, dass der Server lauscht. Die Daten liegen in einem benannten Docker-Volume (`hoard-data`) – sichere es wie jedes andere Volume. Der Container lauscht intern auf Port `8080`; einen anderen Host-Port setzt du mit `HOARD_PORT=9000 docker compose up -d`.
+Warte, bis die Logs zeigen, dass der Server lauscht. Die Daten liegen in einem benannten Docker-Volume (`hoard-data`) – sichere es wie jedes andere Volume. Der Container lauscht intern auf Port `12421`; einen anderen Host-Port setzt du mit `HOARD_PORT=9000 docker compose up -d`.
 
 ## Benutzer und Geräte-Token anlegen
 
@@ -59,7 +59,7 @@ Installiere die [Hoard-Desktop-App](/download) auf jedem Rechner. Wähle im Onbo
 
 ## Im Produktivbetrieb
 
-Für alles, was über dein lokales Netz hinausgeht, beende TLS an einem Reverse-Proxy (Caddy, nginx oder Traefik) und setze `public_url` auf deine echte HTTPS-Adresse. Lieber Bare Metal? Das Repo liefert auch ein `systemd`-Installationsskript und einen Befehl `hoard-server upgrade`, der die Binärdatei atomar austauscht, ohne einen laufenden Sync abzubrechen.
+Für alles, was über dein lokales Netz hinausgeht, beende TLS an einem Reverse-Proxy (Caddy, nginx oder Traefik). Lieber Bare Metal? Das Repo liefert auch ein `systemd`-Installationsskript und einen Befehl `hoard-server upgrade`, der die Binärdatei atomar austauscht, ohne einen laufenden Sync abzubrechen.
 
 ## Selbst hosten oder Hoard Cloud?
 

@@ -10,14 +10,15 @@ use hoard_server::{
     db, upgrade,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 use hoard_server::auth::require_auth;
 use hoard_server::cleanup;
 use hoard_server::routes::{
     admin as admin_routes, auth as auth_routes, cas as cas_routes, devices as device_routes,
     events as event_routes, games as game_routes, health, logs as log_routes,
-    playtime as playtime_routes, saves as save_routes, snapshots as snap_routes,
+    overview as overview_routes, panel as panel_routes, playtime as playtime_routes,
+    saves as save_routes, session as session_routes, snapshots as snap_routes,
 };
 
 #[derive(Parser)]
@@ -199,17 +200,42 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
     // deja a cada cliente con `save_id` que aquí ya no existen — 404 eternos.
     hoard_server::store::guard_against_lost_database(&pool, &cfg.storage.data_dir).await?;
 
+    // Who may speak for someone else. A bad entry is named out loud: failing
+    // open here means "your proxy isn't trusted", which is the safe direction
+    // but an invisible one — every client behind it would silently share one
+    // throttle bucket.
+    let (trusted_proxies, bad_proxies) =
+        hoard_server::clientip::TrustedProxies::parse(&cfg.server.trusted_proxies);
+    for bad in &bad_proxies {
+        warn!(
+            entry = %bad.entry,
+            why = bad.why,
+            "server.trusted_proxies: ignoring an entry that isn't an address or CIDR"
+        );
+    }
+    info!(trusted_proxies = %trusted_proxies, "trusting X-Forwarded-For from");
+
     let state = Arc::new(health::ServerState {
         pool: pool.clone(),
         config: cfg.clone(),
         start_time: Instant::now(),
         events: Default::default(),
         store: store.clone(),
+        trusted_proxies,
     });
 
     // Routes that require auth
     let authed = Router::new()
         .route("/v1/auth/whoami", get(auth_routes::whoami))
+        // Browser session teardown and self-service password change. Both need
+        // an authenticated caller, so they live here; the login that mints the
+        // session is public and sits on the router below.
+        .route("/v1/auth/session", post(session_routes::exchange_token))
+        .route("/v1/auth/logout", post(session_routes::logout))
+        .route("/v1/auth/password", post(session_routes::change_password))
+        // Rollups for the panel's account view (`routes::overview`).
+        .route("/v1/me/overview", get(overview_routes::overview))
+        .route("/v1/me/activity", get(overview_routes::activity))
         // Per-user cap on stored versions per save. Same path shape as the
         // cloud router so the agent hits one URL for both modes.
         .route(
@@ -230,6 +256,19 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         // Admin ops (self-hosted only — see ADR 0017). Gated on is_admin
         // inside the handler; the cloud router never mounts this.
         .route("/v1/admin/upgrade", post(admin_routes::upgrade))
+        // Operator views behind the panel's server section. Each handler
+        // checks `is_admin` itself — see the comment in `routes::admin`.
+        .route("/v1/admin/overview", get(admin_routes::overview))
+        .route(
+            "/v1/admin/users/:id",
+            axum::routing::patch(admin_routes::patch_user),
+        )
+        .route("/v1/admin/tokens", get(admin_routes::tokens))
+        .route(
+            "/v1/admin/tokens/:id/revoke",
+            post(admin_routes::revoke_token),
+        )
+        .route("/v1/admin/logs", get(admin_routes::logs))
         // Games
         .route("/v1/games", get(game_routes::list))
         .route("/v1/games/:slug", get(game_routes::get_one))
@@ -321,10 +360,36 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         .await;
     });
 
-    let mut app = Router::new()
-        .route("/v1/health", get(health::handler))
-        .merge(authed)
-        .with_state(state);
+    let mut public = Router::new().route("/v1/health", get(health::handler));
+
+    // The panel and the password login it needs are one switch: an instance
+    // that only ever talks to the desktop app has no reason to expose a second
+    // way in, and leaving `/v1/auth/login` mounted with the pages gone would be
+    // exactly that. Nothing here is authenticated — the login screen is the
+    // one screen that by definition has no session yet.
+    if cfg.panel.enabled {
+        if cfg.panel.login_throttle_was_raised() {
+            warn!(
+                asked = cfg.panel.login_throttle_secs,
+                using = hoard_server::config::MIN_LOGIN_THROTTLE_SECS,
+                "panel: login_throttle_secs is below the minimum; using the minimum"
+            );
+        }
+        info!(
+            session_days = cfg.panel.session_days,
+            login_throttle_secs = cfg.panel.login_throttle().as_secs(),
+            "web panel enabled at /panel"
+        );
+        public = public
+            .route("/", get(panel_routes::root))
+            .route("/panel", get(panel_routes::index))
+            .route("/panel/panel.css", get(panel_routes::css))
+            .route("/panel/panel.js", get(panel_routes::js))
+            .route("/panel/i18n/:lang", get(panel_routes::i18n))
+            .route("/v1/auth/login", post(session_routes::login));
+    }
+
+    let mut app = public.merge(authed).with_state(state);
 
     // Per-IP rate limiting (covers /v1/health and every authed route). Opt-out
     // via [server.rate_limit]. SmartIpKeyExtractor needs ConnectInfo, which the

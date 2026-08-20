@@ -25,20 +25,20 @@ Essa é a diferença principal em relação a ferramentas como o [Ludusavi](/gui
 
 ## Instalação com Docker Compose
 
-Clone o repositório, crie uma configuração a partir do exemplo, defina seu `public_url` e suba o stack:
+Clone o repositório, crie uma configuração a partir do exemplo e suba o stack:
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-Aguarde até os logs mostrarem que o servidor está escutando. Os dados ficam em um volume nomeado do Docker (`hoard-data`) — faça backup como em qualquer outro volume. O contêiner escuta internamente na porta `8080`; use outra porta do host com `HOARD_PORT=9000 docker compose up -d`.
+Aguarde até os logs mostrarem que o servidor está escutando. Os dados ficam em um volume nomeado do Docker (`hoard-data`) — faça backup como em qualquer outro volume. O contêiner escuta internamente na porta `12421`; use outra porta do host com `HOARD_PORT=9000 docker compose up -d`.
 
 ## Crie seu usuário e um token de dispositivo
 
@@ -59,7 +59,7 @@ Instale o [app de desktop do Hoard](/download) em cada máquina. No fluxo inicia
 
 ## Em produção
 
-Para qualquer coisa exposta além da rede local, termine o TLS em um proxy reverso (Caddy, nginx ou Traefik) e defina `public_url` com seu endereço HTTPS real. Prefere bare metal? O repositório também traz um script de instalação `systemd` e um comando `hoard-server upgrade` que troca o binário de forma atômica sem matar uma sincronização em andamento.
+Para qualquer coisa exposta além da rede local, termine o TLS em um proxy reverso (Caddy, nginx ou Traefik). Prefere bare metal? O repositório também traz um script de instalação `systemd` e um comando `hoard-server upgrade` que troca o binário de forma atômica sem matar uma sincronização em andamento.
 
 ## Self-hosted ou Hoard Cloud?
 

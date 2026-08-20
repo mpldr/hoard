@@ -58,6 +58,7 @@ pub async fn run_once(
     purge_tmp(data_dir, tmp_cleanup_hours).await?;
     purge_trash(pool, data_dir, store, trash_retention_days).await?;
     purge_client_logs(pool, CLIENT_LOG_RETENTION_DAYS).await?;
+    purge_dead_sessions(pool, SESSION_TOMBSTONE_DAYS).await?;
     // Olvidar máquinas que llevan meses sin aparecer, o el censo acumula para
     // siempre cada portátil que alguien usó una tarde. Best-effort: que esto
     // falle no puede tumbar el resto de la limpieza.
@@ -68,6 +69,16 @@ pub async fn run_once(
     }
     Ok(())
 }
+
+/// How long a dead browser session stays in `api_tokens` before the row goes.
+///
+/// Before the panel, nothing ever deleted a token row and that was right: they
+/// are minted by hand, one per device, and a revoked one is audit trail. A
+/// browser session is the opposite — minted on every sign-in, dead in two
+/// weeks — so without this the table grows by one row per login forever. The
+/// window is there so a "who logged in last month" question still has an
+/// answer; only rows tagged as sessions are touched, never a device's token.
+const SESSION_TOMBSTONE_DAYS: i64 = 30;
 
 /// Cuánto sobrevive un dispositivo en el censo sin dar señales. 90 días es lo
 /// mismo que usa cloud: largo para que un equipo que sólo se enciende en
@@ -198,6 +209,30 @@ async fn purge_client_logs(pool: &SqlitePool, retention_days: i64) -> anyhow::Re
     let removed = res.rows_affected();
     if removed > 0 {
         info!(removed, "purged expired client logs");
+    }
+    Ok(())
+}
+
+/// Drop browser sessions that expired or were revoked more than
+/// `tombstone_days` ago. See [`SESSION_TOMBSTONE_DAYS`] for why this exists
+/// only for sessions.
+async fn purge_dead_sessions(pool: &SqlitePool, tombstone_days: i64) -> anyhow::Result<()> {
+    let cutoff = (time::OffsetDateTime::now_utc() - time::Duration::days(tombstone_days))
+        .format(&time::format_description::well_known::Rfc3339)?;
+    let res = sqlx::query(
+        "DELETE FROM api_tokens \
+         WHERE device_name = ? \
+           AND ((expires_at IS NOT NULL AND expires_at < ?) \
+             OR (revoked_at IS NOT NULL AND revoked_at < ?))",
+    )
+    .bind(crate::routes::session::SESSION_DEVICE_NAME)
+    .bind(&cutoff)
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
+    let removed = res.rows_affected();
+    if removed > 0 {
+        info!(removed, "purged dead browser sessions");
     }
     Ok(())
 }

@@ -25,20 +25,20 @@ Hoard è open source e self-hostabile. Invece di usare Hoard Cloud, puoi eseguir
 
 ## Installazione con Docker Compose
 
-Clona il repository, crea una configurazione dall'esempio, imposta il tuo `public_url` e avvia lo stack:
+Clona il repository, crea una configurazione dall'esempio e avvia lo stack:
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-Attendi che i log mostrino che il server è in ascolto. I dati vivono in un volume Docker (`hoard-data`): eseguine il backup come per qualsiasi volume. Il container ascolta internamente sulla porta `8080`; usa un'altra porta host con `HOARD_PORT=9000 docker compose up -d`.
+Attendi che i log mostrino che il server è in ascolto. I dati vivono in un volume Docker (`hoard-data`): eseguine il backup come per qualsiasi volume. Il container ascolta internamente sulla porta `12421`; usa un'altra porta host con `HOARD_PORT=9000 docker compose up -d`.
 
 ## Crea il tuo utente e un token dispositivo
 
@@ -59,7 +59,7 @@ Installa l'[app desktop di Hoard](/download) su ogni macchina. Nella procedura i
 
 ## In produzione
 
-Per tutto ciò che è esposto oltre la rete locale, termina il TLS su un reverse proxy (Caddy, nginx o Traefik) e imposta `public_url` sul tuo vero indirizzo HTTPS. Preferisci il bare metal? Il repository include anche uno script di installazione `systemd` e un comando `hoard-server upgrade` che sostituisce il binario in modo atomico senza interrompere una sync in corso.
+Per tutto ciò che è esposto oltre la rete locale, termina il TLS su un reverse proxy (Caddy, nginx o Traefik). Preferisci il bare metal? Il repository include anche uno script di installazione `systemd` e un comando `hoard-server upgrade` che sostituisce il binario in modo atomico senza interrompere una sync in corso.
 
 ## Self-host o Hoard Cloud?
 

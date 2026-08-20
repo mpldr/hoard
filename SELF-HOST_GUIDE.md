@@ -1,5 +1,14 @@
 # Self-host
 
+[![CI](https://github.com/rleeon/hoard/actions/workflows/ci.yml/badge.svg)](https://github.com/rleeon/hoard/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/rleeon/hoard?label=release)](https://github.com/rleeon/hoard/releases/latest) [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
+> Steam Cloud is not a backup strategy. Your server is.
+
+Run `hoard-server` on your own hardware — a NAS, a VPS, or the machine
+under your desk — and point every device at it. No account, no quota
+beyond the disk you give it, and every byte of every save travels through
+your own server, not someone else's cloud.
+
 ### Docker
 
 ```sh
@@ -7,8 +16,6 @@ git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
 $EDITOR deploy/docker/config/config.toml    # Use nano or vim or something lol
-# public_url = "http://localhost:12421"
-# (or use your IP if accessing from another machine)
 
 cd deploy/docker
 docker compose up -d              # pulls the prebuilt image from GHCR
@@ -31,13 +38,78 @@ git clone https://github.com/rleeon/hoard.git && cd hoard
 sudo ./deploy/scripts/install.sh
 sudo $EDITOR /etc/hoard/config.toml    # Use nano or vim or something lol
 sudo -u hoard hoard-admin --config /etc/hoard/config.toml db migrate
-sudo -u hoard hoard-admin --config /etc/hoard/config.toml \ user create myuser --admin --password 'mypassword'    #change "myuser" and "mypassword", dont delete ''.
+sudo -u hoard hoard-admin --config /etc/hoard/config.toml user create myuser --admin --password 'mypassword'    #change "myuser" and "mypassword", dont delete ''.
 sudo systemctl start hoard-server
 ```
 
 Upgrade later with `sudo hoard-server upgrade`: it swaps the binary
 atomically and prints the `systemctl restart` step (it won't restart the
 service itself, so an in-flight sync isn't killed).
+
+### Tailscale
+
+If both the server and your machines are on a Tailnet, skip the reverse
+proxy entirely: Tailscale encrypts the wire, so the server's lack of TLS
+doesn't matter and none of the proxy settings below apply. The install is
+the same on every machine — the server box is not special, just another
+node of your tailnet — and each machine signs in once:
+
+**Install the client.** 
+
+On Linux — the server included — run the install
+script below. On Windows or macOS, grab the app from
+https://tailscale.com/download and sign in inside it instead of the
+commands below.
+
+```sh
+curl -fsSL https://tailscale.com/install.sh | sh
+```
+
+**Sign in on that machine.**
+
+```sh
+sudo tailscale up
+```
+
+It prints a URL and opens your browser; authenticate once and the machine
+joins your tailnet. On a headless server the URL is only printed — open it
+from your laptop. One `tailscale up` per machine, all logged in to the
+same account.
+
+**Find the server's name.** From any machine in the tailnet:
+
+```sh
+tailscale status
+```
+
+lists every machine with its IPv4 (`100.x`) and its MagicDNS names: the
+short one is the machine's hostname, the long one is
+`<name>.<tailnet>.ts.net` — e.g. `server` and `server.<mytailnet>.ts.net`.
+The names only resolve if MagicDNS is on (it is by default); if it isn't,
+use the `100.x` IPv4 from the same listing.
+
+**Check the server answers.** From a *client* machine, using the server
+machine's short name from the listing above (the real address has no
+brackets):
+
+```sh
+# Remember changue "ip" pls
+tailscale ping ip
+curl http://ip:12421/v1/health
+```
+
+`tailscale ping` reporting the path is up is the whole test — if that
+works, the app will reach the server.
+
+In the app's onboarding, pick **Autohost** and paste `http://server:12421`
+— replace `server` with your server machine's name from `tailscale status`,
+no brackets — or the server's `100.x` IPv4. Both are classified by the
+client as a local server, so the dashboard shows "X used" of your disk
+instead of a quota percentage. Two address shapes are *not* classified as
+local and you'd get the quota view: the full MagicDNS FQDN
+(`<name>.<tailnet>.ts.net`) and an IPv6 literal (`fd7a:…`) — stick to
+the short name or the IPv4. If you paste `http://user@host:12421` out of
+habit, the client strips the `user@` itself.
 
 ### Behind a reverse proxy
 
@@ -115,6 +187,83 @@ Nothing here leaves your server. The census lives in your SQLite, your machines
 write to it directly, and there is no endpoint that forwards it anywhere. It's
 your computers talking to each other through your own server — which is why
 this belongs in self-hosted and operator broadcasts don't.
+
+### The web panel
+
+The server serves a small web panel from the same port it already listens on.
+Point a browser at your server's address — `http://192.168.1.50:12421`, or
+whatever your reverse proxy exposes — and it lands on `/panel`.
+
+Sign in with the username and password you created with `hoard-admin user
+create`. That password was written to the database from the first release and
+never read by anything until now, so an account created two years ago can sign
+in today. Forgot it? `hoard-admin user passwd <user>` sets a new one and closes
+any browser session that was open.
+
+If you would rather not use a password, the panel also takes a `hoard_v1_…`
+token — the same one your desktop app uses. It is exchanged for a session
+immediately and never stored in the browser.
+
+What you get:
+
+- **Your account**: every game, save and version with its real size, what
+  deduplication saved, which machine each version came from, playtime for the
+  last 30 days, and your quota. Any version can be downloaded, sent to the
+  trash, or pulled back out of it — deleted versions stay listed, struck
+  through, until the server purges them for good. The page also updates on its
+  own when another machine uploads.
+- **Your machines**: the same census the app's Eye panel shows — who is on and
+  what they are playing.
+- **Activity**: what the server recorded — versions created, restored, deleted
+  and pruned. This log has been written since the first migration; the panel is
+  the first thing that reads it.
+
+Admin accounts get three more sections: server-wide storage (logical vs. real
+size, orphan objects, database size), users (quotas and roles), and the
+diagnostic logs your clients upload. Non-admins cannot reach them — the check
+is server-side, so hiding the tab is not what protects them.
+
+Deliberately **not** in the panel: creating or deleting accounts, migrating
+storage backends, and verifying every object. Those stay in `hoard-admin`,
+where a terminal can show progress and refuse to be closed halfway.
+
+Two things worth knowing:
+
+- Browser sessions are ordinary API tokens with a short life, so they show up
+  in `hoard-admin token list <user>` next to your devices' tokens and revoking
+  one signs that browser out.
+- Five wrong passwords in a row shut that account's door for
+  `panel.login_throttle_secs` (10 by default), and the reply carries a
+  `Retry-After`. It is deliberately short — the point is to stop the password
+  hashing from being used as a CPU lever, not to lock you out of your own
+  server. Raise it if the panel faces the open internet. You cannot go below
+  2 seconds: a lower value is read as 2 and the server says so at startup.
+- The throttle counts per client address, and the server only takes an
+  `X-Forwarded-For` header at its word when the connection comes from a proxy
+  you named in `server.trusted_proxies` (default: `loopback`). **If your
+  reverse proxy is not on the same machine — a container on a Docker network,
+  another box on the LAN — add it there**, or every client behind it shares one
+  counter. The server prints what it trusts at startup.
+- Sessions last `panel.session_days` (14 by default) and the cookie is marked
+  `Secure` only when the request arrives over HTTPS, so a plain-HTTP LAN
+  instance still works. Put it behind TLS if you expose it to the internet.
+
+To turn the whole thing off — panel pages and password login together — set
+`enabled = false` under `[panel]` in `config.toml`.
+
+```toml
+[server]
+# Only these peers may say who the client is via X-Forwarded-For.
+# "loopback" | "private" | "any" | addresses | CIDRs. [] believes nobody.
+trusted_proxies = ["loopback"]
+
+[panel]
+enabled = true
+# How long a browser session lasts.
+session_days = 14
+# Seconds the login door stays shut after five wrong passwords. Minimum 2.
+login_throttle_secs = 10
+```
 
 ## External storage (S3-compatible)
 
@@ -413,10 +562,22 @@ Windows use `%APPDATA%\hoard\hoard\config\…` and
 | IPC socket | `$XDG_RUNTIME_DIR/hoard/hoardd.sock` |
 
 The service starts on demand — any client spawns it if it isn't running — and
-`hoard sync start` also registers it to start at login. **An AppImage can't do
-the login part**: its binary lives in a temporary mount that doesn't survive a
-reboot, so sync runs whenever Hoard is open and no earlier. Use the `.deb`/`.rpm`
-if you want it up before you open the app.
+`hoard sync start` also registers it to start at login. Since 1.1.2 the 
+engine is a component in its own right instead of a passenger inside 
+the app bundle, so **an AppImage no longer costs you the login part**: 
+As long as a `hoardd` exists somewhere stable — the one:
+`curl -fsSL https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.sh | sh`
+puts in, or the one a `.deb`/`.rpm` brings — the unit points at that copy and
+sync starts with your session while the AppImage stays as the graphical face.
+That is what makes game mode sync on SteamOS, Bazzite and the other atomic
+images, where an AppImage is the only way to run the app.
+
+It only falls back when the *sole* `hoardd` on the disk is the one inside the
+AppImage: that binary lives in a temporary mount that doesn't survive a reboot,
+so declaring the unit would point it at a path that won't exist next boot.
+`hoard sync start` refuses with that reason instead of leaving you a unit that
+dies with `203/EXEC`, and sync then runs whenever Hoard is open and no earlier.
+Installing the core fixes it without giving up the AppImage.
 
 ### The service is running but "offline"
 

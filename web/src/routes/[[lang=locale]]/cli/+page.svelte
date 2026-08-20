@@ -12,9 +12,11 @@
   type Platform = 'windows' | 'macos' | 'linux';
   let detected = $state<Platform | null>(null);
 
-  // One-liner installers hosted at the site root (web/static/install.*).
-  const SH_CMD = 'curl -fsSL https://hoard.services/install.sh | sh';
-  const PS_CMD = 'irm https://hoard.services/install.ps1 | iex';
+  // One-liners point at the raw repo copies (web/static/install.*) so they
+  // still work when hoard.services itself is unreachable; the "read before
+  // running" links below point at the served copies (/install.sh, /install.ps1).
+  const SH_CMD = 'curl -fsSL https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.sh | sh';
+  const PS_CMD = 'irm https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.ps1 | iex';
 
   // Two install rows; the one matching the visitor's OS gets highlighted.
   let installRows = $derived([

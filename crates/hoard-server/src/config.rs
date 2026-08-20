@@ -14,6 +14,10 @@ pub struct Config {
     pub auth: AuthConfig,
     pub retention: RetentionConfig,
     pub logging: LoggingConfig,
+    /// Browser panel served by this same binary. Self-hosted only — the cloud
+    /// router never mounts it.
+    #[serde(default)]
+    pub panel: PanelConfig,
     /// Cloud mode configuration. Required when `database.backend = "postgres"`.
     /// Ignored in self-hosted mode.
     #[serde(default)]
@@ -37,6 +41,26 @@ pub struct ServerConfig {
     /// still rate-limit at the reverse proxy.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Which peers are allowed to tell the server who the client is — i.e.
+    /// whose `X-Forwarded-For` we believe. Addresses, CIDRs, or the shorthands
+    /// `loopback` / `private` / `any`; see
+    /// [`crate::clientip::TrustedProxies::parse`].
+    ///
+    /// Defaults to `loopback`, which covers the usual single-box shape (nginx
+    /// or Caddy on the same host proxying to `127.0.0.1:12421`) and nothing
+    /// else. A proxy that reaches the server from another address — a
+    /// container on a Docker network, a box elsewhere on the LAN — has to be
+    /// named here, or its clients all count as one.
+    ///
+    /// It is not a nicety: the panel's login throttle counts wrong passwords
+    /// per client address, so believing an unvouched header let a direct caller
+    /// rotate it and never hit the limit at all.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+    vec!["loopback".to_string()]
 }
 
 fn default_allow_remote_upgrade() -> bool {
@@ -188,6 +212,81 @@ pub enum DbBackend {
 pub struct AuthConfig {
     pub token_lifetime_days: u64,
     pub allow_registration: bool,
+}
+
+/// The web panel (`GET /panel`).
+///
+/// Off-by-config rather than off-by-default: a self-hoster who never opens a
+/// browser still pays only three static routes, and the ones who do want it
+/// shouldn't have to discover a config key first. Turning it off removes the
+/// panel routes *and* the password login with them, which is the point — an
+/// instance that only ever talks to the desktop app has no reason to expose a
+/// second way in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PanelConfig {
+    #[serde(default = "default_panel_enabled")]
+    pub enabled: bool,
+    /// How long a browser session lasts before the cookie's token expires.
+    /// Short by API standards (`auth.token_lifetime_days` defaults to a year)
+    /// because a browser is a shared, long-lived, extension-infested place and
+    /// this token is as powerful as the one in the desktop app.
+    #[serde(default = "default_panel_session_days")]
+    pub session_days: u64,
+    /// How long the login door stays shut after too many wrong passwords, in
+    /// seconds. Read through [`PanelConfig::login_throttle`], which enforces
+    /// the floor — never read this field directly.
+    ///
+    /// Ten by default, which is short for a login form and right for a box on
+    /// your own network: long enough that an argon2id verify (19 MiB, tens of
+    /// milliseconds a go) stops being a free CPU lever, short enough that
+    /// fumbling your own password three times doesn't lock you out of your own
+    /// server. Raise it towards a minute or more if the panel is exposed to the
+    /// open internet — what protects the account there is the password, and a
+    /// slow door buys it time.
+    #[serde(default = "default_panel_login_throttle_secs")]
+    pub login_throttle_secs: u64,
+}
+
+/// Floor on [`PanelConfig::login_throttle_secs`]. There is no "off": with no
+/// pause at all, each guess costs the server a full password hash and costs the
+/// attacker one request, which is the wrong way round. Two seconds is small
+/// enough to be invisible to a human who mistyped and large enough that the
+/// hashing can't be used as a lever.
+pub const MIN_LOGIN_THROTTLE_SECS: u64 = 2;
+
+impl PanelConfig {
+    /// The throttle window, with the floor applied. The one place the number is
+    /// decided, so a config that asks for less can't leak past a caller that
+    /// forgot to clamp.
+    pub fn login_throttle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.login_throttle_secs.max(MIN_LOGIN_THROTTLE_SECS))
+    }
+
+    /// True when the configured value was raised to the floor — the caller logs
+    /// it once at boot so the operator isn't left thinking their `1` took.
+    pub fn login_throttle_was_raised(&self) -> bool {
+        self.login_throttle_secs < MIN_LOGIN_THROTTLE_SECS
+    }
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_panel_enabled(),
+            session_days: default_panel_session_days(),
+            login_throttle_secs: default_panel_login_throttle_secs(),
+        }
+    }
+}
+
+fn default_panel_enabled() -> bool {
+    true
+}
+fn default_panel_session_days() -> u64 {
+    14
+}
+fn default_panel_login_throttle_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

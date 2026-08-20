@@ -25,20 +25,20 @@ This is the key difference from tools like [Ludusavi](/guides/ludusavi-alternati
 
 ## Install with Docker Compose
 
-Clone the repo, create a config from the example, set your `public_url`, and start the stack:
+Clone the repo, create a config from the example, and start the stack:
 
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
 cp deploy/config.toml.example deploy/docker/config/config.toml
-$EDITOR deploy/docker/config/config.toml      # set public_url at minimum
+$EDITOR deploy/docker/config/config.toml      # Use nano or vim or something lol
 
 cd deploy/docker
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f                         # wait for "listening"
 ```
 
-Wait until the logs show that the server is listening. Data lives in a named Docker volume (`hoard-data`) — back it up like any other volume. The container listens on port `8080` internally; map a different host port with `HOARD_PORT=9000 docker compose up -d`.
+Wait until the logs show that the server is listening. Data lives in a named Docker volume (`hoard-data`) — back it up like any other volume. The container listens on port `12421` internally; map a different host port with `HOARD_PORT=9000 docker compose up -d`.
 
 ## Create your user and a device token
 
@@ -59,7 +59,7 @@ Install the [Hoard desktop app](/download) on each machine. In the onboarding fl
 
 ## Run it in production
 
-For anything exposed beyond your local network, terminate TLS at a reverse proxy (Caddy, nginx or Traefik) and set `public_url` to your real HTTPS address. Prefer bare metal? The repo also ships a `systemd` install script and a `hoard-server upgrade` command that swaps the binary atomically without killing an in-flight sync.
+For anything exposed beyond your local network, terminate TLS at a reverse proxy (Caddy, nginx or Traefik). Prefer bare metal? The repo also ships a `systemd` install script and a `hoard-server upgrade` command that swaps the binary atomically without killing an in-flight sync.
 
 ## Self-host or Hoard Cloud?
 

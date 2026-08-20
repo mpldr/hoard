@@ -11,11 +11,16 @@ deploy/config.toml
 /dist-v1
 /dist-*
 
+# Queda gitignored hasta que se mejore para un contribuidor de verdad.
+CONTRIBUTING.md
+
 # Documentación interna: ADRs y READMEs de crate/carpeta. Se quedan en local.
 # El repo sólo lleva los .md principales de la raíz (README, CHANGELOG,
 # CONTRIBUTING, SELF-HOST_GUIDE, FUNDING), la plantilla de PR y el contenido
 # .md de la web (`web/src/lib/guides/`), que es lo que el sitio compila.
 /docs/
+# Hooks de git locales (CI mirror). Locales, nunca al repo.
+/.githooks/
 /crates/hoard-agent/tests/fixtures/README.md
 /crates/hoard-manifest/data/README.md
 /crates/hoard-screen/README.md
@@ -155,3 +160,7 @@ deploy/docker/config/config.toml
 # Prompt general para delegar trabajo de UI a otro modelo. Nota de trabajo
 # local, con nombres de fichero y trampas que no son doc pública.
 /PROMPT-UI.local.md
+
+# Web-only working notes: how `web/` is built, what it is coupled to, and the
+# rules block handed to other models. Local, never committed.
+/web.md

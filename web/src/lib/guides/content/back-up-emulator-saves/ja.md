@@ -14,7 +14,7 @@ Hoard は一般的なエミュレーターのセーブファイル（`.srm`、`.
 - **RetroArch** — コアごとのセーブとステート
 - **Dolphin**（GameCube / Wii）— メモリーカードと GCI ファイル
 - **PCSX2**（PS2）— メモリーカード
-- **DuckStation / ePSXe**（PS1）、**PPSSPP**（PSP）、**mGBA** など
+- **DuckStation**（PS1）、**PPSSPP**（PSP）、**mGBA** など
 
 Hoard は Ludusavi を支えているのと同じコミュニティデータベースでセーブフォルダーを特定するため、多くのエミュレーターのパスが自動で検出されます。独自の場所については、Hoard を手動でフォルダーに向けられます。
 

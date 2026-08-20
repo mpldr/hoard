@@ -125,7 +125,8 @@ cat <<EOF
 
 Next steps:
 
-  1. Edit $ETC_DIR/config.toml (set public_url, retention, etc.)
+  1. Edit $ETC_DIR/config.toml if you like — the defaults work as-is
+     (tune retention, limits, etc.)
   2. Initialize the database:
        sudo -u $USER_NAME hoard-admin --config $ETC_DIR/config.toml db migrate
   3. Create your first admin user:

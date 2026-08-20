@@ -14,7 +14,7 @@ Hoard 可处理常见的模拟器存档文件（`.srm`、`.sav`、记忆卡）�
 - **RetroArch** —— 按核心区分的存档和即时存档
 - **Dolphin**（GameCube / Wii）—— 记忆卡和 GCI 文件
 - **PCSX2**（PS2）—— 记忆卡
-- **DuckStation / ePSXe**（PS1）、**PPSSPP**（PSP）、**mGBA** 等
+- **DuckStation**（PS1）、**PPSSPP**（PSP）、**mGBA** 等
 
 由于 Hoard 使用与 Ludusavi 相同的社区数据库来定位存档文件夹，许多模拟器路径都会被自动检测。对于任何自定义位置，你都可以手动把 Hoard 指向某个文件夹。
 

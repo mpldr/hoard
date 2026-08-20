@@ -14,7 +14,7 @@ Hoard gère les fichiers de sauvegarde d'émulateur courants (`.srm`, `.sav`, ca
 - **RetroArch** — sauvegardes et états par cœur
 - **Dolphin** (GameCube / Wii) — cartes mémoire et fichiers GCI
 - **PCSX2** (PS2) — cartes mémoire
-- **DuckStation / ePSXe** (PS1), **PPSSPP** (PSP), **mGBA**, et plus
+- **DuckStation** (PS1), **PPSSPP** (PSP), **mGBA**, et plus
 
 Comme Hoard localise les dossiers de sauvegarde avec la même base communautaire que celle qui alimente Ludusavi, de nombreux chemins d'émulateur sont détectés automatiquement. Pour tout cas particulier, vous pouvez pointer Hoard vers un dossier à la main.
 

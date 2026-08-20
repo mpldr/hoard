@@ -25,7 +25,7 @@ if [ ! -f "$CFG" ]; then
     echo "entrypoint: from the repo root, run:" >&2
     echo "entrypoint:   mkdir -p deploy/docker/config" >&2
     echo "entrypoint:   cp deploy/config.toml.example deploy/docker/config/config.toml" >&2
-    echo "entrypoint: edit it (public_url at least), then 'docker compose up -d' again." >&2
+    echo "entrypoint: edit it if you want (the defaults work as-is), then 'docker compose up -d' again." >&2
     exit 1
   fi
 fi

@@ -14,7 +14,7 @@ O Hoard trata os ficheiros de save padrão de emulador (`.srm`, `.sav`, memory c
 - **RetroArch** — saves e estados por core
 - **Dolphin** (GameCube / Wii) — memory cards e ficheiros GCI
 - **PCSX2** (PS2) — memory cards
-- **DuckStation / ePSXe** (PS1), **PPSSPP** (PSP), **mGBA** e mais
+- **DuckStation** (PS1), **PPSSPP** (PSP), **mGBA** e mais
 
 Como o Hoard localiza as pastas de save com a mesma base de dados comunitária que alimenta o Ludusavi, muitos caminhos de emulador são detetados automaticamente. Para qualquer caso personalizado, podes apontar o Hoard para uma pasta à mão.
 

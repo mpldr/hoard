@@ -13,8 +13,8 @@ Third-party content bundled with this software
 
    Files: ludusavi-catalog.json.zst, ludusavi-titles.json.zst
 
-   Derived from the Ludusavi manifest (https://github.com/mtkennerly/
-   ludusavi-manifest) by mtkennerly. The manifest tooling is MIT-licensed;
+   Derived from the Ludusavi manifest (https://github.com/mtkennerly/ludusavi-manifest) 
+   by mtkennerly. The manifest tooling is MIT-licensed;
    the underlying save-path data is sourced from PCGamingWiki
    (https://www.pcgamingwiki.com/) and is licensed
    CC BY-NC-SA 3.0 (https://creativecommons.org/licenses/by-nc-sa/3.0/).

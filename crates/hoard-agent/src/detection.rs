@@ -29,6 +29,7 @@
 //! catalog; the Tauri command pipes it to the frontend as a
 //! `library://scan-progress` event.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -773,8 +774,12 @@ where
         .map(|(s, _)| s.clone())
         .collect();
     // Una pasada por las raíces estándar para todo el bucle: el tope de tiempo
-    // pasa a ser por pasada y no por juego.
-    let host_dirs = NamedDirs::scan(&roots::user_save_roots(os));
+    // pasa a ser por pasada y no por juego. Perezoso porque el caso bueno es que
+    // no quede ningún juego sin resolver, y ahí el índice no llega a mirarse:
+    // construirlo igualmente son siete raíces a `NAME_LOOKUP_TIMEOUT` cada una
+    // —hasta 2,8 s de disco frío— en el camino crítico de la detección, para
+    // nada.
+    let host_dirs = OnceCell::new();
     let mut prefix_indexes: HashMap<PathBuf, NamedDirs> = HashMap::new();
     for slug in unresolved_slugs {
         let (install_dir, prefix_root, display_name) = {
@@ -802,15 +807,17 @@ where
             .unwrap_or_default();
         // Las raíces del host se indexan una vez; las del prefijo, una vez por
         // prefijo — varios juegos comparten el mismo y no hay que reescanearlo.
+        let host = || host_dirs.get_or_init(|| NamedDirs::scan(&roots::user_save_roots(os)));
         let index = match prefix_root.as_deref() {
-            Some(prefix) => prefix_indexes
-                .entry(prefix.to_path_buf())
-                .or_insert_with(|| {
+            Some(prefix) => {
+                if !prefix_indexes.contains_key(prefix) {
                     let mut idx = NamedDirs::scan(&roots::prefix_user_roots(prefix));
-                    idx.absorb(&host_dirs);
-                    idx
-                }),
-            None => &host_dirs,
+                    idx.absorb(host());
+                    prefix_indexes.insert(prefix.to_path_buf(), idx);
+                }
+                &prefix_indexes[prefix]
+            }
+            None => host(),
         };
         let mut discoveries = discover_by_name(index, &display_name, &extra_names, &shields);
         if !discoveries.is_empty() {
@@ -2501,7 +2508,11 @@ impl NamedDirs {
                     continue;
                 };
                 for sub in inner.flatten() {
-                    if looked >= NAME_LOOKUP_MAX_DIRS {
+                    // El reloj también aquí: sin él, una raíz con pocas carpetas
+                    // de primer nivel y muchísimas dentro (un `LocalLow` de un
+                    // estudio prolífico, un disco frío) sólo se frenaba por el
+                    // tope de entradas, que es un número, no un tiempo.
+                    if looked >= NAME_LOOKUP_MAX_DIRS || start.elapsed() >= NAME_LOOKUP_TIMEOUT {
                         break;
                     }
                     looked += 1;

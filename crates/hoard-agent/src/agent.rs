@@ -1174,6 +1174,10 @@ fn reconcile_all(
         let obs = observe_slot(slot, cloud);
         let state = state_from_slot(slot, config, now);
         let (next, decisions) = kernel::reconcile::reconcile(&state, &obs, world);
+        // Read before the state is moved into the slot: it is when the copy can
+        // next go out, and the shell owes the user that number (see the
+        // `Hold` arm below).
+        let floor = kernel::reconcile::backup_floor(&next);
         apply_state_to_slot(slot, next);
 
         // Eventos stuck/recovered puramente del delta de la escalada de fallos.
@@ -1218,10 +1222,67 @@ fn reconcile_all(
                 ),
                 kernel::Decision::Hold { reason } => {
                     tracing::debug!(save_id = %id, reason, "agent: reconcile hold");
+                    if kernel::reconcile::hold_is_paced_backup(reason) {
+                        announce_backup_wait(slots, &id, floor, now, events_tx);
+                    }
                 }
             }
         }
     }
+}
+
+/// Show a deferred backup instead of just logging it.
+///
+/// The reducer can hold an upload for a full minute — the adaptive floor under
+/// a game that rewrites its autosave in a loop — and until now that hold was a
+/// `debug!` line and nothing else. The first attempt at a floor was a fixed one
+/// for everybody and had to be reverted for exactly this: it was invisible, and
+/// what reached support was "Hoard isn't picking up my changes". A conditional
+/// floor that nobody can see fails the same way, only to fewer people.
+///
+/// `next_scheduled_backup_at` is where the answer belongs — the overlay's "next
+/// copy in Xs" and the Settings diagnostics both read it already, and the
+/// debounce timer writes the same field. It is cleared when the upload actually
+/// starts, so a stale deadline can't outlive the wait.
+///
+/// The `BackupScheduled` event that goes with it is announced on the rising
+/// edge only. The reducer holds on **every** tick while the floor stands (every
+/// two seconds), and re-announcing each time is what used to flood the feed
+/// with orphan "queued" rows for a game that autosaves every second.
+fn announce_backup_wait(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    floor: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+    events_tx: &mpsc::Sender<AgentEvent>,
+) {
+    let Some(floor) = floor else { return };
+    let Some(slot) = slots.get_mut(id) else {
+        return;
+    };
+    // Only a save with something to upload is waiting for anything. Holding a
+    // save with nothing pending is the ordinary quiet state, not a queue.
+    if !slot.has_pending {
+        return;
+    }
+    let remaining = floor - now;
+    if !remaining.is_positive() {
+        return;
+    }
+    let already_announced = slot.next_scheduled_backup_at.is_some();
+    slot.next_scheduled_backup_at = Some(floor);
+    if already_announced {
+        return;
+    }
+    let _ = events_tx.try_send(AgentEvent::BackupScheduled {
+        save_id: id.to_string(),
+        delay_ms: (remaining.whole_milliseconds().max(0)) as u64,
+        // The same reason the debounce announces with, so the desktop's
+        // "queued — waiting" surface needs no new variant on the wire (ADR 0021
+        // C.6): what tells the two apart there is the delay being longer than a
+        // debounce, which is precisely what this is.
+        reason: BackupReason::FilesystemSettled,
+    });
 }
 
 /// Ejecuta una [`kernel::Action`] que el reductor pidió: la traducción
@@ -5025,6 +5086,42 @@ mod tests {
     // horas-fantasma del corpus D.4) se movieron con la función al kernel
     // leaf: `hoard_core::kernel::correlation::tests`.
 
+    /// A slot in the state a freshly added save has: nothing pending, nothing
+    /// scheduled, no burst.
+    fn test_slot(save: WatchedSave) -> SaveSlot {
+        SaveSlot {
+            save,
+            watcher: None,
+            pending: None,
+            burst_since: None,
+            burst_backups: 0,
+            is_running: false,
+            weak_session: false,
+            last_running_seen: None,
+            has_pending: false,
+            last_fs_event_at: None,
+            last_restore_at: None,
+            next_scheduled_backup_at: None,
+            first_pending_event_at: None,
+            last_backup_at: None,
+            in_flight: None,
+            next_backup_at: None,
+            next_restore_at: None,
+            restore_failures: kernel::RestoreFailures::default(),
+            last_set_hash: None,
+            synced_fingerprint: None,
+            last_l0_mtime: None,
+            needs_l1: false,
+            manual_requested: false,
+            pending_op_result: None,
+            pending_upload_landed: None,
+            last_restore_error: None,
+            known_version: None,
+            pull_pending: false,
+            deferred_notified: false,
+        }
+    }
+
     #[test]
     fn match_save_for_path_finds_exact_and_subpath() {
         let save = WatchedSave {
@@ -5043,40 +5140,7 @@ mod tests {
             track_only: false,
         };
         let mut slots = HashMap::new();
-        slots.insert(
-            "abc".to_string(),
-            SaveSlot {
-                save,
-                watcher: None,
-                pending: None,
-                burst_since: None,
-                burst_backups: 0,
-                is_running: false,
-                weak_session: false,
-                last_running_seen: None,
-                has_pending: false,
-                last_fs_event_at: None,
-                last_restore_at: None,
-                next_scheduled_backup_at: None,
-                first_pending_event_at: None,
-                last_backup_at: None,
-                in_flight: None,
-                next_backup_at: None,
-                next_restore_at: None,
-                restore_failures: kernel::RestoreFailures::default(),
-                last_set_hash: None,
-                synced_fingerprint: None,
-                last_l0_mtime: None,
-                needs_l1: false,
-                manual_requested: false,
-                pending_op_result: None,
-                pending_upload_landed: None,
-                last_restore_error: None,
-                known_version: None,
-                pull_pending: false,
-                deferred_notified: false,
-            },
-        );
+        slots.insert("abc".to_string(), test_slot(save));
 
         assert_eq!(
             match_save_for_path(&slots, Path::new("/tmp/saves/stardew")),
@@ -5089,6 +5153,65 @@ mod tests {
         assert_eq!(
             match_save_for_path(&slots, Path::new("/tmp/saves/other")),
             None
+        );
+    }
+
+    /// The adaptive floor has to be *visible*. A fixed one was reverted for
+    /// being invisible ("Hoard isn't picking up my changes"); a conditional one
+    /// nobody can see fails the same way to fewer people. The wait lands in
+    /// `next_scheduled_backup_at`, which the overlay's "next copy in Xs" reads,
+    /// and is announced once — not on every one of the thirty ticks the floor
+    /// spans.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deferred_backup_shows_when_it_will_go_out() {
+        let save = WatchedSave {
+            save_id: "burst-1".into(),
+            game_slug: "fake-game".into(),
+            display_name: "Fake Game".into(),
+            label: "main".into(),
+            local_path: PathBuf::from("/tmp/saves/fake"),
+            steam_install_dir: None,
+            processes: vec![],
+            shared_processes: false,
+            policy: Default::default(),
+            allow_device_local: None,
+            known_version: None,
+            set_hash: None,
+            track_only: false,
+        };
+        let mut slots = HashMap::new();
+        slots.insert("burst-1".to_string(), test_slot(save));
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(8);
+
+        let now = OffsetDateTime::now_utc();
+        let floor = now + time::Duration::seconds(60);
+
+        // Nothing pending is the ordinary quiet state, not a queue.
+        announce_backup_wait(&mut slots, "burst-1", Some(floor), now, &events_tx);
+        assert!(slots["burst-1"].next_scheduled_backup_at.is_none());
+        assert!(events_rx.try_recv().is_err());
+
+        slots.get_mut("burst-1").unwrap().has_pending = true;
+        announce_backup_wait(&mut slots, "burst-1", Some(floor), now, &events_tx);
+        assert_eq!(slots["burst-1"].next_scheduled_backup_at, Some(floor));
+        match events_rx.try_recv() {
+            Ok(AgentEvent::BackupScheduled { delay_ms, .. }) => {
+                assert!(
+                    (59_000..=60_000).contains(&delay_ms),
+                    "announced {delay_ms}ms, not the minute it is actually waiting"
+                );
+            }
+            other => panic!("expected a scheduled backup, got {other:?}"),
+        }
+
+        // The reducer holds again on every tick; the feed must not.
+        for i in 1..30 {
+            let t = now + time::Duration::seconds(i * 2);
+            announce_backup_wait(&mut slots, "burst-1", Some(floor), t, &events_tx);
+        }
+        assert!(
+            events_rx.try_recv().is_err(),
+            "re-announced the same wait, which is what flooded the feed with orphan rows"
         );
     }
 

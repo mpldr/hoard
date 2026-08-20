@@ -868,6 +868,12 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
             // Sólo cuando el min-interval aplazó la subida más allá del debounce
             // hay una espera de verdad que enseñar; el debounce rutinario de
             // cada autosave no es "en cola — esperando".
+            //
+            // Esta rama estuvo muerta hasta ago-2026: el único `BackupScheduled`
+            // que se emitía venía del temporizador de debounce y su `delay_ms`
+            // era el debounce exacto, así que nunca lo superaba. Ahora el motor
+            // anuncia también la espera del suelo (`agent::announce_backup_wait`,
+            // 60 s como mínimo), que es la que de verdad hay que enseñar.
             let _ = app.emit("agent://throttled", ev);
         }
         _ => {}

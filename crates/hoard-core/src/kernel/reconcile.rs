@@ -297,13 +297,27 @@ fn decide_backup(
         // juego. En un log valen lo mismo hasta que hay que explicarle a alguien
         // por qué su partida "tarda" — y entonces valen cosas muy distintas.
         return Some(hold(if next.min_backup_interval_secs > 0 {
-            "backup min-interval"
+            HOLD_BACKUP_MIN_INTERVAL
         } else {
-            "backup autosave burst"
+            HOLD_BACKUP_BURST
         }));
     }
     next.in_flight = Some(Op::Backup);
     Some(Decision::Act(Action::Backup))
+}
+
+/// Los dos motivos de retención que significan "hay algo que subir y sube en un
+/// rato", frente a los que significan "no se puede subir" (backoff de error,
+/// fichero abierto). Son constantes y no literales porque el shell decide por
+/// ellos si enseñar la espera en la UI, y un motivo que se renombra aquí y no
+/// allí devuelve el suelo a ser invisible — que es justo por lo que hubo que
+/// revertir el primero.
+pub const HOLD_BACKUP_MIN_INTERVAL: &str = "backup min-interval";
+pub const HOLD_BACKUP_BURST: &str = "backup autosave burst";
+
+/// ¿Es este motivo una espera con hora, que la UI debería poder enseñar?
+pub fn hold_is_paced_backup(reason: &str) -> bool {
+    reason == HOLD_BACKUP_MIN_INTERVAL || reason == HOLD_BACKUP_BURST
 }
 
 /// Ventana en la que se cuentan los commits de un save para decidir si el juego
@@ -345,7 +359,13 @@ fn effective_min_interval(state: &State) -> u64 {
 /// hace del ancla —`last_backup_at`, que sólo avanza con un commit real— la
 /// única memoria del suelo: un no-op no puede empujarlo (regresión R.E.P.O.,
 /// D.8.2).
-fn backup_floor(state: &State) -> Option<OffsetDateTime> {
+///
+/// Public because the shell needs the same number to *show* it: a wait nobody
+/// can see reads as "Hoard isn't picking up my changes", which is why the first
+/// attempt at a fixed floor had to be reverted. The shell asks for the deadline
+/// and puts it in `next_scheduled_backup_at`, where the UI's "next copy in Xs"
+/// already reads from.
+pub fn backup_floor(state: &State) -> Option<OffsetDateTime> {
     let secs = effective_min_interval(state);
     if secs == 0 {
         return None;

@@ -16,13 +16,13 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 
 use crate::api::{
-    ApiClient, CasCommit, CasFile, CasInit, CloudCasFileEntry, CloudCasInit, CloudCasMissingBlob,
-    Snapshot,
+    ApiClient, ApiError, CasCommit, CasFile, CasInit, CloudCasFileEntry, CloudCasInit,
+    CloudCasMissingBlob, RateLimitKind, Snapshot,
 };
 use crate::state::{CliState, SaveState};
 use hoard_core::ids::SaveId;
@@ -34,6 +34,124 @@ use hoard_core::wire::VersionOrigin;
 /// open/read and R2 round-trip latency dominates over raw throughput; a small
 /// window hides that latency without saturating the disk or the uplink.
 const TRANSFER_CONCURRENCY: usize = 4;
+
+/// How many times one blob may be turned away by a request pacer before we stop
+/// and let the whole attempt fail.
+///
+/// This exists so a genuinely misconfigured server (an operator who sets
+/// `per_second = 1`, or a proxy that refuses everything) fails fast with a clear
+/// error instead of crawling for an hour pretending to work.
+const MAX_PACED_RETRIES_PER_BLOB: u32 = 6;
+
+/// Shortest we'll wait after being paced, and the base of the per-blob backoff.
+///
+/// The pacer's own hint is in whole seconds, so at any sane rate limit it says
+/// `0` — true, but not something to act on literally. Four workers each waiting
+/// ~200 ms converges on roughly 20 requests/second, which is the default limit
+/// the server is actually enforcing.
+const PACED_RETRY_FLOOR: Duration = Duration::from_millis(200);
+
+/// Ceiling for a single paced wait. Past this, a "slow down" is better handled
+/// by failing the attempt and re-arming on the agent's long backoff.
+const PACED_RETRY_CEILING: Duration = Duration::from_secs(10);
+
+/// Total time one upload may spend sitting in pacer waits, summed across all
+/// its blobs and all workers.
+///
+/// Summed rather than wall-clock on purpose: wall-clock would also count the
+/// transfer itself, so a legitimately slow 4 GB upload would abort the moment
+/// anything paced it. This counts only time actually spent blocked.
+///
+/// Generous, because the per-blob cap above is what really guards against a
+/// hostile server — this one only has to stop a huge folder from crawling
+/// indefinitely against a very tight limit. A folder of a few thousand small
+/// files paced at 20 requests/second legitimately spends minutes here, and
+/// aborting that would be the same bug in a new hat.
+const PACED_WAIT_BUDGET: Duration = Duration::from_secs(900);
+
+/// The wait a pacer asked for, if this error is one.
+///
+/// Only [`RateLimitKind::Paced`] retries here. A budget 429 (bandwidth window,
+/// storage quota, loop brake) means the operation doesn't fit right now, and
+/// re-sending the same PUT can only make it worse — those keep travelling up to
+/// the agent, which parks the save and comes back later.
+fn paced_wait_hint(e: &anyhow::Error) -> Option<u32> {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<ApiError>())
+        .and_then(|api| match api {
+            ApiError::RateLimited {
+                kind: RateLimitKind::Paced,
+                retry_after_seconds,
+                ..
+            } => Some(*retry_after_seconds),
+            _ => None,
+        })
+}
+
+/// Run one blob's upload, retrying it — and only it — while a pacer says
+/// "too fast".
+///
+/// The upload of a save is N independent PUTs, one per missing blob, and N is
+/// the user's file count: 122 for a Cyberpunk folder with 46 save slots. The
+/// per-IP pacer allows a burst and then a steady rate, so on a fast link the
+/// tail of a large upload is *expected* to be turned away a few times. Letting
+/// that abort the set (`try_collect` cancels every sibling on the first error)
+/// meant a large save could never finish: each attempt got roughly a burst's
+/// worth of blobs through, kept none of them — a fresh `upload_id` stages from
+/// zero — and re-uploaded everything on the next pass, forever.
+///
+/// `attempt` is a closure, not a future, because a retry needs a new body: the
+/// file gets re-opened and re-hashed on the way out, so a save the game rewrote
+/// mid-upload is still caught by the sha check rather than silently retried
+/// with stale bytes.
+async fn put_blob_paced<F, Fut>(
+    relative_path: &str,
+    paced_wait_ms: &AtomicU64,
+    mut attempt: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut retries = 0u32;
+    loop {
+        let err = match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Some(hint_secs) = paced_wait_hint(&err) else {
+            return Err(err);
+        };
+        if retries >= MAX_PACED_RETRIES_PER_BLOB {
+            return Err(err.context(format!(
+                "{relative_path}: still being rate limited after {retries} retries — \
+                 the server's request limit is too tight for this save's file count"
+            )));
+        }
+        // Honour the server's number when it gave a real one; otherwise back
+        // off from the floor. Either way it's capped, so a bogus hint can't
+        // park the upload.
+        let wait = Duration::from_secs(u64::from(hint_secs))
+            .max(PACED_RETRY_FLOOR * 2u32.pow(retries.min(5)))
+            .min(PACED_RETRY_CEILING);
+        let spent = paced_wait_ms.fetch_add(wait.as_millis() as u64, Ordering::Relaxed);
+        if Duration::from_millis(spent) > PACED_WAIT_BUDGET {
+            return Err(err.context(format!(
+                "{relative_path}: gave up after {}s of rate-limit waiting",
+                PACED_WAIT_BUDGET.as_secs()
+            )));
+        }
+        retries += 1;
+        tracing::debug!(
+            file = relative_path,
+            retries,
+            wait_ms = wait.as_millis() as u64,
+            hint_secs,
+            "upload: paced by the server — retrying this blob"
+        );
+        tokio::time::sleep(wait).await;
+    }
+}
 
 /// The source directory exists but holds no regular files to upload (only
 /// empty subdirs, or nothing). Typed so the agent can treat it as "nothing to
@@ -706,35 +824,43 @@ where
     // es la cifra que el usuario está esperando.
     let denom = upload_total.max(1);
     let uploaded = AtomicU64::new(0);
+    // Shared across every worker: the pacer waits are the same queue, so the
+    // give-up budget has to be counted once for the whole upload.
+    let paced_wait_ms = AtomicU64::new(0);
     progress(0, denom);
     let mut put_futs = Vec::with_capacity(pending.len());
     for (f, sha) in pending {
         let uploaded = &uploaded;
+        let paced_wait_ms = &paced_wait_ms;
         let progress = &progress;
         let upload_id = init.upload_id.as_str();
         put_futs.push(
             async move {
-                let file = tokio::fs::File::open(&f.absolute_path)
-                    .await
-                    .with_context(|| format!("opening {}", f.absolute_path.display()))?;
-                let (stream, sent) = hashing_stream(file);
-                client
-                    .cas_upload_blob(
-                        upload_id,
-                        &sha,
-                        reqwest::Body::wrap_stream(stream),
-                        f.size_bytes,
-                    )
-                    .await
-                    .with_context(|| format!("uploading {}", f.relative_path))?;
-                // El server rechaza un blob cuyo contenido no case con su sha,
-                // así que aquí ya no puede colarse contenido cruzado. Se
-                // comprueba igual para dar el mensaje bueno —"el juego rotó el
-                // save mientras subía"— en vez del 400 crudo del server.
-                {
-                    let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
-                    verify_sent(&f.relative_path, &sha, f.size_bytes, &sent)?;
-                }
+                put_blob_paced(&f.relative_path, paced_wait_ms, || async {
+                    let file = tokio::fs::File::open(&f.absolute_path)
+                        .await
+                        .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                    let (stream, sent) = hashing_stream(file);
+                    client
+                        .cas_upload_blob(
+                            upload_id,
+                            &sha,
+                            reqwest::Body::wrap_stream(stream),
+                            f.size_bytes,
+                        )
+                        .await
+                        .with_context(|| format!("uploading {}", f.relative_path))?;
+                    // El server rechaza un blob cuyo contenido no case con su sha,
+                    // así que aquí ya no puede colarse contenido cruzado. Se
+                    // comprueba igual para dar el mensaje bueno —"el juego rotó el
+                    // save mientras subía"— en vez del 400 crudo del server.
+                    {
+                        let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
+                        verify_sent(&f.relative_path, &sha, f.size_bytes, &sent)?;
+                    }
+                    Ok(())
+                })
+                .await?;
                 let done = uploaded.fetch_add(f.size_bytes, Ordering::Relaxed) + f.size_bytes;
                 progress(done, denom);
                 Ok::<_, anyhow::Error>(())
@@ -968,36 +1094,44 @@ where
     // bytes as they land. (Eager Vec of boxed futures for the same
     // trait-inference reason as the hashing pass above.)
     let uploaded = AtomicU64::new(0);
+    // Shared across every worker: the pacer waits are the same queue, so the
+    // give-up budget has to be counted once for the whole upload.
+    let paced_wait_ms = AtomicU64::new(0);
     progress(0, denom);
     let mut put_futs = Vec::with_capacity(pending.len());
     for (blob, f) in pending {
         let uploaded = &uploaded;
+        let paced_wait_ms = &paced_wait_ms;
         let progress = &progress;
         put_futs.push(
             async move {
-                let file = tokio::fs::File::open(&f.absolute_path)
-                    .await
-                    .with_context(|| format!("opening {}", f.absolute_path.display()))?;
-                let (stream, sent) = hashing_stream(file);
-                client
-                    .put_presigned(
-                        &blob.upload,
-                        reqwest::Body::wrap_stream(stream),
-                        f.size_bytes,
-                    )
-                    .await
-                    .with_context(|| format!("uploading {}", f.relative_path))?;
-                // El objeto ya está en el bucket, pero **sin commit no existe
-                // para nadie**: la fila de `cloud_blobs` se crea al confirmar la
-                // versión, y el dedup del servidor mira esa tabla, no el bucket.
-                // Así que abortar aquí deja el objeto huérfano (lo barre el GC) y
-                // el intento siguiente lo vuelve a pedir y lo sobreescribe con el
-                // contenido bueno. Lo que no puede pasar —y es lo que pasaba— es
-                // que se confirme una versión que apunta a bytes que no son.
-                {
-                    let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
-                    verify_sent(&f.relative_path, &blob.sha256, f.size_bytes, &sent)?;
-                }
+                put_blob_paced(&f.relative_path, paced_wait_ms, || async {
+                    let file = tokio::fs::File::open(&f.absolute_path)
+                        .await
+                        .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                    let (stream, sent) = hashing_stream(file);
+                    client
+                        .put_presigned(
+                            &blob.upload,
+                            reqwest::Body::wrap_stream(stream),
+                            f.size_bytes,
+                        )
+                        .await
+                        .with_context(|| format!("uploading {}", f.relative_path))?;
+                    // El objeto ya está en el bucket, pero **sin commit no existe
+                    // para nadie**: la fila de `cloud_blobs` se crea al confirmar la
+                    // versión, y el dedup del servidor mira esa tabla, no el bucket.
+                    // Así que abortar aquí deja el objeto huérfano (lo barre el GC) y
+                    // el intento siguiente lo vuelve a pedir y lo sobreescribe con el
+                    // contenido bueno. Lo que no puede pasar —y es lo que pasaba— es
+                    // que se confirme una versión que apunta a bytes que no son.
+                    {
+                        let sent = sent.lock().map_err(|_| anyhow!("upload hasher poisoned"))?;
+                        verify_sent(&f.relative_path, &blob.sha256, f.size_bytes, &sent)?;
+                    }
+                    Ok(())
+                })
+                .await?;
                 let done = uploaded.fetch_add(f.size_bytes, Ordering::Relaxed) + f.size_bytes;
                 progress(done, denom);
                 Ok::<_, anyhow::Error>(())
@@ -1816,5 +1950,107 @@ mod tests {
         std::fs::write(&file, b"bbbb").unwrap();
         let after = compute_set_signature(&walk_source(&file, &[]).unwrap());
         assert_ne!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod paced_upload_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    fn paced_error() -> anyhow::Error {
+        anyhow!(ApiError::RateLimited {
+            kind: RateLimitKind::Paced,
+            retry_after_seconds: 0,
+            body: "Too Many Requests! Wait for 0s".into(),
+        })
+        .context("uploading AutoSave-6/sav.dat")
+    }
+
+    fn budget_error() -> anyhow::Error {
+        anyhow!(ApiError::RateLimited {
+            kind: RateLimitKind::Budget,
+            retry_after_seconds: 420,
+            body: r#"{"code":"bandwidth_limit","retry_after_seconds":420}"#.into(),
+        })
+        .context("uploading AutoSave-6/sav.dat")
+    }
+
+    /// The bug this whole path exists for: a save with more blobs than the
+    /// server's burst allows used to lose every blob it had already uploaded
+    /// the moment the pacer turned one away.
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_blob_is_retried_rather_than_dropped() {
+        let calls = AtomicU32::new(0);
+        let waited = AtomicU64::new(0);
+        let r = put_blob_paced("AutoSave-6/sav.dat", &waited, || async {
+            match calls.fetch_add(1, Ordering::Relaxed) {
+                0 | 1 => Err(paced_error()),
+                _ => Ok(()),
+            }
+        })
+        .await;
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// A budget is the opposite instruction: the operation doesn't fit right
+    /// now, and re-sending the same PUT can only make it worse. It has to
+    /// travel up untouched so the agent parks the save and comes back later.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_429_is_not_retried() {
+        let calls = AtomicU32::new(0);
+        let waited = AtomicU64::new(0);
+        let r = put_blob_paced("AutoSave-6/sav.dat", &waited, || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(budget_error())
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let api = r.unwrap_err();
+        let api = api.chain().find_map(|c| c.downcast_ref::<ApiError>());
+        assert!(matches!(
+            api,
+            Some(ApiError::RateLimited {
+                kind: RateLimitKind::Budget,
+                ..
+            })
+        ));
+    }
+
+    /// A server whose limit is simply too tight for this save has to fail
+    /// loudly and quickly. Crawling for an hour while pretending to work is
+    /// worse than a clear error the operator can act on.
+    #[tokio::test(start_paused = true)]
+    async fn a_pacer_that_never_relents_gives_up() {
+        let calls = AtomicU32::new(0);
+        let waited = AtomicU64::new(0);
+        let r = put_blob_paced("AutoSave-6/sav.dat", &waited, || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(paced_error())
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            MAX_PACED_RETRIES_PER_BLOB + 1
+        );
+        assert!(format!("{:#}", r.unwrap_err()).contains("too tight"));
+    }
+
+    /// Anything that isn't a pacer keeps its old behaviour: straight up, no
+    /// retry. A blob whose bytes stopped matching its sha must not be re-sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_real_failure_is_not_retried() {
+        let calls = AtomicU32::new(0);
+        let waited = AtomicU64::new(0);
+        let r = put_blob_paced("AutoSave-6/sav.dat", &waited, || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(anyhow!("the game rotated the save while it was uploading"))
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

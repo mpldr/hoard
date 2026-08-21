@@ -11,7 +11,7 @@
 //! `is_logged_in` and `current_user` read from the in-memory cache that the
 //! app populates at startup from the on-disk session.
 
-use hoard_agent::api::{ApiClient, ApiError};
+use hoard_agent::api::{ApiClient, ApiError, RateLimitKind};
 use hoard_agent::credentials::{self, Credentials, UserSection};
 use hoard_core::ipc::{ServerSession, ServerUser};
 use serde::{Deserialize, Serialize};
@@ -379,12 +379,25 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
             ApiError::Network(e) => network_message(e),
             ApiError::TooLarge(detail) => detail.human(),
             ApiError::QuotaExceeded(detail) => detail.human(),
+            // Two different sentences because they're two different problems:
+            // a budget is something the account ran out of and has to wait out,
+            // while pacing is the server asking this machine to send requests
+            // more slowly. Telling someone they hit "the bandwidth limit" when
+            // the server only wanted them to slow down sends them looking at
+            // their plan for a problem that isn't there.
             ApiError::RateLimited {
+                kind: RateLimitKind::Budget,
                 retry_after_seconds,
                 ..
             } => format!(
                 "You've hit the bandwidth limit for now. Try again in about {retry_after_seconds}s."
             ),
+            ApiError::RateLimited {
+                kind: RateLimitKind::Paced,
+                ..
+            } => {
+                "The server is limiting how fast requests can arrive. Try again in a moment.".into()
+            }
             ApiError::Conflict(msg) | ApiError::BadRequest(msg) => msg.clone(),
         };
     }

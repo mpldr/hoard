@@ -4011,17 +4011,26 @@ async fn run_backup_with_retry(
                 // window-slide time and retry without consuming the
                 // network-flake budget. Kept out of the "falló" feed path —
                 // we emit an amber "en espera" entry instead.
-                let retry_after = e
+                //
+                // Only the blob PUTs get retried in place (`backup::put_blob_paced`);
+                // a 429 that reaches here came from a single request — the init or
+                // the commit — so waiting and re-running the whole backup is right
+                // for either kind. The kind still travels because the log line has
+                // to say which one it was: "bandwidth limit" on what was really the
+                // server asking this machine to slow down is what sent a whole
+                // investigation looking at plan quotas.
+                let throttle = e
                     .chain()
                     .find_map(|c| c.downcast_ref::<crate::api::ApiError>())
                     .and_then(|api_err| match api_err {
                         crate::api::ApiError::RateLimited {
+                            kind,
                             retry_after_seconds,
                             ..
-                        } => Some(*retry_after_seconds),
+                        } => Some((*kind, *retry_after_seconds)),
                         _ => None,
                     });
-                if let Some(retry_after) = retry_after {
+                if let Some((kind, retry_after)) = throttle {
                     if throttle_waits < MAX_THROTTLE_WAITS {
                         // Cap the wait so a bogus huge `retry_after` can't park
                         // the upload forever; +2s jitter avoids a thundering
@@ -4033,7 +4042,8 @@ async fn run_backup_with_retry(
                             throttle_waits,
                             retry_after,
                             wait,
-                            "agent: backup throttled by bandwidth limit — waiting to retry"
+                            %kind,
+                            "agent: backup throttled (429) — waiting to retry"
                         );
                         let _ = events_tx
                             .send(AgentEvent::BackupThrottled {

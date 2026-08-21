@@ -51,16 +51,58 @@ pub enum ApiError {
     BadRequest(String),
     #[error("server error ({status}): {body}")]
     Server { status: u16, body: String },
-    /// 429 from the rolling bandwidth limiter. Carries the server's
-    /// `retry_after_seconds` so the caller can wait the *exact* window-slide
-    /// time instead of a short exponential backoff that would just burn every
-    /// retry inside the still-over-quota window. `body` keeps the raw JSON for
-    /// logging/diagnostics.
-    #[error("rate limited (429): retry after {retry_after_seconds}s")]
+    /// HTTP 429. Carries the server's `retry_after_seconds` so the caller can
+    /// wait the *exact* window-slide time instead of a short exponential
+    /// backoff that would just burn every retry inside the still-over-quota
+    /// window. `body` keeps the raw JSON for logging/diagnostics.
+    ///
+    /// `kind` says which of the two very different 429s this is — see
+    /// [`RateLimitKind`]. Collapsing them into one is what wedged large
+    /// self-hosted uploads: a "you're going too fast" answer meant for a single
+    /// PUT was treated as "the whole upload doesn't fit right now".
+    #[error("rate limited (429, {kind}): retry after {retry_after_seconds}s")]
     RateLimited {
+        kind: RateLimitKind,
         retry_after_seconds: u32,
         body: String,
     },
+}
+
+/// Which kind of 429 came back, because Hoard's servers answer 429 for two
+/// reasons that need opposite reactions.
+///
+/// The wire tells them apart by structure, not by a flag: every budget answer
+/// Hoard writes carries a JSON `code` (`bandwidth_limit`,
+/// `quota_exceeded_paced`, `restore_paced`, `too_many_attempts`), while the
+/// per-IP pacer is `tower_governor` middleware that never sees our types and
+/// answers a bare body. A reverse proxy's own limiter (nginx `limit_req`, which
+/// the self-host guide recommends putting in front) lands in the same
+/// unstructured shape — and wants the same reaction — so "no code" is the right
+/// test rather than sniffing for a particular server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    /// Per-IP request pacing: *this request* arrived too fast. The wait is
+    /// milliseconds to seconds and the operation as a whole is perfectly
+    /// welcome — retry the single request and carry on. Abandoning the whole
+    /// operation here is how a 122-blob upload could never finish: the pacer
+    /// let ~60 through per attempt, the client threw away the other 62 along
+    /// with the ones that had already landed, and the next attempt started
+    /// from zero.
+    Paced,
+    /// A budget the whole operation does not fit inside right now: the rolling
+    /// bandwidth window, the storage quota, or a loop brake. Retrying the same
+    /// request in a tight loop cannot help — the caller has to give up on this
+    /// attempt and come back after the stated wait.
+    Budget,
+}
+
+impl std::fmt::Display for RateLimitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RateLimitKind::Paced => "paced",
+            RateLimitKind::Budget => "budget",
+        })
+    }
 }
 
 /// Structured body of a 413. All fields default to zero/empty so a body we
@@ -243,13 +285,26 @@ fn fmt_bytes(n: u64) -> String {
 impl ApiError {
     pub async fn from_response(resp: reqwest::Response) -> Self {
         let status = resp.status();
-        // Grab the Retry-After header before consuming the body — it's our
-        // fallback for `retry_after_seconds` if the JSON is unparseable.
-        let retry_after_header = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        // Grab the wait hints before consuming the body — they're our fallback
+        // for `retry_after_seconds` if the JSON is unparseable.
+        //
+        // Two header names, because the per-IP pacer speaks a different one:
+        // `tower_governor` emits `x-ratelimit-after` and nothing else, so a
+        // client that only looks for `Retry-After` throws away the one number
+        // the pacer *did* send and invents its own. Note the pacer's value is
+        // whole seconds (`Duration::as_secs`), so a sub-second wait — which is
+        // every wait at the default 20 req/s — arrives as a legitimate `0`.
+        // `0` means "almost immediately", not "no hint"; the retry loop applies
+        // its own floor.
+        let headers = resp.headers();
+        let retry_after_header = ["retry-after", "x-ratelimit-after"]
+            .iter()
+            .find_map(|name| {
+                headers
+                    .get(*name)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            });
         let body = resp.text().await.unwrap_or_default();
         match status {
             StatusCode::UNAUTHORIZED => ApiError::Unauthorized,
@@ -283,18 +338,9 @@ impl ApiError {
             StatusCode::CONFLICT => ApiError::Conflict(extract_message(&body)),
             StatusCode::BAD_REQUEST => ApiError::BadRequest(extract_message(&body)),
             StatusCode::TOO_MANY_REQUESTS => {
-                let retry_after_seconds = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("retry_after_seconds")
-                            .and_then(|x| x.as_u64())
-                            .map(|n| n as u32)
-                    })
-                    .or(retry_after_header)
-                    // Defensive floor: a 429 with no usable hint still waits a
-                    // sensible spell rather than hammering immediately.
-                    .unwrap_or(60);
+                let (kind, retry_after_seconds) = classify_rate_limit(&body, retry_after_header);
                 ApiError::RateLimited {
+                    kind,
                     retry_after_seconds,
                     body,
                 }
@@ -320,6 +366,40 @@ fn extract_message(body: &str) -> String {
 }
 
 /// Pull the stable machine-readable `code` out of a cloud error body, if any.
+/// Read a 429's body and wait hints into a kind and a number of seconds.
+///
+/// Split out from `from_response` so the wire rules are testable without an
+/// HTTP round trip — they're the whole point of the change and easy to break
+/// by accident later.
+fn classify_rate_limit(body: &str, retry_after_header: Option<u32>) -> (RateLimitKind, u32) {
+    // A `code` means one of our handlers wrote this answer, and every one of
+    // those is a budget: bandwidth window, storage quota, loop brake, login
+    // throttle. An unknown code counts as a budget too — backing off fully is
+    // the safe way to be wrong about a server newer than us.
+    let kind = match extract_code(body) {
+        Some(_) => RateLimitKind::Budget,
+        None => RateLimitKind::Paced,
+    };
+    let secs = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("retry_after_seconds")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as u32)
+        })
+        .or(retry_after_header)
+        .unwrap_or(match kind {
+            // A budget with no usable hint waits a sensible spell rather than
+            // hammering. For pacing the same 60s would be a lie with teeth: the
+            // real wait is milliseconds, and 122 blobs served 60s each is a
+            // two-hour upload. Leave it at 0 and let the retry loop's floor
+            // decide.
+            RateLimitKind::Budget => 60,
+            RateLimitKind::Paced => 0,
+        });
+    (kind, secs)
+}
+
 fn extract_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -587,6 +667,15 @@ impl ApiClient {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
+            // The bytes go straight to the bucket here, so this 429 is the
+            // storage provider's own pacing, not ours. Surface it as a typed
+            // `RateLimited` rather than a string so the blob retry loop can
+            // honour it exactly like it honours the self-hosted one — a plain
+            // `bail!` made the whole upload fail on a signal that only ever
+            // meant "slow down".
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(anyhow!(ApiError::from_response(resp).await));
+            }
             let text = resp.text().await.unwrap_or_default();
             bail!("storage upload failed ({status}): {text}");
         }
@@ -1497,5 +1586,73 @@ mod too_large_tests {
             assert_eq!(d.kind(), TooLargeKind::Proxy, "{body}");
             assert!(d.human().contains("reverse proxy"), "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// Every 429 one of our handlers writes carries a `code`, and every one of
+    /// them means "this operation doesn't fit right now" — wait it out, don't
+    /// re-send.
+    #[test]
+    fn our_own_429s_are_budgets() {
+        for (body, expect_secs) in [
+            (
+                r#"{"error":"bandwidth quota exceeded","code":"bandwidth_limit","retry_after_seconds":420}"#,
+                420,
+            ),
+            (
+                r#"{"error":"storage quota exceeded","code":"quota_exceeded_paced","retry_after_seconds":300}"#,
+                300,
+            ),
+            (
+                r#"{"error":"already downloaded","code":"restore_paced","retry_after_seconds":900}"#,
+                900,
+            ),
+            (
+                r#"{"error":"too many attempts","code":"too_many_attempts","retry_after_secs":30}"#,
+                60,
+            ),
+        ] {
+            let (kind, secs) = classify_rate_limit(body, None);
+            assert_eq!(kind, RateLimitKind::Budget, "{body}");
+            assert_eq!(secs, expect_secs, "{body}");
+        }
+    }
+
+    /// The per-IP pacer is middleware: it never sees our types, so its answer
+    /// has no `code` and its wait rides in `x-ratelimit-after`. Reading that as
+    /// a budget is what wedged large self-hosted uploads.
+    #[test]
+    fn the_per_ip_pacer_is_not_a_budget() {
+        let (kind, secs) = classify_rate_limit("Too Many Requests! Wait for 0s", Some(0));
+        assert_eq!(kind, RateLimitKind::Paced);
+        assert_eq!(secs, 0);
+    }
+
+    /// A reverse proxy's own limiter — which the self-host guide tells
+    /// operators to put in front — answers HTML with no headers at all. Same
+    /// meaning as our pacer, so the same handling, and crucially *not* the
+    /// 60-second default that a budget gets: 122 blobs served a fabricated
+    /// minute each is a two-hour upload.
+    #[test]
+    fn an_unstructured_429_paces_rather_than_inventing_a_minute() {
+        let (kind, secs) = classify_rate_limit(
+            "<html><head><title>429 Too Many Requests</title></head></html>",
+            None,
+        );
+        assert_eq!(kind, RateLimitKind::Paced);
+        assert_eq!(secs, 0);
+    }
+
+    /// `Retry-After` still wins when it's there — a proxy that speaks the
+    /// standard header is telling the truth about its own window.
+    #[test]
+    fn a_standard_retry_after_header_is_honoured() {
+        let (kind, secs) = classify_rate_limit("slow down", Some(5));
+        assert_eq!(kind, RateLimitKind::Paced);
+        assert_eq!(secs, 5);
     }
 }

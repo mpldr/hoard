@@ -110,6 +110,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `start_paused` for the upload retry tests: the pacer backoff climbs to
+# seconds, and a suite that actually sleeps through it is a suite nobody runs.
+# Dev-only under resolver 2, so no production build picks it up.
+tokio = { workspace = true, features = ["test-util"] }
 # Mirror of the cfg(windows) prod dep: GOG Galaxy's sqlite reader lives in
 # `launchers.rs`, but its parser code is OS-agnostic and gets exercised by
 # tests on Linux too (synthesised fixture). The dev-dep makes the

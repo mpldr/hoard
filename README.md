@@ -51,7 +51,8 @@ One codebase, two ways to run it:
   Sign in with Google, install the app, done. Free tier: 2 GB, 3 devices,
   full version history — free forever.
 - **Self-hosted** — run the same `hoard-server` binary on your own box and
-  point the app at it. No account, no quota — just your cloud.
+  point the app at it. No account, no quota — just your cloud. On a NAS it is
+  two boxes to fill in: Docker image, or the [Unraid template](Unraid.md).
 
 Pro (from 1.99 €/month) gives you 100 GB — [I don't profit from it](https://github.com/rleeon/hoard). It unlocks
 **Hoard Screen**, an in-game overlay to browse and roll back snapshots without
@@ -105,7 +106,7 @@ irm https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.ps1 |
 
 ## Documentation
 
-- **[Self-hosting guide](SELF-HOST_GUIDE.md)** — Docker, bare-metal + systemd, and the headless CLI.
+- **[Self-hosting guide](SELF-HOST_GUIDE.md)** — Docker, Unraid, bare-metal + systemd, and the headless CLI.
 - **[Contributing](CONTRIBUTING.md)** — building from source, the release flow, and the architecture.
 - **[Funding](FUNDING.md)** — where the money goes and what your sponsorship covers.
 

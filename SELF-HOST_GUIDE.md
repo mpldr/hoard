@@ -31,6 +31,45 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml token cre
 
 In the app's onboarding, pick **Autohost**, paste the server URL and token.
 
+### Unraid
+
+Hoard ships an Unraid template, so on a NAS none of the above is needed:
+
+**Apps** → search **Hoard** → *Install*. Fill in the two boxes it asks for — an
+admin username and a password — and press *Apply*. The container writes its own
+config, creates that account, and prints a device token in its log **once**:
+
+```
+
+ Hoard is ready. Copy this token — it is shown ONCE:
+
+ hoard_v1_…
+```
+
+Copy it, open the desktop app on your gaming PC, pick **Self-hosted**, and give
+it `http://IP:12421` plus that token. Remember changue "IP" pls --  The container's *WebUI* button 
+opens the web panel, where the same username and password get you in.
+
+Another PC later? Container → *Console*:
+
+```sh
+hoard-admin token create myuser --device 'living-room PC'
+```
+
+Two folders under `/mnt/user/appdata/hoard/` hold everything — `data/` (the
+database and every version of every save) and `config/` (`config.toml`, for when
+you want to raise a limit or move storage to S3). Back up `data/` and you have
+backed up the lot.
+
+Not in the Apps tab yet? The template can be installed by hand — from the Unraid
+terminal:
+
+```sh
+wget -O /boot/config/plugins/dockerMan/templates-user/hoard.xml https://raw.githubusercontent.com/rleeon/hoard/main/templates/hoard.xml
+```
+
+then **Docker** → *Add Container* → pick **Hoard** from the *Template* dropdown.
+
 ### Bare metal + systemd
 
 ```sh
@@ -94,8 +133,8 @@ brackets):
 
 ```sh
 # Remember changue "ip" pls
-tailscale ping ip
-curl http://ip:12421/v1/health
+tailscale ping IP
+curl http://IP:12421/v1/health
 ```
 
 `tailscale ping` reporting the path is up is the whole test — if that

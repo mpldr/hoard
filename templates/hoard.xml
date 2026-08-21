@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Hoard</Name>
+  <Repository>ghcr.io/rleeon/hoard:latest</Repository>
+  <Registry>https://github.com/rleeon/hoard/pkgs/container/hoard</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/rleeon/hoard/issues</Support>
+  <Project>https://hoard.services</Project>
+  <Overview>Hoard backs up and syncs your game saves. It watches the save folders on your gaming PCs, keeps every version so you can go back to yesterday's run, and puts the newest one on whichever PC you sit down at next. With this container the saves stay on your NAS.
+
+This is the server half. The machines you play on need the Hoard desktop app (Windows, Linux, macOS, Steam Deck) or the CLI: hoard.services/download
+
+Setup:
+1. Type an admin username and password below, then press Apply.
+2. Open the container log. The device token for your first PC is printed there, once.
+3. In the desktop app choose "Self-hosted", enter http://TOWER-IP:12421 and paste the token.
+4. WebUI opens the web panel. Log in with the same username and password to see your saves, devices and users.
+
+To add another PC later, open this container's Console and run:
+  hoard-admin token create YOUR-USER --device "living-room PC"
+
+Everything is stored in the two appdata folders below. Back up data/ and you have your saves. Free and open source (AGPL-3.0), with no account and no telemetry when self-hosted.</Overview>
+  <Category>Backup: Cloud: Tools:Utilities</Category>
+  <WebUI>http://[IP]:[PORT:12421]/panel</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/rleeon/hoard/main/templates/hoard.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/rleeon/hoard/main/web/static/icon-512.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <DonateText>Sponsor development</DonateText>
+  <DonateLink>https://github.com/sponsors/rleeon</DonateLink>
+  <Requires>The Hoard desktop app or CLI on each PC you play on: hoard.services/download</Requires>
+  <Config Name="WebUI / API Port" Target="12421" Default="12421" Mode="tcp" Description="The port the server listens on. Both the desktop app and the web panel use it." Type="Port" Display="always" Required="true" Mask="false">12421</Config>
+  <Config Name="Saves and database" Target="/var/lib/hoard" Default="/mnt/user/appdata/hoard/data" Mode="rw" Description="Everything the server stores: the database and every version of every save. This is the folder to back up." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/hoard/data</Config>
+  <Config Name="Config folder" Target="/etc/hoard" Default="/mnt/user/appdata/hoard/config" Mode="rw" Description="Holds config.toml. Leave it empty and the container writes a working one on first start. Edit it afterwards to change limits or use S3-compatible storage." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/hoard/config</Config>
+  <Config Name="Admin username" Target="HOARD_ADMIN_USERNAME" Default="" Mode="" Description="Creates this admin account the first time the container starts on an empty database. Ignored after that, so it is safe to leave filled in." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Admin password" Target="HOARD_ADMIN_PASSWORD" Default="" Mode="" Description="Password for the account above, at least 8 characters. It is what you type into the web panel, and you can change it there later." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="First device name" Target="HOARD_ADMIN_DEVICE" Default="unraid" Mode="" Description="Label for the device token printed in the log on first start. Name it after the PC you are going to use it on." Type="Variable" Display="advanced" Required="false" Mask="false">unraid</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="The user the server runs as. 99 (nobody) matches the rest of appdata." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="The group the server runs as. 100 (users) matches the rest of appdata." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="Log level" Target="HOARD__LOGGING__LEVEL" Default="info" Mode="" Description="error, warn, info, debug or trace." Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
+  <Config Name="Log format" Target="HOARD__LOGGING__FORMAT" Default="pretty" Mode="" Description="pretty reads well in this log window. Use json if you ship the logs somewhere that parses them." Type="Variable" Display="advanced" Required="false" Mask="false">pretty</Config>
+</Container>

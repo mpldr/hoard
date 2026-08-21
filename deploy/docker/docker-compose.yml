@@ -31,11 +31,22 @@ services:
       # host-side mapping above instead.
       HOARD__LOGGING__LEVEL: ${HOARD_LOG_LEVEL:-info}
       HOARD__LOGGING__FORMAT: ${HOARD_LOG_FORMAT:-json}
+      # Set both on a FIRST start and the server creates that admin and prints
+      # a device token in the log, instead of you running `hoard-admin` by hand.
+      # Ignored once the database has users.
+      HOARD_ADMIN_USERNAME: ${HOARD_ADMIN_USERNAME:-}
+      HOARD_ADMIN_PASSWORD: ${HOARD_ADMIN_PASSWORD:-}
+      # The user the server runs as. The entrypoint starts as root only to take
+      # ownership of the volumes below and then drops to this. Set `user:` on
+      # the service instead and it never runs as root at all.
+      PUID: ${HOARD_PUID:-10001}
+      PGID: ${HOARD_PGID:-10001}
     volumes:
       # Persistent data (SQLite DB, snapshots, tmp, trash).
       - hoard-data:/var/lib/hoard
-      # Drop your own config.toml here; the entrypoint will use it.
-      - ./config:/etc/hoard:ro
+      # Your config.toml. Left empty, the container writes a working one here on
+      # first start — so it is mounted read-write, not read-only.
+      - ./config:/etc/hoard
     healthcheck:
       # Compose-side healthcheck (the Dockerfile one is intentionally shallow).
       # Uses wget which we install via a tiny addition below; if you'd rather

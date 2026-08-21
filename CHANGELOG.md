@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **The server installs itself on a NAS.** An Unraid template ships in
+  `templates/`, so Hoard can be installed from the Apps tab: the ports and
+  folders come filled in, and the only two boxes to type into are an admin
+  username and a password. The container does the rest of what used to be a
+  shell session — it writes a working `config.toml` if the config folder is
+  empty, creates that first admin when the database is new, and prints a device
+  token in the log, once, for the desktop app to paste. `HOARD_ADMIN_USERNAME`
+  and `HOARD_ADMIN_PASSWORD` do the same for anyone running the container by
+  hand; they are ignored from the second start on.
+
+### Fixed
+- **A game with many save files could never finish uploading to a self-hosted
+  server.** A save folder travels as one request per file, so a game keeping
+  dozens of slots — 46 in the report that found this — sends more requests
+  back-to-back than the server's per-IP limit allows. That limit answers "you
+  are going too fast", which is a request to slow down, but the client read it
+  as "this upload does not fit" and threw away the whole attempt, including the
+  files that had already arrived. The next attempt started from zero and hit the
+  same wall, forever: one user's game retried 105 times over two days without a
+  single version ever being saved. Uploads now slow down instead of failing —
+  each file waits its turn and the upload finishes, taking seconds rather than
+  never. Size was never the problem: the same server had accepted a 3.8 GB game
+  the day before, because a few big files arrive slowly enough to stay under the
+  limit.
+- **"You've hit the bandwidth limit" when nothing had hit any limit.** The
+  client treated every kind of "too many requests" as the account running out
+  of bandwidth, so a server merely asking it to slow down produced a message
+  that sent people looking at their plan for a problem that was not there, and
+  a wait of a fabricated 60 seconds — the real wait was a fraction of a second.
+  The two are now told apart and each says what it actually is.
+- **A container on a NAS could never write its own data.** Bind-mounted folders
+  arrive owned by root and the server does not run as root, so the very first
+  write failed and the container restarted forever. It now takes ownership of
+  the two mounted folders at startup and drops root before the server runs —
+  `PUID`/`PGID` say who to become (`10001:10001` as before, `99:100` on Unraid,
+  where it matches the rest of appdata). Starting the container with an explicit
+  `--user` skips all of that, exactly as it used to behave.
+- **Mounting an empty config folder stopped the container instead of filling
+  it.** The example config lived at the one path a config mount hides, so the
+  container had nothing to copy from and exited with instructions. It now keeps
+  its copy out of reach of the mount and bootstraps.
+
 ## [1.1.4] - 2026-08-20
 
 ### Added

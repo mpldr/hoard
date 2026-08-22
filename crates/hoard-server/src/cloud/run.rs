@@ -2,7 +2,7 @@
 //! `database.backend = "postgres"`.
 
 use crate::cloud::{
-    account_purge, archive,
+    abandoned, account_purge, archive,
     auth::{require_active_account, require_cloud_auth, JwksCache},
     bandwidth, compress, db, export, polar, pollguard, r2,
     routes::{
@@ -133,6 +133,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     //     cadence; deletes R2 objects then cascades the DB rows. Detached like
     //     the sweepers above.
     account_purge::spawn(state.clone());
+    // Picks up after uploads that started and never committed: their manifest
+    // rows, and the blobs they left in the bucket with nothing referencing them.
+    abandoned::spawn(state.clone());
 
     // Fulfils `export_jobs` rows: builds the ZIP, uploads to R2, emails the
     // link, and expires old exports.

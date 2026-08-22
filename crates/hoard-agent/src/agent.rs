@@ -408,6 +408,20 @@ enum AgentCommand {
     /// [`kernel::reconcile::QUOTA_FULL_BACKOFF_SECS`] instead of retrying every
     /// ten minutes against a wall that only a human can move.
     ParkBackupQuotaFull(String),
+    /// Internal: the upload hit a **budget** 429 — a rolling bandwidth window,
+    /// the storage quota, or the server's loop brake. Same wedge-avoidance
+    /// contract as the two above (no `BackupDone`, `has_pending` survives), fed
+    /// to the reducer as [`kernel::OpResult::Throttled`] so the wait the server
+    /// actually asked for is the one we sit out.
+    ///
+    /// Separate from [`AgentCommand::ParkBackupQuotaFull`] because the wait is
+    /// the server's number, not ours: a bandwidth window slides in minutes while
+    /// a full account needs an hour, and answering both with the same constant
+    /// is how a client ends up hammering one or sleeping through the other.
+    ParkBackupThrottled {
+        id: String,
+        retry_after_secs: u32,
+    },
     /// Latest known cloud version per save id, as last seen by the `cloud_pull`
     /// poller's manifest. The poller already fetches the full manifest once per
     /// tick, so it hands the map to the agent and the reconciliation sweep can
@@ -1816,6 +1830,26 @@ async fn run_agent(
                                 save_id = %id,
                                 backoff_secs = kernel::reconcile::QUOTA_FULL_BACKOFF_SECS,
                                 "agent: cloud storage full — parking the upload until space is freed"
+                            );
+                        }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads,
+                        );
+                    }
+                    Some(AgentCommand::ParkBackupThrottled { id, retry_after_secs }) => {
+                        // Budget 429. Like the two branches above this is a
+                        // reducer input, but the deadline comes off the wire:
+                        // `OpResult::Throttled` carries the server's own
+                        // `retry_after` into `reconcile::throttle_until`.
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.next_scheduled_backup_at = None;
+                            slot.pending_op_result =
+                                Some(kernel::OpResult::Throttled { retry_after_secs });
+                            tracing::info!(
+                                save_id = %id,
+                                retry_after_secs,
+                                "agent: server asked for a wait — parking the upload until it's up"
                             );
                         }
                         reconcile_all(
@@ -4026,15 +4060,74 @@ async fn run_backup_with_retry(
                         crate::api::ApiError::RateLimited {
                             kind,
                             retry_after_seconds,
-                            ..
-                        } => Some((*kind, *retry_after_seconds)),
+                            body,
+                        } => Some((*kind, *retry_after_seconds, body.clone())),
                         _ => None,
                     });
-                if let Some((kind, retry_after)) = throttle {
+                if let Some((kind, retry_after, body)) = throttle {
+                    // A budget 429 is the server saying this operation does not
+                    // fit right now — the bandwidth window, the storage quota,
+                    // or the loop brake. Sitting on it inside the backup task is
+                    // the wrong shape twice over: it holds the task open for
+                    // whatever the server asked (an hour, for a full account),
+                    // and the cap that stopped it doing so silently shortened
+                    // the wait to five minutes, which is how one account
+                    // collected ~170 refusals an hour for four days against a
+                    // brake that had already told it to come back in one.
+                    //
+                    // So we don't wait here at all: give up on the attempt and
+                    // hand the server's own deadline to the reducer, which
+                    // parks the slot and keeps `has_pending` (the bytes are
+                    // still only on disk). Same contract as the 402 path.
+                    if kind == crate::api::RateLimitKind::Budget {
+                        // A full account gets the plain 402 for its first few
+                        // refusals and this paced 429 afterwards, and the two
+                        // mean the same thing to whoever has to act on it. Say
+                        // the same thing, then: the quota event is what puts
+                        // "free up space / go Pro" in front of them, and
+                        // answering the brake with a wordless wait meant the
+                        // one moment worth explaining went quiet exactly when
+                        // it started repeating.
+                        let quota = crate::api::paced_quota_detail(&body);
+                        tracing::info!(
+                            save_id = %save.save_id,
+                            game_slug = %save.game_slug,
+                            retry_after,
+                            full = quota.is_some(),
+                            "agent: backup parked — the server asked for a wait before trying again"
+                        );
+                        let event = match &quota {
+                            Some(detail) => AgentEvent::BackupQuotaFull {
+                                save_id: save.save_id.clone(),
+                                game_slug: save.game_slug.clone(),
+                                label: save.label.clone(),
+                                plan: detail.plan.clone(),
+                                used_bytes: detail.used_bytes,
+                                limit_bytes: detail.limit_bytes,
+                            },
+                            None => AgentEvent::BackupThrottled {
+                                save_id: save.save_id.clone(),
+                                game_slug: save.game_slug.clone(),
+                                label: save.label.clone(),
+                                retry_after_secs: retry_after,
+                            },
+                        };
+                        let _ = events_tx.send(event).await;
+                        let _ = cmd_tx
+                            .send(AgentCommand::ParkBackupThrottled {
+                                id: save.save_id.clone(),
+                                retry_after_secs: retry_after,
+                            })
+                            .await;
+                        return;
+                    }
                     if throttle_waits < MAX_THROTTLE_WAITS {
-                        // Cap the wait so a bogus huge `retry_after` can't park
-                        // the upload forever; +2s jitter avoids a thundering
-                        // herd of saves all retrying on the same tick.
+                        // Pacing only, now: *this request* arrived too fast and
+                        // the wait is milliseconds to seconds. The cap stays
+                        // because that number comes from a per-IP limiter or a
+                        // proxy in front rather than from one of our handlers;
+                        // +2s jitter avoids a thundering herd of saves all
+                        // retrying on the same tick.
                         let wait = (u64::from(retry_after)).clamp(1, 300) + 2;
                         tracing::info!(
                             save_id = %save.save_id,

@@ -366,6 +366,27 @@ fn extract_message(body: &str) -> String {
 }
 
 /// Pull the stable machine-readable `code` out of a cloud error body, if any.
+/// A paced 429 that is really "your account is full", unpacked into the same
+/// figures the 402 carries.
+///
+/// The server answers a full account with a plain 402 until it has refused the
+/// same account five times in an hour, and with a 429 (`quota_exceeded_paced`)
+/// after that. Both mean the identical thing to a person — *you are out of
+/// space, here is how much and here is the upgrade* — but only the 402 was
+/// wired to say so, so the moment the brake engaged the account stopped seeing
+/// the "free up space / go Pro" prompt and started seeing a wordless wait. The
+/// figures were in the paced body the whole time; this reads them back out.
+///
+/// `None` for every other budget 429 (bandwidth window, login throttle), which
+/// are genuinely just a wait.
+pub fn paced_quota_detail(body: &str) -> Option<QuotaExceeded> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("code")?.as_str()? != "quota_exceeded_paced" {
+        return None;
+    }
+    serde_json::from_value(v).ok()
+}
+
 /// Read a 429's body and wait hints into a kind and a number of seconds.
 ///
 /// Split out from `from_response` so the wire rules are testable without an
@@ -1619,6 +1640,33 @@ mod rate_limit_tests {
             let (kind, secs) = classify_rate_limit(body, None);
             assert_eq!(kind, RateLimitKind::Budget, "{body}");
             assert_eq!(secs, expect_secs, "{body}");
+        }
+    }
+
+    /// A full account says the same thing whether it is answered with the 402
+    /// or, once the brake engages, with the paced 429 — so the figures behind
+    /// "free up space / go Pro" have to survive the switch.
+    #[test]
+    fn a_paced_quota_429_still_carries_the_full_account() {
+        let body = r#"{"error":"storage quota exceeded; retries are being spaced out",
+            "code":"quota_exceeded_paced","retry_after_seconds":3600,"repeated":7,
+            "plan":"free","used_bytes":2147483648,"limit_bytes":2147483648,
+            "requested_bytes":1048576,"upgrade_url":"https://hoard.services/upgrade"}"#;
+        let d = paced_quota_detail(body).expect("the quota figures ride in the paced body");
+        assert_eq!(d.plan, "free");
+        assert_eq!(d.limit_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(d.upgrade_url.as_deref(), Some("https://hoard.services/upgrade"));
+
+        // Every other budget 429 is genuinely just a wait — nothing to offer,
+        // nothing to explain, and inventing a "you are full" prompt out of a
+        // bandwidth window would be worse than saying nothing.
+        for other in [
+            r#"{"error":"bandwidth quota exceeded","code":"bandwidth_limit","retry_after_seconds":420}"#,
+            r#"{"error":"already downloaded","code":"restore_paced","retry_after_seconds":900}"#,
+            "Too Many Requests! Wait for 0s",
+            "",
+        ] {
+            assert!(paced_quota_detail(other).is_none(), "{other}");
         }
     }
 

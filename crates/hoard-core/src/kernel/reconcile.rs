@@ -65,6 +65,21 @@ pub const BACKUP_FAILURE_BACKOFF_SECS: i64 = 10 * 60;
 /// hora que ya sabemos que van a devolver 402.
 pub const QUOTA_FULL_BACKOFF_SECS: i64 = 60 * 60;
 
+/// Ceiling on the wait a 429 can ask this client to sit out.
+///
+/// The cap exists so a malformed or hostile `retry_after` can't park a save
+/// until the next restart, not to second-guess our own server. It used to be
+/// 300 s, which did second-guess it: `loopguard::QUOTA_WAIT_SECS` answers a full
+/// account with 3600 — the same hour as [`QUOTA_FULL_BACKOFF_SECS`], picked so
+/// both ends behave alike — and the client silently shortened it to five
+/// minutes. One account spent four days at ~170 refusals an hour against a
+/// brake that had already told it to come back in one.
+///
+/// Derived from `QUOTA_FULL_BACKOFF_SECS` rather than written as another 3600:
+/// the two numbers mean the same thing (how long a wall a human has to move
+/// stays a wall) and drifting apart would put the loop straight back.
+pub const MAX_THROTTLE_WAIT_SECS: i64 = QUOTA_FULL_BACKOFF_SECS;
+
 /// Cadencia fija del poll airbag a `/v1/cloud/sync`. **Fuente de verdad del
 /// número**: `hoard_agent::prefs::CLOUD_POLL_INTERVAL_SECS` la re-exporta, para
 /// que el umbral de obsolescencia de abajo se derive de la cadencia real en vez
@@ -658,7 +673,7 @@ fn backoff_secs(failures: u32) -> i64 {
 /// motor invertido el shell deriva `seed` del `save_id`, replicando el
 /// `hash(id) % 6` original de forma inyectable.
 fn throttle_until(now: OffsetDateTime, retry_after_secs: u32, seed: u64) -> OffsetDateTime {
-    let wait = (u64::from(retry_after_secs)).clamp(1, 300) + 2;
+    let wait = (u64::from(retry_after_secs)).clamp(1, MAX_THROTTLE_WAIT_SECS as u64) + 2;
     let mut rng = StdRng::seed_from_u64(seed);
     let jitter: u64 = rng.gen_range(0..6);
     now + Duration::seconds((wait + jitter) as i64)
@@ -842,6 +857,48 @@ mod tests {
                 Some(Action::Throttle { .. })
             ),
             "backup también emite Throttle: {bds:?}"
+        );
+    }
+
+    /// The hour the server's brake asks for has to survive the cap.
+    ///
+    /// `loopguard::QUOTA_WAIT_SECS` answers a full account with 3600 —
+    /// deliberately the same as [`QUOTA_FULL_BACKOFF_SECS`] — and the 300 s cap
+    /// that used to live here silently shortened it to five minutes: twelve
+    /// retries an hour, per save, against a wall only a person can move.
+    #[test]
+    fn a_server_asking_for_an_hour_gets_an_hour() {
+        let state = State {
+            in_flight: Some(Op::Backup),
+            has_pending: true,
+            ..base_state()
+        };
+        let obs = Observation {
+            op_result: Some(OpResult::Throttled {
+                retry_after_secs: QUOTA_FULL_BACKOFF_SECS as u32,
+            }),
+            ..quiet_obs()
+        };
+        let (next, _ds) = reconcile(&state, &obs, world(0));
+        let waited = (next.next_backup_at.expect("parked") - at(0)).whole_seconds();
+        assert!(
+            waited >= QUOTA_FULL_BACKOFF_SECS,
+            "the cap must not shorten what the server asked for: {waited}s"
+        );
+
+        // And the cap still exists: an absurd `retry_after` can't park the save
+        // until the next restart.
+        let obs_bogus = Observation {
+            op_result: Some(OpResult::Throttled {
+                retry_after_secs: u32::MAX,
+            }),
+            ..quiet_obs()
+        };
+        let (bogus, _) = reconcile(&state, &obs_bogus, world(0));
+        let capped = (bogus.next_backup_at.expect("parked") - at(0)).whole_seconds();
+        assert!(
+            capped <= MAX_THROTTLE_WAIT_SECS + 8,
+            "a junk retry_after gets capped: {capped}s"
         );
     }
 

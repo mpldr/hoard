@@ -184,7 +184,7 @@ fn collect(root: &Path, label: &'static str, out: &mut Vec<WrapperHit>, seen: &m
             continue;
         }
         let path = resolve_game_container_dir(&container);
-        if !dir_non_empty(&path) {
+        if !dir_non_empty(&path) || !holds_anything_but_bookkeeping(&path) {
             continue;
         }
         seen.push(container);
@@ -231,6 +231,53 @@ fn dir_non_empty(p: &Path) -> bool {
     std::fs::read_dir(p).is_ok_and(|mut r| r.next().is_some())
 }
 
+/// Files the emulator writes for itself. None of them is a saved game:
+/// achievements, stats, the Steam Cloud cache and the subscribed-groups lists
+/// all appear on their own the first time the game runs, saved or not.
+const WRAPPER_BOOKKEEPING_FILES: &[&str] = &[
+    "achievements.json",
+    "remotecache.vdf",
+    "stats.txt",
+    "stats.bin",
+    "leaderboards.json",
+    "subscribed_groups.json",
+    "subscribed_groups_clans.json",
+    "time.txt",
+];
+
+/// `true` if the folder holds anything that could be a saved game.
+///
+/// [`dir_non_empty`] wasn't enough, and Stellaris is the case that showed it: a
+/// Goldberg repack leaves `GSE Saves/281990/achievements.json` **with no
+/// `remote/`**, because the real saves live where the game has always put them
+/// (`Documents/Paradox Interactive/Stellaris/save games`). That folder isn't
+/// empty, so it was offered as the game's save on every sweep — a log line
+/// every ten minutes, forever, about a directory with no game in it.
+///
+/// Deliberately conservative: it only rejects when **everything** there is
+/// known emulator bookkeeping. One unknown file, one subdirectory, anything off
+/// the list, and the folder passes — missing a real save is far worse than one
+/// spurious offer.
+fn holds_anything_but_bookkeeping(p: &Path) -> bool {
+    let Ok(read) = std::fs::read_dir(p) else {
+        return false;
+    };
+    for entry in read.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            return true;
+        }
+        let name = entry.file_name();
+        let lower = name.to_string_lossy().to_lowercase();
+        if !WRAPPER_BOOKKEEPING_FILES.contains(&lower.as_str()) {
+            return true;
+        }
+    }
+    // Nothing worth offering — including the empty case. `dir_non_empty` also
+    // rejects that one, and the two agreeing is the point: a caller that ever
+    // drops the other check doesn't silently start offering empty folders.
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +296,25 @@ mod tests {
         touch(&app.join("remotecache.vdf"));
         touch(&app.join("playtime.txt"));
         assert_eq!(resolve_game_container_dir(&app), app.join("remote"));
+    }
+
+    /// The Stellaris case: the repack leaves the achievements file and nothing
+    /// else, because the real saves go where the game has always written them.
+    #[test]
+    fn a_folder_with_only_emulator_bookkeeping_is_not_a_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("281990");
+        touch(&app.join("achievements.json"));
+        assert!(dir_non_empty(&app), "not empty — which is why it used to pass");
+        assert!(
+            !holds_anything_but_bookkeeping(&app),
+            "emulator bookkeeping only: not a save"
+        );
+
+        // One unknown file and the folder passes again: rejecting too much
+        // costs a save, rejecting too little costs a log line.
+        touch(&app.join("campaign01.sav"));
+        assert!(holds_anything_but_bookkeeping(&app));
     }
 
     #[test]

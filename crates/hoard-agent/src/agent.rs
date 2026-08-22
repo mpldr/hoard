@@ -4562,6 +4562,22 @@ fn process_poll(
         corr_index.entry(pname).or_default().push(save_id);
     }
 
+    // The three indexes above all answer "which save is this process?" by
+    // process NAME, and a save only appears in them if something ever wrote its
+    // `processes` list. Plenty never did: they were tracked by folder and the
+    // list is empty. That's fine for "is this game running" — the identity and
+    // correlation paths cover it — but not for the heavy-process warning, which
+    // reads an empty list as "not tracked". Stellaris has been tracked for
+    // months with `processes: []`, so every launch asked for a detection scan
+    // for a game that was already in. Hence a second check by identity: the
+    // slug of the title the manifest gives this executable, against the slugs
+    // already tracked.
+    let tracked_slugs: HashSet<&str> = slots
+        .values()
+        .map(|s| s.save.game_slug.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // Señal DÉBIL = transición de PID, no presencia+CPU. `first_tick` (no había
     // foto previa) marca el arranque del agente: en él NO disparamos "arrancó"
     // por correlación —adoptamos lo que ya corría como pre-existente— para no
@@ -4737,6 +4753,22 @@ fn process_poll(
                         .and_then(hoard_manifest::ludusavi::title_for_exe)
                 })
                 .map(str::to_string);
+            // Last check before bothering anyone: if the title the manifest
+            // puts on this executable is already one of the tracked slugs, the
+            // game is in and all it's missing is a process list. Scanning for
+            // it finds nothing new, and the desktop repeats it on every launch,
+            // forever.
+            if let Some(slug) = title.as_deref().map(hoard_core::ids::slugify) {
+                if tracked_slugs.contains(slug.as_str()) {
+                    tracing::debug!(
+                        process = %name,
+                        %slug,
+                        "agent: heavy process belongs to a save we already track; no scan needed"
+                    );
+                    reported_heavy.insert(*pid);
+                    continue;
+                }
+            }
             tracing::info!(
                 process = %name,
                 title = %title.as_deref().unwrap_or("-"),

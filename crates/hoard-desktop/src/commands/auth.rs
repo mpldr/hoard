@@ -398,6 +398,16 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
             } => {
                 "The server is limiting how fast requests can arrive. Try again in a moment.".into()
             }
+            // Names the host and says whose problem it is. The bytes go
+            // straight to the bucket, so this failure has nothing to do with
+            // the Hoard server the user just typed in — and every second spent
+            // checking that address is a second not spent on the network that
+            // is actually broken.
+            ApiError::StorageUnreachable { host, .. } => format!(
+                "Can't reach the storage endpoint ({host}). Hoard's server answered fine, \
+                 so this is the connection between this machine and the storage — a VPN, \
+                 a firewall, or the network's route to it."
+            ),
             ApiError::Conflict(msg) | ApiError::BadRequest(msg) => msg.clone(),
         };
     }

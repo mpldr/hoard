@@ -45,6 +45,23 @@ pub enum ApiError {
     /// say how far over the line the account is.
     #[error("{}", .0.human())]
     QuotaExceeded(QuotaExceeded),
+    /// The blob endpoint never answered — the TCP connection couldn't be
+    /// opened, or it timed out on the way.
+    ///
+    /// Typed for two reasons, both learned from one report. The first is what it
+    /// looked like: on Cloud the bytes go straight to a presigned R2 URL, and
+    /// `reqwest`'s own error renders the whole URL, so the feed showed the user
+    /// a 400-character AWS signature and the words "error sending request"
+    /// where it should have said the storage can't be reached. The second is
+    /// what it cost: this is not a flake, it's a path that is down, so the
+    /// exponential retry budget meant for a dropped packet just burns six
+    /// attempts at a ~21 s connect timeout each — four minutes per round — and
+    /// then re-arms and does it again. The caller parks instead.
+    ///
+    /// `host` and not the URL on purpose: it is the part a person can act on
+    /// (or send to their ISP) and the part that carries no signature.
+    #[error("can't reach the storage endpoint ({host}): {reason}")]
+    StorageUnreachable { host: String, reason: String },
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -366,6 +383,45 @@ fn extract_message(body: &str) -> String {
 }
 
 /// Pull the stable machine-readable `code` out of a cloud error body, if any.
+/// Turn a transport failure against a presigned storage URL into something a
+/// person can read and the caller can branch on.
+///
+/// Only *connect* failures become [`ApiError::StorageUnreachable`]: the socket
+/// never opened, which is a path problem and not a flake worth six retries.
+/// Everything else keeps its original shape, because everything else is worth
+/// retrying.
+///
+/// Timeouts deliberately do **not** count, tempting as it looks — the two
+/// clients that reach here are built for long transfers and a timeout means
+/// something entirely different on each. `download_http` carries a per-read
+/// `read_timeout`, so its timeout is a transfer that opened fine and then
+/// stalled; calling that "can't reach the storage" would be exactly the kind of
+/// misleading error this function exists to stop, and parking on it would give
+/// up on a slow connection that just needs another go. A connect failure is
+/// unambiguous on both.
+///
+/// The message is rebuilt from the error's cause chain rather than passed
+/// through, because `reqwest`'s own `Display` starts with the full URL — and a
+/// presigned URL is a 400-character AWS signature that has no business in a log
+/// or a feed row. The host survives; the signature doesn't.
+fn storage_transport_error(url: &str, e: reqwest::Error) -> anyhow::Error {
+    if !e.is_connect() {
+        return anyhow!(e);
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "storage".to_owned());
+    // Innermost cause: the OS-level reason ("connection timed out", "network is
+    // unreachable"), which is the only part that says anything new.
+    let mut source: &dyn std::error::Error = &e;
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    let reason = source.to_string();
+    anyhow!(ApiError::StorageUnreachable { host, reason })
+}
+
 /// A paced 429 that is really "your account is full", unpacked into the same
 /// figures the 402 carries.
 ///
@@ -685,7 +741,8 @@ impl ApiClient {
             .header(reqwest::header::CONTENT_LENGTH, content_length)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| storage_transport_error(&presigned.url, e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             // The bytes go straight to the bucket here, so this 429 is the
@@ -889,7 +946,8 @@ impl ApiClient {
             .download_http
             .request(method, &presigned.url)
             .send()
-            .await?;
+            .await
+            .map_err(|e| storage_transport_error(&presigned.url, e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

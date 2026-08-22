@@ -4153,6 +4153,48 @@ async fn run_backup_with_retry(
                     // Exhausted our patience for the window — fall through and
                     // surface it as a normal failure below.
                 }
+                // The storage endpoint never answered. Not a flake: the
+                // connection didn't open, and it won't open on the next attempt
+                // either — the retry budget just spends six connect timeouts
+                // (~21 s each on Windows) before parking, then re-arms and
+                // spends them again. One user's ISP stopped routing to the two
+                // anycast addresses R2's S3 endpoint resolves to, and every
+                // round burned four minutes to learn the same thing.
+                //
+                // So park on the first one, with the same no-`BackupDone`
+                // contract as the exhausted-retries path below: the bytes are
+                // still only on disk, `has_pending` has to survive, and the long
+                // backoff is the recovery that doesn't need a new fs event.
+                let unreachable = e.chain().find_map(|c| {
+                    match c.downcast_ref::<crate::api::ApiError>() {
+                        Some(crate::api::ApiError::StorageUnreachable { host, .. }) => {
+                            Some(host.clone())
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(host) = unreachable {
+                    let chain = format!("{e:#}");
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        %host,
+                        error = %chain,
+                        "agent: backup parked — the storage endpoint can't be reached from this machine"
+                    );
+                    let _ = events_tx
+                        .send(AgentEvent::BackupFailed {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            error: chain,
+                            will_retry: true,
+                        })
+                        .await;
+                    let _ = cmd_tx
+                        .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                        .await;
+                    return;
+                }
                 let will_retry = attempt < max_retries;
                 // `{:#}` renders the whole anyhow context chain — `.to_string()`
                 // alone collapses it to the outermost label ("cloud cas init"),

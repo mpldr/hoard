@@ -76,6 +76,10 @@ export function applyTheme(id: ThemeId): void {
  *
  * Lightness/chroma track Obsidian's emerald so it reads well on dark themes; on
  * Quartz (light) it's an approximation — the picker is a power-user touch.
+ *
+ * The mark's gem (`--logo-gem-*`, drawn by `Logo.svelte`) follows along, but on
+ * its own lightness/chroma: the logo always sits on a near-black tile, so it
+ * can't borrow the emerald ramp, which Quartz darkens for paper.
  */
 const ACCENT_STOPS: [string, number, number][] = [
   ["--color-emerald-300", 0.75, 0.15],
@@ -85,20 +89,84 @@ const ACCENT_STOPS: [string, number, number][] = [
   ["--color-emerald-700", 0.5, 0.15],
 ];
 
+/** The mark's gem: lightness, chroma and a hue offset from the chosen accent.
+ *  The offset keeps the logo's two-tone sweep (the top stop leads the bottom
+ *  one, teal→emerald in the default gem) instead of flattening it to one hue. */
+const GEM_STOPS: [string, number, number, number][] = [
+  ["--logo-gem-from", 0.855, 0.138, 20],
+  ["--logo-gem-to", 0.6, 0.13, 2],
+  ["--logo-gem-ring", 0.7, 0.149, 0],
+];
+
 export function applyAccentHue(hue: number | null): void {
   const root = document.documentElement;
   if (hue == null) {
     for (const [k] of ACCENT_STOPS) root.style.removeProperty(k);
+    for (const [k] of GEM_STOPS) root.style.removeProperty(k);
     root.style.removeProperty("--color-accent");
     root.style.removeProperty("--color-accent-hover");
     return;
   }
-  const h = (((hue % 360) + 360) % 360).toFixed(1);
+  const deg = ((hue % 360) + 360) % 360;
+  const h = deg.toFixed(1);
   for (const [k, l, c] of ACCENT_STOPS) {
     root.style.setProperty(k, `oklch(${l} ${c} ${h})`);
   }
+  for (const [k, l, c, offset] of GEM_STOPS) {
+    const gh = ((deg + offset) % 360).toFixed(1);
+    root.style.setProperty(k, `oklch(${l} ${c} ${gh})`);
+  }
   root.style.setProperty("--color-accent", `oklch(0.62 0.15 ${h})`);
   root.style.setProperty("--color-accent-hover", `oklch(0.72 0.16 ${h})`);
+}
+
+/**
+ * Named gems offered in the Settings picker.
+ *
+ * The hue wheel is still there behind "Custom", but nobody thinks "I want 265
+ * degrees" — they think "I want it blue". These seven walk the whole wheel
+ * without two of them landing on the same colour.
+ *
+ * Emerald is `null`, not 160: it means "whatever gem this theme ships", which
+ * is what the reset button always did. So picking Emerald *is* the reset, and
+ * Quartz keeps its own darker emerald instead of being overridden with a hue
+ * tuned for Obsidian.
+ */
+export type Gem = { id: string; hue: number | null; labelKey: string };
+
+export const gems: Gem[] = [
+  { id: "emerald", hue: null, labelKey: "settings.gem_emerald" },
+  { id: "citrine", hue: 100, labelKey: "settings.gem_citrine" },
+  { id: "amber", hue: 70, labelKey: "settings.gem_amber" },
+  { id: "ruby", hue: 20, labelKey: "settings.gem_ruby" },
+  { id: "amethyst", hue: 305, labelKey: "settings.gem_amethyst" },
+  { id: "sapphire", hue: 265, labelKey: "settings.gem_sapphire" },
+  { id: "aquamarine", hue: 205, labelKey: "settings.gem_aquamarine" },
+];
+
+/** Default hue for the swatch preview when the choice is `null`. Matches the
+ *  `--logo-gem-*` defaults in `app.css`, i.e. what Obsidian actually paints. */
+const DEFAULT_GEM_HUE = 161;
+
+/**
+ * The two gradient stops a given hue produces, as CSS colours. Settings uses
+ * them to draw each swatch with the *same* maths `applyAccentHue` will apply,
+ * so a swatch is a real preview of the mark rather than a lookalike dot.
+ */
+export function gemSwatch(hue: number | null): { from: string; to: string } {
+  const deg = hue == null ? DEFAULT_GEM_HUE : (((hue % 360) + 360) % 360);
+  const at = (key: string) => {
+    const stop = GEM_STOPS.find(([k]) => k === key)!;
+    const [, l, c, offset] = stop;
+    return `oklch(${l} ${c} ${(deg + offset) % 360})`;
+  };
+  return { from: at("--logo-gem-from"), to: at("--logo-gem-to") };
+}
+
+/** Which gem a stored hue corresponds to, or `null` when it's a custom hue.
+ *  Drives both the selected ring and whether the custom slider starts open. */
+export function gemFor(hue: number | null): Gem | null {
+  return gems.find((g) => g.hue === hue) ?? null;
 }
 
 /** Persist a custom hue (or clear it) and apply immediately. */

@@ -5,8 +5,10 @@
    * lucide `Archive` box that used to stand in for the logo in the sidebar.
    *
    * Drawn as inline SVG (rather than shipping the PNG into the webview bundle)
-   * so it stays crisp at any size. The two stops mirror the icon's
-   * teal→emerald gradient.
+   * so it stays crisp at any size, and so the gem can be recoloured: the two
+   * stops and the tile's ring read `--logo-gem-*`, which the accent picker in
+   * Settings repoints to the user's chosen hue. The tile itself stays
+   * near-black on every theme — it's the mark, not a surface.
    */
   type Props = { size?: number; class?: string };
   let { size = 36, class: klass = "" }: Props = $props();
@@ -34,8 +36,8 @@
       y2="38"
       gradientUnits="userSpaceOnUse"
     >
-      <stop stop-color="#5eead4" />
-      <stop offset="1" stop-color="#059669" />
+      <stop stop-color="var(--logo-gem-from)" />
+      <stop offset="1" stop-color="var(--logo-gem-to)" />
     </linearGradient>
   </defs>
   <!-- Dark rounded tile -->
@@ -46,7 +48,7 @@
     width="46"
     height="46"
     rx="12"
-    stroke="#10b981"
+    stroke="var(--logo-gem-ring)"
     stroke-opacity="0.25"
     stroke-width="1"
   />

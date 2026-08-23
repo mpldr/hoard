@@ -33,6 +33,8 @@
     ServerCog,
     MousePointer2,
     Gamepad2,
+    Sparkles,
+    ZoomIn,
   } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
@@ -46,7 +48,23 @@
     type ThemeId,
     accentHue,
     setAccentHue,
+    gems,
+    gemSwatch,
+    gemFor,
   } from "../lib/stores/theme";
+  import {
+    atmosphere,
+    atmospheres,
+    setAtmosphere,
+    type AtmosphereId,
+  } from "../lib/stores/atmosphere";
+  import {
+    uiScale,
+    setUiScale,
+    resetUiScale,
+    MIN_SCALE,
+    MAX_SCALE,
+  } from "../lib/stores/uiScale";
   import {
     motionIntensity,
     setMotionIntensity,
@@ -101,6 +119,39 @@
   }
   function resetAccent(): void {
     setAccentHue(null);
+  }
+
+  // The named gems. `gemFor` returns null for a hue that matches no preset,
+  // which is exactly when the custom slider should already be open — otherwise
+  // someone who picked 187 degrees last week reopens Settings and finds no
+  // gem selected and no slider to explain why.
+  let customOpen = $state(gemFor($accentHue) == null);
+  const selectedGem = $derived(gemFor($accentHue));
+
+  /** The mark's gradient for a given hue, as an inline `background` — same
+   *  maths the logo uses, so a swatch previews the real thing. */
+  function gemStyle(hue: number | null): string {
+    const { from, to } = gemSwatch(hue);
+    return `background: linear-gradient(140deg, ${from}, ${to});`;
+  }
+
+  // Background atmosphere. Small inline previews rather than words alone:
+  // "vignette" means nothing until you have seen one.
+  const atmosPreview: Record<AtmosphereId, string> = {
+    grain:
+      "background: #0a0a0a; background-image: radial-gradient(oklch(1 0 0 / 0.14) 0.5px, transparent 0.5px); background-size: 3px 3px;",
+    flat: "background: #0a0a0a;",
+    glow: "background: radial-gradient(120% 80% at 50% -30%, color-mix(in oklch, var(--color-accent) 55%, transparent), #0a0a0a 70%);",
+    vignette:
+      "background: radial-gradient(90% 90% at 50% 45%, oklch(0.32 0.01 165), #050505 100%);",
+  };
+
+  // Interface scale. Engine zoom, so `onchange` would feel laggy — `oninput`
+  // zooms while dragging, and the slider rides its own zoom, which is odd for
+  // a second and then obviously right.
+  function onScaleInput(e: Event): void {
+    const v = Number((e.currentTarget as HTMLInputElement).value);
+    if (Number.isFinite(v)) setUiScale(v / 100);
   }
 
   // Intensidad del relieve: 0 lo apaga, 100 son los 8° históricos, 50 —el
@@ -803,32 +854,172 @@
               </button>
             {/each}
           </div>
+          <!-- Named gems. The hue wheel is still here, one click away, but it
+               is no longer the only way in: nobody thinks "I want 265 degrees",
+               they think "I want it blue". Emerald is the `null` hue — the
+               theme's own gem — so picking it is what Reset used to be, and
+               Quartz keeps its darker emerald instead of being overridden with
+               a hue tuned for a black background. -->
+          <div class="mt-4 border-t border-white/[0.08] pt-4">
+            <div class="flex items-start gap-3">
+              <Palette size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium text-zinc-100">
+                  {$_("settings.accent_label")}
+                </p>
+                <p class="mt-0.5 text-xs text-zinc-500">
+                  {$_("settings.accent_desc")}
+                </p>
+              </div>
+              <button
+                type="button"
+                onclick={() => (customOpen = !customOpen)}
+                aria-expanded={customOpen}
+                class="shrink-0 rounded-md border px-2 py-1 text-xs transition-colors {customOpen
+                  ? 'border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-zinc-100'
+                  : 'border-white/[0.08] text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-100'}"
+              >
+                {$_("settings.accent_custom")}
+              </button>
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              {#each gems as g (g.id)}
+                {@const active = selectedGem?.id === g.id}
+                <button
+                  type="button"
+                  onclick={() => {
+                    setAccentHue(g.hue);
+                    customOpen = false;
+                  }}
+                  aria-pressed={active}
+                  class="group flex w-20 flex-col items-center gap-1.5 rounded-lg border p-1.5 transition-colors {active
+                    ? 'border-[var(--color-accent)]/50 bg-white/[0.04]'
+                    : 'border-transparent hover:bg-white/[0.03]'}"
+                >
+                  <!-- The mark itself, not a coloured dot: same tile, same
+                       gradient maths, so the swatch shows what the logo will
+                       actually become. -->
+                  <span
+                    class="flex h-8 w-8 items-center justify-center rounded-lg bg-[#0a0a0a] ring-1 ring-inset ring-white/[0.08]"
+                  >
+                    <span
+                      class="h-4 w-4 rounded-[3px]"
+                      style={gemStyle(g.hue)}
+                      aria-hidden="true"
+                    ></span>
+                  </span>
+                  <span
+                    class="w-full truncate text-center text-[10px] {active
+                      ? 'text-zinc-100'
+                      : 'text-zinc-500 group-hover:text-zinc-300'}"
+                  >
+                    {$_(g.labelKey)}
+                  </span>
+                </button>
+              {/each}
+            </div>
+            {#if customOpen}
+              <div class="mt-3 flex items-center gap-3">
+                <input
+                  type="range"
+                  min="0"
+                  max="359"
+                  step="1"
+                  value={$accentHue ?? 160}
+                  oninput={onAccentInput}
+                  class="hue-slider min-w-0 flex-1"
+                  aria-label={$_("settings.accent_label")}
+                />
+                <button
+                  type="button"
+                  onclick={resetAccent}
+                  class="shrink-0 rounded-md border border-white/[0.08] px-2 py-1 text-xs text-zinc-400 transition-colors hover:bg-zinc-800/40 hover:text-zinc-100"
+                >
+                  {$_("settings.accent_reset")}
+                </button>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Background atmosphere. The pure-black-plus-grain canvas was a
+               good call for WOLED panels and a bad decree for everyone else;
+               it stays the default and becomes a choice. Previews rather than
+               words alone — "vignette" means nothing until you've seen one. -->
+          <div class="mt-4 border-t border-white/[0.08] pt-4">
+            <div class="flex items-start gap-3">
+              <Sparkles size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium text-zinc-100">
+                  {$_("settings.atmos_label")}
+                </p>
+                <p class="mt-0.5 text-xs text-zinc-500">
+                  {$_("settings.atmos_desc")}
+                </p>
+              </div>
+            </div>
+            <div class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {#each atmospheres as a (a.id)}
+                {@const active = $atmosphere === a.id}
+                <button
+                  type="button"
+                  onclick={() => setAtmosphere(a.id)}
+                  aria-pressed={active}
+                  class="flex flex-col gap-1.5 rounded-lg border p-1.5 text-left transition-colors {active
+                    ? 'border-[var(--color-accent)]/50 bg-white/[0.04]'
+                    : 'border-white/[0.08] hover:bg-white/[0.03]'}"
+                >
+                  <span
+                    class="block h-10 w-full rounded-md ring-1 ring-inset ring-white/[0.08]"
+                    style={atmosPreview[a.id]}
+                    aria-hidden="true"
+                  ></span>
+                  <span
+                    class="truncate text-[11px] {active
+                      ? 'text-zinc-100'
+                      : 'text-zinc-500'}"
+                  >
+                    {$_(a.labelKey)}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <!-- Interface scale. This is the engine's own zoom, not a CSS trick:
+               the app has ~130 hard-coded pixel sizes and icons sized by
+               number, and none of those would move for a font-size hack. Also
+               bound to Ctrl+wheel and Ctrl +/-/0 app-wide, which is the first
+               thing anyone tries. -->
           <div class="mt-4 flex items-center gap-3 border-t border-white/[0.08] pt-4">
-            <Palette size={16} class="mt-0.5 shrink-0 text-zinc-500" />
+            <ZoomIn size={16} class="mt-0.5 shrink-0 text-zinc-500" />
             <div class="min-w-0 flex-1">
               <p class="text-sm font-medium text-zinc-100">
-                {$_("settings.accent_label")}
+                {$_("settings.scale_label")}
               </p>
               <p class="mt-0.5 text-xs text-zinc-500">
-                {$_("settings.accent_desc")}
+                {$_("settings.scale_desc")}
               </p>
             </div>
             <input
               type="range"
-              min="0"
-              max="359"
-              step="1"
-              value={$accentHue ?? 160}
-              oninput={onAccentInput}
-              class="hue-slider w-40"
-              aria-label={$_("settings.accent_label")}
+              min={Math.round(MIN_SCALE * 100)}
+              max={Math.round(MAX_SCALE * 100)}
+              step="5"
+              value={Math.round($uiScale * 100)}
+              oninput={onScaleInput}
+              class="motion-slider w-40 shrink-0"
+              aria-label={$_("settings.scale_label")}
+              aria-valuetext="{Math.round($uiScale * 100)}%"
             />
+            <span class="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-400">
+              {Math.round($uiScale * 100)}%
+            </span>
             <button
               type="button"
-              onclick={resetAccent}
+              onclick={resetUiScale}
               class="shrink-0 rounded-md border border-white/[0.08] px-2 py-1 text-xs text-zinc-400 transition-colors hover:bg-zinc-800/40 hover:text-zinc-100"
             >
-              {$_("settings.accent_reset")}
+              {$_("settings.scale_reset")}
             </button>
           </div>
 

@@ -97,6 +97,15 @@ body,
 :root {
   color-scheme: dark;
 
+  /* The mark's gem. Its own tokens rather than the `emerald` ramp: the logo
+     always sits on a near-black tile, so it needs lightness fixed high enough
+     to read there even under Quartz (where the ramp is darkened for paper).
+     `applyAccentHue` rewrites just the hue, keeping the two-tone sweep — the
+     top stop leads the bottom one by ~20 degrees, same as teal -> emerald. */
+  --logo-gem-from: oklch(0.855 0.138 181);
+  --logo-gem-to: oklch(0.6 0.13 163);
+  --logo-gem-ring: oklch(0.7 0.149 162);
+
   /* ---- Elevación ---------------------------------------------------- */
   /* Tres superficies y su filo. Fuera de `@theme` a propósito: son valores
      compuestos (con alfa) que cada tema repinta, no colores que Tailwind deba
@@ -142,6 +151,76 @@ body::before {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
+/* ---- Atmosphere ------------------------------------------------------ */
+/* The background above is the default ("grain"); `stores/atmosphere.ts` puts
+   the user's choice on `<html data-atmos>` and the rest is here.
+
+   The glow and the vignette get their own `::after` layer rather than the
+   body's `background-image`, because Quartz already uses that slot for its two
+   radial washes and the two would overwrite each other. Both layers sit at
+   z-index 0, under `#app`. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 320ms ease;
+}
+
+/* Flat — the grain off, nothing else. */
+:root[data-atmos="flat"] body::before {
+  display: none;
+}
+
+/* Glow — the top light the WOLED default deliberately withholds, tinted with
+   whatever gem is active so it moves with the accent picker. */
+:root[data-atmos="glow"] body::after {
+  opacity: 1;
+  background: radial-gradient(
+    130% 75% at 50% -25%,
+    color-mix(in oklch, var(--color-accent) 26%, transparent) 0%,
+    color-mix(in oklch, var(--color-accent) 7%, transparent) 38%,
+    transparent 68%
+  );
+}
+
+/* Vignette — darkened edges to pull the eye to the middle.
+   It is the one atmosphere that has to raise the floor before it can dig:
+   Obsidian's canvas is already pure black, and black over black is an
+   expensive way to paint nothing. So the middle comes up a step and the
+   corners fall back to the same #000 as everywhere else — which keeps the
+   WOLED argument intact, since the black stays black exactly where the
+   vignette is darkest.
+
+   The floor rule ties on specificity with `[data-theme="quartz"] body`
+   further down, and later wins, so paper keeps its own background without
+   needing a compound selector. Load-bearing on source order: don't move
+   this block below the Quartz one. */
+:root[data-atmos="vignette"] body {
+  background-color: oklch(0.155 0.005 165);
+}
+:root[data-atmos="vignette"] body::after {
+  opacity: 1;
+  background: radial-gradient(
+    115% 95% at 50% 45%,
+    transparent 38%,
+    oklch(0 0 0 / 55%) 76%,
+    oklch(0 0 0) 100%
+  );
+}
+/* On paper, black at the edges reads as dirt rather than depth: the light
+   theme shades with its own warm ink, and much more gently. */
+:root[data-theme="quartz"][data-atmos="vignette"] body::after {
+  background: radial-gradient(
+    115% 95% at 50% 45%,
+    transparent 42%,
+    oklch(0.35 0.02 95 / 12%) 78%,
+    oklch(0.35 0.02 95 / 30%) 100%
+  );
+}
+
 /* La ventana del HUD es transparente: sin esto, el fondo negro del `body` (y
    su capa de grano) taparía el juego con un rectángulo opaco en vez de dejar
    ver lo de debajo. La pone `main.ts` al montar en esa ventana. */
@@ -149,8 +228,9 @@ html.is-overlay,
 html.is-overlay body {
   background: transparent !important;
 }
-html.is-overlay body::before {
-  display: none;
+html.is-overlay body::before,
+html.is-overlay body::after {
+  display: none !important;
 }
 
 /* Las barras de desplazamiento las pinta el motor con el tema del sistema, y

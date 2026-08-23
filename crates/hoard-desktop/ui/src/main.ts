@@ -3,6 +3,8 @@
 import { i18nReady } from "./lib/i18n";
 import { initTheme } from "./lib/stores/theme";
 import { initMotion } from "./lib/stores/motion";
+import { initAtmosphere } from "./lib/stores/atmosphere";
+import { initUiScale, initUiScaleShortcuts } from "./lib/stores/uiScale";
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
@@ -16,6 +18,18 @@ initTheme();
 // Igual con la intensidad del relieve: marca `<html data-motion>` antes del
 // primer pintado para que nadie vea el resplandor a tope y luego atenuarse.
 initMotion();
+// Same for the background — grain, glow or vignette settled before anything is
+// drawn, so nobody watches one background swap for another. Skipped in the HUD:
+// that window has to stay see-through, and while `app.css` already outranks any
+// atmosphere rule there, marking it at all invites the next person to write a
+// rule that lands a grain rectangle over the game.
+if (!isOverlayWindow()) {
+  initAtmosphere();
+  // Ctrl+wheel and Ctrl +/-/0. Wiring two listeners costs nothing and belongs
+  // here rather than in the awaited scale below, where the shortcuts would sit
+  // dead until the locale dictionary finished loading.
+  initUiScaleShortcuts();
+}
 
 // Wait for svelte-i18n to finish loading the active locale's dictionary
 // before mounting. If we mount eagerly, the first render hits `$_(...)`
@@ -53,6 +67,12 @@ async function bootstrap() {
     document.documentElement.classList.add("is-overlay");
     return mount(Overlay, { target: document.getElementById("app")! });
   }
+  // Interface scale is the engine's own zoom, so it travels over IPC and
+  // can't be applied synchronously the way the theme is. Awaiting it here costs
+  // nothing visible — the main window is created with `visible: false` and Rust
+  // only shows it once the app is up — and buys a first frame already at the
+  // chosen size instead of one that snaps to it a moment later.
+  await initUiScale();
   return mount(App, {
     target: document.getElementById("app")!,
   });

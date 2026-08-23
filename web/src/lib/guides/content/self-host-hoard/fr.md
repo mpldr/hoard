@@ -55,7 +55,7 @@ Le jeton n'est affiché qu'une fois et **ne peut pas être récupéré ensuite**
 
 ## Connectez l'application de bureau
 
-Installez l'[app de bureau Hoard](/download) sur chaque machine. Dans l'assistant, choisissez **Autohost**, puis collez l'URL de votre serveur et le jeton que vous venez de créer. Ensuite, le comportement est identique à Hoard Cloud : détection des jeux, sauvegarde automatique et historique versionné. Voir [synchroniser ses sauvegardes entre PC](/guides/sync-game-saves-across-pcs) pour l'usage quotidien.
+Installez l'[app de bureau Hoard](/download) sur chaque machine. Dans l'assistant, choisissez **Self-Host**, puis collez l'URL de votre serveur et le jeton que vous venez de créer. Ensuite, le comportement est identique à Hoard Cloud : détection des jeux, sauvegarde automatique et historique versionné. Voir [synchroniser ses sauvegardes entre PC](/guides/sync-game-saves-across-pcs) pour l'usage quotidien.
 
 ## En production
 

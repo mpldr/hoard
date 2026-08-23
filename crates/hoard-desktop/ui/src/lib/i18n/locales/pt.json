@@ -43,7 +43,7 @@
   "welcome.title": "Bem-vindo ao Hoard",
   "choose.title": "Como queres entrar?",
   "choose.subtitle": "Usa o Hoard Cloud com a tua conta, ou liga-te ao teu próprio servidor auto-alojado.",
-  "choose.selfhost_title": "Auto-alojado",
+  "choose.selfhost_title": "Self-Host",
   "choose.selfhost_desc": "Liga-te a um servidor Hoard que geres tu.",
   "choose.cloud_title": "Entrar com a Cloud",
   "choose.cloud_desc": "Usa o Hoard Cloud — nada para configurar.",

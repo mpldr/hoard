@@ -55,7 +55,7 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml \
 
 ## デスクトップアプリを接続
 
-各マシンに [Hoard デスクトップアプリ](/download) をインストールします。オンボーディングで **Autohost** を選び、サーバーの URL と作成したトークンを貼り付けます。あとは Hoard Cloud とまったく同じで、ゲームを検出し、自動でバックアップし、バージョン履歴を保持します。日常的な使い方は [複数の PC 間でセーブを同期する](/guides/sync-game-saves-across-pcs) を参照してください。
+各マシンに [Hoard デスクトップアプリ](/download) をインストールします。オンボーディングで **セルフホスト** を選び、サーバーの URL と作成したトークンを貼り付けます。あとは Hoard Cloud とまったく同じで、ゲームを検出し、自動でバックアップし、バージョン履歴を保持します。日常的な使い方は [複数の PC 間でセーブを同期する](/guides/sync-game-saves-across-pcs) を参照してください。
 
 ## 本番運用
 

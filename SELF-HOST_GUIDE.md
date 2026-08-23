@@ -29,7 +29,7 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml token cre
 # SAVE THE TOKEN NOW — it cannot be retrieved later
 ```
 
-In the app's onboarding, pick **Autohost**, paste the server URL and token.
+In the app's onboarding, pick **Self-Host**, paste the server URL and token.
 
 ### Unraid
 
@@ -46,7 +46,7 @@ config, creates that account, and prints a device token in its log **once**:
  hoard_v1_…
 ```
 
-Copy it, open the desktop app on your gaming PC, pick **Self-hosted**, and give
+Copy it, open the desktop app on your gaming PC, pick **Self-Host**, and give
 it `http://IP:12421` plus that token. Remember changue "IP" pls --  The container's *WebUI* button 
 opens the web panel, where the same username and password get you in.
 
@@ -140,7 +140,7 @@ curl http://IP:12421/v1/health
 `tailscale ping` reporting the path is up is the whole test — if that
 works, the app will reach the server.
 
-In the app's onboarding, pick **Autohost** and paste `http://server:12421`
+In the app's onboarding, pick **Self-Host** and paste `http://server:12421`
 — replace `server` with your server machine's name from `tailscale status`,
 no brackets — or the server's `100.x` IPv4. Both are classified by the
 client as a local server, so the dashboard shows "X used" of your disk

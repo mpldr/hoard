@@ -55,7 +55,7 @@ Il token viene mostrato una sola volta e **non può essere recuperato in seguito
 
 ## Collega l'app desktop
 
-Installa l'[app desktop di Hoard](/download) su ogni macchina. Nella procedura iniziale scegli **Autohost**, poi incolla l'URL del server e il token appena creato. Da lì si comporta esattamente come Hoard Cloud: rileva i giochi, salva automaticamente e mantiene la cronologia versionata. Vedi [sincronizzare i salvataggi tra più PC](/guides/sync-game-saves-across-pcs) per l'uso quotidiano.
+Installa l'[app desktop di Hoard](/download) su ogni macchina. Nella procedura iniziale scegli **Self-Host**, poi incolla l'URL del server e il token appena creato. Da lì si comporta esattamente come Hoard Cloud: rileva i giochi, salva automaticamente e mantiene la cronologia versionata. Vedi [sincronizzare i salvataggi tra più PC](/guides/sync-game-saves-across-pcs) per l'uso quotidiano.
 
 ## In produzione
 

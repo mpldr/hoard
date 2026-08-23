@@ -55,7 +55,7 @@ Das Token wird nur einmal angezeigt und **kann später nicht wiederhergestellt w
 
 ## Die Desktop-App verbinden
 
-Installiere die [Hoard-Desktop-App](/download) auf jedem Rechner. Wähle im Onboarding **Autohost** und füge deine Server-URL und das eben erstellte Token ein. Ab da verhält es sich genau wie Hoard Cloud: Es erkennt deine Spiele, sichert Spielstände automatisch und führt einen versionierten Verlauf. Siehe [Spielstände zwischen PCs synchronisieren](/guides/sync-game-saves-across-pcs) für den Alltag.
+Installiere die [Hoard-Desktop-App](/download) auf jedem Rechner. Wähle im Onboarding **Self-Host** und füge deine Server-URL und das eben erstellte Token ein. Ab da verhält es sich genau wie Hoard Cloud: Es erkennt deine Spiele, sichert Spielstände automatisch und führt einen versionierten Verlauf. Siehe [Spielstände zwischen PCs synchronisieren](/guides/sync-game-saves-across-pcs) für den Alltag.
 
 ## Im Produktivbetrieb
 

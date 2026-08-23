@@ -19,7 +19,7 @@ Then **Docker** → *Add Container* → pick **Hoard** from the *Template* dropd
 
 Either way, the first start writes its own config, creates the admin account you
 named, and prints a device token in the container log **once**. Copy it, open
-the desktop app, pick *Self-hosted*, and give it `http://TOWER-IP:12421` plus
+the desktop app, pick *Self-Host*, and give it `http://TOWER-IP:12421` plus
 that token. The *WebUI* button opens the web panel, where the username and
 password you typed get you in.
 

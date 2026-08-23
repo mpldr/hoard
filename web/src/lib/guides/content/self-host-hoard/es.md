@@ -55,7 +55,7 @@ El token se muestra una sola vez y **no se puede recuperar después**, así que 
 
 ## Conecta la aplicación de escritorio
 
-Instala la [app de escritorio de Hoard](/download) en cada equipo. En el asistente inicial elige **Autohost**, y pega la URL de tu servidor y el token que acabas de crear. A partir de ahí se comporta igual que Hoard Cloud: detecta tus juegos, copia las partidas automáticamente y mantiene el historial versionado. Consulta [sincronizar partidas entre varios PC](/guides/sync-game-saves-across-pcs) para el día a día.
+Instala la [app de escritorio de Hoard](/download) en cada equipo. En el asistente inicial elige **Self-Host**, y pega la URL de tu servidor y el token que acabas de crear. A partir de ahí se comporta igual que Hoard Cloud: detecta tus juegos, copia las partidas automáticamente y mantiene el historial versionado. Consulta [sincronizar partidas entre varios PC](/guides/sync-game-saves-across-pcs) para el día a día.
 
 ## Llevarlo a producción
 

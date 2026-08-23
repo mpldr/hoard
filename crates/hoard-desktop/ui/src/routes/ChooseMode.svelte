@@ -32,7 +32,7 @@
     </p>
 
     <div class="mt-6 grid grid-cols-2 gap-3">
-      <!-- Autohost — black -->
+      <!-- Self-host — black -->
       <button
         type="button"
         onclick={chooseSelfHost}

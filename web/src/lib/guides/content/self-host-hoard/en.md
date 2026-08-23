@@ -55,7 +55,7 @@ The token is printed once and **cannot be retrieved later**, so copy it now.
 
 ## Connect the desktop app
 
-Install the [Hoard desktop app](/download) on each machine. In the onboarding flow, pick **Autohost**, then paste your server URL and the token you just created. From there it behaves exactly like Hoard Cloud: it detects your games, backs up saves automatically, and keeps versioned history. See [syncing saves across PCs](/guides/sync-game-saves-across-pcs) for the day-to-day flow.
+Install the [Hoard desktop app](/download) on each machine. In the onboarding flow, pick **Self-Host**, then paste your server URL and the token you just created. From there it behaves exactly like Hoard Cloud: it detects your games, backs up saves automatically, and keeps versioned history. See [syncing saves across PCs](/guides/sync-game-saves-across-pcs) for the day-to-day flow.
 
 ## Run it in production
 

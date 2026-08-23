@@ -55,7 +55,7 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml \
 
 ## 连接桌面应用
 
-在每台机器上安装 [Hoard 桌面应用](/download)。在初始引导中选择 **Autohost**，然后粘贴你的服务器 URL 和刚创建的令牌。之后它的行为与 Hoard Cloud 完全相同：检测你的游戏、自动备份存档、保留版本历史。日常用法请参见[在多台 PC 之间同步存档](/guides/sync-game-saves-across-pcs)。
+在每台机器上安装 [Hoard 桌面应用](/download)。在初始引导中选择 **自托管**，然后粘贴你的服务器 URL 和刚创建的令牌。之后它的行为与 Hoard Cloud 完全相同：检测你的游戏、自动备份存档、保留版本历史。日常用法请参见[在多台 PC 之间同步存档](/guides/sync-game-saves-across-pcs)。
 
 ## 在生产环境中运行
 

@@ -352,17 +352,17 @@ impl Prefs {
         Ok((Self::load(&path)?, path))
     }
 
-    /// Atomically (best-effort) write the prefs file. We `create_dir_all`
-    /// the parent so first-run writes succeed before the rest of state has
-    /// been touched.
+    /// Atomically write the prefs file — temp sibling, fsync, rename over the
+    /// target (see [`crate::atomic_write`]). The parent is created on the way
+    /// through, so first-run writes succeed before the rest of state has been
+    /// touched.
+    ///
+    /// This used to be a plain `fs::write`, which truncates first: a process
+    /// that died mid-write left a 0-byte `prefs.json` and [`Self::load`] then
+    /// silently reset every setting the user had chosen.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let text = serde_json::to_string_pretty(self).context("serializing prefs")?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        crate::atomic_write::write_atomic(path, text.as_bytes())
     }
 }
 
@@ -533,5 +533,69 @@ mod tests {
         let back: Prefs = serde_json::from_str(&json2).unwrap();
         assert!(back.automatic_mode);
         assert!(!back.auto_restore);
+    }
+
+    /// A crash inside the old truncate-then-write left exactly this: a file
+    /// that exists and is empty. Loading has to survive it (it already did),
+    /// and the record of what it costs the user lives here.
+    #[test]
+    fn a_zero_byte_prefs_file_loads_as_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        std::fs::write(&path, b"").unwrap();
+
+        let p = Prefs::load(&path).expect("a 0-byte prefs.json must not fail the load");
+
+        assert_eq!(p.sync_mode(), Prefs::default().sync_mode());
+        assert_eq!(p.close_to_tray, Prefs::default().close_to_tray);
+    }
+
+    /// The other half of a torn write: some bytes made it, the closing brace
+    /// didn't.
+    #[test]
+    fn a_truncated_prefs_file_loads_as_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        std::fs::write(&path, br#"{"close_to_tray": fal"#).unwrap();
+
+        let p = Prefs::load(&path).expect("a truncated prefs.json must not fail the load");
+
+        assert_eq!(p.close_to_tray, Prefs::default().close_to_tray);
+    }
+
+    /// The fix proper: saving replaces the file in one step, so the reload sees
+    /// the whole thing and no temp file is left in the state dir.
+    #[test]
+    fn saving_over_a_corrupt_file_writes_it_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        std::fs::write(&path, b"").unwrap();
+
+        let mut p = Prefs::default();
+        p.set_sync_mode(SyncMode::FullSync);
+        p.close_to_tray = !Prefs::default().close_to_tray;
+        p.save(&path).unwrap();
+
+        let back = Prefs::load(&path).unwrap();
+        assert_eq!(back.sync_mode(), SyncMode::FullSync);
+        assert_eq!(back.close_to_tray, p.close_to_tray);
+
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["prefs.json".to_string()]);
+    }
+
+    /// Saving into a state dir that doesn't exist yet is the first-run path;
+    /// the atomic write has to keep doing the `create_dir_all` the old one did.
+    #[test]
+    fn saving_creates_the_state_dir_on_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("prefs.json");
+
+        Prefs::default().save(&path).unwrap();
+
+        assert!(Prefs::load(&path).is_ok());
     }
 }

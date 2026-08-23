@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod atomic_write;
 pub mod backup;
 pub mod cloud_account;
 pub mod cloud_auth;

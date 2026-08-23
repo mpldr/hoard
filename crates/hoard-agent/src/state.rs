@@ -252,14 +252,16 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T>
 }
 
 /// Serialize `value` to `path` (pretty JSON), creating the parent dir.
+///
+/// The write is atomic (see [`crate::atomic_write`]) because the recovery above
+/// is expensive here: a plain `fs::write` truncates before it writes, and a
+/// process that dies in that window leaves a 0-byte file that [`load_json`]
+/// reads as corrupt. For `device.json` that costs the user their manual paths
+/// and exclusions; for `contexts/<id>.json` it costs them the entire list of
+/// tracked saves.
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
     let text = serde_json::to_string_pretty(value).context("serializing state")?;
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    crate::atomic_write::write_atomic(path, text.as_bytes())
 }
 
 /// One-time migration of the pre-split monolithic `state.json`.
@@ -942,5 +944,75 @@ mod tests {
     fn an_empty_exclude_list_costs_nothing_and_excludes_nothing() {
         let s = CliState::default();
         assert!(!s.is_path_excluded(Path::new("/anything/at/all")));
+    }
+
+    /// A 0-byte `contexts/<id>.json` is what the old truncate-then-write left
+    /// after a crash, and it is the expensive one: `load_json` moves it aside
+    /// and hands back `Default`, so the user's tracked-save list is gone.
+    #[test]
+    fn a_zero_byte_context_file_costs_the_saves_and_is_kept_for_forensics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts").join("cloud-a.json");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+        std::fs::write(&ctx, b"").unwrap();
+
+        let state = CliState::load_split(&device, &ctx).expect("load must not fail on a 0-byte file");
+
+        assert!(state.saves.is_empty());
+        let backups: Vec<_> = std::fs::read_dir(ctx.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "the corrupt file must be moved aside, not deleted");
+        assert!(!ctx.exists(), "the corrupt file must not be left in place");
+    }
+
+    /// The other half of a torn write, on the device-level file: some bytes
+    /// made it, the closing brace didn't.
+    #[test]
+    fn a_truncated_device_file_falls_back_to_empty_prefs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts").join("cloud-a.json");
+        std::fs::write(&device, br#"{"manual_paths":{"factorio":"/sav"#).unwrap();
+
+        let state =
+            CliState::load_split(&device, &ctx).expect("load must not fail on a truncated file");
+
+        assert!(state.manual_paths.is_empty());
+        assert!(state.saves.is_empty());
+    }
+
+    /// The fix proper: both files are replaced in one step each, so a reload
+    /// sees the whole thing and no temp file is left behind in the state dir.
+    #[test]
+    fn saving_over_corrupt_files_writes_them_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tmp.path().join("device.json");
+        let ctx = tmp.path().join("contexts").join("cloud-a.json");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+        std::fs::write(&device, b"").unwrap();
+        std::fs::write(&ctx, b"{\"saves\": {").unwrap();
+
+        let mut state = CliState::default();
+        state.saves.insert("s1".to_string(), save_state("factorio"));
+        state.set_manual_path("factorio", PathBuf::from("/saves/factorio"));
+        state.save_split(&device, &ctx).unwrap();
+
+        let back = CliState::load_split(&device, &ctx).unwrap();
+        assert_eq!(back.saves.len(), 1);
+        assert_eq!(
+            back.manual_paths.get("factorio"),
+            Some(&PathBuf::from("/saves/factorio"))
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(ctx.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
 }

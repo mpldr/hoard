@@ -118,6 +118,27 @@ pub fn rejected_root(slug: &str, path: &Path, reason: &str) {
     );
 }
 
+/// An emulator's save root the walk found and refused: a container of one
+/// folder per title, with no title inside it yet. Says which emulator, which
+/// is the whole point — the row is a line for the catalog to answer, because
+/// a root that never fills up usually means the template points at the wrong
+/// per-install identifier (rpcs3's `00000001` profile is only the first one).
+///
+/// Once per run and root, for the same reason as [`no_snapshots`]: the walk
+/// runs again every sweep and the root is still there.
+pub fn emulator_root_skipped(emulator: &str, path: &Path) {
+    if !first_time(format!("emulator_root|{emulator}|{}", path.display())) {
+        return;
+    }
+    tracing::info!(
+        target: TELEMETRY_TARGET,
+        verdict = "emulator_root_skipped",
+        slug = %emulator,
+        path = %path.display(),
+        "telemetry: emulator save root has no title inside it"
+    );
+}
+
 /// A game we found no cover art for, down every path we know.
 ///
 /// The only verdict here that doesn't come from detection, and it lives in this

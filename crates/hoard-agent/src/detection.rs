@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::correlation::{self, CorrelationStore};
+use crate::emulators;
 use crate::junkdirs;
 use crate::launchers::{self, LauncherApp};
 use crate::manifest::Os;
@@ -2980,6 +2981,16 @@ pub fn discover_in_folder(
         if !is_root && dir_name_is_negative(&dir) {
             continue;
         }
+        // Emulator save root: it's a container of one folder per title, so
+        // what's offered is those, and the walk stops here. Without the stop
+        // the same titles come back a second time from below, and any
+        // subfolder deeper than a title would be offered on its own.
+        if emulators::save_root_at(&dir).is_some() {
+            if !path_already_known(&dir, known_paths) {
+                push_attributed(&mut out, &dir, store);
+            }
+            continue;
+        }
         // One subfolder per save inside (the Cyberpunk 2077 shape): the folder
         // the user wants tracked is THIS one, not each of the ones inside.
         // Pointing at it returned seventeen identical rows — one per save, all
@@ -3214,10 +3225,116 @@ fn dir_name_is_negative(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What to offer for a folder that turns out to be an emulator's save root.
+///
+/// `None` means it isn't one — carry on with the ordinary attribution.
+///
+/// The root of an emulator is a **container of one folder per title**, not a
+/// save. Offering it whole produced the two failures this answers: a slug torn
+/// off the tree's plumbing (`dev_hdd0`, from rpcs3's
+/// `dev_hdd0/home/<profile>/savedata`, on macOS and on RetroDECK), and a save
+/// that can never back up — one rpcs3 root logged "nothing to back up and this
+/// save has never had a snapshot" 224 times and was still logging it in
+/// ago-2026. The likeliest reason is the profile id: the catalog template says
+/// `00000001`, and a user whose active rpcs3 profile is `00000002` has a
+/// `00000001/savedata` that stays empty forever.
+///
+/// So the answer is one row per title, named the way the "add emulator" dialog
+/// names them (`emu-<id>-<title>`), and an **empty vec** — refuse — when there
+/// is no title inside to name. Refusing is the honest end of an empty
+/// container: there is nothing there to back up, and the dialog is the flow
+/// built for adding it once there is.
+///
+/// A root that holds files of its own is not a container at all (RetroArch
+/// keeps flat `.srm`s in `saves/`); that one is offered, but under the
+/// emulator's name instead of whatever segment the ancestor walk landed on.
+///
+/// Unlike the dialog, these rows carry no process list, so they don't need its
+/// `shared_processes` pin: nothing here can make the emulator's executable
+/// count as playing all of them at once.
+fn emulator_candidates(dir: &Path, store: &CorrelationStore) -> Option<Vec<AttributedSave>> {
+    let Some(def) = emulators::save_root_at(dir) else {
+        // Dentro de una raíz, no en ella: el barrido baja hasta donde hay
+        // ficheros. Lo que se ofrece es la carpeta del título, con el mismo
+        // nombre que tendría si se hubiera entrado por la raíz.
+        let (def, title) = emulators::save_root_above(dir)?;
+        return Some(vec![emulator_title_save(def, &title)]);
+    };
+    let titles = emulators::titles_in(def, dir);
+
+    if titles.is_empty() {
+        if emulators::has_direct_file(dir) {
+            // Save plano: la carpeta es el save, sólo estaba mal bautizada.
+            let graded = classify_dir_as_save_like(dir, def.display_name, store);
+            return Some(vec![AttributedSave {
+                slug: format!("emu-{}", def.id),
+                display_name: def.display_name.to_string(),
+                path: dir.to_path_buf(),
+                confidence: graded
+                    .as_ref()
+                    .map(|g| g.confidence)
+                    .unwrap_or(Confidence::Medium),
+                reason: format!("{}'s own save folder ({})", def.display_name, def.system),
+                steam_app_id: None,
+            }]);
+        }
+        tracing::info!(
+            emulator = def.id,
+            path = %dir.display(),
+            "detect: emulator save root with no title inside — not offering it as a save"
+        );
+        crate::telemetry::emulator_root_skipped(def.id, dir);
+        return Some(Vec::new());
+    }
+
+    Some(
+        titles
+            .iter()
+            .map(|t| emulator_title_save(def, &t.path))
+            .collect(),
+    )
+}
+
+/// Una carpeta de título dentro de la raíz de saves de `def`, con el nombre y
+/// el slug que le pondría el diálogo de "añadir emulador": el **id** del
+/// título, no su nombre, porque es lo único que las dos máquinas llaman igual.
+fn emulator_title_save(def: &'static emulators::EmulatorDef, title: &Path) -> AttributedSave {
+    let title_id = title
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    AttributedSave {
+        slug: format!("emu-{}-{}", def.id, ludusavi::slugify(title_id)),
+        display_name: format!("{} — {}", def.display_name, title_id),
+        path: title.to_path_buf(),
+        confidence: Confidence::Medium,
+        reason: format!("one {} title inside its save root", def.display_name),
+        steam_app_id: None,
+    }
+}
+
+/// Append candidates the caller doesn't already have. Several hits under the
+/// same emulator title all fold back to that one folder, so without this the
+/// same title lands in the list once per file the walk stopped at.
+fn extend_without_repeats(out: &mut Vec<AttributedSave>, found: Vec<AttributedSave>) {
+    for save in found {
+        if !out.iter().any(|s| s.path == save.path) {
+            out.push(save);
+        }
+    }
+}
+
 /// Attribute one discovered folder to a game and append it. The scoring runs
 /// only to grade the hit (`Low` when it wouldn't even qualify on its own) —
 /// in this walk it never decides whether the folder makes the list.
 fn push_attributed(out: &mut Vec<AttributedSave>, dir: &Path, store: &CorrelationStore) {
+    // Una raíz de emulador no se atribuye a ningún juego: se parte por título
+    // o se rechaza. Va antes que todo lo demás porque su nombre sale de la
+    // fontanería del emulador, no del árbol de saves del usuario.
+    if let Some(found) = emulator_candidates(dir, store) {
+        extend_without_repeats(out, found);
+        return;
+    }
     let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
     let graded = classify_dir_as_save_like(dir, name, store);
     let Some(display_name) = attribute_game_name(dir, store) else {
@@ -3288,6 +3405,10 @@ fn discover_in_roots(
                 continue;
             }
             if !emitted.insert(hit.path.clone()) {
+                continue;
+            }
+            if let Some(found) = emulator_candidates(&hit.path, store) {
+                extend_without_repeats(&mut out, found);
                 continue;
             }
             let Some(display_name) = attribute_game_name(&hit.path, store) else {
@@ -5294,6 +5415,90 @@ mod tests {
         }
         assert!(!is_skip_dir("saves"));
         assert!(!is_skip_dir("SaveGames"));
+    }
+
+    /// La raíz de un emulador, entrando por donde entra el usuario: señalando
+    /// la carpeta. Lo que sale es una fila por título, con el nombre y el slug
+    /// que le pondría el diálogo de emuladores — nunca la raíz, que es un
+    /// contenedor y no tiene un solo fichero que respaldar.
+    #[test]
+    fn pointing_at_an_emulator_root_lists_its_titles_not_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // La forma real: `<lo que sea>/rpcs3/dev_hdd0/home/<perfil>/savedata`.
+        let root = tmp.path().join("rpcs3/dev_hdd0/home/00000001/savedata");
+        for title in ["BLUS30443-AUTOSAVE", "NPUB30493-SAVEDATA01"] {
+            let d = root.join(title);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("PARAM.SFO"), b"x").unwrap();
+        }
+
+        let found = discover_in_folder(&root, &CorrelationStore::default(), &HashSet::new());
+        let mut rows: Vec<(String, String)> = found
+            .iter()
+            .map(|a| (a.slug.clone(), a.display_name.clone()))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "emu-rpcs3-blus30443-autosave".to_string(),
+                    "RPCS3 — BLUS30443-AUTOSAVE".to_string()
+                ),
+                (
+                    "emu-rpcs3-npub30493-savedata01".to_string(),
+                    "RPCS3 — NPUB30493-SAVEDATA01".to_string()
+                ),
+            ]
+        );
+        // Y ninguna fila es la raíz: era ella la que no podía respaldar nada.
+        assert!(
+            found.iter().all(|a| a.path != root),
+            "la raíz del emulador no se ofrece como save"
+        );
+        // Tampoco sobrevive el slug que salía del árbol del emulador.
+        assert!(found.iter().all(|a| a.slug != "dev-hdd0"));
+    }
+
+    /// Y la raíz vacía —rpcs3 instalado, perfil sin estrenar: el caso de las
+    /// 224 líneas de "nothing to back up"— no ofrece nada en absoluto.
+    #[test]
+    fn an_empty_emulator_root_is_refused_instead_of_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rpcs3/dev_hdd0/home/00000001/savedata");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let found = discover_in_folder(&root, &CorrelationStore::default(), &HashSet::new());
+        assert!(
+            found.is_empty(),
+            "una raíz de emulador sin un solo título dentro no es un save: {found:?}"
+        );
+    }
+
+    /// El barrido no aterriza en la raíz: baja hasta donde hay ficheros. Entrar
+    /// por encima tiene que dar exactamente lo mismo que señalarla, y una sola
+    /// fila por título aunque haya varios ficheros dentro.
+    #[test]
+    fn walking_into_an_emulator_root_from_above_still_files_it_by_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rpcs3/dev_hdd0/home/00000001/savedata");
+        let title = root.join("BLUS30443-AUTOSAVE");
+        std::fs::create_dir_all(title.join("deep")).unwrap();
+        std::fs::write(title.join("PARAM.SFO"), b"x").unwrap();
+        std::fs::write(title.join("deep/SDATA"), b"x").unwrap();
+
+        let found = discover_in_folder(
+            &tmp.path().join("rpcs3"),
+            &CorrelationStore::default(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "una fila por título, no una por fichero: {found:?}"
+        );
+        assert_eq!(found[0].slug, "emu-rpcs3-blus30443-autosave");
+        assert_eq!(found[0].path, title);
     }
 
     /// The names production actually minted saves under, plus the ones a walk

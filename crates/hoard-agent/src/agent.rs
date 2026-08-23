@@ -5327,6 +5327,43 @@ mod tests {
         assert!(cands.contains(&canon_token("the-witcher-3-wild-hunt")));
     }
 
+    /// Same poisoning, handheld flavour (report ago-2026, Linux handheld): a
+    /// save minted from an emulator front-end's `~/Emulation/storage` tree got
+    /// the slug `storage`, and on an image-based distro every containerised
+    /// process runs out of `…/containers/storage/overlay/<hash>/merged/…`, so
+    /// that slug matched a path component of half the process table as a STRONG
+    /// signal. The game was "running" forever and nothing could close it.
+    #[test]
+    fn handheld_plumbing_tokens_are_vetoed() {
+        for t in ["storage", "emulation", "roms", "containers", "overlay"] {
+            assert!(is_generic_identity_token(t), "{t} should be vetoed");
+        }
+        // Game side: no tokens at all, so no process can "run" it.
+        assert!(game_identity_tokens("storage", "storage").is_empty());
+        // Process side: a binary inside a container contributes neither
+        // "storage" nor the rest of the overlay plumbing as an identity.
+        let cands = process_identity_candidates(
+            "gnome-shell",
+            Some(Path::new(
+                "/var/lib/containers/storage/overlay/2f9a1b/merged/usr/bin/gnome-shell",
+            )),
+        );
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c == "storage" || c == "containers" || c == "overlay" || c == "merged"),
+            "container plumbing can't be an identity: {cands:?}"
+        );
+        // And a real game under the same root keeps its own.
+        let cands = process_identity_candidates(
+            "hollow_knight",
+            Some(Path::new(
+                "/home/deck/Emulation/roms/Hollow Knight/hollow_knight.x86_64",
+            )),
+        );
+        assert!(cands.contains(&canon_token("hollow-knight")));
+    }
+
     #[test]
     fn config_defaults_are_sane() {
         let c = AgentConfig::default();

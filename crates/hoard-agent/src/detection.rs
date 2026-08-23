@@ -5549,6 +5549,14 @@ mod tests {
             "00000001",
             "0004000000033400",
             "a1b2c3d4e5f6a7b8",
+            // And the plumbing of a Linux handheld: an emulator front-end's
+            // per-emulator tree (which IS one of our own deep-scan roots) and
+            // the system's container store.
+            "Emulation",
+            "storage",
+            "roms",
+            "containers",
+            "overlay",
         ] {
             assert!(
                 segment_names_no_game(name),

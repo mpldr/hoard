@@ -128,6 +128,25 @@ pub const GENERIC_IDENTITY_TOKENS: &[&str] = &[
     "default",
     "logs",
     "crashes",
+    // Handheld / emulator plumbing. `storage` is the one that bit: an
+    // emulator front-end keeps its per-emulator trees under
+    // `~/Emulation/storage`, which is one of our own deep-scan roots, so the
+    // ancestor walk minted a game called "storage" — and on an image-based
+    // Linux distro every containerised process runs out of
+    // `…/containers/storage/overlay/<hash>/merged/…`, whose path components
+    // then matched that slug as a STRONG identity signal. Result: a game that
+    // is "running" forever and can never be closed. `bios` is deliberately
+    // absent — the catalog has a game by that name.
+    "storage",
+    "emulation",
+    "roms",
+    "states",
+    "savestates",
+    "screenshots",
+    "backups",
+    "containers",
+    "overlay",
+    "merged",
 ];
 
 /// Por qué un valor no pasó la puerta. `kind` nombra el newtype para que el
@@ -928,7 +947,18 @@ mod tests {
     /// re-deriva —ya está bien formado— sino que se marca.
     #[test]
     fn repair_quarantines_a_degenerate_slug() {
-        for poison in ["users", "appdata", "steamapps", "savedgames"] {
+        for poison in [
+            "users",
+            "appdata",
+            "steamapps",
+            "savedgames",
+            // Handheld flavour: an emulator front-end's `storage` tree, plus
+            // the container store every process runs from on an image-based
+            // distro. Same failure, different plumbing.
+            "storage",
+            "containers",
+            "overlay",
+        ] {
             match GameSlug::repair(poison) {
                 Repair::Quarantined { reason, raw } => {
                     assert_eq!(reason, QuarantineReason::Degenerate);

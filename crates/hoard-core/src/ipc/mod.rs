@@ -661,6 +661,12 @@ pub struct EngineStatus {
     /// pintaba antes (C.6: append-only, el protocolo no sube).
     #[serde(default)]
     pub reason: EngineDownReason,
+    /// Which way the keyring failed, when [`EngineDownReason::KeyringUnreadable`]
+    /// is the reason. `None` for any other reason, and on a service too old to
+    /// classify it — the window then shows the general keyring sentence, which is
+    /// what it showed before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyring: Option<KeyringFault>,
 }
 
 /// Por qué no hay motor, clasificado en origen.
@@ -693,6 +699,56 @@ pub enum EngineDownReason {
     SessionExpired,
     /// Cualquier otra cosa. `last_error` lleva el detalle.
     Other,
+}
+
+/// Cómo falló el llavero, cuando [`EngineDownReason::KeyringUnreadable`] es el
+/// motivo.
+///
+/// The reason is one; the advice is not. A machine with no secret-service daemon
+/// at all is never going to answer, and telling that user to unlock their login
+/// keyring sends them looking for something that isn't installed. A locked one
+/// unlocks. A damaged entry is rewritten by signing in again. Four errors from
+/// production, four different next steps:
+/// `The name is not activatable` (nothing to talk to), `Did not receive a reply`
+/// (there, mute), `Crypto error: Unpad Error` (there, answering, and what it
+/// holds can't be decrypted) and our own five-second cap.
+///
+/// Travels as a **new optional field** on [`EngineStatus`] rather than as new
+/// [`EngineDownReason`] variants, and that is deliberate: a field an older client
+/// doesn't know is a field it ignores, while a variant it doesn't know fails the
+/// parse of the whole status and leaves it with no data at all about the daemon.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyringFault {
+    /// There is no secret-service daemon on this machine to talk to.
+    Missing,
+    /// It's there and it doesn't answer: locked and waiting on an unlock prompt
+    /// nobody can see, or a session bus that swallowed the call.
+    Locked,
+    /// It answered and said no — a macOS ACL that authorises a different binary,
+    /// a denied access rule.
+    Refused,
+    /// It answered, and what it holds can't be read back: a corrupt entry, a
+    /// crypto session that won't negotiate.
+    Damaged,
+    /// A fault a newer service classified and this build doesn't know. Keeps an
+    /// older client parsing a newer status instead of dropping it whole.
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+impl KeyringFault {
+    /// Stable tag for the wire and for the UI to key its sentence on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Locked => "locked",
+            Self::Refused => "refused",
+            Self::Damaged => "damaged",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -975,6 +1031,49 @@ mod tests {
         .unwrap();
         assert_eq!(old.engine.reason, EngineDownReason::Unknown);
         assert_eq!(old.engine.last_error.as_deref(), Some("no session"));
+    }
+
+    /// The keyring fault is append-only in the way that matters: a service too
+    /// old to classify it doesn't send the field, and the client reads `None` and
+    /// shows the general keyring sentence — exactly what it showed before the
+    /// field existed. This is the reason it is a field and not two more
+    /// `EngineDownReason` variants: an unknown *variant* fails the parse of the
+    /// whole status and leaves the client with no data about the daemon at all.
+    #[test]
+    fn an_engine_without_a_keyring_fault_reads_as_none() {
+        let old: DaemonStatus = serde_json::from_str(
+            r#"{"daemon_version":"1.1.4","protocol":1,"pid":1,"epoch":"e",
+                "uptime_secs":0,"cursor":0,
+                "engine":{"running":false,"reason":"keyring_unreadable"},"slots":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.engine.reason, EngineDownReason::KeyringUnreadable);
+        assert_eq!(old.engine.keyring, None);
+    }
+
+    /// And the same protection the other way round: a fault a newer service
+    /// classifies and this build has no name for reads as `Unknown` instead of
+    /// dropping the status. Without `#[serde(other)]` every future variant would
+    /// be a client that goes blind against a newer daemon.
+    #[test]
+    fn an_unknown_keyring_fault_doesnt_sink_the_status() {
+        let newer: DaemonStatus = serde_json::from_str(
+            r#"{"daemon_version":"9.9.9","protocol":1,"pid":1,"epoch":"e",
+                "uptime_secs":0,"cursor":0,
+                "engine":{"running":false,"reason":"keyring_unreadable",
+                          "keyring":"eaten_by_a_grue"},"slots":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.engine.keyring, Some(KeyringFault::Unknown));
+
+        let json = serde_json::to_value(&EngineStatus {
+            running: false,
+            reason: EngineDownReason::KeyringUnreadable,
+            keyring: Some(KeyringFault::Missing),
+            ..EngineStatus::default()
+        })
+        .unwrap();
+        assert_eq!(json["keyring"], "missing");
     }
 
     /// Y en el cable va en `snake_case`, que es lo que la UI compara.

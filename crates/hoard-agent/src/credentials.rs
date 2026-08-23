@@ -160,14 +160,18 @@ pub fn save(creds: &Credentials) -> Result<TokenStorage> {
     };
     write_session(&session)?;
 
-    match try_keyring_set(creds) {
+    match store_in_keyring(creds) {
         Ok(()) => {
             // Belt and braces: if the file had a stale token from a previous
             // fallback run, scrub it now that the keyring took over.
             scrub_file_token().ok();
             Ok(TokenStorage::Keyring)
         }
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "keyring: keeping the self-hosted session in the protected file instead"
+            );
             let mut session = read_session()?.unwrap_or_default();
             session.auth = Some(AuthSection {
                 token: creds.token.clone(),
@@ -311,7 +315,10 @@ fn pick_token(
 /// respaldo que funciona es exactamente la jugada que deja al usuario sin sync la
 /// próxima vez que se bloquee. El fichero es 0600 y ya contenía ese token.
 pub fn promote_to_keyring(creds: &Credentials) -> bool {
-    match try_keyring_set(creds) {
+    // Verified, like `save`: a promotion that reports success on a keyring which
+    // can't read the entry back would have the daemon believe the session moved
+    // and stop looking at the file it actually still lives in.
+    match store_in_keyring(creds) {
         Ok(()) => {
             tracing::info!(
                 "credentials: la sesión self-hosted pasa al llavero a nombre del servicio"
@@ -624,6 +631,20 @@ fn try_keyring_set(creds: &Credentials) -> Result<()> {
             Ok(())
         },
     )
+}
+
+/// Write the token to the keyring **and read it back**. The twin of
+/// `cloud_auth::store_in_keyring`, and for the same reason: a `set_password`
+/// that returns `Ok` isn't proof the entry can be read again, and this caller
+/// scrubs the file copy on success. Trust the write and a keyring that accepts
+/// what it can't decrypt leaves the machine with no token anywhere.
+fn store_in_keyring(creds: &Credentials) -> Result<()> {
+    try_keyring_set(creds)?;
+    match try_keyring_get() {
+        Ok(Some(blob)) if blob.token == creds.token => Ok(()),
+        Ok(_) => anyhow::bail!("the keyring accepted the session and didn't give it back"),
+        Err(err) => Err(err.context("reading back the session we just saved")),
+    }
 }
 
 fn try_keyring_get() -> Result<Option<KeyringBlob>> {

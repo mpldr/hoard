@@ -36,7 +36,12 @@
   import SaveGameCard from "../lib/components/SaveGameCard.svelte";
   import MirrorWarningBanner from "../lib/components/MirrorWarningBanner.svelte";
   import * as api from "../lib/api";
-  import type { EngineDownReason, MirrorWarning, TrackedSave } from "../lib/api";
+  import type {
+    EngineDownReason,
+    KeyringFault,
+    MirrorWarning,
+    TrackedSave,
+  } from "../lib/api";
   import { auth, refreshQuota, signOut } from "../lib/stores/auth";
   import { storageGamesCloud } from "../lib/stores/cloud";
   import { activity, status } from "../lib/stores/agent";
@@ -385,16 +390,39 @@
   /** Which sentence explains an engine that isn't up. An older service (or a
    *  failure we don't classify) reports nothing, and then the generic line is
    *  the honest answer — inventing a cause would be worse than "it's down". */
-  function offlineMessageKey(reason: EngineDownReason | undefined): string {
+  function offlineMessageKey(
+    reason: EngineDownReason | undefined,
+    keyring: KeyringFault | null | undefined,
+  ): string {
     switch (reason) {
       case "no_session":
         return "dashboard.service_offline_no_session";
       case "keyring_unreadable":
-        return "dashboard.service_offline_keyring";
+        return keyringMessageKey(keyring);
       case "session_expired":
         return "dashboard.service_offline_expired";
       default:
         return "dashboard.service_offline_banner";
+    }
+  }
+
+  /** "The keyring won't hand it over" is one reason with four different next
+   *  steps, and getting that wrong sends the user after the wrong thing: a
+   *  machine with no secret-service daemon has nothing to unlock, and being told
+   *  to unlock a login keyring there is a dead end. What all four share is that
+   *  signing in again works — the session then lands in Hoard's own protected
+   *  file instead, and stays there. An older service doesn't classify, and then
+   *  the general sentence is what shows, exactly as before. */
+  function keyringMessageKey(fault: KeyringFault | null | undefined): string {
+    switch (fault) {
+      case "missing":
+        return "dashboard.service_offline_keyring_missing";
+      case "locked":
+        return "dashboard.service_offline_keyring_locked";
+      case "damaged":
+        return "dashboard.service_offline_keyring_damaged";
+      default:
+        return "dashboard.service_offline_keyring";
     }
   }
 
@@ -519,7 +547,7 @@
     >
       <AlertTriangle size={15} class="mt-0.5 shrink-0 text-amber-400" />
       <div class="min-w-0 flex-1">
-        <p>{$_(offlineMessageKey($status.reason))}</p>
+        <p>{$_(offlineMessageKey($status.reason, $status.keyring))}</p>
         <!-- El texto crudo del servicio. No es para el usuario medio, es para
              que pueda pegarlo en un reporte sin tener que encontrar el log. -->
         {#if $status.last_error}

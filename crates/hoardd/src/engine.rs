@@ -38,7 +38,7 @@ use hoard_agent::presence::PresenceHandle;
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::Finished;
 use hoard_agent::{cloud_live, library, presence};
-use hoard_core::ipc::{EngineDownReason, EngineStatus};
+use hoard_core::ipc::{EngineDownReason, EngineStatus, KeyringFault};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -256,6 +256,7 @@ impl Engine {
             since: Some(OffsetDateTime::now_utc()),
             last_error: None,
             reason: EngineDownReason::Unknown,
+            keyring: None,
         };
         // Un motor previo (por ejemplo el que murió y estamos reemplazando) se
         // tira aquí: `Running::aux` aborta sus tareas al soltarse.
@@ -267,11 +268,15 @@ impl Engine {
         guard.in_flight_since = None;
     }
 
-    fn note_error(&self, error: String, reason: EngineDownReason) {
+    fn note_error(&self, error: String, reason: EngineDownReason, keyring: Option<KeyringFault>) {
         let mut guard = self.lock();
         guard.status.running = false;
         guard.status.last_error = Some(error);
         guard.status.reason = reason;
+        // Which way the keyring failed, when that's what failed. Cleared
+        // otherwise, or a machine that once hit a locked keyring would keep
+        // explaining every later failure with it.
+        guard.status.keyring = keyring;
         guard.running = None;
     }
 
@@ -432,8 +437,15 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             Err(err) => {
                 let text = format!("{err:#}");
                 let reason = classify(&err);
-                tracing::warn!(error = %text, ?reason, retry_in_secs = backoff.as_secs(), "hoardd: couldn't start the engine");
-                engine.note_error(text, reason);
+                let keyring = hoard_agent::keychain::fault(&err);
+                tracing::warn!(
+                    error = %text,
+                    ?reason,
+                    keyring = keyring.map(|f| f.as_str()).unwrap_or("-"),
+                    retry_in_secs = backoff.as_secs(),
+                    "hoardd: couldn't start the engine"
+                );
+                engine.note_error(text, reason, keyring);
                 engine.nap(backoff).await;
                 backoff = (backoff * 2).min(START_BACKOFF_MAX);
             }

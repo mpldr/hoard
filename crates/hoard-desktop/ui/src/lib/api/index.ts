@@ -545,7 +545,21 @@ export type AgentStatus = {
   /** Raw text of the last start failure, for the detail line and for the user
    *  to paste into a report. The translated sentence comes from `reason`. */
   last_error?: string | null;
+  /** Which way the keyring failed, when `reason` is `keyring_unreadable`. One
+   *  reason, four next steps: a machine with no secret-service daemon is not a
+   *  locked one, and telling that user to unlock their login keyring sends them
+   *  after something that isn't installed. Absent on an older service, and then
+   *  the general keyring sentence is what shows — exactly as before. */
+  keyring?: KeyringFault | null;
 };
+
+/** Mirrors `hoard_core::ipc::KeyringFault` (snake_case on the wire). */
+export type KeyringFault =
+  | "missing"
+  | "locked"
+  | "refused"
+  | "damaged"
+  | "unknown";
 
 /** Mirrors `hoard_core::ipc::EngineDownReason` (snake_case on the wire). */
 export type EngineDownReason =

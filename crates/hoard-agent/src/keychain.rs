@@ -15,6 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+pub use hoard_core::ipc::KeyringFault;
 
 /// Tope de espera de **cualquier** operación del llavero.
 ///
@@ -83,6 +84,76 @@ impl std::fmt::Display for KeyringUnreadable {
 }
 
 impl std::error::Error for KeyringUnreadable {}
+
+/// Which way the keyring failed, for the sentence the window shows.
+///
+/// [`KeyringUnreadable`] and [`KeyringTimeout`] answer "can Hoard get the saved
+/// session?" — no, and no. This answers "why not", and the four production
+/// errors want four different next steps: `DBus error: The name is not
+/// activatable` is a machine with no secret-service daemon, so telling that user
+/// to unlock their login keyring sends them looking for something that isn't
+/// installed; `Did not receive a reply` and our own cap are one that's there and
+/// mute; `Platform secure storage failure: Crypto error: Unpad Error` is one
+/// that's there, answering, and holding something it can't decrypt.
+///
+/// **This is the one place a message gets read to classify it, and it's allowed
+/// here because the message isn't ours.** Everywhere else in this codebase the
+/// rule is downcast-never-match, precisely because our own wording gets rewritten
+/// without a thought. `keyring::Error::PlatformFailure` boxes the platform's
+/// error and covers all three D-Bus shapes, so the variant alone can't tell them
+/// apart and the only signal left is the text the platform produced. Read it as
+/// data from outside, and keep the fallback honest: anything unrecognised is
+/// [`Refused`](KeyringFault::Refused), never a guess.
+pub fn fault(err: &anyhow::Error) -> Option<KeyringFault> {
+    // Our own cap first: it never reaches `keyring::Error`, because the point of
+    // it is that the call never came back.
+    if err.is::<KeyringTimeout>() {
+        return Some(KeyringFault::Locked);
+    }
+    let native = err.downcast_ref::<keyring::Error>()?;
+    Some(match native {
+        keyring::Error::NoEntry => return None,
+        keyring::Error::BadEncoding(_) | keyring::Error::Ambiguous(_) => KeyringFault::Damaged,
+        keyring::Error::PlatformFailure(inner) | keyring::Error::NoStorageAccess(inner) => {
+            classify_platform(&inner.to_string())
+        }
+        _ => KeyringFault::Refused,
+    })
+}
+
+/// The platform's own words, for the three shapes production actually produced.
+fn classify_platform(text: &str) -> KeyringFault {
+    let lower = text.to_ascii_lowercase();
+    // Nothing to talk to: the bus has no such name and can't start one. On a
+    // headless box or a desktop without a secret-service daemon this is the
+    // permanent answer, not a bad moment.
+    if lower.contains("not activatable")
+        || lower.contains("serviceunknown")
+        || lower.contains("no such interface")
+        || lower.contains("no session bus")
+        || lower.contains("not provided by any .service files")
+    {
+        return KeyringFault::Missing;
+    }
+    // There, and mute. Same shape as our own cap running out.
+    if lower.contains("did not receive a reply")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("is locked")
+    {
+        return KeyringFault::Locked;
+    }
+    // There, answering, and what it holds won't come back out. `Unpad Error` is
+    // the encrypted-session negotiation failing.
+    if lower.contains("crypto error")
+        || lower.contains("unpad")
+        || lower.contains("decrypt")
+        || lower.contains("corrupt")
+    {
+        return KeyringFault::Damaged;
+    }
+    KeyringFault::Refused
+}
 
 type KeyringJob = Box<dyn FnOnce() + Send>;
 
@@ -219,6 +290,67 @@ mod tests {
         .expect_err("el fallo del llavero se propaga");
         assert!(err.downcast_ref::<KeyringTimeout>().is_none());
         assert_eq!(err.to_string(), "no D-Bus session bus");
+    }
+
+    /// The four shapes production actually produced, each landing on the advice
+    /// that helps. Telling someone with no secret-service daemon to unlock their
+    /// login keyring sends them looking for something that isn't installed, and
+    /// that was the state of the art for seven users.
+    #[test]
+    fn the_four_production_errors_classify_apart() {
+        fn platform(text: &'static str) -> anyhow::Error {
+            anyhow::Error::new(keyring::Error::PlatformFailure(text.into()))
+        }
+
+        assert_eq!(
+            fault(&platform("DBus error: The name is not activatable")),
+            Some(KeyringFault::Missing)
+        );
+        assert_eq!(
+            fault(&platform("Did not receive a reply")),
+            Some(KeyringFault::Locked)
+        );
+        assert_eq!(
+            fault(&platform("Crypto error: Unpad Error")),
+            Some(KeyringFault::Damaged)
+        );
+        // Our own cap never reaches a `keyring::Error` — the whole point is that
+        // the call didn't come back — so it has to be recognised on its own.
+        let capped = anyhow::Error::new(KeyringTimeout {
+            doing: "reading the Cloud session",
+            after: KEYRING_TIMEOUT,
+        });
+        assert_eq!(fault(&capped), Some(KeyringFault::Locked));
+    }
+
+    /// The reason has to survive the wrapping every caller does on the way up,
+    /// and "no entry" is not a fault at all: a machine that was never signed in
+    /// would otherwise be told its keyring is broken.
+    #[test]
+    fn the_fault_survives_context_and_ignores_an_empty_keyring() {
+        let wrapped = anyhow::Error::new(keyring::Error::PlatformFailure(
+            "Crypto error: Unpad Error".into(),
+        ))
+        .context(KeyringUnreadable {
+            doing: "reading the Cloud session",
+        })
+        .context("starting the engine");
+        assert_eq!(fault(&wrapped), Some(KeyringFault::Damaged));
+
+        assert_eq!(fault(&anyhow::Error::new(keyring::Error::NoEntry)), None);
+        assert_eq!(fault(&anyhow::anyhow!("no network")), None);
+    }
+
+    /// Anything the platform says that we don't recognise is `Refused`, not a
+    /// guess at the friendliest-sounding cause. `Missing` in particular tells the
+    /// user this machine has no keyring at all, and being wrong about that sends
+    /// them off to install something they already have.
+    #[test]
+    fn an_unrecognised_platform_error_is_not_guessed_at() {
+        let odd = anyhow::Error::new(keyring::Error::NoStorageAccess(
+            "the vault is on fire".into(),
+        ));
+        assert_eq!(fault(&odd), Some(KeyringFault::Refused));
     }
 
     /// El tope vale para las dos sesiones, que es el motivo de que el hilo sea

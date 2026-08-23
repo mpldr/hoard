@@ -55,7 +55,8 @@ use hoard_agent::agent::{AgentConfig, AgentEvent};
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
 use hoard_core::ipc::{
-    AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, EngineDownReason, IpcError, Payload,
+    AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, EngineDownReason, IpcError,
+    KeyringFault, Payload,
     Request, ServerSession, UpdateState,
 };
 use hoardd::client::{Client, Push};
@@ -118,6 +119,11 @@ pub struct AgentStatus {
     /// El texto crudo del último fallo, para el detalle y para que el usuario
     /// pueda copiarlo en un reporte. La frase traducida sale de `reason`.
     pub last_error: Option<String>,
+    /// Which way the keyring failed, when `reason` is `KeyringUnreadable`. One
+    /// reason, four next steps: a machine with no secret-service daemon is not a
+    /// locked one, and telling that user to unlock their login keyring sends them
+    /// after something that isn't installed.
+    pub keyring: Option<KeyringFault>,
 }
 
 impl AgentStatus {
@@ -135,6 +141,7 @@ impl AgentStatus {
             // más honesto que inventar un motivo.
             reason: EngineDownReason::Unknown,
             last_error: None,
+            keyring: None,
         }
     }
 
@@ -151,6 +158,9 @@ impl AgentStatus {
             // arriba es ruido que la ventana no debe enseñar.
             last_error: (!status.engine.running)
                 .then(|| status.engine.last_error.clone())
+                .flatten(),
+            keyring: (!status.engine.running)
+                .then_some(status.engine.keyring)
                 .flatten(),
         }
     }

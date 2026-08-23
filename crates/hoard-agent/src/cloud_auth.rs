@@ -35,7 +35,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::keychain::{keyring_op, KeyringTimeout, KEYRING_TIMEOUT};
+use crate::keychain::{keyring_op, KeyringTimeout, KeyringUnreadable, KEYRING_TIMEOUT};
 
 const CLOUD_DEFAULT_URL: &str = "https://api.hoard.services";
 const KEYRING_SERVICE: &str = "hoard-desktop-cloud";
@@ -581,9 +581,18 @@ fn pick_auth(
             // Sin nada en el fichero, el error del llavero **es** la respuesta y
             // tiene que llegar entero a `last_error` y al log: es la única pista
             // de que el llavero está bloqueado. Un tope agotado ya se explica
-            // solo; a cualquier otro fallo se le añade dónde ocurrió.
+            // solo; a cualquier otro fallo se le añade el motivo tipado.
+            //
+            // That typed reason is what the Cloud path was missing while the
+            // self-hosted one had it: everything that wasn't our own cap arrived
+            // as plain context, classified as `EngineDownReason::Other`, and the
+            // window showed the generic "the service is offline" banner. Seven
+            // users on Linux, no session, and the one thing that would have
+            // explained it dropped one line before it could be said.
             None if e.is::<KeyringTimeout>() => Err(e),
-            None => Err(e.context("leyendo la sesión Cloud del keyring")),
+            None => Err(e.context(KeyringUnreadable {
+                doing: "reading the Cloud session",
+            })),
         },
     }
 }
@@ -602,9 +611,13 @@ pub fn store_tokens(tokens: &Tokens, server_url: &str) -> Result<()> {
     if session.server_url.is_empty() {
         session.server_url = server_url.to_string();
     }
-    match keyring_set(&tokens.access, &tokens.refresh) {
+    match store_in_keyring(tokens) {
         Ok(()) => session.auth = None,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "keyring: keeping the Cloud session in the protected file instead"
+            );
             session.auth = Some(AuthSection {
                 access_token: tokens.access.clone(),
                 refresh_token: tokens.refresh.clone(),
@@ -612,6 +625,27 @@ pub fn store_tokens(tokens: &Tokens, server_url: &str) -> Result<()> {
         }
     }
     write_session_file(&session)
+}
+
+/// Write the pair to the keyring **and read it back**, so that "the keyring took
+/// it" is something we know rather than something we assumed.
+///
+/// A `set_password` that returns `Ok` is not proof the entry can be read: the
+/// error users actually hit is `Platform secure storage failure: Crypto error:
+/// Unpad Error`, a keyring that accepts writes and can't decrypt what it holds.
+/// Trusting the write is what turned that into a lockout — the caller sets
+/// `auth = None`, so the only copy of the session lives in a store that will
+/// never give it back, and the machine stops syncing with nothing on disk to
+/// recover from. The read-back is one extra call on a healthy keyring, in the
+/// milliseconds it answers in, and it is the whole difference between degrading
+/// to the 0600 file and having no session at all.
+fn store_in_keyring(tokens: &Tokens) -> Result<()> {
+    keyring_set(&tokens.access, &tokens.refresh)?;
+    match keyring_get() {
+        Ok(Some(saved)) if saved.access_token == tokens.access => Ok(()),
+        Ok(_) => bail!("the keyring accepted the session and didn't give it back"),
+        Err(err) => Err(err.context("reading back the session we just saved")),
+    }
 }
 
 /// Persiste el par **sin tocar el llavero**: fichero 0600 y nada más.
@@ -880,6 +914,29 @@ mod tests {
             .expect("el fichero salva la sesión")
             .expect("tokens");
         assert_eq!(got.access_token, "jwt-del-fichero");
+    }
+
+    /// The gap the Cloud path had that the self-hosted one didn't: a keyring that
+    /// **answers and refuses** carried no typed reason, so it arrived at the
+    /// window as `EngineDownReason::Other` and got the generic "the service is
+    /// offline" banner. Seven Linux users, no Cloud session, and the sentence
+    /// that would have explained it dropped one line short.
+    #[test]
+    fn a_refusing_keyring_carries_a_typed_reason_too() {
+        let refused = anyhow::Error::new(keyring::Error::PlatformFailure(
+            "Crypto error: Unpad Error".into(),
+        ));
+        let err = pick_auth(Err(refused), None).expect_err("no puede ser Ok(None)");
+        assert!(
+            err.downcast_ref::<KeyringUnreadable>().is_some(),
+            "the reason has to be typed, not just in the text: {err:#}"
+        );
+        // And the finer classification survives the wrapping, so the window can
+        // say *which* way it failed instead of the general keyring line.
+        assert_eq!(
+            crate::keychain::fault(&err),
+            Some(crate::keychain::KeyringFault::Damaged)
+        );
     }
 
     /// Y un llavero sano gana al fichero, con o sin fichero.

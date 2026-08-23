@@ -284,17 +284,38 @@ async fn poll_loop(
     // Realtime socket is down. Immediacy comes from Realtime; this only
     // needs to keep them *eventually* honest, so it's throttled to at
     // most once per `FALLBACK_MIN_SECS`.
-    // Initialized in the past so the first tick primes both feeds.
+    //
+    // Backdated so the first tick primes both feeds. Plain subtraction used to
+    // do it and panicked with "overflow when subtracting duration from instant"
+    // whenever the monotonic clock hadn't run `FALLBACK_MIN_SECS` yet — the
+    // login autostart, where the poller comes up seconds after the clock's
+    // origin. The supervisor caught it four times with `ran_secs: 0`, restarting
+    // a loop that could only panic again. `checked_sub` answers `None` there
+    // instead, which [`feed_refresh_is_due`] reads as "never refreshed" — the
+    // same first-tick prime the backdating was for, by a route that can't die.
     let mut last_feed = tokio::time::Instant::now()
-        - Duration::from_secs(crate::commands::cloud_feed::FALLBACK_MIN_SECS);
+        .checked_sub(Duration::from_secs(
+            crate::commands::cloud_feed::FALLBACK_MIN_SECS,
+        ));
     loop {
         ticker.tick().await;
         guarded_pull(app, seen, gate, "timer").await;
-        if last_feed.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS {
-            last_feed = tokio::time::Instant::now();
+        if feed_refresh_is_due(last_feed) {
+            last_feed = Some(tokio::time::Instant::now());
             crate::commands::cloud_feed::kick_all(app);
         }
     }
+}
+
+/// Has the fallback feed refresh gone stale enough to run again?
+///
+/// `None` means nothing has been refreshed yet, which covers both the first
+/// tick after a start and the cold-start case where [`poll_loop`] couldn't
+/// backdate its clock at all. Both want the refresh to fire.
+fn feed_refresh_is_due(last_feed: Option<tokio::time::Instant>) -> bool {
+    last_feed.is_none_or(|t| {
+        t.elapsed().as_secs() >= crate::commands::cloud_feed::FALLBACK_MIN_SECS
+    })
 }
 
 /// Fire a single manifest pull immediately, off the regular cadence.
@@ -552,4 +573,59 @@ async fn run_one_pull(app: &AppHandle, seen: &Arc<Mutex<Vec<ManifestSeenEntry>>>
     // poll de respaldo) y hace las tres cosas con menos latencia que nosotros.
     // Este poller se queda con lo que siempre fue suyo, **pintar**: de él salen
     // el dot de nube, el contador de versiones y las filas del feed.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::cloud_feed::FALLBACK_MIN_SECS;
+
+    /// The cold-start case. `poll_loop` backdates its clock so the first tick
+    /// primes the feeds; on a monotonic clock younger than the throttle there
+    /// is no such instant to name, and `checked_sub` hands back `None`. That
+    /// has to read as due, or the fix would trade a panic for a first tick
+    /// that silently skips the prime.
+    #[test]
+    fn a_clock_too_young_to_backdate_still_primes_the_feeds() {
+        assert!(feed_refresh_is_due(None));
+    }
+
+    /// And the arithmetic that produces it no longer aborts the task. `-` on
+    /// an instant panics as soon as the result would predate the clock's
+    /// origin, which is what the supervisor caught four times with
+    /// `ran_secs: 0`; `checked_sub` returns `None` for the same input. Asked
+    /// for more than any clock has run so the case is reachable from a test.
+    #[test]
+    fn an_unrepresentable_backdate_returns_none_instead_of_panicking() {
+        let origin = tokio::time::Instant::now();
+        assert!(origin.checked_sub(Duration::from_secs(u64::MAX)).is_none());
+        assert!(feed_refresh_is_due(
+            origin.checked_sub(Duration::from_secs(u64::MAX))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_refresh_holds_until_the_window_has_passed() {
+        let refreshed = tokio::time::Instant::now();
+        assert!(!feed_refresh_is_due(Some(refreshed)));
+
+        tokio::time::advance(Duration::from_secs(FALLBACK_MIN_SECS - 1)).await;
+        assert!(!feed_refresh_is_due(Some(refreshed)));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(feed_refresh_is_due(Some(refreshed)));
+    }
+
+    /// The path `poll_loop` takes once the clock has run long enough: the
+    /// backdated instant exists and is due on the very first tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_backdated_instant_is_due_immediately() {
+        tokio::time::advance(Duration::from_secs(FALLBACK_MIN_SECS * 2)).await;
+
+        let backdated =
+            tokio::time::Instant::now().checked_sub(Duration::from_secs(FALLBACK_MIN_SECS));
+
+        assert!(backdated.is_some(), "clock has run long enough to backdate");
+        assert!(feed_refresh_is_due(backdated));
+    }
 }

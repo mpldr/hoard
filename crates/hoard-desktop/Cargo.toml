@@ -76,3 +76,8 @@ tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `start_paused` for the cloud-pull throttle tests: the fallback feed refresh
+# only unblocks after a minute of wall clock, and a suite that actually waits
+# out a minute is a suite nobody runs. Dev-only under resolver 2, so no
+# production build picks it up.
+tokio = { workspace = true, features = ["test-util"] }

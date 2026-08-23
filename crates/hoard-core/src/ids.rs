@@ -74,26 +74,60 @@ pub const MIN_IDENTITY_TOKEN_LEN: usize = 4;
 /// real) los añade el shell — ver `hoard_agent::agent::is_generic_identity_token`,
 /// que extiende esta lista con `directories::UserDirs`.
 pub const GENERIC_IDENTITY_TOKENS: &[&str] = &[
+    // Perfil de usuario y raíces del sistema.
     "users",
+    "user",
+    "public",
     "home",
     "appdata",
     "roaming",
     "local",
     "locallow",
     "documents",
-    "savedgames",
-    "mygames",
-    "saves",
-    "games",
-    "programfiles",
-    "programfilesx86",
-    "steamapps",
-    "common",
-    "compatdata",
-    "drivec",
+    "library",
+    "applicationsupport",
+    "config",
+    "share",
+    "state",
+    "cache",
+    "temp",
     "windows",
     "desktop",
     "downloads",
+    // Contenedores de partidas: dicen que dentro hay saves, no de qué juego.
+    "savedgames",
+    "mygames",
+    "save",
+    "saves",
+    "savegame",
+    "savegames",
+    "savedata",
+    "savefiles",
+    "profile",
+    "profiles",
+    "slot",
+    "slots",
+    // Fontanería de instalación y de tienda.
+    "games",
+    "game",
+    "programfiles",
+    "programfilesx86",
+    "steam",
+    "steamapps",
+    "steamuser",
+    "userdata",
+    "common",
+    "compatdata",
+    "drivec",
+    "remote",
+    // Carpetas de servicio que un juego deja junto a sus partidas.
+    "settings",
+    "options",
+    "data",
+    "content",
+    "default",
+    "logs",
+    "crashes",
 ];
 
 /// Por qué un valor no pasó la puerta. `kind` nombra el newtype para que el
@@ -476,6 +510,47 @@ pub fn canon_token(s: &str) -> String {
         }
     }
     out
+}
+
+/// Shortest a path segment can be and still plausibly be a game's name. Two
+/// characters (`cd`, `ps`) name a medium or a console, never a title.
+pub const MIN_NAMEABLE_LEN: usize = 3;
+
+/// `true` when a raw path segment cannot honestly name a game.
+///
+/// The naming counterpart of [`GENERIC_IDENTITY_TOKENS`]: that list keeps a
+/// degenerate slug from poisoning correlation *after the fact*, this keeps one
+/// from being minted in the first place. Both read the same list on purpose —
+/// a name this returns `false` for is a name the loader will not quarantine.
+///
+/// A segment fails in one of three ways:
+///
+/// * it is plumbing every machine has (`AppData`, `steamapps`, `user`);
+/// * it is an identifier the machine minted for itself — a Steam appid, a
+///   SteamID64, a profile uuid, the hex ids Citra derives from console keys.
+///   None of them is a name, and every one of them differs on the next
+///   machine, so a save named after one cannot be paired across devices;
+/// * there is not enough of it left to be a title (`cd`).
+///
+/// Only static text is consulted, so this cannot know the user's own home
+/// path — `C:\Users\<account>` names the account, never the game. Callers with
+/// an environment extend it; see `hoard_agent::agent::is_generic_identity_token`.
+pub fn is_generic_name(raw: &str) -> bool {
+    let tok = canon_token(raw);
+    if tok.len() < MIN_NAMEABLE_LEN {
+        return true;
+    }
+    if GENERIC_IDENTITY_TOKENS.contains(&tok.as_str()) {
+        return true;
+    }
+    if tok.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Hex ids only. A digit has to be in there: without that clause ordinary
+    // words made of hex letters ("facade", "decade") would read as ids.
+    tok.len() >= 8
+        && tok.chars().any(|c| c.is_ascii_digit())
+        && tok.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 // ---------------------------------------------------------------------------

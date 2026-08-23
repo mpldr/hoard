@@ -750,6 +750,19 @@ where
                         .and_then(ludusavi::title_for_app_id)
                         .map(str::to_string)
                         .unwrap_or_else(|| hit.folder.clone());
+                    // Los wrappers se organizan por appid, así que cuando el
+                    // catálogo no conoce ese appid el "nombre de carpeta" ES el
+                    // appid: así nacieron los saves `2059170` y `2479090`. Un
+                    // número no nombra un juego y no dice nada al de al lado.
+                    if segment_names_no_game(&name) {
+                        tracing::debug!(
+                            wrapper = hit.wrapper,
+                            folder = %name,
+                            path = %hit.path.display(),
+                            "detect: wrapper entry has no name of its own — skipped"
+                        );
+                        continue;
+                    }
                     let slug = ludusavi::slugify(&name);
                     if slug.is_empty() {
                         continue;
@@ -2826,27 +2839,22 @@ const PHASE4_WALK_MAX_DEPTH: usize = 4;
 const PHASE4_DEEP_WALK_MAX_DEPTH: usize = 6;
 const PHASE4_DEEP_WALK_TIMEOUT: Duration = Duration::from_millis(5000);
 
-/// Generic path segments that are containers, never the game's name. When
-/// attributing a discovered save folder we walk up past these (and past
-/// recognised save-words) to reach the segment that actually names the game.
-const GENERIC_SEGMENTS: &[&str] = &[
-    "appdata",
-    "roaming",
-    "local",
-    "locallow",
-    "documents",
-    "my games",
-    "saved games",
-    "savedgames",
-    ".config",
-    ".local",
-    "share",
-    "state",
-    "users",
-    "steamuser",
-    "drive_c",
-    "home",
-];
+/// `true` when a path segment is a container, an identifier or an account
+/// name — anything but the name of a game. Walking up to attribute a save
+/// folder skips these; landing on one is the whole reason production grew
+/// saves called `user`, `steam`, `settings` and `2059170`.
+///
+/// One list, three sources, and they have to be the same three the loader
+/// quarantines against or we mint names that state loading then rejects:
+/// [`hoard_core::ids::is_generic_name`] for the static plumbing, the
+/// machine-minted ids and the too-short segments; and
+/// [`crate::agent::is_generic_identity_token`] for the components of THIS
+/// user's home path, which no static list can know — an OEM Windows box whose
+/// account is literally `user` was the single biggest source of the bad names.
+fn segment_names_no_game(name: &str) -> bool {
+    hoard_core::ids::is_generic_name(name)
+        || crate::agent::is_generic_identity_token(&hoard_core::ids::canon_token(name))
+}
 
 /// A save folder discovered catalog-free (phase 4) and attributed to a game.
 /// `slug`/`display_name` come from the attribution heuristic: the process
@@ -3212,7 +3220,13 @@ fn dir_name_is_negative(dir: &Path) -> bool {
 fn push_attributed(out: &mut Vec<AttributedSave>, dir: &Path, store: &CorrelationStore) {
     let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
     let graded = classify_dir_as_save_like(dir, name, store);
-    let display_name = attribute_game_name(dir, store);
+    let Some(display_name) = attribute_game_name(dir, store) else {
+        tracing::debug!(
+            path = %dir.display(),
+            "detect: no segment of this path names a game — not offering it"
+        );
+        return;
+    };
     let slug = ludusavi::slugify(&display_name);
     if slug.is_empty() {
         return;
@@ -3276,7 +3290,13 @@ fn discover_in_roots(
             if !emitted.insert(hit.path.clone()) {
                 continue;
             }
-            let display_name = attribute_game_name(&hit.path, store);
+            let Some(display_name) = attribute_game_name(&hit.path, store) else {
+                tracing::debug!(
+                    path = %hit.path.display(),
+                    "detect: no segment of this path names a game — not offering it"
+                );
+                continue;
+            };
             let slug = ludusavi::slugify(&display_name);
             if slug.is_empty() {
                 continue;
@@ -3342,7 +3362,13 @@ pub fn path_is_inside(inner: &Path, outer: &Path) -> bool {
 /// 2. Otherwise walk up from the folder past recognised save-words and
 ///    generic container segments; the first "real" segment names the game
 ///    (`…/My Games/Skyrim/Saves` → `Skyrim`).
-fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
+///
+/// `None` when neither ladder reaches a name that could belong to a game. The
+/// caller must then drop the candidate rather than file it under whatever
+/// segment was nearest: production carries saves called `user` (13 accounts),
+/// `steam` (11), `settings`, `logs` and bare Steam appids, all minted here,
+/// all of them unpairable across machines and unsearchable in the library.
+fn attribute_game_name(path: &Path, store: &CorrelationStore) -> Option<String> {
     let obs = store.signal_for(path);
     // Nombre de proceso atribuido, sólo si sigue superando las reglas ACTUALES:
     // una atribución envenenada de antes del fix `is_installer_like` (p.ej.
@@ -3362,7 +3388,7 @@ fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
         // 1. El ejecutable, cuando pertenece a un solo juego del manifiesto.
         for probe in [name.to_string(), format!("{name}.exe")] {
             if let Some(title) = ludusavi::title_for_exe(&probe) {
-                return title.to_string();
+                return Some(title.to_string());
             }
         }
     }
@@ -3384,49 +3410,56 @@ fn attribute_game_name(path: &Path, store: &CorrelationStore) -> String {
         // Mars: Relaunched"— no está en él, así que buscarla ahí devolvía nada y
         // el save acababa llamándose "Mars", por el ejecutable.
         if let Some(title) = ludusavi::title_for_canon_name(dir) {
-            return title.to_string();
+            return Some(title.to_string());
         }
     }
     // 3. El primer ancestro con nombre propio del save, si es un juego del
     //    manifiesto. `…/Saved Games/Surviving Mars Relaunched/<steamid>` lo es.
     let ancestor = meaningful_ancestor(path);
     if let Some(title) = ancestor.and_then(ludusavi::title_for_canon_name) {
-        return title.to_string();
+        return Some(title.to_string());
     }
     // 4. El mismo ancestro, pero con el título del catálogo como PREFIJO: la
     //    carpeta lleva un calificador que el catálogo no tiene (`Surviving Mars
     //    Relaunched`, `… Definitive Edition`). Sin esto cada edición se
     //    convierte en un juego fantasma con nombre propio.
     if let Some(entry) = ancestor.and_then(ludusavi::find_by_name_prefix) {
-        return entry.display_name.clone();
+        return Some(entry.display_name.clone());
     }
 
     // --- Y si el catálogo no reconoce nada, los nombres crudos ---
+    //
+    // Crudos, pero por la misma puerta: un proceso llamado `game.exe` o
+    // `steam.exe` nombra tan mal como el segmento de ruta que ya se vetó, y
+    // aquí ya no hay catálogo detrás que lo desmienta.
     if let Some(name) = proc_name {
         // Sin la extensión: el nombre va a la UI, no a un matcher.
-        return prettify_process_name(name.strip_suffix(".exe").unwrap_or(name));
+        let bare = name.strip_suffix(".exe").unwrap_or(name);
+        if !segment_names_no_game(bare) {
+            return Some(prettify_process_name(bare));
+        }
     }
-    if let Some(name) = ancestor {
-        return name.to_string();
-    }
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string()
+    // `ancestor` ya pasó la puerta al elegirse; si no hay, no hay nombre. El
+    // último segmento de `path` NO vale de recambio: es justo el que la subida
+    // acaba de descartar.
+    ancestor.map(str::to_string)
 }
 
 /// El primer segmento subiendo desde `path` que puede ser el nombre de un
 /// juego: ni un contenedor genérico (`AppData`, `Saved Games`), ni un id de
 /// cuenta (`…/Plan B Terraform/76561197960287930/saves` debe dar "Plan B
 /// Terraform", no el SteamID), ni una palabra de save.
+///
+/// `None` means the climb reached the filesystem root without finding one.
+/// That is an answer, not a failure: it is what `~/.local/share/<opaque>` and
+/// `C:\Users\user\AppData\Local` really have to say about which game wrote
+/// there, and inventing a name from the last segment looked at — which is what
+/// this used to fall back to — is how `local`, `user` and `logs` became games.
 fn meaningful_ancestor(path: &Path) -> Option<&str> {
     let mut cur = Some(path);
     while let Some(dir) = cur {
         if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
-            let lower = name.to_lowercase();
-            let generic = GENERIC_SEGMENTS.contains(&lower.as_str());
-            let id_like = name.len() >= 6 && name.chars().all(|c| c.is_ascii_digit());
-            if !generic && !id_like && !scoring::name_recognised(name) {
+            if !segment_names_no_game(name) && !scoring::name_recognised(name) {
                 return Some(name);
             }
         }
@@ -5263,6 +5296,124 @@ mod tests {
         assert!(!is_skip_dir("SaveGames"));
     }
 
+    /// The names production actually minted saves under, plus the ones a walk
+    /// runs into on the way there. Every one of them is a container, an
+    /// account or an identifier — never a title — and every one has to be
+    /// refused at the moment of naming, not just quarantined afterwards.
+    #[test]
+    fn a_generic_segment_never_names_a_game() {
+        // Slugs seen in production (ago-2026), with the accounts behind them:
+        // user (13), steam (11), cd (4), and the loose ones.
+        for name in [
+            "user",
+            "steam",
+            "cd",
+            "settings",
+            "local",
+            "logs",
+            "game",
+            // Steam appids that reached the library bare, through a repack
+            // wrapper whose appid the catalog doesn't carry.
+            "2059170",
+            "2479090",
+            // Y la fontanería que atraviesa cualquier subida por la ruta.
+            "AppData",
+            "Roaming",
+            "LocalLow",
+            "Saved Games",
+            "My Games",
+            "steamapps",
+            "common",
+            "compatdata",
+            "drive_c",
+            "steamuser",
+            "userdata",
+            "remote",
+            "Documents",
+            "Public",
+            ".config",
+            ".local",
+            // Identificadores que la máquina se inventa: SteamID64, uuid de
+            // perfil, los ids hex que Citra deriva de las claves de consola.
+            "76561197960287930",
+            "00000001",
+            "0004000000033400",
+            "a1b2c3d4e5f6a7b8",
+        ] {
+            assert!(
+                segment_names_no_game(name),
+                "{name:?} no nombra ningún juego y debe vetarse al bautizar"
+            );
+        }
+
+        // El control: nombres de carpeta reales que NO se pueden perder.
+        for name in [
+            "Stellaris",
+            "Elden Ring",
+            "Surviving Mars Relaunched",
+            "Cyberpunk 2077",
+            "Project 64",
+            "S.T.A.L.K.E.R.",
+            "2064 Read Only Memories",
+            "DOOM",
+            "NieRAutomata",
+        ] {
+            assert!(
+                !segment_names_no_game(name),
+                "{name:?} es un nombre de juego perfectamente válido"
+            );
+        }
+    }
+
+    /// La guarda, ya en la escalera de atribución: subir por la ruta buscando
+    /// un nombre útil, y si arriba no hay ninguno, decir que no hay.
+    ///
+    /// El caso de la izquierda es el que llenó producción: el último segmento
+    /// mirado se usaba de recambio, así que una ruta entera de fontanería
+    /// acababa bautizando un juego con el trozo más cercano.
+    #[test]
+    fn attribution_refuses_a_path_that_names_no_game() {
+        let empty = CorrelationStore::default();
+        let cases: &[(&str, Option<&str>)] = &[
+            // --- Nada aquí nombra un juego: la respuesta es "ninguno" ------
+            //
+            // Cuenta de Windows OEM llamada literalmente `user`: 13 usuarios.
+            ("C:/Users/user/AppData/Local", None),
+            ("C:/Users/user/AppData/LocalLow", None),
+            // `cd` bajo pura fontanería: 4 usuarios.
+            ("C:/Users/user/AppData/Roaming/cd", None),
+            // `local` suelto, la mitad Linux del mismo fallo.
+            ("/home/u/.local/share", None),
+            // `steam` / `common`: 11 usuarios.
+            ("/home/u/.steam/steam/steamapps/common", None),
+            // El appid pelado, con el SteamID64 de por medio.
+            (
+                "/home/u/.local/share/Steam/userdata/76561197960287930/2059170/remote",
+                None,
+            ),
+            // --- Y lo que NO se puede romper arreglando lo de arriba -------
+            //
+            // El mismo árbol de Steam, pero con el juego dentro: sube desde la
+            // palabra de save y para en el título.
+            (
+                "/home/u/.steam/steam/steamapps/common/Stellaris/save games",
+                Some("Stellaris"),
+            ),
+            // Un juego que el catálogo no conoce, bajo la cuenta `user`: el
+            // veto de la cuenta no puede llevarse por delante el título que
+            // hay por debajo.
+            (
+                "C:/Users/user/Documents/My Games/Frobnicate Deluxe/Saves",
+                Some("Frobnicate Deluxe"),
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let got = attribute_game_name(Path::new(raw), &empty);
+            assert_eq!(got.as_deref(), *expected, "{raw}\n{}", catalog_source());
+        }
+    }
+
     /// Atribución (fase 4): el nombre del proceso que escribió la carpeta gana
     /// sobre la heurística de ancestro; sin proceso, se usa el primer segmento
     /// no genérico subiendo por el árbol.
@@ -5272,7 +5423,10 @@ mod tests {
 
         // Sin correlación: sube desde `Saves` (save-word) hasta `Skyrim`.
         let empty = CorrelationStore::default();
-        assert_eq!(attribute_game_name(&path, &empty), "Skyrim");
+        assert_eq!(
+            attribute_game_name(&path, &empty).as_deref(),
+            Some("Skyrim")
+        );
 
         // Con correlación: el proceso atribuido manda.
         let mut store = CorrelationStore::default();
@@ -5283,7 +5437,10 @@ mod tests {
                 exe: None,
             }],
         );
-        assert_eq!(attribute_game_name(&path, &store), "EldenRing");
+        assert_eq!(
+            attribute_game_name(&path, &store).as_deref(),
+            Some("EldenRing")
+        );
     }
 
     /// El título del catálogo gana al nombre crudo del proceso. Es lo que
@@ -5303,7 +5460,10 @@ mod tests {
         );
         let expected =
             ludusavi::title_for_exe("factorio.exe").expect("el manifiesto declara este ejecutable");
-        assert_eq!(attribute_game_name(&path, &store), expected);
+        assert_eq!(
+            attribute_game_name(&path, &store).as_deref(),
+            Some(expected)
+        );
         // Y el slug resultante es estable, que es lo que evita la fila nueva.
         assert_eq!(ludusavi::slugify(expected), "factorio");
     }
@@ -5331,7 +5491,7 @@ mod tests {
             ludusavi::title_for_exe("mars.exe").is_none(),
             "mars.exe lo reclama más de un juego; no debe resolver"
         );
-        let name = attribute_game_name(&save, &store);
+        let name = attribute_game_name(&save, &store).expect("la ruta nombra un juego");
         assert_eq!(name, "Surviving Mars: Relaunched", "{}", catalog_source());
         assert_eq!(ludusavi::slugify(&name), "surviving-mars-relaunched");
     }
@@ -5371,8 +5531,8 @@ mod tests {
             }],
         );
         assert_eq!(
-            attribute_game_name(&save, &store),
-            "Surviving Mars: Relaunched",
+            attribute_game_name(&save, &store).as_deref(),
+            Some("Surviving Mars: Relaunched"),
             "{}",
             catalog_source()
         );
@@ -5384,7 +5544,7 @@ mod tests {
     fn attribution_upgrades_a_folder_name_to_its_catalog_title() {
         let path = PathBuf::from("/home/u/.local/share/StardewValley/Saves");
         let name = attribute_game_name(&path, &CorrelationStore::default());
-        assert_eq!(name, "Stardew Valley");
+        assert_eq!(name.as_deref(), Some("Stardew Valley"));
     }
 
     #[test]

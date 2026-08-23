@@ -54,6 +54,7 @@
     save,
     now,
     versions,
+    footprintBytes,
     agentRunning,
     showLabel,
     aspect,
@@ -69,6 +70,14 @@
     /** Stored-version count for this save. `undefined` = still loading,
      *  `null` = couldn't be fetched (rendered as "—"). */
     versions: number | null | undefined;
+    /** What this game actually occupies in the cloud: every stored version,
+     *  deduplicated. `undefined` = still loading, `null` = unavailable
+     *  (self-hosted, offline), and then the card falls back to the head
+     *  version's size — which is all the manifest carries. The two differ by
+     *  a lot on a game whose folder changes wholesale every save, and the
+     *  head-only number is the one that made a user ask why 35 MB of saves
+     *  reported 79 MB of quota. */
+    footprintBytes: number | null | undefined;
     /** Whether the sync service is up — gates the manual backup button. */
     agentRunning: boolean;
     /** True when another tracked save shares this slug: the label chip is
@@ -495,12 +504,14 @@
         {/if}
       </div>
       <div class="flex items-baseline justify-between gap-3">
-        <span class="text-zinc-500">{$_("dashboard.total_size")}</span>
+        <span class="text-zinc-500">{$_("dashboard.cloud_footprint")}</span>
         <span
           class="tabular-nums text-zinc-200"
-          title={$_("dashboard.cloud_size_title")}
+          title={footprintBytes != null
+            ? $_("dashboard.cloud_footprint_title")
+            : $_("dashboard.cloud_size_title")}
         >
-          {formatBytes(save.total_size_bytes)}
+          {formatBytes(footprintBytes ?? save.total_size_bytes)}
         </span>
       </div>
       <div class="flex items-baseline justify-between gap-3">

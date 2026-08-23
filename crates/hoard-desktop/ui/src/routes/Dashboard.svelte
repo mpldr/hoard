@@ -77,7 +77,12 @@
   const sortedSaves = $derived.by(() => {
     const arr = [...saves];
     if (sortBy === "size") {
-      arr.sort((a, b) => (b.total_size_bytes ?? 0) - (a.total_size_bytes ?? 0));
+      // Rank by the real cloud footprint when we have it: "biggest" has to
+      // mean "what's eating the quota", which is the whole point of sorting
+      // by size. Falls back to the head size before the footprints land.
+      const weight = (s: TrackedSave) =>
+        footprints[s.save_id] ?? s.total_size_bytes ?? 0;
+      arr.sort((a, b) => weight(b) - weight(a));
     } else {
       const t = (s: TrackedSave) =>
         s.last_backup_at ? new Date(s.last_backup_at).getTime() : 0;
@@ -119,6 +124,7 @@
   }
 
   $effect(() => {
+    let anyChanged = false;
     for (const s of saves) {
       const live = $activity[s.save_id]?.last_version;
       const changed = live != null && seenLiveVersion.get(s.save_id) !== live;
@@ -591,13 +597,26 @@
         </p>
       </div>
       <div>
-        <p class="text-xs text-zinc-500">{$_("dashboard.total_size")}</p>
+        <p class="text-xs text-zinc-500">
+          {$_(cloudUsed != null ? "dashboard.cloud_total" : "dashboard.total_size")}
+        </p>
         <p
           class="mt-1.5 flex items-center gap-2 text-xl font-semibold text-zinc-100"
+          title={cloudUsed != null ? $_("dashboard.cloud_total_title") : undefined}
         >
           <HardDrive size={18} class="text-zinc-500" />
           <span class="tabular-nums">{formatBytes(totalSize)}</span>
         </p>
+        <!-- The head sum is still worth showing — it's what a fresh restore
+             would pull — but only once it's clear it isn't the total, and
+             only when history actually makes the two differ. -->
+        {#if cloudUsed != null && headSize > 0 && cloudUsed > headSize * 1.1}
+          <p class="mt-0.5 pl-[26px] text-[11px] tabular-nums text-zinc-500">
+            {$_("dashboard.current_versions_sub", {
+              values: { size: formatBytes(headSize) },
+            })}
+          </p>
+        {/if}
       </div>
       <div>
         <p class="text-xs text-zinc-500">{$_("dashboard.last_backup")}</p>
@@ -746,6 +765,9 @@
           {save}
           {now}
           versions={versionCounts[save.save_id]}
+          footprintBytes={footprintsLoaded
+            ? (footprints[save.save_id] ?? null)
+            : undefined}
           agentRunning={$status.running}
           showLabel={dupSlugs.has(save.game_slug)}
           aspect={coverAspect()}

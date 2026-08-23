@@ -34,8 +34,12 @@ Third-party content bundled with this software
 2. Rust and JavaScript dependencies
 
    Their licences (MIT, Apache-2.0, BSD, ISC and others) are those declared
-   in Cargo.toml / package.json and reproduced in the vendored crates and
-   node_modules trees.
+   in Cargo.toml and package.json, which pin the exact version of every
+   dependency. Neither a vendored crates tree nor node_modules is
+   distributed with this software or checked into the repository, so the
+   licence texts themselves do not travel with a build; run `cargo vendor`
+   or `pnpm install` against those manifests to obtain them. Shipping a
+   THIRD-PARTY-NOTICES file with each package is still owed.
 
 3. Game cover art
 

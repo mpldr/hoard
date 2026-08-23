@@ -122,6 +122,44 @@ pub fn deep_save_roots(os: Os) -> Vec<PathBuf> {
     out
 }
 
+/// The storefront roots that aren't Steam's, for the `<root>` placeholder —
+/// one entry per row of [`pathexpand::NON_STEAM_STORE_ROOTS`], filtered to the
+/// ones installed here.
+///
+/// Native only, and Windows-only in practice: no such launcher ships a Linux
+/// or macOS build, and under Proton the same roots live inside the prefix,
+/// where `pathexpand::expand_path_in_prefix_as_user` resolves them from the
+/// same table.
+pub fn other_store_roots(os: Os) -> Vec<PathBuf> {
+    if !matches!(os, Os::Windows) {
+        return Vec::new();
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for store in crate::pathexpand::NON_STEAM_STORE_ROOTS {
+        // The env vars are the only way to `Program Files` — `pathexpand`
+        // carries no placeholder for it, because no save template needs one.
+        for key in ["ProgramFiles(x86)", "ProgramFiles"] {
+            if let Some(base) = std::env::var_os(key) {
+                candidates.push(PathBuf::from(base).join(store.program_files));
+            }
+        }
+        if let Some(local) = store.local_appdata {
+            for p in expand_path("<winLocalAppData>", os) {
+                candidates.push(p.join(local));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for p in candidates {
+        if seen.insert(p.clone()) && p.is_dir() {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Carpetas donde la gente agrupa programas descomprimidos. Se miran un nivel
 /// por dentro además de la propia raíz de la unidad.
 const COLLECTION_DIRS: &[&str] = &["Emulators", "Emulation", "Emus", "Games", "Juegos", "ROMs"];

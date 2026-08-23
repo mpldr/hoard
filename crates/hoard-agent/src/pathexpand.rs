@@ -65,7 +65,8 @@ pub struct PathScope {
     /// candidates are normal: the same folder name can exist in more than
     /// one Steam library.
     pub install_dirs: Vec<PathBuf>,
-    /// Storefront roots (the Steam install root(s)) — resolves `<root>`.
+    /// Storefront roots — resolves `<root>`. Steam's library roots plus any
+    /// other storefront installed on this host ([`NON_STEAM_STORE_ROOTS`]).
     pub store_roots: Vec<PathBuf>,
 }
 
@@ -74,6 +75,34 @@ impl PathScope {
         self.install_dirs.is_empty() && self.store_roots.is_empty()
     }
 }
+
+/// Where one storefront keeps its own directory — what `<root>` names for the
+/// templates constrained to that store.
+///
+/// Steam's roots come from live state (its library folders move), so they are
+/// resolved separately; a store with a fixed layout only needs this. One table
+/// serves both the native lookup ([`crate::roots::other_store_roots`]) and the
+/// inside-a-prefix one, so the two can't drift.
+pub struct StoreRootLayout {
+    /// Path under `Program Files` / `Program Files (x86)`.
+    pub program_files: &'static str,
+    /// Path under `%LOCALAPPDATA%`, for a store that also keeps one there.
+    pub local_appdata: Option<&'static str>,
+}
+
+/// Storefronts other than Steam that `<root>` can mean. **Adding one is a
+/// row** — nothing else in the expander knows any store by name.
+///
+/// Today there is one, because the catalog says so: of the 3.1k `<root>`
+/// templates, 2.9k are Steam's `userdata/...` and 219 are the Ubisoft
+/// launcher's `savegames/<storeUserId>/<gameId>` — the only save path 63 games
+/// declare, the whole Assassin's Creed / Far Cry / Watch Dogs line among them.
+/// With Steam as the sole `<root>` those expanded to `…/Steam/savegames/…` and
+/// found nothing, so the games came back with no save folder at all.
+pub const NON_STEAM_STORE_ROOTS: &[StoreRootLayout] = &[StoreRootLayout {
+    program_files: "Ubisoft/Ubisoft Game Launcher",
+    local_appdata: Some("Ubisoft Game Launcher"),
+}];
 
 /// Expand a template that may reference the game's install dir.
 ///
@@ -360,29 +389,66 @@ pub fn expand_path_in_prefix(template: &str, prefix: &Path) -> Vec<PathBuf> {
 /// launchers) name their user after the host login (`$USER`), not
 /// `steamuser`, so the caller must pass the real user-dir name.
 pub fn expand_path_in_prefix_as_user(template: &str, prefix: &Path, user: &str) -> Vec<PathBuf> {
-    let Some((placeholder, tail)) = split_placeholder(template) else {
+    // Same inline substitution the native path does, with the prefix's own
+    // Windows user instead of the host login. Without it `<storeUserId>` stayed
+    // literal inside a prefix, so every template that carries one mid-path —
+    // the whole Ubisoft launcher family, `savegames/<storeUserId>/<gameId>` —
+    // expanded to a directory that can't exist.
+    let substituted = template
+        .replace("<storeUserId>", "*")
+        .replace("<osUserName>", user);
+    let Some((placeholder, tail)) = split_placeholder(&substituted) else {
         // Literal templates don't apply to a prefix — they're absolute
         // host paths, not Wine paths. Drop them.
         return Vec::new();
     };
-    let Some(base) = expand_placeholder_in_prefix(&placeholder, prefix, user) else {
+    let bases = expand_placeholder_in_prefix(&placeholder, prefix, user);
+    if bases.is_empty() {
         return Vec::new();
-    };
-    let tail_clean = tail.trim_start_matches(['/', '\\']);
-    if tail_clean.is_empty() {
-        vec![base]
-    } else {
-        vec![base.join(tail_clean)]
     }
+    let tail_clean = tail.trim_start_matches(['/', '\\']);
+    let mut out = Vec::new();
+    for base in bases {
+        if tail_clean.is_empty() {
+            out.push(base);
+        } else if has_glob(tail_clean) {
+            expand_glob_tail(&base, tail_clean, &mut out);
+        } else {
+            out.push(base.join(tail_clean));
+        }
+    }
+    out
 }
 
-/// Map one Ludusavi placeholder onto the corresponding directory inside a
-/// Wine prefix for the given Windows user. Returns `None` for placeholders
-/// that don't apply (Linux/Mac tokens, per-install identifiers, unknown
-/// names).
-fn expand_placeholder_in_prefix(name: &str, prefix: &Path, user: &str) -> Option<PathBuf> {
+/// Map one Ludusavi placeholder onto the corresponding directories inside a
+/// Wine prefix for the given Windows user. Empty for placeholders that don't
+/// apply (Linux/Mac tokens, per-install identifiers, unknown names); more than
+/// one for `<root>`, which has as many candidates as there are storefronts
+/// inside the prefix.
+fn expand_placeholder_in_prefix(name: &str, prefix: &Path, user: &str) -> Vec<PathBuf> {
     let drive_c = prefix.join("drive_c");
     let userhome = drive_c.join("users").join(user);
+    // `<root>` is the STOREFRONT root, and a prefix can hold more than one:
+    // `drive_c` is the layout it always meant, and every storefront in the
+    // table adds its own. Which one a template meant is decided by the store
+    // constraint the catalog carries; expanding all of them and letting the
+    // caller keep what exists is cheaper than threading that constraint down
+    // here, and it can't misfire — two storefronts never share a tree.
+    if name == "root" {
+        let mut out = vec![drive_c.clone()];
+        for store in NON_STEAM_STORE_ROOTS {
+            out.push(
+                drive_c
+                    .join("Program Files (x86)")
+                    .join(store.program_files),
+            );
+            out.push(drive_c.join("Program Files").join(store.program_files));
+            if let Some(local) = store.local_appdata {
+                out.push(userhome.join("AppData/Local").join(local));
+            }
+        }
+        return out;
+    }
     let mapped = match name {
         "winAppData" => userhome.join("AppData/Roaming"),
         "winLocalAppData" => userhome.join("AppData/Local"),
@@ -397,10 +463,9 @@ fn expand_placeholder_in_prefix(name: &str, prefix: &Path, user: &str) -> Option
         "winProgramData" => drive_c.join("ProgramData"),
         "winDir" => drive_c.join("windows"),
         "home" => userhome,
-        "root" => drive_c,
-        _ => return None,
+        _ => return Vec::new(),
     };
-    Some(mapped)
+    vec![mapped]
 }
 
 /// Split `<name>tail` into `("name", "tail")`. Returns `None` if the template
@@ -878,7 +943,6 @@ mod tests {
             ("<winProgramData>/X", "/p/drive_c/ProgramData/X"),
             ("<winDir>/X", "/p/drive_c/windows/X"),
             ("<home>/X", "/p/drive_c/users/steamuser/X"),
-            ("<root>/X", "/p/drive_c/X"),
         ];
         for (template, expected) in cases {
             let out = expand_path_in_prefix(template, &prefix);
@@ -888,6 +952,38 @@ mod tests {
                 "template {template} mismatched"
             );
         }
+        // `<root>` is the odd one out: a prefix can hold more than one
+        // storefront, so it expands to every candidate. `drive_c` stays first
+        // (the Steam-in-prefix layout it always meant).
+        let root = expand_path_in_prefix("<root>/X", &prefix);
+        assert_eq!(root.first(), Some(&PathBuf::from("/p/drive_c/X")));
+        assert!(root.contains(&PathBuf::from(
+            "/p/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/X"
+        )));
+    }
+
+    /// The reason `<root>` grew a list, and the reason the prefix expander
+    /// substitutes inline placeholders: every modern Assassin's Creed (and the
+    /// rest of the Ubisoft line) declares exactly one save path,
+    /// `<root>/savegames/<storeUserId>/<gameId>`. Under Proton that used to
+    /// expand to `drive_c/savegames/<storeUserId>/…` — a literal
+    /// `<storeUserId>` under a folder that doesn't exist — so the game came
+    /// back with no save folder and the user had to find it by hand.
+    #[test]
+    fn a_ubisoft_save_resolves_inside_a_proton_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().join("pfx");
+        let save = prefix
+            .join("drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/savegames")
+            .join("1234567")
+            .join("5092");
+        std::fs::create_dir_all(&save).unwrap();
+
+        let out = expand_path_in_prefix("<root>/savegames/<storeUserId>/5092", &prefix);
+        assert!(
+            out.contains(&save),
+            "the launcher's save inside the prefix didn't resolve: {out:?}"
+        );
     }
 
     #[test]

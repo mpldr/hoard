@@ -404,7 +404,12 @@ where
     // applies to the current OS and stat()s every candidate path.
     // `<base>`-relative templates need to know where each game is installed.
     // Built once, shared by every task.
-    let store_roots = steam::detect_steam_libraries(os);
+    // `<root>` is the storefront root, and Steam is not the only storefront
+    // (`pathexpand::NON_STEAM_STORE_ROOTS`). A root that doesn't own the
+    // template costs one stat that misses; leaving it out costs every game
+    // whose save lives under another store its save folder.
+    let mut store_roots = steam::detect_steam_libraries(os);
+    store_roots.extend(roots::other_store_roots(os));
     let install_index = install_dir_index(os, &steam_apps);
     tracing::info!(
         install_dirs = install_index.len(),

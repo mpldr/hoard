@@ -11,6 +11,26 @@ your own server, not someone else's cloud.
 
 ### Docker
 
+The server is a prebuilt multi-arch image — `ghcr.io/rleeon/hoard`, amd64 and
+arm64, published on every release tag. It needs no compiler and no clone:
+
+```sh
+mkdir hoard && cd hoard
+curl -O https://raw.githubusercontent.com/rleeon/hoard/main/deploy/docker/docker-compose.yml
+
+# Those two variables are read only when the database is empty: on a first
+# start they create that admin and print a device token in the log, once.
+HOARD_ADMIN_USERNAME=myuser HOARD_ADMIN_PASSWORD='mypassword' docker compose up -d
+docker compose logs -f server     # wait for "listening", then copy the token
+```
+
+The container writes itself a working `config.toml` into `./config/`, so there
+is nothing to prepare beforehand. In the app's onboarding pick **Self-Host**
+and give it `http://IP:12421` plus that token.
+
+Clone the repo instead if you'd rather read the config before anything starts,
+or build the image yourself:
+
 ```sh
 git clone https://github.com/rleeon/hoard.git && cd hoard
 mkdir -p deploy/docker/config
@@ -30,6 +50,20 @@ docker compose exec server hoard-admin --config /etc/hoard/config.toml token cre
 ```
 
 In the app's onboarding, pick **Self-Host**, paste the server URL and token.
+
+Update later with both halves of this, in order:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+`pull` fetches the new image; `up -d` recreates the container from it. Stop
+after the first and the old container keeps running untouched, so `/v1/health`
+goes on reporting the old version and the update looks like it silently failed.
+`git pull` updates neither: what runs is the published image, not your
+checkout — that's only the source, and it's used only if you uncommented
+`build:`. Pin a version (`ghcr.io/rleeon/hoard:1.1`) in place of `:latest` if
+you'd rather choose when that happens.
 
 ### Unraid
 

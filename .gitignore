@@ -1,170 +1,120 @@
-/target
-.venv*/
-*.db
-*.db-wal
-*.db-shm
-.env
-.info
-.env.local
-deploy/config.toml
-/dist
-/dist-v1
-/dist-*
+# ─── Todo lo privado, en un sitio ────────────────────────────────────
+# Notas de trabajo, ADRs, auditoría de seguridad, legal, investigación.
+# Índice en `.local/README.md`. Nunca sale de la máquina.
+/.local/
 
-# Queda gitignored hasta que se mejore para un contribuidor de verdad.
+# El contexto para las sesiones de IA: uno en la raíz y uno por crate.
+# Sin slash: ignora el fichero a cualquier nivel del árbol.
+CLAUDE.md
+.claude/
+
+# Hooks de git locales (espejo de la CI).
+/.githooks/
+
+# Metadatos del editor (bóveda de Obsidian sobre el repo).
+.obsidian/
+
+# ─── Secretos y config de máquina ────────────────────────────────────
+.env
+.env.local
+.info
+deploy/config.toml
+
+# El config del stack de Docker es del usuario, no del repo: versionarlo
+# hacía que un `git pull` le pisara su configuración (y con ella el
+# `data_dir`), que fue como un self-hoster perdió de vista su base en
+# ago-2026. La guía ya dice `cp deploy/config.toml.example ...`.
+deploy/docker/config/config.toml
+
+# Bot de estado de Discord: infra local con secretos.
+/deploy/.env.discord-bot
+/deploy/scripts/discord-status-bot.py
+/deploy/systemd/hoard-discord-bot.service
+
+# Panel de métricas admin (usa service_role).
+/tools/admin-dashboard.html
+/tools/serve-dashboard.sh
+
+# ─── Migraciones con el uid del usuario empotrado ────────────────────
+# Se aplican a mano en producción. `sqlx::migrate!` empotra la carpeta en
+# tiempo de compilación y aborta el arranque con `VersionMissing` si la
+# base tiene una versión que el binario no trae — por eso el server cloud
+# se construye desde este árbol (deploy/fly/Dockerfile), donde sí están
+# en disco, y no desde un clon limpio. Desde 2026-08-13 el migrador va
+# con `set_ignore_missing(true)`, así que un build sin ellas arranca en
+# vez de quedarse en bucle de reinicios. Costó una mañana de servicio
+# aprenderlo: despliegue desde un worktree, `VersionMissing(30)`, y la
+# API abajo hasta el rollback.
+/crates/hoard-server/migrations/postgres/0030_admin_metrics.sql
+/crates/hoard-server/migrations/postgres/0039_admin_metrics_v2.sql
+/crates/hoard-server/migrations/postgres/0044_admin_metrics_screen.sql
+
+# ─── Fuera del repo a propósito ──────────────────────────────────────
+# Banco de pruebas del motor: herramienta de desarrollo, nunca se publica
+# ni se empaqueta. Vive fuera del workspace (`exclude` en el Cargo.toml
+# raíz) para que su ausencia no rompa un clon limpio.
+/crates/hoard-pruebas/
+
+# Mapa de saves: prototipo aparcado (defectuoso, fuera de 1.0). Se
+# mantiene en local para retomarlo, pero no se publica.
+crates/hoard-desktop/ui/src/routes/Map.svelte
+
+# Se queda fuera hasta que sirva para un contribuidor de verdad.
 CONTRIBUTING.md
 
-# Documentación interna: ADRs y READMEs de crate/carpeta. Se quedan en local.
-# El repo sólo lleva los .md principales de la raíz (README, CHANGELOG,
-# CONTRIBUTING, SELF-HOST_GUIDE, FUNDING), la plantilla de PR y el contenido
-# .md de la web (`web/src/lib/guides/`), que es lo que el sitio compila.
-/docs/
-# Hooks de git locales (CI mirror). Locales, nunca al repo.
-/.githooks/
+# READMEs internos de crate y carpeta.
 /crates/hoard-agent/tests/fixtures/README.md
 /crates/hoard-manifest/data/README.md
 /crates/hoard-screen/README.md
 /deploy/docker/README.md
 
-# Banco de pruebas del motor: herramienta de desarrollo, nunca se publica ni
-# se empaqueta. Vive fuera del workspace (`exclude` en el Cargo.toml raíz) para
-# que su ausencia no rompa un clon limpio.
-/crates/hoard-pruebas/
+# Listas que sólo escribe el usuario.
+/rleeon.md
+/vista.md
 
-# Local scratch / draft notes that should never be committed.
-# Root-only patterns: CHANGELOG.md y el resto de principales no se ven afectados.
+# ─── Artefactos de build ─────────────────────────────────────────────
+/target
+/dist
+/dist-v1
+/dist-*
+.venv*/
+*.db
+*.db-wal
+*.db-shm
+
+# Tauri
+crates/hoard-desktop/gen/
+
+# Frontend
+crates/hoard-desktop/ui/node_modules/
+crates/hoard-desktop/ui/dist/
+crates/hoard-desktop/ui/.vite/
+
+# Sidecars compilados (`hoard-screen-<triple>`, `hoardd-<triple>`,
+# `hoard-<triple>`), que `scripts/build-sidecar.sh` deja junto a
+# `tauri.conf.json` para que el bundler los aplane al lado del exe — el
+# resolver de runtime los busca ahí, y el viejo subdirectorio `binaries/`
+# rompía esa resolución. Las fuentes viven en `crates/`.
+crates/hoard-desktop/binaries/
+crates/hoard-desktop/hoard-screen-*
+crates/hoard-desktop/hoardd-*
+crates/hoard-desktop/hoard-x86_64-*
+crates/hoard-desktop/hoard-aarch64-*
+
+# Este proyecto usa pnpm: los lockfiles de npm/yarn caídos por accidente
+# no se trackean. `pnpm-lock.yaml` es la fuente de verdad.
+package-lock.json
+yarn.lock
+
+# Archivos sueltos dejados en el árbol por accidente.
+*.zip
+
+# ─── Borradores en la raíz ───────────────────────────────────────────
+# Sólo raíz: CHANGELOG.md y los demás principales no se ven afectados.
 /guide*.md
 /version*.md
 /plan*.md
 /notes*.md
 /draft*.md
 /scratch*.md
-
-# Security audit: full threat map with exact code paths. Internal only —
-# must never reach the public repo.
-/SECURITY-AUDIT.md
-
-# Private working notes. Workstation-specific, may reference local paths
-# or tokens — never committed.
-CLAUDE.md
-.claude/
-
-# Local editor metadata (Obsidian vault state over the repo).
-.obsidian/
-
-# Tauri build artifacts
-crates/hoard-desktop/gen/
-
-# Frontend build artifacts
-crates/hoard-desktop/ui/node_modules/
-crates/hoard-desktop/ui/dist/
-crates/hoard-desktop/ui/.vite/
-
-# Compiled sidecars (`hoard-screen-<triple>`, `hoardd-<triple>`), built from the
-# in-repo crates by `scripts/build-sidecar.sh` and dropped here so the bundler
-# flattens them adjacent to the app exe (the runtime sidecar resolver finds them
-# there; the old `binaries/` subdir broke runtime resolution). The compiled
-# artifacts are never committed — the sources live under `crates/`.
-crates/hoard-desktop/binaries/
-crates/hoard-desktop/hoard-screen-*
-crates/hoard-desktop/hoardd-*
-# …y la CLI, que también viaja como sidecar desde la instalación unificada.
-# Faltaba: `hoard-<triple>` no casa con ninguno de los dos patrones de arriba y
-# se quedaba sin ignorar, a un `git add -A` de meter 10 MB de binario en el repo.
-crates/hoard-desktop/hoard-x86_64-*
-crates/hoard-desktop/hoard-aarch64-*
-
-# This project uses pnpm — npm/yarn lockfiles dropped in by accident
-# (e.g. running `npm install` against the same package.json) shouldn't
-# be tracked. pnpm-lock.yaml is the source of truth.
-package-lock.json
-yarn.lock
-
-# Stray archives accidentally dropped in the tree (e.g. an exported
-# `hoard-agent.zip`) — build/scratch artifacts, never source.
-*.zip
-
-# Mapa de saves: prototipo aparcado (defectuoso, fuera de 1.0). Se mantiene
-# en local para retomarlo, pero no se publica.
-crates/hoard-desktop/ui/src/routes/Map.svelte
-
-# Backlog de trabajo local (futuros cambios), nunca al repo.
-/TODO.local.md
-
-# Revisión + recolección de datos del pipeline de detección. Local.
-/DETECTION.local.md
-
-# Notas de cambios por versión + dónde tocar. Local.
-/CAMBIOS-1.0.2.local.md
-
-# Dashboard de métricas admin (usa service_role). Solo local, nunca al repo.
-/tools/admin-dashboard.html
-/tools/serve-dashboard.sh
-# Su migración/RPC (admin_metrics con mi uid). Se aplica a mano en prod.
-/crates/hoard-server/migrations/postgres/0030_admin_metrics.sql
-# La v2 de esa misma RPC lleva el uid empotrado igual que la 0030, así que se
-# ignora por lo mismo y se aplica a mano. Ojo: `sqlx::migrate!` empotra la
-# carpeta en tiempo de compilación y aborta el arranque con `VersionMissing`
-# si la base tiene aplicada una versión que el binario no trae — por eso el
-# server cloud se construye desde este árbol (deploy/fly/Dockerfile), donde
-# los dos ficheros sí están en disco, y no desde un clon limpio del repo.
-# Desde el 2026-08-13 eso ya no es sólo una regla que hay que recordar: el
-# migrador va con `set_ignore_missing(true)` (cloud/db.rs), así que un build
-# sin estos ficheros arranca en vez de quedarse en bucle de reinicios. Se
-# perdió una mañana de servicio aprendiéndolo: despliegue desde un worktree,
-# `VersionMissing(30)`, y la API abajo hasta el rollback.
-/crates/hoard-server/migrations/postgres/0039_admin_metrics_v2.sql
-# Screen's own admin metrics: a separate function so that touching them never
-# means rewriting the 706-line body of `admin_metrics()`, but the same embedded
-# uid and therefore the same rule — ignored here, applied by hand in prod.
-/crates/hoard-server/migrations/postgres/0044_admin_metrics_screen.sql
-
-# Visión del rediseño del CLI. Doc de trabajo local.
-/HOARD-CLI.local.md
-
-# Idea del plugin de Decky para el CLI. Nota de trabajo local.
-/hoard-cli-deckyplugin.local.md
-
-# Prompt de handoff: fixes de sync en Windows. Nota de trabajo local.
-/hoard-cli-windows-sync-fixes.local.md
-
-# Lista de tareas del usuario (solo la escribe él). Nunca al repo.
-/rleeon.md
-/vista.md
-
-# Bot de estado de Discord (infra local, secretos). Nunca al repo.
-/deploy/.env.discord-bot
-/deploy/scripts/discord-status-bot.py
-/deploy/systemd/hoard-discord-bot.service
-
-# Telemetría de detección: idea a futuro y por qué. Nota de trabajo local.
-/TELEMETRIA.local.md
-
-# Plan de SEO/GEO: dónde colocarse para que un LLM recupere Hoard. Nota local.
-/6-8-seo.local.md
-
-# Ficha de SaaSHub para copiar y pegar (datos del formulario). Nota local.
-/saashub-listing.local.md
-
-# Reparto de trabajo para opencode: qué está rojo hoy y con qué prompt se
-# delega. Nota de trabajo local.
-/TAREAS-OPENCODE.local.md
-
-# Encargos de investigación larga (prompts) y lo que devuelven. Datos en bruto
-# con fuentes; se destila a mano antes de que nada de esto toque el repo.
-/INVESTIGACION.local.md
-/investigacion/
-
-# El config del stack de Docker es del usuario, no del repo: versionarlo hacía
-# que un `git pull` le pisara su configuración (y con ella el `data_dir`), que
-# fue como un self-hoster perdió de vista su base en ago-2026. La guía ya dice
-# `cp deploy/config.toml.example deploy/docker/config/config.toml`.
-deploy/docker/config/config.toml
-
-# Prompt general para delegar trabajo de UI a otro modelo. Nota de trabajo
-# local, con nombres de fichero y trampas que no son doc pública.
-/PROMPT-UI.local.md
-
-# Web-only working notes: how `web/` is built, what it is coupled to, and the
-# rules block handed to other models. Local, never committed.
-/web.md
+/*.local.md

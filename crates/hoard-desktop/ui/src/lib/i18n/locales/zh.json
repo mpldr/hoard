@@ -444,6 +444,8 @@
   "settings.forget_confirm_body": "Hoard 将删除为 {url} 保存的地址和访问令牌。服务器上的快照不会受到影响：你以后可以使用地址和令牌重新连接。",
   "settings.forget_confirm_cta": "忘记服务器",
   "settings.forgotten_toast": "已忘记服务器。",
+  "settings.service_autostart_no_stable_path": "应用本身会在登录时启动，但同步服务不会：该 AppImage 从一个临时文件夹运行，下次登录时它已不存在，也无法写入引擎的稳定副本。只要 Hoard 处于打开状态，同步仍会运行。若想无需打开任何窗口即可运行，请安装核心组件： curl -fsSL https://hoard.services/install.sh | sh",
+  "settings.service_autostart_no_service_manager": "应用本身会在登录时启动，但同步服务不会：这台机器没有可供注册的用户级服务管理器。只要 Hoard 处于打开状态，同步仍会运行 — 若想无需打开任何窗口即可运行，请用你自己的进程管理器启动 hoardd。",
   "settings.autostart_rejected": "系统拒绝了开机自启 — 请尝试在启动器设置中启用。",
   "settings.language_label": "显示语言",
   "settings.language_desc": "选择 Hoard 在菜单、按钮和消息中使用的语言。",

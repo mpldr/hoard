@@ -979,6 +979,33 @@ export function isAutostartEnabled(): Promise<boolean> {
   return invoke<boolean>("is_autostart_enabled");
 }
 
+/** Why the sync *service* can't start at login, when it can't. The app's own
+ *  launcher entry and the service are two separate registrations since the
+ *  engine moved out of the window (ADR 0021, Slice 4), and only the first one
+ *  works everywhere: an AppImage runs from a mount that's gone by the next
+ *  login, and a machine without systemd has nothing to declare a unit to.
+ *  Mirrors `commands::prefs::ServiceAutostart`. */
+export type ServiceAutostart = {
+  enabled: boolean;
+  /** Which manager took it: "systemd --user", "Task Scheduler", "Startup entry
+   *  (HKCU Run)". On Windows those last two are genuinely different outcomes —
+   *  the Run entry is the fallback when the task needs an elevated console. */
+  manager?: string | null;
+  unit?: string | null;
+  /** Typed reason, or absent when login start is registered (or off on
+   *  purpose). The sentence shown comes from i18n keyed on this. */
+  unsupported?: ServiceAutostartBlock | null;
+  /** Raw failure text for the detail line and for a bug report. */
+  detail?: string | null;
+};
+
+export type ServiceAutostartBlock = "no_stable_path" | "no_service_manager";
+
+/** Read the last outcome of registering the sync service for login start. */
+export function serviceAutostartState(): Promise<ServiceAutostart> {
+  return invoke<ServiceAutostart>("service_autostart_state");
+}
+
 /** Recolour the tray icon. The frontend derives the global state from the
  * activity store and pushes it here. */
 export function setTrayState(state: TrayStateName): Promise<void> {

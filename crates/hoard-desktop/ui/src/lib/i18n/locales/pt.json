@@ -444,6 +444,8 @@
   "settings.forget_confirm_body": "O Hoard vai apagar o endereço e o token de acesso guardados para {url}. As tuas cópias no servidor não são afetadas: podes voltar a ligar-te mais tarde com o endereço e um token.",
   "settings.forget_confirm_cta": "Esquecer servidor",
   "settings.forgotten_toast": "Servidor esquecido.",
+  "settings.service_autostart_no_stable_path": "A app arranca no início de sessão, mas o serviço de sincronização não: esta AppImage corre a partir de uma pasta temporária que já não existe no arranque seguinte, e também não foi possível deixar uma cópia estável do motor. A sincronização continua a funcionar sempre que o Hoard estiver aberto. Para funcionar sem abrir nada, instala o núcleo com: curl -fsSL https://hoard.services/install.sh | sh",
+  "settings.service_autostart_no_service_manager": "A app arranca no início de sessão, mas o serviço de sincronização não: esta máquina não tem um gestor de serviços de utilizador onde o registar. A sincronização continua a funcionar sempre que o Hoard estiver aberto — para funcionar sem abrir nada, arranca o hoardd com o teu próprio supervisor.",
   "settings.autostart_rejected": "O sistema rejeitou a alteração de arranque automático — tenta nas definições do lançador.",
   "settings.language_label": "Idioma da interface",
   "settings.language_desc": "Escolhe o idioma usado em menus, botões e mensagens.",

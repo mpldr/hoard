@@ -90,7 +90,7 @@ minisign-verify = "0.2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
+winreg = { workspace = true }
 # `SendMessageTimeoutW` para difundir `WM_SETTINGCHANGE` tras tocar el PATH del
 # usuario en `install::ensure_cli_reachable`. Sin esa difusión el cambio queda
 # escrito pero invisible: Explorer conserva su bloque de entorno en caché y toda

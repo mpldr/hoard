@@ -120,6 +120,11 @@ notify-rust = "4"
 # Object-safe async traits (`hoard-server` BlobStore abstraction).
 async-trait = "0.1"
 
+# HKCU registry access. `hoard-agent` writes the user PATH with it; `hoardd`
+# writes the Run entry that starts the service at logon when the Task Scheduler
+# refuses to register a task without an elevated console.
+winreg = "0.52"
+
 # Test-only — used by per-crate `[dev-dependencies]` blocks.
 tempfile = "3"
 

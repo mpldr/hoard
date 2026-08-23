@@ -8,9 +8,22 @@
 //!
 //! - **Linux**: unidad `systemd --user` (`hoard-sync.service`). Además se intenta
 //!   `loginctl enable-linger`, para que una máquina headless (NAS / SteamOS /
-//!   servidor casero) siga sincronizando sin sesión gráfica abierta.
+//!   servidor casero) siga sincronizando sin sesión gráfica abierta. From an
+//!   AppImage the `ExecStart` is never the binary inside the mount: it is the
+//!   installed `hoardd`, or a stable copy of it.
 //! - **macOS**: LaunchAgent de `launchd` (`com.hoard.sync`).
-//! - **Windows**: tarea del Task Scheduler al inicio de sesión (`HoardSync`).
+//! - **Windows**: a Task Scheduler logon task (`HoardSync`) and, when the Task
+//!   Scheduler refuses it without an elevated console, the user's own `Run`
+//!   entry. Neither elevates; the second exists because the first says no on
+//!   machines whose user token arrives filtered.
+//!
+//! ## When there is no way in
+//!
+//! "No backend here" is a legitimate answer (a machine without systemd, an
+//! AppImage with a read-only `$HOME`) and it has to **reach the window**:
+//! [`Unsupported`] classifies it and [`unsupported_reason`] recovers it by
+//! downcast. A `tracing::warn!` does not do the job — the switch stays on, the
+//! sync doesn't start at the next login, and the user has nothing to look at.
 //!
 //! **Por usuario, nunca system-wide**, y no es una preferencia estética: el token
 //! Cloud vive en el almacén de secretos de *tu* sesión (Secret Service / Keychain
@@ -70,6 +83,60 @@ pub struct Installed {
     pub path: Option<PathBuf>,
 }
 
+/// Why this machine can't start the service at login.
+///
+/// Typed because this is what the window has to **say**, and saying it right
+/// depends on which of the two cases it is: one is fixed by installing the core,
+/// the other can't be fixed from the app at all. Both used to end in a
+/// `tracing::warn!` inside the service — nowhere a user looks: the switch stayed
+/// on, the sync didn't start at the next login, and there was nothing to report
+/// beyond "it doesn't work".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsupported {
+    /// The app's format leaves no path that survives closing it, and a stable
+    /// copy of the daemon couldn't be written either (an AppImage with a
+    /// read-only `$HOME`, or none at all).
+    NoStablePath,
+    /// There is no user service manager to declare anything to: a machine
+    /// without systemd, or an OS with no backend here.
+    NoServiceManager,
+}
+
+impl Unsupported {
+    /// Stable tag for the wire and the UI. Not the message: the sentence the
+    /// user reads comes out of i18n keyed on this.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoStablePath => "no_stable_path",
+            Self::NoServiceManager => "no_service_manager",
+        }
+    }
+}
+
+/// Login start can't be declared here, with the typed reason and the detail for
+/// the log.
+#[derive(Debug)]
+pub struct LoginStartUnsupported {
+    pub kind: Unsupported,
+    pub detail: String,
+}
+
+impl std::fmt::Display for LoginStartUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for LoginStartUnsupported {}
+
+/// The typed reason inside `err`, if it carries one. By downcast and never by
+/// the message text, the same way [`crate::engine`] classifies why there's no
+/// engine: a message gets reworded without a thought and the classification
+/// breaks silently.
+pub fn unsupported_reason(err: &anyhow::Error) -> Option<Unsupported> {
+    err.downcast_ref::<LoginStartUnsupported>().map(|u| u.kind)
+}
+
 /// El binario que la unidad ejecuta: el `hoardd` de **esta** instalación — el
 /// que viaja junto a quien la declara (el bundle del desktop lo empaqueta como
 /// `externalBin`, el tarball lo pone junto a `hoard`), y si no, el del `PATH`.
@@ -120,12 +187,18 @@ pub async fn ensure_installed() -> Result<Installed> {
     // los tarballs de la CLI desde la 1.1.0 no llevaban `hoardd`, así que todo
     // el que instaló por `curl | sh` acabó aquí.
     ensure_daemon_present()?;
-    let (installed, changed) = platform::declare()?;
+    let (mut installed, changed) = platform::declare()?;
     // Con la definición intacta y el servicio ya instalado no hay nada que
     // hacer: esto lo llama el desktop en cada arranque, y dos subprocesos por
     // arranque para reafirmar lo que ya está es peaje sin contrapartida.
     if changed || !platform::installed().await {
-        platform::enable().await?;
+        // The backend can end up using a different mechanism than the one it
+        // declared (Windows falls from the Task Scheduler to the Run entry when
+        // the task wants an elevated console), and whoever shows it has to show
+        // the real one.
+        if let Some(manager) = platform::enable().await? {
+            installed.manager = manager;
+        }
     }
     Ok(installed)
 }
@@ -298,10 +371,115 @@ mod platform {
         if bin_exists("systemctl") {
             return Ok(());
         }
-        anyhow::bail!(
-            "systemd not found. On a non-systemd init, run the service under your own \
-             supervisor (e.g. an OpenRC/runit service, or `nohup hoardd &`)."
-        )
+        Err(anyhow::Error::new(LoginStartUnsupported {
+            kind: Unsupported::NoServiceManager,
+            detail: "systemd not found. On a non-systemd init, run the service under your own \
+                     supervisor (e.g. an OpenRC/runit service, or `nohup hoardd &`)."
+                .to_string(),
+        }))
+    }
+
+    /// Where we keep binaries that have to outlive the app closing.
+    ///
+    /// A **Hoard-owned** directory, not `~/.local/bin`, for the same reason
+    /// `install::link_into` refuses to overwrite a file that isn't ours:
+    /// `~/.local/bin` is exactly where the core installer puts the real
+    /// `hoardd`, and dropping an AppImage's copy there would trade an
+    /// installation that updates itself for one chained to the image.
+    fn stable_bin_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(|| home().map(|h| h.join(".local").join("share")))?;
+        Ok(base.join("hoard").join("bin"))
+    }
+
+    /// A `hoardd` installed **outside** the mount, if there is one.
+    ///
+    /// First choice and the best one: the core installer put it there, it
+    /// updates on its own and we don't have to keep it in sync. Only when it
+    /// isn't there do we copy the one from the mount.
+    fn daemon_outside_the_mount() -> Option<PathBuf> {
+        let paths = std::env::var_os("PATH")?;
+        std::env::split_paths(&paths)
+            .map(|d| d.join("hoardd"))
+            .find(|p| p.is_file() && !is_inside_appimage(p))
+    }
+
+    /// Leave a stable copy of the `hoardd` that travels inside the AppImage and
+    /// return its path.
+    ///
+    /// The copy is redone when the version changes, not on every start:
+    /// comparing two binaries of tens of MB every time the app opens is a toll
+    /// for nothing, and a new image always carries a new version. The stamp is a
+    /// separate file because a binary can't be asked its version without running
+    /// it.
+    ///
+    /// **Written by `rename`, never copied over.** The destination may be the
+    /// executable the service is running right now, and writing over a running
+    /// binary is `ETXTBSY` on Linux; renaming over it leaves the live process
+    /// with its inode and the next start with the new one. Same move
+    /// `hoard-server upgrade` makes on its own binary.
+    pub fn stage_stable_daemon(bundled: &Path) -> Result<PathBuf> {
+        let dir = stable_bin_dir()?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dest = dir.join("hoardd");
+        let stamp = dir.join("hoardd.version");
+        let version = env!("CARGO_PKG_VERSION");
+        let staged = std::fs::read_to_string(&stamp).ok();
+        if dest.is_file() && staged.as_deref().map(str::trim) == Some(version) {
+            return Ok(dest);
+        }
+        let tmp = dir.join("hoardd.staging");
+        std::fs::copy(bundled, &tmp)
+            .with_context(|| format!("copying {} to {}", bundled.display(), tmp.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("making {} executable", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &dest)
+            .with_context(|| format!("moving {} into place", dest.display()))?;
+        // The stamp goes in **after** the rename: crash in between and the next
+        // round re-copies, which is harmless. The other order would leave a new
+        // stamp over an old binary, and that never corrects itself.
+        let _ = std::fs::write(&stamp, version);
+        tracing::info!(
+            path = %dest.display(),
+            version,
+            "autostart: staged a stable copy of the AppImage's sync engine"
+        );
+        Ok(dest)
+    }
+
+    /// The path that goes into the `ExecStart` when an AppImage is the one
+    /// declaring the unit.
+    ///
+    /// Inside an AppImage the binary lives in an ephemeral mount point
+    /// (`/tmp/.mount_XXXX/...`) that disappears when the app closes: a unit
+    /// pointing there would start at the next login against a path that no
+    /// longer exists. This **used to be a dead end** — it bailed out and the
+    /// user was left with no login start and the switch still on — and it never
+    /// had to be one: the engine is a component in its own right, so either one
+    /// is installed outside the mount, or a stable copy of the one inside is
+    /// left on disk.
+    fn stable_exec_start(bundled: &Path) -> Result<PathBuf> {
+        if let Some(installed) = daemon_outside_the_mount() {
+            return Ok(installed);
+        }
+        stage_stable_daemon(bundled).map_err(|err| {
+            anyhow::Error::new(LoginStartUnsupported {
+                kind: Unsupported::NoStablePath,
+                detail: format!(
+                    "this AppImage has no stable path for the service ({} lives in a temporary \
+                     mount) and a stable copy couldn't be written either: {err:#}. The sync \
+                     still runs whenever Hoard is open. To start it at login, install the core \
+                     with `curl -fsSL https://hoard.services/install.sh | sh`.",
+                    bundled.display()
+                ),
+            })
+        })
     }
 
     /// El texto de la unidad. Puro y testeable: es el contrato con systemd.
@@ -340,28 +518,12 @@ mod platform {
     /// reafirmarla en cada arranque del desktop no cueste dos subprocesos.
     pub fn declare() -> Result<(Installed, bool)> {
         ensure_systemd()?;
-        let exe = service_binary();
-        // Dentro de un AppImage el binario vive en un punto de montaje efímero
-        // (`/tmp/.mount_XXXX/...`) que desaparece al cerrar la app: una unidad
-        // apuntando ahí arrancaría en el siguiente login contra una ruta que ya
-        // no existe.
-        //
-        // Esto **dejó de ser un callejón sin salida** al volver el motor un
-        // componente instalable por derecho propio: si hay un `hoardd` fuera del
-        // montaje —el que pone el instalador de terminal, que es lo que ocurre
-        // en SteamOS y en cualquier imagen atómica, donde el AppImage es la única
-        // vía para la app— la unidad apunta a ése y el sync arranca en boot con
-        // toda normalidad. El AppImage se queda de cara gráfica, que es lo suyo.
-        // Sólo se aborta cuando el único `hoardd` del disco es el de dentro.
+        let mut exe = service_binary();
+        // An AppImage runs from an ephemeral mount, so whatever `service_binary`
+        // resolves is no good for a unit that starts tomorrow: it has to go
+        // through the installed `hoardd`, or a stable copy of the one inside.
         if std::env::var_os("APPIMAGE").is_some() && is_inside_appimage(&exe) {
-            anyhow::bail!(
-                "this AppImage has no stable path for the service ({} lives in a temporary \
-                 mount), so it can't start at login. The sync still runs whenever Hoard is \
-                 open. To start it at login, install the core with \
-                 `curl -fsSL https://hoard.services/install.sh | sh` — it puts `hoardd` \
-                 somewhere stable and this AppImage will use it.",
-                exe.display()
-            );
+            exe = stable_exec_start(&exe)?;
         }
         let path = unit_path()?;
         if let Some(parent) = path.parent() {
@@ -385,7 +547,7 @@ mod platform {
         ))
     }
 
-    pub async fn enable() -> Result<()> {
+    pub async fn enable() -> Result<Option<&'static str>> {
         ensure_systemd()?;
         run_quiet("systemctl", &["--user", "daemon-reload"]).await?;
         if !run_quiet("systemctl", &["--user", "enable", UNIT]).await? {
@@ -394,7 +556,7 @@ mod platform {
         // Que siga sincronizando sin sesión activa (NAS / SteamOS / servidor).
         // Best-effort: puede pedir un polkit que no hay a quien enseñar.
         let _ = run_quiet("loginctl", &["enable-linger"]).await;
-        Ok(())
+        Ok(None)
     }
 
     pub async fn start() -> Result<()> {
@@ -519,8 +681,8 @@ mod platform {
     /// launchd no distingue "instalar" de "cargar": el plist en
     /// `~/Library/LaunchAgents` ya se carga en el siguiente inicio de sesión, así
     /// que escribirlo **es** habilitarlo.
-    pub async fn enable() -> Result<()> {
-        Ok(())
+    pub async fn enable() -> Result<Option<&'static str>> {
+        Ok(None)
     }
 
     pub async fn start() -> Result<()> {
@@ -581,10 +743,59 @@ mod platform {
 
     pub const UNIT: &str = "HoardSync";
 
+    /// The two mechanisms, in the order they're tried.
+    const TASK_SCHEDULER: &str = "Task Scheduler";
+    const RUN_KEY_MANAGER: &str = "Startup entry (HKCU Run)";
+
+    /// Windows' other way into login start: a value under
+    /// `HKCU\...\CurrentVersion\Run`, which Explorer runs when the session opens.
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const RUN_VALUE: &str = UNIT;
+
     pub async fn installed() -> bool {
+        task_installed().await || run_entry().is_some()
+    }
+
+    async fn task_installed() -> bool {
         run_quiet("schtasks", &["/Query", "/TN", UNIT])
             .await
             .unwrap_or(false)
+    }
+
+    fn open_run_key(write: bool) -> Result<winreg::RegKey> {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+        let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+        let access = if write { KEY_READ | KEY_WRITE } else { KEY_READ };
+        // `create_subkey_with_flags` opens a key that already exists; `Run` is
+        // in every profile, but one just created by an unattended installer may
+        // not have it yet.
+        hkcu.create_subkey_with_flags(RUN_KEY, access)
+            .map(|(key, _)| key)
+            .with_context(|| format!("opening HKCU\\{RUN_KEY}"))
+    }
+
+    /// The command recorded in the Run entry, if there is one.
+    fn run_entry() -> Option<String> {
+        let key = open_run_key(false).ok()?;
+        let value: String = key.get_value(RUN_VALUE).ok()?;
+        (!value.trim().is_empty()).then_some(value)
+    }
+
+    /// Write the Run entry pointing at `exe`.
+    ///
+    /// Quoted for the same reason the systemd unit is: Explorer splits the value
+    /// on spaces, and `C:\Program Files\...` is the most common path there is.
+    fn set_run_entry(exe: &Path) -> Result<()> {
+        let key = open_run_key(true)?;
+        let command = format!("\"{}\"", exe.display());
+        key.set_value(RUN_VALUE, &command)
+            .with_context(|| format!("writing HKCU\\{RUN_KEY}\\{RUN_VALUE}"))
+    }
+
+    fn remove_run_entry() {
+        if let Ok(key) = open_run_key(true) {
+            let _ = key.delete_value(RUN_VALUE);
+        }
     }
 
     /// Dónde anotamos qué ejecutable quedó en la tarea.
@@ -642,9 +853,18 @@ mod platform {
     /// actualización que mueva el `.exe` re-apunte la tarea sola, igual que el
     /// desktop reafirma su propia entrada de autostart en cada arranque.
     pub fn declare() -> Result<(Installed, bool)> {
+        // A Run entry only exists on a machine that already fell back (`enable`
+        // deletes it the moment the task takes), so it is the honest answer for
+        // callers that re-declare without re-enabling — `restart`, which would
+        // otherwise report a Task Scheduler that refused this machine.
+        let manager = if run_entry().is_some() {
+            RUN_KEY_MANAGER
+        } else {
+            TASK_SCHEDULER
+        };
         Ok((
             Installed {
-                manager: "Task Scheduler",
+                manager,
                 id: UNIT,
                 path: None,
             },
@@ -652,10 +872,48 @@ mod platform {
         ))
     }
 
-    pub async fn enable() -> Result<()> {
+    /// Register login start. Tries the task; if the Task Scheduler refuses it,
+    /// falls back to the user's Run entry.
+    ///
+    /// The task is tried first because it is the better one: it survives an
+    /// Explorer that doesn't come up, it has a single-instance policy, and it
+    /// can be fired by hand (`/Run`). But **it can say no without an elevated
+    /// console**, and that was the end of the road: 81 events across 3 users
+    /// whose only way out was re-running it as administrator — asking someone to
+    /// open a PowerShell so their game saves itself.
+    ///
+    /// The Run entry never needs elevation (it is the user's own profile) and it
+    /// does the one thing that matters here: start `hoardd` at logon. What it
+    /// doesn't do is supervise, so `schtasks /Run` and `/End` have nobody left
+    /// to talk to and those paths start and stop the daemon directly instead.
+    pub async fn enable() -> Result<Option<&'static str>> {
         let exe = service_binary();
         let account = current_account()?;
-        let xml = super::task_xml(&exe.to_string_lossy(), &account);
+        match create_task(&exe, &account).await {
+            Ok(()) => {
+                // With the task in place the Run entry is redundant and in the
+                // way: two starts in the same logon means one `hoardd` losing
+                // the socket bind and exiting — an error in the log for nothing.
+                remove_run_entry();
+                record_exec(&exe);
+                Ok(Some(TASK_SCHEDULER))
+            }
+            Err(err) => {
+                tracing::info!(
+                    error = %format!("{err:#}"),
+                    "autostart: the Task Scheduler refused the task; using the user Run entry"
+                );
+                set_run_entry(&exe).with_context(|| {
+                    format!("the Task Scheduler refused the task ({err:#}) and the user Run entry")
+                })?;
+                record_exec(&exe);
+                Ok(Some(RUN_KEY_MANAGER))
+            }
+        }
+    }
+
+    async fn create_task(exe: &Path, account: &str) -> Result<()> {
+        let xml = super::task_xml(&exe.to_string_lossy(), account);
 
         // `/XML` lee la definición de un fichero; se escribe junto a los demás
         // temporales del proceso y con el pid en el nombre, para que dos shells
@@ -678,19 +936,28 @@ mod platform {
         let _ = std::fs::remove_file(&path);
 
         if !created? {
-            anyhow::bail!(
-                "`schtasks /Create` failed. Re-run it from an elevated PowerShell \
-                 (right-click → \"Run as administrator\")."
-            );
+            anyhow::bail!("`schtasks /Create /TN {UNIT}` was refused");
         }
-        record_exec(&exe);
         Ok(())
     }
 
+    /// Start the service now.
+    ///
+    /// With a task, by firing it. Without one there is nothing to fire — the Run
+    /// entry only acts at logon — so the daemon comes up the same way a client
+    /// would bring it up. `install` then waits for it to listen, so a failed
+    /// start doesn't pass for good down either path.
     pub async fn start() -> Result<()> {
-        if !run_quiet("schtasks", &["/Run", "/TN", UNIT]).await? {
-            anyhow::bail!("`schtasks /Run /TN {UNIT}` failed — see `hoard sync`");
+        if task_installed().await {
+            if !run_quiet("schtasks", &["/Run", "/TN", UNIT]).await? {
+                anyhow::bail!("`schtasks /Run /TN {UNIT}` failed — see `hoard sync`");
+            }
+            return Ok(());
         }
+        let endpoint = Endpoint::resolve().context("resolving the hoardd endpoint")?;
+        Client::ensure_running(&endpoint, "hoard autostart (start)")
+            .await
+            .context("starting the Hoard service")?;
         Ok(())
     }
 
@@ -699,13 +966,20 @@ mod platform {
         start().await
     }
 
+    /// Remove both entries. Both, always: a machine that went through the task
+    /// and later through the Run entry (or the other way round, after an update
+    /// that fixed its permissions) would have the other one still set, and
+    /// "turn off autostart" would leave the sync starting on its own anyway.
     pub async fn disable() -> Result<()> {
         let _ = run_quiet("schtasks", &["/End", "/TN", UNIT]).await;
-        if !run_quiet("schtasks", &["/Delete", "/TN", UNIT, "/F"]).await? {
+        let had_task = task_installed().await;
+        remove_run_entry();
+        if had_task && !run_quiet("schtasks", &["/Delete", "/TN", UNIT, "/F"]).await? {
             anyhow::bail!("`schtasks /Delete /TN {UNIT}` failed");
         }
-        // Sin tarea no hay ejecutable anotado: dejarlo mentiría a
-        // `daemon_binary`, que lo trata como la respuesta con más autoridad.
+        // With no login start there is no recorded executable: leaving it would
+        // lie to `daemon_binary`, which treats it as the most authoritative
+        // answer there is.
         if let Some(path) = recorded_exec_path() {
             let _ = std::fs::remove_file(path);
         }
@@ -724,9 +998,13 @@ mod platform {
     pub const UNIT: &str = "hoard-sync";
 
     pub fn declare() -> Result<(Installed, bool)> {
-        anyhow::bail!("no service backend for this OS — run `hoardd` under your own supervisor")
+        Err(anyhow::Error::new(LoginStartUnsupported {
+            kind: Unsupported::NoServiceManager,
+            detail: "no service backend for this OS — run `hoardd` under your own supervisor"
+                .to_string(),
+        }))
     }
-    pub async fn enable() -> Result<()> {
+    pub async fn enable() -> Result<Option<&'static str>> {
         anyhow::bail!("no service backend for this OS")
     }
     pub async fn start() -> Result<()> {
@@ -949,5 +1227,107 @@ mod tests {
             "/home/ada/.local/bin/hoardd"
         )));
         assert!(!platform::is_inside_appimage(Path::new("/usr/bin/hoardd")));
+    }
+
+    /// An AppImage is no longer a dead end: the daemon it carries gets copied
+    /// somewhere that survives closing the app, and *that* is what the unit
+    /// execs. Staging into a Hoard-owned directory is the whole point — the copy
+    /// must never land on top of a `hoardd` the core installer put there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_appimages_daemon_is_staged_somewhere_stable() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let data = home.path().join("data");
+        let mount = home.path().join(".mount_Hoard9z9z/usr/bin");
+        std::fs::create_dir_all(&mount).unwrap();
+        let bundled = mount.join("hoardd");
+        std::fs::write(&bundled, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let staged = temp_env(&data, || platform::stage_stable_daemon(&bundled)).expect("staged");
+        assert!(staged.is_file(), "the copy has to exist: {}", staged.display());
+        assert!(
+            !platform::is_inside_appimage(&staged),
+            "a copy still inside the mount would vanish with the app: {}",
+            staged.display()
+        );
+        // Executable, or the unit dies with 203/EXEC at the next login and the
+        // only trace is a line in a journal nobody is reading.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "staged copy isn't executable: {mode:o}");
+    }
+
+    /// The re-stage path is the one that breaks silently: the destination can be
+    /// the binary the service is running, so it is replaced by `rename` and the
+    /// stamp decides whether there is anything to do at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_staged_daemon_is_replaced_not_written_over() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let data = home.path().join("data");
+        let bundled = home.path().join("hoardd-bundled");
+        std::fs::write(&bundled, b"new").unwrap();
+
+        let dir = data.join("hoard").join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("hoardd");
+        std::fs::write(&dest, b"old").unwrap();
+        // A stamp from another version: this is what makes it re-stage.
+        std::fs::write(dir.join("hoardd.version"), "0.0.0-previous").unwrap();
+        let before = std::fs::metadata(&dest).unwrap().ino();
+
+        let staged = temp_env(&data, || platform::stage_stable_daemon(&bundled)).expect("staged");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+        assert_ne!(
+            std::fs::metadata(&staged).unwrap().ino(),
+            before,
+            "the copy was written in place; a running daemon would have given ETXTBSY"
+        );
+
+        // And with the stamp current there is nothing to do: re-copying tens of
+        // MB on every app start would be a toll for nothing.
+        let after = std::fs::metadata(&staged).unwrap().ino();
+        std::fs::write(&bundled, b"newer, but same version").unwrap();
+        let again = temp_env(&data, || platform::stage_stable_daemon(&bundled)).expect("staged");
+        assert_eq!(std::fs::metadata(&again).unwrap().ino(), after);
+    }
+
+    /// `XDG_DATA_HOME` is process-wide, so the two staging tests have to take
+    /// turns with it or they read each other's directory.
+    #[cfg(target_os = "linux")]
+    fn temp_env<T>(data: &Path, body: impl FnOnce() -> T) -> T {
+        use std::sync::Mutex;
+        static ENV: Mutex<()> = Mutex::new(());
+        let _guard = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: the lock above is what serialises this against the other test;
+        // nothing else in this crate's suite touches `XDG_DATA_HOME`.
+        unsafe { std::env::set_var("XDG_DATA_HOME", data) };
+        let out = body();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        out
+    }
+
+    /// The reason travels typed. Classifying it by matching on the message is
+    /// what breaks the first time somebody rewords the sentence, and rewording a
+    /// user-facing sentence is the most ordinary edit there is.
+    #[test]
+    fn the_unsupported_reason_survives_the_error_chain() {
+        let err = anyhow::Error::new(LoginStartUnsupported {
+            kind: Unsupported::NoStablePath,
+            detail: "no stable path".to_string(),
+        })
+        .context("installing the Hoard sync service");
+        assert_eq!(unsupported_reason(&err), Some(Unsupported::NoStablePath));
+        assert_eq!(Unsupported::NoStablePath.as_str(), "no_stable_path");
+
+        // And an ordinary failure carries no reason: the window falls back to
+        // the generic line instead of blaming the app's format.
+        let plain = anyhow::anyhow!("`systemctl --user enable` failed");
+        assert_eq!(unsupported_reason(&plain), None);
     }
 }

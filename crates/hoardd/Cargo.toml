@@ -49,6 +49,9 @@ notify-rust = { workspace = true }
 # y comandos del sync. La ADR pide permisos solo-usuario (0600 / ACL), así que
 # construimos un SD con SDDL desde el SID del usuario actual.
 [target.'cfg(windows)'.dependencies]
+# The Run entry under HKCU that starts the service at logon when the Task
+# Scheduler won't take a task (see `autostart::platform`).
+winreg = { workspace = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

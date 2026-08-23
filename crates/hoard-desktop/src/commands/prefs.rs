@@ -178,7 +178,13 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     // son dos procesos, así que "arranca al iniciar sesión" tiene dos entradas
     // que registrar, y apagarlo tiene que quitar las dos — si no, el usuario
     // apaga el arranque automático y el sync sigue arrancando solo.
-    sync_service_autostart(actually_enabled);
+    //
+    // Awaited, unlike the app-start reaffirmation: the user is standing in front
+    // of the switch they just flipped, and a service half that failed has to be
+    // known by the time this returns or the page has nothing to show. The reason
+    // is typed and cached, so the page reads it back with
+    // `service_autostart_state`.
+    apply_service_autostart(actually_enabled).await;
 
     Ok(actually_enabled)
 }
@@ -241,29 +247,124 @@ pub(crate) fn register_installation() {
     });
 }
 
+/// How the sync service's login start actually went, for the window to show.
+///
+/// The interesting field is `unsupported`: a machine where login start can't be
+/// declared at all (an AppImage that can't leave a stable copy of the daemon, a
+/// box without systemd). That used to end in a `tracing::warn!` inside the
+/// service, so the Settings switch read "on" while the sync only ever ran with
+/// the window open — and the user had nothing to look at. It is `None` when
+/// login start is registered, and when it's off because the user turned it off.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ServiceAutostart {
+    /// Whether login start is meant to be on at all (mirrors `prefs.autostart`).
+    pub enabled: bool,
+    /// Which service manager took it (`"systemd --user"`, `"Task Scheduler"`,
+    /// `"Startup entry (HKCU Run)"`). The one that *actually* took it: on
+    /// Windows the task and the Run entry are two different answers.
+    pub manager: Option<String>,
+    /// Unit / label / task name, for a user who wants to ask the OS directly.
+    pub unit: Option<String>,
+    /// Typed reason there is no login start here, if there isn't one:
+    /// `"no_stable_path"` / `"no_service_manager"`. The sentence comes from
+    /// i18n keyed on this; the raw text is in `detail`.
+    pub unsupported: Option<String>,
+    /// Raw failure text, for the detail line and for a bug report. `None` when
+    /// nothing failed.
+    pub detail: Option<String>,
+}
+
+/// Last outcome of registering the service for login start.
+///
+/// Cached rather than probed on demand, because probing honestly would mean
+/// doing the work: whether an AppImage can leave a stable copy of the daemon is
+/// only answered by trying. This is what really happened on the last attempt —
+/// at app start, and on every flip of the switch.
+fn service_autostart_slot() -> &'static std::sync::Mutex<ServiceAutostart> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<ServiceAutostart>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(ServiceAutostart::default()))
+}
+
+fn record_service_autostart(state: ServiceAutostart) {
+    let mut slot = service_autostart_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = state;
+}
+
+/// What the Settings page reads to explain a login start that isn't happening.
+#[tauri::command]
+pub fn service_autostart_state() -> ServiceAutostart {
+    service_autostart_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Register (or remove) the sync service's login start and record how it went.
+///
+/// Returns the outcome instead of only logging it. The service manager
+/// subprocesses (`systemctl`, `launchctl`, `schtasks`) are the slow part, but
+/// none of these declare-or-remove calls starts or stops a running service, so
+/// they're a couple of subprocesses and a file write — quick enough for the
+/// Settings toggle to wait on, which is the only way its failure can ever be
+/// said out loud.
+pub(crate) async fn apply_service_autostart(enabled: bool) -> ServiceAutostart {
+    let outcome = if enabled {
+        hoardd::autostart::ensure_installed().await.map(|i| {
+            tracing::info!(
+                manager = i.manager,
+                unit = i.id,
+                "sync service set to start at login"
+            );
+            ServiceAutostart {
+                enabled,
+                manager: Some(i.manager.to_string()),
+                unit: Some(i.id.to_string()),
+                unsupported: None,
+                detail: None,
+            }
+        })
+    } else {
+        hoardd::autostart::uninstall().await.map(|removed| {
+            if removed {
+                tracing::info!("sync service removed from login start");
+            }
+            ServiceAutostart {
+                enabled,
+                ..Default::default()
+            }
+        })
+    };
+    let state = match outcome {
+        Ok(state) => state,
+        Err(err) => {
+            let detail = format!("{err:#}");
+            let unsupported = hoardd::autostart::unsupported_reason(&err);
+            tracing::warn!(
+                error = %detail,
+                enabled,
+                unsupported = unsupported.map(|u| u.as_str()).unwrap_or("-"),
+                "the sync service won't start at login"
+            );
+            ServiceAutostart {
+                enabled,
+                manager: None,
+                unit: None,
+                unsupported: unsupported.map(|u| u.as_str().to_string()),
+                detail: Some(detail),
+            }
+        }
+    };
+    record_service_autostart(state.clone());
+    state
+}
+
+/// The app-start half: reaffirm what prefs say without holding up the window.
 pub(crate) fn sync_service_autostart(enabled: bool) {
     tauri::async_runtime::spawn(async move {
-        let outcome = if enabled {
-            hoardd::autostart::ensure_installed().await.map(|i| {
-                tracing::info!(
-                    manager = i.manager,
-                    unit = i.id,
-                    "sync service set to start at login"
-                );
-            })
-        } else {
-            hoardd::autostart::uninstall().await.map(|removed| {
-                if removed {
-                    tracing::info!("sync service removed from login start");
-                }
-            })
-        };
-        if let Err(err) = outcome {
-            // Incluye el caso esperado del AppImage (sin ruta estable que
-            // ejecutar al iniciar sesión). El mensaje explica la degradación y
-            // qué sigue funcionando; no hay nada que arreglar en caliente.
-            tracing::warn!(error = %format!("{err:#}"), enabled, "the sync service won't start at login");
-        }
+        apply_service_autostart(enabled).await;
     });
 }
 

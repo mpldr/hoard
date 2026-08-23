@@ -444,6 +444,8 @@
   "settings.forget_confirm_body": "Hoard は {url} に保存されたアドレスとアクセストークンを削除します。サーバー上のスナップショットには影響しません。後でアドレスとトークンを使って再接続できます。",
   "settings.forget_confirm_cta": "サーバーを削除",
   "settings.forgotten_toast": "サーバーを削除しました。",
+  "settings.service_autostart_no_stable_path": "アプリ自体はログイン時に起動しますが、同期サービスは起動できません。この AppImage は次のログイン時には消えている一時フォルダーから実行されており、エンジンの安定したコピーも作成できませんでした。Hoard を開いている間は同期は動作します。何も開かずに動かすには、次のコマンドでコアをインストールしてください: curl -fsSL https://hoard.services/install.sh | sh",
+  "settings.service_autostart_no_service_manager": "アプリ自体はログイン時に起動しますが、同期サービスは起動できません。このマシンには登録先となるユーザーサービスマネージャーがありません。Hoard を開いている間は同期は動作します。何も開かずに動かすには、ご自身の管理下で hoardd を起動してください。",
   "settings.autostart_rejected": "OS が自動起動の変更を拒否しました — ランチャーの設定からお試しください。",
   "settings.language_label": "表示言語",
   "settings.language_desc": "メニューやボタン、メッセージで使う言語を選びます。",

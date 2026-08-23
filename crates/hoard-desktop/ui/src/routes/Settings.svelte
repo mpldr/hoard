@@ -206,6 +206,40 @@
     }
   }
 
+  // Why the sync *service* isn't set to start at login, when it isn't. The
+  // switch below registers two things — the app's launcher entry and the
+  // service's own unit — and the second one can fail where the first can't:
+  // an AppImage runs from a mount that's gone by the next login, and a machine
+  // without systemd has nowhere to declare a unit. Saying so here is the whole
+  // point: this used to be a line in the service's log, so the switch read "on"
+  // while the sync only ever ran with the window open.
+  let serviceAutostart = $state<api.ServiceAutostart | null>(null);
+
+  async function refreshServiceAutostart() {
+    try {
+      serviceAutostart = await api.serviceAutostartState();
+    } catch (e) {
+      console.warn("serviceAutostartState failed:", e);
+    }
+  }
+
+  /** The sentence for a login start that can't happen here. Only ever shown
+   *  when the switch is on: with it off there's nothing to explain. */
+  const serviceAutostartBlocked = $derived(
+    serviceAutostart?.enabled && serviceAutostart?.unsupported
+      ? serviceAutostart
+      : null,
+  );
+
+  function serviceAutostartMessageKey(reason: api.ServiceAutostartBlock) {
+    switch (reason) {
+      case "no_stable_path":
+        return "settings.service_autostart_no_stable_path";
+      case "no_service_manager":
+        return "settings.service_autostart_no_service_manager";
+    }
+  }
+
   // Catalog (Ludusavi) update state. We poll status once on mount and listen
   // for `catalog://update-progress` events while a refresh is in flight so
   // the button can show "Downloading…" / "Parsing…" / "Saving…" instead of a
@@ -264,6 +298,7 @@
     } catch (e) {
       console.warn("isAutostartEnabled probe failed:", e);
     }
+    await refreshServiceAutostart();
     try {
       catalog = await api.catalogStatus();
     } catch (e) {
@@ -449,6 +484,11 @@
           toastError($_("settings.autostart_rejected"));
         }
         await hydratePrefs();
+        // The app's launcher entry and the sync service are two registrations,
+        // and the second one can fail on its own (an AppImage with nowhere
+        // stable to run from). `set_autostart` waits for it, so by now the
+        // outcome is there to read.
+        await refreshServiceAutostart();
       } else {
         await updatePrefs({ [field]: value });
       }
@@ -912,6 +952,24 @@
               />
             {/each}
           </div>
+          {#if serviceAutostartBlocked}
+            <div
+              class="border-t border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+            >
+              <p>
+                {$_(
+                  serviceAutostartMessageKey(
+                    serviceAutostartBlocked.unsupported!,
+                  ),
+                )}
+              </p>
+              {#if serviceAutostartBlocked.detail}
+                <p class="mt-1 break-words text-xs text-amber-200/70">
+                  {serviceAutostartBlocked.detail}
+                </p>
+              {/if}
+            </div>
+          {/if}
         </Card>
       </section>
 

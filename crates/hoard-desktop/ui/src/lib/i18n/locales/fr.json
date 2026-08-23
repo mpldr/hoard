@@ -444,6 +444,8 @@
   "settings.forget_confirm_body": "Hoard supprimera l'adresse et le jeton d'accès enregistrés pour {url}. Vos instantanés sur le serveur ne sont pas touchés : vous pourrez vous reconnecter plus tard avec l'adresse et un jeton.",
   "settings.forget_confirm_cta": "Oublier le serveur",
   "settings.forgotten_toast": "Serveur oublié.",
+  "settings.service_autostart_no_stable_path": "L'application démarrera bien à l'ouverture de session, mais pas le service de synchronisation : cet AppImage s'exécute depuis un dossier temporaire qui aura disparu à la prochaine session, et aucune copie stable du moteur n'a pu être écrite. La synchronisation fonctionne toujours tant que Hoard est ouvert. Pour qu'elle tourne sans rien ouvrir, installez le cœur avec : curl -fsSL https://hoard.services/install.sh | sh",
+  "settings.service_autostart_no_service_manager": "L'application démarrera bien à l'ouverture de session, mais pas le service de synchronisation : cette machine n'a aucun gestionnaire de services utilisateur où l'enregistrer. La synchronisation fonctionne toujours tant que Hoard est ouvert — pour qu'elle tourne sans rien ouvrir, lancez hoardd sous votre propre superviseur.",
   "settings.autostart_rejected": "Le système a rejeté le changement de démarrage automatique — essayez depuis les paramètres de votre lanceur.",
   "settings.language_label": "Langue d'affichage",
   "settings.language_desc": "Choisissez la langue utilisée par Hoard pour les menus, boutons et messages.",

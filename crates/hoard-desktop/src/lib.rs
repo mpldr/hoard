@@ -298,6 +298,7 @@ pub fn run() {
             commands::prefs::save_prefs,
             commands::prefs::set_autostart,
             commands::prefs::is_autostart_enabled,
+            commands::prefs::service_autostart_state,
             commands::prefs::set_automatic_mode,
             commands::prefs::set_global_sync,
             commands::prefs::set_sync_mode,

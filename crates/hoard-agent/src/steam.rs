@@ -123,6 +123,37 @@ fn lib_key(p: &Path) -> String {
     }
 }
 
+/// Is this the storage saying the whole device isn't there, rather than one
+/// file being unreadable?
+///
+/// The difference decides whether it's worth reading the next file in the same
+/// folder. A corrupt manifest is one game; a drive that isn't plugged in is
+/// every game on it, and asking each one in turn produces a log line per game
+/// per sweep — 553 rows in 48 hours from a single user with `e:/steam`
+/// unplugged, all of them the same fact.
+///
+/// Checked by raw OS code, not by `ErrorKind`: the codes that mean "no device"
+/// map to `Uncategorized`, which is not matchable, and `NotFound` deliberately
+/// isn't here — a missing appmanifest is Steam deleting one mid-scan, which is
+/// a race and not a dead drive.
+fn device_is_gone(e: &std::io::Error) -> bool {
+    let Some(code) = e.raw_os_error() else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_READY, ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST,
+        // ERROR_NO_SUCH_DEVICE (the 433 in the reports),
+        // ERROR_DEVICE_NOT_CONNECTED.
+        matches!(code, 21 | 53 | 55 | 433 | 1167)
+    }
+    #[cfg(not(windows))]
+    {
+        // EIO, ENXIO, ENODEV, ESTALE (a stale NFS handle after an unmount).
+        matches!(code, 5 | 6 | 19 | 116)
+    }
+}
+
 /// List Steam apps installed across all detected libraries.
 ///
 /// Errors reading individual library folders / appmanifest files are logged
@@ -130,6 +161,10 @@ fn lib_key(p: &Path) -> String {
 /// missing or one manifest file is corrupt. Returning `Ok(vec![])` is a
 /// normal outcome (Steam not installed); detection treats it as "no
 /// Steam apps found, fall back to filesystem heuristic".
+///
+/// A library whose drive is absent costs **one** line per sweep, not one per
+/// game: the root is probed before anything is opened, and a device-level error
+/// mid-loop abandons that library instead of asking it about the next file.
 pub fn list_installed_steam_games(os: Os) -> Result<Vec<SteamApp>> {
     let libraries = detect_steam_libraries(os);
     if libraries.is_empty() {
@@ -140,46 +175,30 @@ pub fn list_installed_steam_games(os: Os) -> Result<Vec<SteamApp>> {
     let mut out: Vec<SteamApp> = Vec::new();
     for lib in &libraries {
         let steamapps = lib.join("steamapps");
-        let entries = match std::fs::read_dir(&steamapps) {
-            Ok(e) => e,
+        let scan = match scan_library(&steamapps) {
+            Ok(scan) => scan,
             Err(e) => {
-                tracing::warn!(
-                    path = %steamapps.display(),
+                tracing::info!(
+                    library = %steamapps.display(),
                     error = %e,
-                    "skipping Steam library — read_dir failed"
+                    "skipping Steam library — its folder isn't reachable (drive offline / not mounted / no permission?)"
                 );
                 continue;
             }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
-                continue;
-            }
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "appmanifest unreadable; skipping"
-                    );
-                    continue;
-                }
-            };
-            match parse_app_manifest(&text, &steamapps) {
-                Some(app) => out.push(app),
-                None => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        "appmanifest missing required fields (appid/installdir); skipping"
-                    );
-                }
-            }
+        if scan.unreadable > 0 {
+            // One line for the whole library, whatever the count: the per-file
+            // version of this is what filled a user's log with the same fact 553
+            // times in two days.
+            tracing::warn!(
+                library = %steamapps.display(),
+                unreadable = scan.unreadable,
+                device_gone = scan.device_gone,
+                error = %scan.first_error.unwrap_or_default(),
+                "appmanifests in this Steam library couldn't be read; skipped"
+            );
         }
+        out.extend(scan.apps);
     }
     out.sort_by_key(|a| a.app_id);
     out.dedup_by(|a, b| a.app_id == b.app_id);
@@ -189,6 +208,79 @@ pub fn list_installed_steam_games(os: Os) -> Result<Vec<SteamApp>> {
         "Steam scan complete"
     );
     Ok(out)
+}
+
+/// What one library's `steamapps` folder yielded, and what it couldn't.
+#[derive(Debug)]
+struct LibraryScan {
+    apps: Vec<SteamApp>,
+    /// Manifests that wouldn't read. A count and not a log line each: the caller
+    /// says it once.
+    unreadable: usize,
+    /// The first failure's text, which is the one worth showing — the rest are
+    /// the same fact about the same drive.
+    first_error: Option<String>,
+    /// The device answered "I'm not here" and the rest of the library was
+    /// abandoned unread.
+    device_gone: bool,
+}
+
+/// Read every `appmanifest_*.acf` in one library.
+///
+/// `Err` means the folder itself isn't reachable, which is the answer for a
+/// library on a drive that isn't plugged in. That check happens **before**
+/// anything inside is opened, because the alternative is asking the same absent
+/// drive about every game it holds and logging each answer.
+fn scan_library(steamapps: &Path) -> std::io::Result<LibraryScan> {
+    // Probe the root first. A listing that never opens is the cheapest question
+    // to ask, and an absent drive usually answers it.
+    std::fs::metadata(steamapps)?;
+    let entries = std::fs::read_dir(steamapps)?;
+
+    let mut scan = LibraryScan {
+        apps: Vec::new(),
+        unreadable: 0,
+        first_error: None,
+        device_gone: false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                scan.unreadable += 1;
+                if scan.first_error.is_none() {
+                    scan.first_error = Some(e.to_string());
+                }
+                // The drive went away under us. A directory listing can be
+                // served from cache while the reads behind it reach the
+                // hardware, which is how a root that probed fine still fails
+                // here — and every remaining file in this library has the same
+                // answer waiting, so stop asking for them one at a time.
+                if device_is_gone(&e) {
+                    scan.device_gone = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        match parse_app_manifest(&text, steamapps) {
+            Some(app) => scan.apps.push(app),
+            None => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "appmanifest missing required fields (appid/installdir); skipping"
+                );
+            }
+        }
+    }
+    Ok(scan)
 }
 
 /// Enumerate every Proton/Wine prefix Steam has created on this host.
@@ -646,6 +738,61 @@ pub fn primary_user_dir(os: Os) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library on a drive that isn't there is one answer, not one per game.
+    /// Asking each file in turn is what put 553 identical rows in a user's log
+    /// over two days with `e:/steam` unplugged.
+    #[test]
+    fn an_unreachable_library_answers_once_at_the_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = scan_library(&dir.path().join("nope/steamapps"))
+            .expect_err("an absent folder can't be scanned");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The codes that mean "the device isn't there" have to be told apart from
+    /// an ordinary unreadable file, because they decide whether it's worth
+    /// reading the next one. `NotFound` is deliberately not one of them: a
+    /// missing appmanifest is Steam deleting one mid-scan.
+    #[test]
+    fn a_dead_device_is_told_apart_from_one_bad_file() {
+        use std::io::{Error, ErrorKind};
+
+        #[cfg(windows)]
+        let gone = Error::from_raw_os_error(433); // ERROR_NO_SUCH_DEVICE
+        #[cfg(not(windows))]
+        let gone = Error::from_raw_os_error(19); // ENODEV
+        assert!(device_is_gone(&gone));
+
+        assert!(!device_is_gone(&Error::from_raw_os_error(13))); // EACCES / access denied
+        assert!(!device_is_gone(&Error::new(ErrorKind::NotFound, "gone mid-scan")));
+        // No OS code at all (a synthesised error) is never a dead device.
+        assert!(!device_is_gone(&Error::other("made up")));
+    }
+
+    /// One bad manifest doesn't cost the library: the rest still parse, and what
+    /// failed comes back as a count for the caller to say once.
+    #[test]
+    fn one_unreadable_manifest_doesnt_cost_the_library() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let steamapps = dir.path().join("steamapps");
+        std::fs::create_dir_all(steamapps.join("common")).unwrap();
+        std::fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\"220\"\n\t\"name\"\t\"Half-Life 2\"\n\t\"installdir\"\t\"Half-Life 2\"\n}\n",
+        )
+        .unwrap();
+        // A directory where a manifest should be: reading it fails the same way
+        // a broken file does, without needing to be root to arrange it.
+        std::fs::create_dir(steamapps.join("appmanifest_440.acf")).unwrap();
+
+        let scan = scan_library(&steamapps).expect("the folder is reachable");
+        assert_eq!(scan.apps.len(), 1, "the good manifest still parses");
+        assert_eq!(scan.apps[0].app_id, 220);
+        assert_eq!(scan.unreadable, 1);
+        assert!(scan.first_error.is_some(), "the caller needs something to show");
+        assert!(!scan.device_gone, "a bad file is not a missing drive");
+    }
 
     #[test]
     fn parses_library_folders_v2() {

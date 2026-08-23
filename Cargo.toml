@@ -9,12 +9,15 @@ members = [
     "crates/hoard-desktop",
     "crates/hoardd",
     "crates/hoard-manifest",
-    "crates/hoard-watcher",
     "crates/hoard-screen",
-    "crates/hoard-wrapple",
-    # Banco de pruebas local: NO se commitea (ver crates/hoard-pruebas/README).
-    "crates/hoard-pruebas",
 ]
+
+# The benchmark harness is a development tool and is never published, so it is
+# not a member either. A member missing from a clean clone doesn't just fail to
+# build itself: `cargo build --workspace` aborts before compiling anything, so
+# the whole tree — server included — stops building. Excluded, its absence goes
+# unnoticed; it carries its own `[workspace]` table to still build standalone.
+exclude = ["crates/hoard-pruebas"]
 
 [workspace.package]
 edition = "2021"

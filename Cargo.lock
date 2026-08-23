@@ -3243,26 +3243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hoard-pruebas"
-version = "1.1.4"
-dependencies = [
- "anyhow",
- "clap",
- "hoard-agent",
- "hoard-core",
- "hoardd",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "hoard-screen"
 version = "1.1.4"
 dependencies = [
@@ -3324,21 +3304,6 @@ dependencies = [
  "uuid",
  "zip",
 ]
-
-[[package]]
-name = "hoard-watcher"
-version = "1.1.4"
-dependencies = [
- "notify",
- "notify-debouncer-mini",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "hoard-wrapple"
-version = "1.1.4"
 
 [[package]]
 name = "hoardd"

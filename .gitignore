@@ -24,8 +24,12 @@ CONTRIBUTING.md
 /crates/hoard-agent/tests/fixtures/README.md
 /crates/hoard-manifest/data/README.md
 /crates/hoard-screen/README.md
-/crates/hoard-pruebas/README.md
 /deploy/docker/README.md
+
+# Banco de pruebas del motor: herramienta de desarrollo, nunca se publica ni
+# se empaqueta. Vive fuera del workspace (`exclude` en el Cargo.toml raíz) para
+# que su ausencia no rompa un clon limpio.
+/crates/hoard-pruebas/
 
 # Local scratch / draft notes that should never be committed.
 # Root-only patterns: CHANGELOG.md y el resto de principales no se ven afectados.

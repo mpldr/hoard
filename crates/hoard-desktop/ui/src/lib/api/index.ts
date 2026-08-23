@@ -457,11 +457,13 @@ export function clearManualPath(slug: string): Promise<void> {
   return invoke<void>("clear_manual_path", { slug });
 }
 
-/** Persistently blacklist a detected slug so it stops appearing in the
- *  Library grid. Reversible via {@link unignoreDetectedGame}; the matching
+/** Persistently blacklist a slug: it stops appearing in the Library grid
+ *  **and** any save tracked under it stops being watched on this machine
+ *  (snapshots on the server are kept). Resolves to how many tracked saves
+ *  that dropped. Reversible via {@link unignoreDetectedGame}; the matching
  *  Settings list renders every currently-ignored slug. */
-export async function ignoreDetectedGame(slug: string): Promise<void> {
-  await invoke("ignore_detected_game", { slug });
+export async function ignoreDetectedGame(slug: string): Promise<number> {
+  return await invoke<number>("ignore_detected_game", { slug });
 }
 
 /** Reactivate a previously-blacklisted slug; the next scan re-surfaces it

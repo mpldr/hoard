@@ -164,6 +164,15 @@
   let dismissTarget = $state<DetectedGame | null>(null);
   let dismissBlacklist = $state(false);
   let dismissBusy = $state(false);
+  /** How many saves this machine tracks under the slug being dismissed.
+   *  Blacklisting untracks them, so the modal warns first. Orphans don't
+   *  count: they're another machine's rows and nothing here watches them. */
+  const dismissTrackedCount = $derived(
+    dismissTarget
+      ? tracked.filter((t) => t.game_slug === dismissTarget!.slug && !t.orphan)
+          .length
+      : 0,
+  );
   /** Slugs the user dismissed in this session only — wiped on reload. They
    *  reappear on the next scan unless the user also blacklisted them. */
   let sessionDismissed = $state(new Set<string>());
@@ -775,11 +784,21 @@
     dismissBusy = true;
     try {
       if (dismissBlacklist) {
+        let untracked = 0;
         try {
-          await api.ignoreDetectedGame(target.slug);
+          untracked = await api.ignoreDetectedGame(target.slug);
         } catch (e) {
           showError(e);
           return;
+        }
+        // Blacklisting also stops tracking the saves filed under that slug,
+        // so the list the user is looking at is stale.
+        if (untracked > 0) {
+          try {
+            tracked = await api.listTrackedSaves();
+          } catch {
+            tracked = tracked.filter((t) => t.game_slug !== target.slug);
+          }
         }
         // Re-fetch so the new blacklist entry takes effect immediately —
         // the backend already filters on read, so we just consume the
@@ -795,7 +814,13 @@
             };
           }
         }
-        toastSuccess($_("library.ignored_toast"));
+        toastSuccess(
+          untracked > 0
+            ? $_("library.ignored_untracked_toast", {
+                values: { count: untracked },
+              })
+            : $_("library.ignored_toast"),
+        );
       } else {
         sessionDismissed.add(target.slug);
         // Force a reactive update — Svelte 5 runes don't track Set mutations.
@@ -2078,6 +2103,16 @@
       />
       <span>{$_("library.ignore_blacklist_check")}</span>
     </label>
+    <!-- The blacklist also stops tracking whatever is filed under that slug,
+         so say it before the click, not in the toast afterwards. Only shown
+         when there is something to lose. -->
+    {#if dismissBlacklist && dismissTrackedCount > 0}
+      <p class="mt-2 pl-6 text-xs text-amber-300/90">
+        {$_("library.ignore_blacklist_untracks", {
+          values: { count: dismissTrackedCount },
+        })}
+      </p>
+    {/if}
     {#snippet footer()}
       <Button
         variant="ghost"

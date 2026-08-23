@@ -516,23 +516,22 @@ pub async fn clear_manual_path(
     Ok(())
 }
 
-/// Persistently blacklist a detected game from the Library page. Subsequent
-/// scans run the full detection pipeline but the matching slug is filtered
-/// out before the report reaches the UI. Reversible via
-/// [`unignore_detected_game`]. Idempotent.
+/// Persistently blacklist a game from the Library page: future scans filter
+/// the slug out **and** any save tracked under it stops being watched here
+/// (server data untouched — see [`hoard_agent::library::ignore_slug`]).
+/// Reversible via [`unignore_detected_game`]. Idempotent.
+///
+/// Returns how many tracked saves it dropped, so the UI can say so.
 #[tauri::command]
-pub async fn ignore_detected_game(slug: String) -> Result<(), AppError> {
-    let trimmed = slug.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::plain("Slug is empty."));
+pub async fn ignore_detected_game(
+    slug: String,
+    state: State<'_, AppState>,
+) -> Result<usize, AppError> {
+    let untracked = library::ignore_slug(&slug).map_err(|e| AppError::plain(pretty_error(e)))?;
+    for save_id in &untracked {
+        detach_save_if_running(&state, save_id.clone()).await;
     }
-    let (mut cli_state, path) =
-        CliState::load_default().map_err(|e| AppError::plain(e.to_string()))?;
-    cli_state.add_ignored_slug(trimmed.to_string());
-    cli_state
-        .save(&path)
-        .map_err(|e| AppError::plain(e.to_string()))?;
-    Ok(())
+    Ok(untracked.len())
 }
 
 /// Descarta una carpeta del escaneo. Wrapper fino sobre el agente: la lógica
@@ -562,17 +561,7 @@ pub async fn list_excluded_scan_paths() -> Result<Vec<String>, AppError> {
 /// the Library. Mirror of [`ignore_detected_game`]. Idempotent.
 #[tauri::command]
 pub async fn unignore_detected_game(slug: String) -> Result<(), AppError> {
-    let trimmed = slug.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::plain("Slug is empty."));
-    }
-    let (mut cli_state, path) =
-        CliState::load_default().map_err(|e| AppError::plain(e.to_string()))?;
-    cli_state.remove_ignored_slug(trimmed);
-    cli_state
-        .save(&path)
-        .map_err(|e| AppError::plain(e.to_string()))?;
-    Ok(())
+    library::unignore_slug(&slug).map_err(|e| AppError::plain(pretty_error(e)))
 }
 
 /// Return every slug the user has blacklisted. Sorted alphabetically so the

@@ -1978,6 +1978,76 @@ pub fn untrack(save_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Blacklist a game **and stop tracking it here**, in one state write.
+///
+/// Blacklisting used to be detection-only: the slug was filtered out of every
+/// future scan while the save it named went on being watched, synced and
+/// counted as playing. That reads as a bug from the outside — a user whose
+/// library had a bogus game blacklisted it, saw nothing change, and had no way
+/// to tell that the row doing the damage was a *tracked* one, not a detected
+/// one. So the blacklist now means what people take it to mean: this game is
+/// not to be watched on this machine.
+///
+/// Server data is untouched, exactly like [`untrack`]: the snapshots stay, the
+/// row can be re-tracked from the Library, and [`unignore_slug`] puts the game
+/// back in front of detection. Returns the ids that stopped being tracked so
+/// the caller can detach them from the live engine.
+pub fn ignore_slug(slug: &str) -> Result<Vec<String>> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        anyhow::bail!("slug is empty");
+    }
+    let (mut cli_state, path) = CliState::load_default()?;
+    let dropped = ignore_slug_in_state(&mut cli_state, slug);
+    cli_state.save(&path)?;
+
+    for (_, save) in &dropped {
+        // Same denial `untrack` records: the pipeline proposed this folder and
+        // the user threw it out.
+        crate::telemetry::untracked(&save.game_slug, &save.local_path);
+    }
+    Ok(dropped.into_iter().map(|(id, _)| id).collect())
+}
+
+/// The state mutation behind [`ignore_slug`], split out so it can be tested
+/// without a state file on disk. Returns the rows it dropped.
+fn ignore_slug_in_state(
+    cli_state: &mut CliState,
+    slug: &str,
+) -> Vec<(String, crate::state::SaveState)> {
+    cli_state.add_ignored_slug(slug.to_string());
+
+    let dropped: Vec<(String, crate::state::SaveState)> = cli_state
+        .saves
+        .iter()
+        .filter(|(_, save)| save.game_slug == slug)
+        .map(|(id, save)| (id.clone(), save.clone()))
+        .collect();
+    for (id, _) in &dropped {
+        cli_state.saves.remove(id);
+    }
+    // The override is what would bounce a re-add straight back to the folder
+    // the user just rejected, so it goes with the row.
+    if !dropped.is_empty() {
+        cli_state.clear_manual_path(slug);
+    }
+    dropped
+}
+
+/// Undo [`ignore_slug`]: the next scan offers the game again. The saves it
+/// untracked are **not** restored — re-tracking is the user's call, and the
+/// Library offers the game as soon as detection sees it.
+pub fn unignore_slug(slug: &str) -> Result<()> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        anyhow::bail!("slug is empty");
+    }
+    let (mut cli_state, path) = CliState::load_default()?;
+    cli_state.remove_ignored_slug(slug);
+    cli_state.save(&path)?;
+    Ok(())
+}
+
 /// Borrado duro: elimina fila + todos los snapshots del server Y purga el estado
 /// local, incluido el override `manual_paths` (para que un re-add no rebote a la
 /// carpeta mala). El frontend despega el save del agente vivo.
@@ -2223,6 +2293,60 @@ mod tests {
             processes: Vec::new(),
             shared_processes: false,
         }
+    }
+
+    /// Blacklisting is what a user reaches for when a bogus game appears, and
+    /// until aug-2026 it only filtered future scans: the row already tracked
+    /// under that slug went on being watched, so the user saw nothing change
+    /// (report: a phantom game that kept claiming to be running). Now it
+    /// untracks too — and takes the manual override with it, or a re-add would
+    /// bounce straight back to the rejected folder.
+    #[test]
+    fn blacklisting_a_slug_also_stops_tracking_it() {
+        let mut state = CliState::default();
+        state.saves.insert(
+            "row-1".into(),
+            save_state("storage", "/home/u/Emulation/storage"),
+        );
+        state
+            .saves
+            .insert("row-2".into(), save_state("stardew-valley", "/home/u/sv"));
+        state.set_manual_path("storage", PathBuf::from("/home/u/Emulation/storage"));
+
+        let dropped = super::ignore_slug_in_state(&mut state, "storage");
+
+        assert_eq!(dropped.len(), 1, "only the blacklisted slug's row goes");
+        assert_eq!(dropped[0].0, "row-1");
+        assert!(state.is_ignored("storage"));
+        assert!(!state.saves.contains_key("row-1"));
+        assert!(
+            state.saves.contains_key("row-2"),
+            "another game's row is untouched"
+        );
+        assert!(
+            !state.manual_paths.contains_key("storage"),
+            "the override goes with the row"
+        );
+
+        // Idempotent: blacklisting again finds nothing left to untrack.
+        assert!(super::ignore_slug_in_state(&mut state, "storage").is_empty());
+    }
+
+    /// A slug with nothing tracked under it keeps the old behaviour exactly:
+    /// blacklist the name, touch no row, and leave any override alone (it
+    /// belongs to a folder the user picked, not to a row we just dropped).
+    #[test]
+    fn blacklisting_an_untracked_slug_only_blacklists() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("row-1".into(), save_state("stardew-valley", "/home/u/sv"));
+        state.set_manual_path("some-game", PathBuf::from("/home/u/some-game"));
+
+        assert!(super::ignore_slug_in_state(&mut state, "some-game").is_empty());
+        assert!(state.is_ignored("some-game"));
+        assert_eq!(state.saves.len(), 1);
+        assert!(state.manual_paths.contains_key("some-game"));
     }
 
     /// The aug-2026 Factorio incident, as a test.

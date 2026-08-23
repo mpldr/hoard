@@ -105,6 +105,16 @@ pub struct DetectedGame {
     /// keeps older cached reports loading without migration.
     #[serde(default)]
     pub path_confidences: Vec<Confidence>,
+    /// Per-path WHY, aligned 1:1 with [`found_paths`]: the scored reasons
+    /// that put each folder where it ended up ("name exact, strong save ext,
+    /// recent save-like file", or the correlation note). The breakdown was
+    /// already computed by [`grade_and_rank_paths`] and thrown away, which is
+    /// why "why did it pick THIS folder" was unanswerable — locally or from
+    /// support. Empty strings are placeholders for paths this build didn't
+    /// re-grade (single-path rows inherit the rolled-up grade without extra
+    /// I/O); an empty vec means the row predates the field.
+    #[serde(default)]
+    pub path_reasons: Vec<String>,
     pub source: DetectionSource,
     /// If we matched via Steam, the app id is preserved so the UI can show it.
     pub steam_app_id: Option<u64>,
@@ -136,6 +146,29 @@ pub struct DetectionReport {
     /// reports from older builds loading without migration.
     #[serde(default)]
     pub stats: DetectionStats,
+    /// Tracked folders that look like the game's own backup mirror of another
+    /// detected folder (P9). Read-only on purpose — nothing here re-points a
+    /// save; surfacing the suggestion is as far as the pipeline goes, because
+    /// silent repointing is what broke slot pairing in aug-2026. `default`
+    /// keeps older cached reports loading.
+    #[serde(default)]
+    pub mirror_warnings: Vec<MirrorWarning>,
+}
+
+/// One already-tracked folder that [`detect_tracked_mirrors`] flagged as a
+/// backup mirror of a better candidate sitting right next to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MirrorWarning {
+    pub save_id: String,
+    pub game_slug: String,
+    pub label: String,
+    /// The tracked folder that looks like the mirror (`…/SaveGamesBackup`).
+    pub tracked_path: PathBuf,
+    /// The sibling that looks like the real save (`…/SaveGames/<id>`).
+    pub suggested_path: PathBuf,
+    /// Why: `"mirror of <suggested> (content superset)"` when the structural
+    /// check passed, `"name-only"` when only the suffix relation matched.
+    pub reason: String,
 }
 
 /// What each pipeline stage contributed to one detection pass, plus the wall
@@ -324,6 +357,7 @@ where
                 // empty, instead of silently backing up the install dir.
                 found_paths: Vec::new(),
                 path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
                 confidence: Confidence::Medium,
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
@@ -896,6 +930,7 @@ where
                             display_name: a.display_name,
                             found_paths: vec![a.path],
                             path_confidences: vec![a.confidence],
+                            path_reasons: vec![a.reason],
                             confidence: a.confidence,
                             source: DetectionSource::FilesystemHeuristic,
                             steam_app_id: None,
@@ -962,6 +997,35 @@ where
     let mut games: Vec<DetectedGame> = by_slug.into_values().collect();
     games.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
+    // P1: for every slug where several folders were in play, ship the choice
+    // and its reasons. This is the "why did it pick THIS folder" answer that
+    // used to die inside grade_and_rank_paths. Deduped per (slug, path) per
+    // process so the exempt channel doesn't fill with the same verdict every
+    // 10-minute tick.
+    for g in games.iter().filter(|g| g.found_paths.len() > 1) {
+        if matches!(g.source, DetectionSource::ManualOverride) {
+            continue;
+        }
+        let reason = g.path_reasons.first().cloned().unwrap_or_default();
+        crate::telemetry::ranked_choice(&g.slug, &g.found_paths[0], &reason);
+    }
+
+    // P9: evaluate already-tracked folders against the mirror rule. Fixing
+    // scoring does NOT heal rows tracked before the fix — run_scan skips
+    // tracked slugs entirely, so without this the mirror keeps uploading
+    // forever. Read-only: it warns, it never re-points.
+    let mirror_warnings = detect_tracked_mirrors(state, &games);
+    for w in &mirror_warnings {
+        tracing::warn!(
+            slug = %w.game_slug,
+            save_id = %w.save_id,
+            tracked = %w.tracked_path.display(),
+            suggested = %w.suggested_path.display(),
+            "tracked folder looks like the game's own backup mirror; suggest re-pointing"
+        );
+        crate::telemetry::tracked_mirror(&w.game_slug, &w.save_id, &w.tracked_path, &w.suggested_path);
+    }
+
     stats.duration_ms = wall.elapsed().as_millis() as u64;
     tracing::info!(
         detected = games.len(),
@@ -978,6 +1042,7 @@ where
         steam_apps_found: steam_apps.len(),
         scanned_at_ms: started,
         stats,
+        mirror_warnings,
     })
 }
 
@@ -1139,6 +1204,7 @@ fn apply_steam_name_fallback(
                 display_name: entry.display_name.clone(),
                 found_paths: Vec::new(),
                 path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
                 confidence: Confidence::Low,
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
@@ -1243,6 +1309,7 @@ fn apply_launcher_name_fallback(
                         display_name: entry.display_name.clone(),
                         found_paths: Vec::new(),
                         path_confidences: Vec::new(),
+                        path_reasons: Vec::new(),
                         confidence: Confidence::Low,
                         source: DetectionSource::SteamLibrary,
                         steam_app_id: None,
@@ -1391,6 +1458,7 @@ fn merge_fs_hit(
                     display_name,
                     found_paths: hits,
                     path_confidences: Vec::new(),
+                    path_reasons: Vec::new(),
                     confidence: Confidence::Medium,
                     source: DetectionSource::FilesystemHeuristic,
                     steam_app_id: None,
@@ -1560,7 +1628,34 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
             }
         }
     }
-    refined
+    // P2 (the incident's veto): a refined entry that is another entry's backup
+    // mirror — name-plus-suffix AND a content superset — is the game's own
+    // rotating copy, never the save. Dropped outright here so it can't reach
+    // `found_paths`, get probed for correlation, or lead auto-track. The
+    // superset condition is what makes the veto safe: without it a `-bak`
+    // folder that merely sits next to a save would be condemned by its name.
+    let mirrors: Vec<bool> = refined
+        .iter()
+        .map(|c| {
+            refined
+                .iter()
+                .any(|o| o != c && is_backup_mirror(c, o))
+        })
+        .collect();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(refined.len());
+    for (cand, is_mirror) in refined.into_iter().zip(mirrors) {
+        if is_mirror {
+            tracing::debug!(
+                path = %cand.display(),
+                "dropping candidate: it is the game's own backup mirror of another candidate"
+            );
+            continue;
+        }
+        if !kept.contains(&cand) {
+            kept.push(cand);
+        }
+    }
+    kept
 }
 
 /// El último segmento **habla** de saves sin ser una de las grafías exactas:
@@ -1644,6 +1739,7 @@ fn apply_manual_overrides(
                     display_name: entry.display_name.clone(),
                     found_paths: vec![path.clone()],
                     path_confidences: vec![Confidence::High],
+                    path_reasons: vec![String::new()],
                     confidence: Confidence::High,
                     source: DetectionSource::ManualOverride,
                     steam_app_id: entry.steam_app_id,
@@ -3520,18 +3616,221 @@ fn is_internal_or_trash(path: &Path) -> bool {
     })
 }
 
-/// Grade a single save folder with the same multi-signal scoring the
-/// discovery walk uses, but never drop it: an already-attributed catalog/Steam
-/// path stays in the list even when it scores low (it's a real candidate, just
-/// weak evidence — a near-empty Steam-Cloud stub *should* read `Low`).
-fn grade_path(path: &Path, store: &CorrelationStore) -> Confidence {
+/// Grade a single save folder, keeping the WHY. Catalog/Steam paths are never
+/// dropped here — an already-attributed path stays in the list even when it
+/// scores low (it's a real candidate, just weak evidence — a near-empty
+/// Steam-Cloud stub *should* read `Low`).
+fn grade_path_reasoned(path: &Path, store: &CorrelationStore) -> (Confidence, String) {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    classify_dir_as_save_like(path, name, store)
-        .map(|d| d.confidence)
-        .unwrap_or(Confidence::Low)
+    match classify_dir_as_save_like(path, name, store) {
+        Some(d) => (d.confidence, d.reason),
+        None => (
+            Confidence::Low,
+            "below the save-like floor (0.35): no name, content or recency signal".into(),
+        ),
+    }
+}
+
+/// Basenames of every regular file under `dir`, recursively. Bounded like the
+/// scoring scans (depth + shared budget) so a pathological tree can't turn a
+/// comparison into a walk of the whole drive; symlinks never count.
+///
+/// `false` means "unknown" — the budget ran out — and callers must treat that
+/// as NO answer: an incomplete listing must never decide a demotion.
+fn collect_file_basenames(dir: &Path, depth: usize, budget: &mut usize, out: &mut HashSet<String>) -> bool {
+    if depth == 0 || *budget == 0 {
+        return false;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return true; // unreadable = empty set, not unknown
+    };
+    for entry in read.flatten() {
+        if *budget == 0 {
+            return false;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            if !collect_file_basenames(&path, depth - 1, budget, out) {
+                return false;
+            }
+        } else if ft.is_file() {
+            *budget -= 1;
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                out.insert(name.to_lowercase());
+            }
+        }
+    }
+    true
+}
+
+/// Is `copy` the game's own backup mirror of `original`? (P2,
+/// DETECCION-REVISION §4 R3.) Two conditions, BOTH required:
+///
+/// * **Name relation**: some ancestor of `original` — the folder itself or a
+///   parent — sits next to `copy` and `copy` is its name plus a backup
+///   suffix. This covers both shapes: same-parent twins (`Saves` vs
+///   `SavesOld`) and the incident's shape, where the copy hugs the original
+///   from one level up (`SaveGames/<id>` vs `SaveGamesBackup`).
+/// * **Content superset**: every file basename under `original` also exists
+///   somewhere under `copy`. A rotating mirror accumulates copies, so it
+///   always holds for a live twin; two unrelated folders fail it. Names only,
+///   not sizes or hashes — each backup pass rewrites the saves, so bytes and
+///   sizes differ by design.
+///
+/// Either check failing (or being *unknowable* — budget exhausted) returns
+/// `false`: this function gates a demotion, so its false-positive cost is the
+/// expensive one. A `-bak` sibling without the content relation stays exactly
+/// where it was.
+pub(crate) fn is_backup_mirror(copy: &Path, original: &Path) -> bool {
+    use crate::junkdirs::{ends_with_backup_suffix, normalize_dir_name};
+    // Cheap gate first: no backup suffix on the copy, nothing to talk about.
+    if !ends_with_backup_suffix(
+        copy.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default(),
+    ) {
+        return false;
+    }
+    let copy_norm = normalize_dir_name(
+        copy.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default(),
+    );
+    let Some(copy_parent) = copy.parent() else {
+        return false;
+    };
+
+    // Deepest ancestor of `original` whose parent is `copy`'s parent and
+    // whose name (normalized) is a strict prefix of `copy`'s.
+    let mut anc = Some(original);
+    let mut name_related = false;
+    while let Some(a) = anc {
+        if a.parent() == Some(copy_parent) {
+            if let Some(an) = a.file_name().and_then(|s| s.to_str()) {
+                let an = normalize_dir_name(an);
+                if !an.is_empty()
+                    && copy_norm.len() > an.len()
+                    && copy_norm.starts_with(&an)
+                {
+                    name_related = true;
+                    break;
+                }
+            }
+        }
+        anc = a.parent();
+    }
+    if !name_related {
+        return false;
+    }
+
+    const NAMES_DEPTH: usize = 4;
+    let mut orig_budget: usize = 2048;
+    let mut orig_names: HashSet<String> = HashSet::new();
+    let mut copy_budget: usize = 4096;
+    let mut copy_names: HashSet<String> = HashSet::new();
+    if !collect_file_basenames(original, NAMES_DEPTH, &mut orig_budget, &mut orig_names) {
+        return false;
+    }
+    if orig_names.is_empty() {
+        // An empty "original" would make the superset vacuous and let any
+        // suffixed neighbour be condemned by nothing at all.
+        return false;
+    }
+    if !collect_file_basenames(copy, NAMES_DEPTH, &mut copy_budget, &mut copy_names) {
+        return false;
+    }
+    orig_names.iter().all(|n| copy_names.contains(n))
+}
+
+/// P9: check every tracked save against the mirror rule. A row tracked before
+/// the scoring fixes never gets re-evaluated by the pipeline (`run_scan`
+/// skips tracked slugs), so this is the only path that can notice "you are
+/// backing up `SaveGamesBackup` while your actual save sits next door".
+///
+/// Strictness mirrors [`grade_and_rank_paths`]: a warning needs either the
+/// full structural twin (name relation + content superset) or, weaker, just
+/// the suffix relation — the reason string says which one fired so the UI and
+/// support can weigh it. Purely read-only: repointing stays a user act.
+fn detect_tracked_mirrors(
+    state: &CliState,
+    games: &[DetectedGame],
+) -> Vec<MirrorWarning> {
+    let mut candidates: Vec<&PathBuf> = games
+        .iter()
+        .flat_map(|g| g.found_paths.iter())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+
+    let mut out = Vec::new();
+    for (save_id, s) in state.saves.iter() {
+        if s.paused {
+            continue;
+        }
+        let tracked = &s.local_path;
+        // The mirror rule compares against OTHER folders; a candidate inside
+        // (or containing) the tracked folder is not a sibling, it is the same
+        // data at a different granularity.
+        let mut best_strict: Option<&PathBuf> = None;
+        let mut best_name_only: Option<&PathBuf> = None;
+        for cand in &candidates {
+            if *cand == tracked || paths_overlap(cand, tracked) {
+                continue;
+            }
+            if is_backup_mirror(tracked, cand) {
+                best_strict = Some(cand);
+                break; // sorted: deterministic pick
+            }
+            // Name-only relation: the suffix half of the rule without the
+            // superset. Weaker evidence, kept separately.
+            use crate::junkdirs::{ends_with_backup_suffix, normalize_dir_name};
+            let tn = tracked
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(normalize_dir_name)
+                .unwrap_or_default();
+            let cn = cand
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(normalize_dir_name)
+                .unwrap_or_default();
+            if ends_with_backup_suffix(
+                tracked
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default(),
+            ) && !cn.is_empty()
+                && tn.starts_with(&cn)
+                && tn.len() > cn.len()
+            {
+                best_name_only = Some(cand);
+            }
+        }
+        if let Some(suggested) = best_strict.or(best_name_only) {
+            let strict = best_strict.is_some();
+            out.push(MirrorWarning {
+                save_id: save_id.clone(),
+                game_slug: s.game_slug.clone(),
+                label: s.label.clone(),
+                tracked_path: tracked.clone(),
+                suggested_path: (*suggested).clone(),
+                reason: format!(
+                    "{} of {}",
+                    if strict { "mirror" } else { "name-only" },
+                    suggested.display()
+                ),
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.game_slug, &a.save_id).cmp(&(&b.game_slug, &b.save_id)));
+    out
 }
 
 /// Re-score every game's `found_paths`, sort them strongest-first, and fill
@@ -3545,27 +3844,52 @@ fn grade_and_rank_paths(
     for g in by_slug.values_mut() {
         if g.found_paths.is_empty() {
             g.path_confidences.clear();
+            g.path_reasons.clear();
             continue;
         }
         if matches!(g.source, DetectionSource::ManualOverride) || g.found_paths.len() == 1 {
-            // Trust the existing grade; just make the parallel vec match.
+            // Trust the existing grade; just make the parallel vecs match.
             g.path_confidences = vec![g.confidence; g.found_paths.len()];
+            g.path_reasons = vec![String::new(); g.found_paths.len()];
             continue;
         }
-        let mut graded: Vec<(PathBuf, Confidence)> = g
+        let graded: Vec<(PathBuf, Confidence, String)> = g
             .found_paths
             .iter()
-            .map(|p| (p.clone(), grade_path(p, store)))
+            .map(|p| {
+                let (c, r) = grade_path_reasoned(p, store);
+                (p.clone(), c, r)
+            })
             .collect();
-        // Strongest first; stable so equal grades keep discovery order.
-        graded.sort_by_key(|p| std::cmp::Reverse(confidence_rank(p.1)));
-        g.confidence = graded
+        // P2: a backup mirror of ANOTHER candidate never leads, even when its
+        // confidence would tie or win — the mirror is written constantly, so
+        // correlation loves it, and that is precisely the Wukong failure.
+        // Stable sort keeps discovery order everywhere else.
+        let mirrors: Vec<bool> = graded
             .iter()
-            .map(|(_, c)| *c)
+            .map(|(p, _, _)| {
+                graded
+                    .iter()
+                    .any(|(q, _, _)| q != p && is_backup_mirror(p, q))
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..graded.len()).collect();
+        order.sort_by_key(|&i| {
+            (
+                mirrors[i],
+                std::cmp::Reverse(confidence_rank(graded[i].1)),
+            )
+        });
+        let ranked: Vec<_> = order.iter().map(|&i| graded[i].clone()).collect();
+
+        g.confidence = ranked
+            .iter()
+            .map(|(_, c, _)| *c)
             .max_by_key(|c| confidence_rank(*c))
             .unwrap_or(g.confidence);
-        g.found_paths = graded.iter().map(|(p, _)| p.clone()).collect();
-        g.path_confidences = graded.into_iter().map(|(_, c)| c).collect();
+        g.found_paths = ranked.iter().map(|(p, _, _)| p.clone()).collect();
+        g.path_confidences = ranked.iter().map(|(_, c, _)| *c).collect();
+        g.path_reasons = ranked.iter().map(|(_, _, r)| r.clone()).collect();
     }
 }
 
@@ -3726,6 +4050,7 @@ mod tests {
                 display_name: "X".into(),
                 found_paths: Vec::new(),
                 path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
                 confidence: Confidence::Medium,
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(42),
@@ -4092,6 +4417,7 @@ mod tests {
                 display_name: "Test Game".into(),
                 found_paths: Vec::new(),
                 path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
                 confidence: Confidence::Medium,
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(999),
@@ -4189,6 +4515,7 @@ mod tests {
                 display_name: "Stellaris".into(),
                 found_paths: vec![PathBuf::from("/wrong/path")],
                 path_confidences: vec![Confidence::Medium],
+                path_reasons: vec![String::new()],
                 confidence: Confidence::Medium,
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: Some(281990),
@@ -4239,6 +4566,7 @@ mod tests {
                 display_name: "Factorio".into(),
                 found_paths: vec![real.clone()],
                 path_confidences: vec![Confidence::High],
+                    path_reasons: vec![String::new()],
                 confidence: Confidence::High,
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
@@ -4267,6 +4595,7 @@ mod tests {
                 display_name: "Stellaris".into(),
                 found_paths: vec![a.clone(), b.clone()],
                 path_confidences: vec![Confidence::Medium, Confidence::Low],
+                path_reasons: vec![String::new(), String::new()],
                 confidence: Confidence::Medium,
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
@@ -5316,5 +5645,229 @@ mod tests {
         assert!(
             ludusavi::find_by_name_prefix("Fallout New Vegas").is_none_or(|e| e.slug != "fallout")
         );
+    }
+
+    // ---- P2/P9: backup mirrors (DETECCION-REVISION §4 R3, §8) -------------
+    //
+    // Every fixture lives in a tempdir and touches neither the catalog nor
+    // XDG_CACHE_HOME: the only input is the tree it builds itself. That
+    // isolation is deliberate — a refreshed `~/.cache/hoard` has silently
+    // decided other tests in this file before.
+
+    /// A tree with `n` saves sharing their names under each given root.
+    fn write_saves(base: &std::path::Path, files: &[&str]) {
+        for f in files {
+            let p = base.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+    }
+
+    fn tracked_state(slug: &str, label: &str, path: &Path) -> CliState {
+        let mut state = CliState::default();
+        state.saves.insert(
+            "save-1".to_string(),
+            crate::state::SaveState {
+                local_path: path.to_path_buf(),
+                game_slug: slug.to_string(),
+                label: label.to_string(),
+                last_backup_at: None,
+                last_version_num: None,
+                paused: false,
+                preset: None,
+                allow_device_local: None,
+                set_hash: None,
+                processes: Vec::new(),
+                shared_processes: false,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn mirror_needs_suffix_relation_and_content_superset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("Saves");
+        let twin = tmp.path().join("SavesOld");
+        write_saves(&orig, &["slot1.sav", "slot2.sav", "slot3.sav"]);
+        write_saves(&twin, &["slot1.sav", "slot2.sav", "slot3.sav"]);
+
+        assert!(is_backup_mirror(&twin, &orig), "full twin must match");
+        assert!(
+            !is_backup_mirror(&orig, &twin),
+            "the relation is directed: the ORIGINAL never mirrors its copy"
+        );
+
+        // Prefix, not suffix: `BackupSaves` next to `Saves` is no twin.
+        let prefixed = tmp.path().join("BackupSaves");
+        write_saves(&prefixed, &["slot1.sav"]);
+        assert!(!is_backup_mirror(&prefixed, &orig));
+    }
+
+    #[test]
+    fn wukong_shape_mirror_is_recognised_across_two_levels() {
+        // The incident's exact shape: the copy wraps the real save's parent,
+        // and its saves hang two levels further down inside it.
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = tmp.path().join("Saved");
+        let real = saved.join("SaveGames").join("76561199002555123");
+        let mirror = saved.join("SaveGamesBackup");
+        write_saves(&real, &["slot.sav", "profile.sav", "meta.sav"]);
+        write_saves(
+            &mirror.join("01RealtimeBackup").join("2026-08-20_104233"),
+            &["slot.sav", "profile.sav", "meta.sav"],
+        );
+        write_saves(
+            &mirror.join("02HourlyBackup").join("2026-08-20_110000"),
+            &["slot.sav", "profile.sav", "meta.sav"],
+        );
+        assert!(is_backup_mirror(&mirror, &real));
+    }
+
+    #[test]
+    fn a_bak_sibling_without_the_content_relation_is_not_a_mirror() {
+        // The negative case that makes the veto safe: `-bak` with no superset
+        // (aquí ni siquiera contiene un save) no altera nada.
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("NobodyT");
+        let bak = tmp.path().join("NobodyT-bak");
+        write_saves(&orig, &["slot.sav"]);
+        write_saves(&bak, &["notes.txt"]);
+
+        assert!(!is_backup_mirror(&bak, &orig));
+    }
+
+    #[test]
+    fn an_empty_original_cannot_condemn_its_suffixed_neighbour() {
+        // With no content to compare, the superset would hold vacuously and
+        // any suffixed sibling would be condemned by nothing at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("Saves");
+        std::fs::create_dir_all(&orig).unwrap();
+        let twin = tmp.path().join("SavesOld");
+        write_saves(&twin, &["whatever.sav"]);
+        assert!(!is_backup_mirror(&twin, &orig));
+    }
+
+    /// The incident fixture down the refinement path: the mirror arrives as a
+    /// catalog hit and must not come out of `refine_save_dir` alive.
+    #[test]
+    fn refine_drops_the_wukong_mirror_but_keeps_the_real_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = tmp.path().join("Saved");
+        let real_dir = saved.join("SaveGames").join("76561199002555123");
+        let mirror = saved.join("SaveGamesBackup");
+        write_saves(&real_dir, &["slot.sav", "profile.sav", "meta.sav"]);
+        write_saves(
+            &mirror.join("02HourlyBackup").join("2026-08-20_104233"),
+            &["slot.sav", "profile.sav", "meta.sav"],
+        );
+        // Exactly as the pipeline delivers them: the `*.sav` template yields
+        // the FILE, and `SaveGamesBackup` the whole directory.
+        let hits = vec![
+            real_dir.join("slot.sav"),
+            mirror.clone(),
+        ];
+        let refined = refine_save_dir("black-myth-wukong", hits);
+        assert_eq!(
+            refined,
+            vec![real_dir.clone()],
+            "the mirror must be gone and the real save kept"
+        );
+    }
+
+    /// Brief check 3: with both folders candidate, the real one leads
+    /// `found_paths` even when the mirror ties on confidence, and the
+    /// razones viajan alineadas (P1).
+    #[test]
+    fn wukong_ranking_leads_with_the_real_save_and_records_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("SaveGames").join("76561199002555123");
+        let mirror = tmp.path().join("SaveGamesBackup");
+        write_saves(&real, &["slot.sav", "profile.sav", "meta.sav"]);
+        write_saves(
+            &mirror.join("01RealtimeBackup").join("2026-08-20_104233"),
+            &["slot.sav", "profile.sav", "meta.sav"],
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "black-myth-wukong".to_string(),
+            DetectedGame {
+                slug: "black-myth-wukong".into(),
+                display_name: "Black Myth: Wukong".into(),
+                // Catalog discovery order: the mirror came first. Ranking has
+                // to correct that.
+                found_paths: vec![mirror.clone(), real.clone()],
+                path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
+                confidence: Confidence::Medium,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: Some(2358720),
+                install_dir: None,
+                steam_cloud: true,
+            },
+        );
+        grade_and_rank_paths(&mut map, &CorrelationStore::default());
+        let g = &map["black-myth-wukong"];
+        assert_eq!(g.found_paths[0], real, "the real save leads");
+        assert_eq!(g.found_paths[1], mirror, "the mirror falls behind");
+        assert_eq!(g.found_paths.len(), g.path_confidences.len());
+        assert_eq!(g.found_paths.len(), g.path_reasons.len());
+        // P1: the winner's reason explains the pick — it is not empty.
+        assert!(
+            !g.path_reasons[0].is_empty(),
+            "the leading path must carry its why"
+        );
+    }
+
+    /// Brief check 5: a row ALREADY tracking the mirror produces the warning
+    /// pointing at the right sibling, without mutating any state.
+    #[test]
+    fn a_tracked_mirror_warns_with_the_right_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("Saved").join("SaveGames").join("uid1");
+        let mirror = tmp.path()
+            .join("Saved")
+            .join("SaveGamesBackup");
+        write_saves(&real, &["slot.sav", "profile.sav", "meta.sav"]);
+        write_saves(
+            &mirror.join("03DailyBackup").join("2026-08-20"),
+            &["slot.sav", "profile.sav", "meta.sav"],
+        );
+        let state = tracked_state("black-myth-wukong", "main", &mirror);
+        let games = vec![DetectedGame {
+            slug: "black-myth-wukong".into(),
+            display_name: "Black Myth: Wukong".into(),
+            found_paths: vec![real.clone()],
+            path_confidences: vec![Confidence::High],
+            path_reasons: Vec::new(),
+            confidence: Confidence::High,
+            source: DetectionSource::FilesystemHeuristic,
+            steam_app_id: Some(2358720),
+            install_dir: None,
+            steam_cloud: true,
+        }];
+        let warnings = detect_tracked_mirrors(&state, &games);
+        assert_eq!(warnings.len(), 1, "one warning for the tracked mirror");
+        let w = &warnings[0];
+        assert_eq!(w.save_id, "save-1");
+        assert_eq!(w.tracked_path, mirror);
+        assert_eq!(w.suggested_path, real, "must point at the REAL sibling");
+        assert!(w.reason.starts_with("mirror of"));
+        // Read-only by construction (&CliState); the assert makes it explicit.
+        assert_eq!(
+            state.saves["save-1"].local_path, mirror,
+            "nothing may re-point the row by itself"
+        );
+    }
+
+    #[test]
+    fn a_tracked_folder_without_a_better_sibling_stays_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("saves");
+        write_saves(&real, &["slot.sav"]);
+        let state = tracked_state("factorio", "main", &real);
+        let warnings = detect_tracked_mirrors(&state, &[]);
+        assert!(warnings.is_empty());
     }
 }

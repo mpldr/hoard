@@ -34,9 +34,11 @@
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import SaveGameCard from "../lib/components/SaveGameCard.svelte";
+  import MirrorWarningBanner from "../lib/components/MirrorWarningBanner.svelte";
   import * as api from "../lib/api";
-  import type { EngineDownReason, TrackedSave } from "../lib/api";
-  import { refreshQuota, signOut } from "../lib/stores/auth";
+  import type { EngineDownReason, MirrorWarning, TrackedSave } from "../lib/api";
+  import { auth, refreshQuota, signOut } from "../lib/stores/auth";
+  import { storageGamesCloud } from "../lib/stores/cloud";
   import { activity, status } from "../lib/stores/agent";
   import {
     customNames,
@@ -119,14 +121,84 @@
       if (!countsRequested.has(s.save_id) || changed) {
         countsRequested.add(s.save_id);
         void fetchVersions(s.save_id);
+        anyChanged ||= changed;
       }
     }
+    // A committed version moves the footprint too. One call for the whole
+    // batch, not one per save: the endpoint is account-wide.
+    if (anyChanged) void fetchFootprints();
   });
 
-  // Summary-bar aggregates.
-  const totalSize = $derived(
+  // ---------------------------------------------------------------------
+  // Real cloud footprint, per save and account-wide.
+  //
+  // The manifest only carries each save's HEAD version (`total_size_bytes`),
+  // so summing it answers "what would a restore pull down", never "what am I
+  // storing" — version history is forever, and a game whose folder is
+  // rewritten wholesale each save can hold many times its head size. Showing
+  // the head sum next to the sidebar's quota bar put two contradictory
+  // totals on the same screen; a user with 34.9 MB of heads and 79 MB of
+  // quota reasonably read it as a billing bug.
+  //
+  // `/v1/cloud/storage/games` already computes the honest number (it drives
+  // the "free up space" dialog): per save, its exclusive deduplicated blobs.
+  // Cloud-only — self-hosted has no quota and no black box, so there we keep
+  // falling back to the head sum.
+  // ---------------------------------------------------------------------
+  let footprints = $state<Record<string, number>>({});
+  let cloudUsed = $state<number | null>(null);
+  let footprintsLoaded = $state(false);
+
+  // Backup-mirror warnings for saves already tracked (P9). Read from the scan
+  // cache rather than triggering a scan: the tick refreshes it every 10 min
+  // anyway, and the panel must not pay for a detection pass on mount.
+  let mirrorWarnings = $state<MirrorWarning[]>([]);
+
+  async function loadMirrorWarnings() {
+    try {
+      const report = await api.cachedDetection();
+      mirrorWarnings = report?.mirror_warnings ?? [];
+    } catch {
+      // No cache yet (first run) or unreadable: nothing to warn about that we
+      // can prove, so stay quiet rather than guess.
+      mirrorWarnings = [];
+    }
+  }
+
+  async function fetchFootprints() {
+    // Cloud only. Self-hosted (and signed out) settle straight into "asked and
+    // there's nothing", so `undefined` keeps meaning "still loading" and the
+    // cards don't sit on a spinner that will never resolve.
+    if ($auth.user?.is_local_server !== false) {
+      footprintsLoaded = true;
+      return;
+    }
+    try {
+      const s = await storageGamesCloud();
+      const next: Record<string, number> = {};
+      for (const g of s.games) next[g.save_id] = g.freeable_bytes;
+      // Blobs two live saves share belong to neither's exclusive footprint,
+      // so the per-card figures fall short of the account total by exactly
+      // this much. Kept aside rather than smeared across the cards: the
+      // account total has to keep matching the quota bar to the byte.
+      footprints = next;
+      cloudUsed = s.used_bytes;
+      footprintsLoaded = true;
+    } catch {
+      // Offline / signed out: the cards fall back to their head size and the
+      // summary keeps summing those. No error surfaced — this is a nicety on
+      // a view that must still render.
+      footprintsLoaded = true;
+    }
+  }
+
+  // Summary-bar aggregates. Prefer the account's real deduped footprint (the
+  // same number the quota bar shows) and only fall back to the head sum when
+  // it isn't available.
+  const headSize = $derived(
     saves.reduce((sum, s) => sum + (s.total_size_bytes ?? 0), 0),
   );
+  const totalSize = $derived(cloudUsed ?? headSize);
   const totalVersions = $derived.by(() => {
     let sum = 0;
     let seen = false;
@@ -306,6 +378,8 @@
     } finally {
       loading = false;
     }
+    void fetchFootprints();
+    void loadMirrorWarnings();
   });
 
   /** Which sentence explains an engine that isn't up. An older service (or a
@@ -423,6 +497,22 @@
        reason (`AgentStatus.reason`); this banner says it and offers the one
        action that fixes the session cases. The generic line stays as the
        fallback for an older service or an unclassified failure. -->
+  <!-- Above the offline banner on purpose: the service being down is a
+       transient the user already knows about, while syncing the wrong folder
+       has been quietly costing them quota for weeks. -->
+  {#if !loading && mirrorWarnings.length > 0}
+    <MirrorWarningBanner
+      warnings={mirrorWarnings}
+      {footprints}
+      onFixed={async () => {
+        saves = await api.listTrackedSaves();
+        await loadMirrorWarnings();
+        void fetchFootprints();
+        void refreshQuota();
+      }}
+    />
+  {/if}
+
   {#if !loading && !$status.running}
     <div
       class="mb-5 flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-200"

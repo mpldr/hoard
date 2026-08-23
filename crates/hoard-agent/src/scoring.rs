@@ -388,6 +388,36 @@ pub fn score_dir(path: &Path, name: &str) -> ScoreBreakdown {
         reasons.push("recent save-like file".into());
     }
 
+    // COPY name (P3, DETECCION-REVISION §8): a directory whose name ENDS in a
+    // backup suffix (`SaveGamesBackup`, `SavesOld`, `NobodyT-bak`) is the
+    // game's own archive rather than its save — but only when it also holds
+    // rotating content (≥3 strong saves here or one level down). Suffix, never
+    // prefix: `BackupSaves` pays nothing. Without the content gate a real
+    // folder with an unlucky name would lose 0.20 for free; with it, the
+    // Wukong case drops 0.50 → 0.30 and falls below the candidate floor.
+    //
+    // Note this penalty does NOT by itself rank the mirror under the real
+    // save: it cancels the +0.20 the mirror got for containing "savegames"
+    // and the two TIE. What actually reorders them is the structural veto in
+    // `detection::is_backup_mirror`. Removing the cushion is not choosing.
+    //
+    // And it is capped at the bonus the name actually earned, never taking a
+    // folder net-negative. The catalog lists plenty of games whose ONLY save
+    // path is literally a `backup/` — Don't Starve Together, NIMBY Rails,
+    // Morbid, Isles of Sea and Sky, The Last Caretaker. Those names score
+    // nothing positive to begin with (`backup` is not in the vocabulary), so
+    // a flat −0.20 would push the one real folder under the 0.35 floor and
+    // lose the game outright. Cancelling a cushion is defensible; inventing a
+    // debt is not.
+    let suffix_penalty = name_pos.min(0.20);
+    if suffix_penalty > 0.0
+        && strong_total >= STRONG_ROTATING_MIN
+        && crate::junkdirs::ends_with_backup_suffix(name)
+    {
+        score -= suffix_penalty;
+        reasons.push("backup-suffix name on rotating content".into());
+    }
+
     // Negativas de contenido + hard rule (§4): una carpeta sólo-imágenes o
     // sólo-ruido (config/log) NUNCA se auto-confirma, por más que el nombre
     // matchee.
@@ -588,6 +618,116 @@ mod archive_tests {
         // Carpeta sin nombre-save: un zip de fotos no debe puntuar como save.
         let b = score_dir(dir.path(), "downloads");
         assert!(b.score < SCORE_POSSIBLE, "score {} too high", b.score);
+    }
+}
+
+#[cfg(test)]
+mod backup_suffix_tests {
+    use super::*;
+
+    /// Fixture: `n` strong-extension saves sitting directly in the folder.
+    fn dir_with_strong_saves(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..n {
+            std::fs::write(dir.path().join(format!("slot{i}.sav")), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// P3: the copy suffix only penalises alongside rotating content, and a
+    /// prefix never does. Each pair shares a name-signal class so the delta
+    /// isolates the penalty and nothing else.
+    #[test]
+    fn suffix_penalises_but_only_with_rotating_content() {
+        let rotating = dir_with_strong_saves(4);
+        let lonely = dir_with_strong_saves(1);
+
+        // Same content, copy name vs original name (both +0.20 from the
+        // substring): the mirror loses exactly the 0.20 of the penalty.
+        let mirror = score_dir(rotating.path(), "savegamesxbackup");
+        let plain = score_dir(rotating.path(), "savegamesx");
+        assert!(
+            mirror.reasons.iter().any(|r| r.contains("backup-suffix")),
+            "expected the penalty reason: {:?}",
+            mirror.reasons
+        );
+        assert!((mirror.score - (plain.score - 0.20)).abs() < 1e-5);
+
+        // A single strong save is NOT rotation: no penalty.
+        let lone_mirror = score_dir(lonely.path(), "savegamesxbackup");
+        let lone_plain = score_dir(lonely.path(), "savegamesx");
+        assert_eq!(lone_mirror.score, lone_plain.score);
+        assert!(
+            !lone_mirror
+                .reasons
+                .iter()
+                .any(|r| r.contains("backup-suffix"))
+        );
+    }
+
+    #[test]
+    fn prefix_never_penalises() {
+        let dir = dir_with_strong_saves(4);
+        // `BackupSaves` shape: the suffix rules, and here it isn't at the end.
+        let prefixed = score_dir(dir.path(), "backupsavesgamesx");
+        let plain = score_dir(dir.path(), "savesgamesx2");
+        assert!(
+            !prefixed.reasons.iter().any(|r| r.contains("backup-suffix")),
+            "prefix must not be penalised: {:?}",
+            prefixed.reasons
+        );
+        assert_eq!(prefixed.score, plain.score);
+    }
+
+    #[test]
+    fn wukong_shape_loses_its_static_edge_over_the_real_save() {
+        // The incident's shape: the mirror carried a +0.20 name bonus the
+        // real save (a numeric id) never had. The penalty cancels it exactly,
+        // so with equal strong content the two TIE — and the tiebreak falls to
+        // discovery order (the real one comes first in the catalog) or to P2's
+        // structural veto. This test asserts the tie on purpose: an earlier
+        // run claimed the mirror ended up lower, and it does not.
+        let mirror_dir = dir_with_strong_saves(4);
+        let real_dir = dir_with_strong_saves(4);
+        let mirror = score_dir(mirror_dir.path(), "SaveGamesBackup");
+        let real = score_dir(real_dir.path(), "76561199002555123");
+        assert!(
+            mirror.reasons.iter().any(|r| r.contains("backup-suffix")),
+            "mirror must carry the penalty: {:?}",
+            mirror.reasons
+        );
+        assert!(
+            (mirror.score - real.score).abs() < 1e-5,
+            "penalty must neutralise the name edge: mirror {} vs real {}",
+            mirror.score,
+            real.score
+        );
+    }
+
+    /// The catalog lists games whose ONLY save path is a folder literally
+    /// called `backup`: Don't Starve Together, NIMBY Rails, Morbid, Isles of
+    /// Sea and Sky, The Last Caretaker. They earn no name bonus (`backup` is
+    /// not in the vocabulary), so a flat penalty would take them net-negative
+    /// and drop the game's one real folder under the candidate floor. The
+    /// penalty is capped at the bonus actually granted, so these are untouched.
+    #[test]
+    fn a_lone_backup_folder_is_never_pushed_under_the_floor() {
+        let dir = dir_with_strong_saves(4);
+        for name in ["backup", "backups", "save_backups", "SaveGameBackups"] {
+            let scored = score_dir(dir.path(), name);
+            let neutral = score_dir(dir.path(), "zzqqx");
+            assert!(
+                scored.score >= neutral.score,
+                "{name} must not score below a meaningless name: {} vs {}",
+                scored.score,
+                neutral.score
+            );
+            assert!(
+                scored.score >= SCORE_POSSIBLE,
+                "{name} is a real game's only save folder and must stay a candidate: {}",
+                scored.score
+            );
+        }
     }
 }
 

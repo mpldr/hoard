@@ -2314,6 +2314,7 @@ mod tests {
                 found_paths: vec![PathBuf::from(path)],
                 confidence: Confidence::High,
                 path_confidences: vec![Confidence::High],
+                path_reasons: vec![String::new()],
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
@@ -2323,6 +2324,7 @@ mod tests {
             steam_apps_found: 0,
             scanned_at_ms: 0,
             stats: DetectionStats::default(),
+            mirror_warnings: Vec::new(),
         }
     }
 
@@ -2823,6 +2825,7 @@ mod tests {
             found_paths: paths.iter().map(PathBuf::from).collect(),
             confidence: rolled,
             path_confidences: per_path.to_vec(),
+            path_reasons: vec![String::new(); per_path.len()],
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: None,
             install_dir: None,
@@ -2837,6 +2840,7 @@ mod tests {
             steam_apps_found: 0,
             scanned_at_ms: 0,
             stats: DetectionStats::default(),
+            mirror_warnings: Vec::new(),
         }
     }
 
@@ -3046,6 +3050,7 @@ mod tests {
             display_name: slug.into(),
             found_paths: paths.iter().map(PathBuf::from).collect(),
             path_confidences: vec![Confidence::High; paths.len()],
+            path_reasons: vec![String::new(); paths.len()],
             confidence: Confidence::High,
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: None,
@@ -3061,6 +3066,7 @@ mod tests {
             steam_apps_found: 0,
             scanned_at_ms: 0,
             stats: Default::default(),
+            mirror_warnings: Vec::new(),
         }
     }
 

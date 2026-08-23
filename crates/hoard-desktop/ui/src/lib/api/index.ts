@@ -135,6 +135,29 @@ export type DetectionReport = {
    * and diagnostics. Optional: cached reports from older builds lack it.
    */
   stats?: Record<string, number>;
+  /**
+   * Saves already tracked whose folder looks like the game's OWN backup
+   * mirror, with what looks like the real save sitting next to it.
+   *
+   * Detection never revisits a folder once it's tracked (`run_scan` skips
+   * tracked slugs), so fixing the scoring doesn't repoint anybody: this is
+   * the only thing that can tell an affected user their backups are the only
+   * thing syncing. Optional — reports cached by older builds lack it.
+   */
+  mirror_warnings?: MirrorWarning[];
+};
+
+/** A tracked folder that looks like a backup mirror, plus the sibling that
+ *  looks like the real save. Purely advisory: repointing is a user act. */
+export type MirrorWarning = {
+  save_id: string;
+  game_slug: string;
+  label: string;
+  tracked_path: string;
+  suggested_path: string;
+  /** Which evidence fired — the full structural twin, or only the name
+   *  relation. Shown so the user can weigh a weaker match. */
+  reason: string;
 };
 
 export type ScanProgress = {

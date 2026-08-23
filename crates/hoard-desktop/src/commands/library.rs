@@ -205,6 +205,7 @@ pub async fn scan_folder(path: String) -> Result<Vec<DetectedGame>, String> {
                 display_name: a.display_name,
                 found_paths: vec![a.path],
                 path_confidences: vec![a.confidence],
+                path_reasons: vec![a.reason],
                 confidence: a.confidence,
                 source: DetectionSource::FilesystemHeuristic,
                 // Puesto sólo cuando la atribución cayó en una entrada del

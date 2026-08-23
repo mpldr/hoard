@@ -92,6 +92,72 @@ pub fn looks_like_save_dir_name(name: &str) -> bool {
     !is_cache_dir_name(name) && normalize_dir_name(name).contains("save")
 }
 
+/// Suffixes that give away a COPY of saves rather than the live save:
+/// `SaveGamesBackup`, `SavesOld`, `NobodyT-bak`. Suffix, never prefix —
+/// `BackupSaves` is a save folder with an odd prefix and must not match.
+///
+/// [`normalize_dir_name`] has already eaten the separators by the time we
+/// compare, so `_bak`, `-bak` and `.bak` all arrive as `…bak`. `old` is the
+/// one risky term (any word ending in -old matches), which is why callers
+/// treat this as a weak signal — a penalty or a warning — and never as a veto
+/// on its own (see `scoring::score_dir` and `detection::is_backup_mirror`).
+pub const BACKUP_DIR_SUFFIXES: &[&str] = &["backup", "backups", "bak", "old"];
+
+/// The subset that needs a word boundary to count. `backup`/`backups`/`bak`
+/// are unambiguous enough to match even when a name runs straight into them
+/// (`savegamesbackup`): checked against the whole catalog, every leaf ending
+/// in those letters really is a copy. `old` is the opposite — it is the tail
+/// of ordinary words, and demanding the boundary is the only thing standing
+/// between the rule and `Stranglehold`.
+const BOUNDED_SUFFIXES: &[&str] = &["old"];
+
+/// `true` when the name ends in a copy suffix **at a real word boundary**.
+///
+/// The boundary is the whole point. Matching the bare letters against a
+/// separator-stripped name is what a first cut did, and the catalog is full of
+/// counter-examples it would have condemned: `Sunday Gold`, `Stranglehold`,
+/// `Stikbold`, `Defold`, `Making History Gold`, `Castle of Heart_ Retold` —
+/// and `wildlife-park-gold-remastered`, whose only save path is a `savegold/`
+/// folder of `.sav` files that clears the rotating-content gate and would have
+/// eaten the penalty for nothing. All of them merely *end in the letters*
+/// "old".
+///
+/// So an ambiguous suffix ([`BOUNDED_SUFFIXES`]) counts only when the name IS
+/// it (`old`), or when what precedes it is a separator (`Saves_Old`) or a case
+/// change (`SavesOld`). Lowercase letters running straight into it are part of
+/// a longer word, not a marker. The unambiguous ones match either way.
+pub fn ends_with_backup_suffix(name: &str) -> bool {
+    let raw: Vec<char> = name.chars().collect();
+    let lower: String = name.to_lowercase();
+    for suf in BACKUP_DIR_SUFFIXES {
+        let Some(head) = lower.strip_suffix(suf) else {
+            continue;
+        };
+        // The whole name is the suffix.
+        if head.is_empty() {
+            return true;
+        }
+        if !BOUNDED_SUFFIXES.contains(suf) {
+            return true;
+        }
+        // `head` is a char-count prefix only while the name is ASCII, which
+        // every one of these markers is; index defensively all the same.
+        let cut = head.chars().count();
+        let Some(&prev) = raw.get(cut.wrapping_sub(1)) else {
+            continue;
+        };
+        if matches!(prev, ' ' | '_' | '-' | '.') {
+            return true;
+        }
+        // Case change: `SaveGames|Backup`. The suffix's own first character
+        // must be the uppercase one, or we are inside a word.
+        if prev.is_lowercase() && raw.get(cut).is_some_and(|c| c.is_uppercase()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Profundidad máxima bajo la raíz de instalación. Llega a los layouts que
 /// los juegos usan de verdad (`<install>/savegames/<id>`,
 /// `<install>/Binaries/Saves`) sin pasear un árbol de assets entero.
@@ -513,6 +579,66 @@ mod tests {
         }
         for n in ["config", "binaries", "shaders"] {
             assert!(!looks_like_save_dir_name(n));
+        }
+    }
+
+    #[test]
+    fn backup_suffix_matches_only_at_the_end() {
+        // Suffix: yes, whatever the separator or case — including the bare
+        // word `Backup`, which IS the suffix.
+        for n in [
+            "SaveGamesBackup",
+            "saves_backup",
+            "Saves-Backup",
+            "NobodyT-bak",
+            "slot.bak",
+            "SavesOld",
+            "backups",
+            "Backup",
+        ] {
+            assert!(ends_with_backup_suffix(n), "{n} ends in a copy suffix");
+        }
+        // Prefix or unrelated word: NO. `BackupSaves` is a save folder.
+        for n in ["BackupSaves", "saves", "SaveGames", "autosave"] {
+            assert!(!ends_with_backup_suffix(n), "{n} is not a copy by name");
+        }
+    }
+
+    /// The names below are not invented: every one is a real save-folder leaf
+    /// from the Ludusavi catalog whose letters happen to end in "old". A first
+    /// cut of this rule compared the separator-stripped name and condemned all
+    /// of them. `savegold` is the one that proves the cost — it is
+    /// `wildlife-park-gold-remastered`'s ONLY save path, a folder of `.sav`
+    /// files that clears the rotating-content gate, so the penalty would have
+    /// applied with nothing to back it up.
+    ///
+    /// A regression here is invisible to the name-recall benchmark (that one
+    /// measures the positive vocabulary, which this rule never touches), so
+    /// the corpus has to live as its own test.
+    #[test]
+    fn real_catalog_names_ending_in_old_are_not_copies() {
+        for n in [
+            "Sunday Gold",
+            "Making History Gold",
+            "Trolley_Gold",
+            "Hegemony Gold",
+            "savegold",
+            "rescuequestgold",
+            "Stranglehold",
+            "Stikbold",
+            "Faerie Solitaire Harvest Defold",
+            "Castle of Heart_ Retold",
+            "jp.konami.mac.FroggerTTGold",
+            "Blake Stone - Aliens of Gold",
+        ] {
+            assert!(
+                !ends_with_backup_suffix(n),
+                "{n} is a real game's save folder, not a backup copy"
+            );
+        }
+        // The boundary is what separates them from the genuine articles.
+        for n in ["Saves_Old", "SavesOld", "saves old", "old"] {
+            assert!(ends_with_backup_suffix(n), "{n} really is a copy marker");
         }
     }
 

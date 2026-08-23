@@ -102,7 +102,29 @@ struct LudusaviEntry {
     files: BTreeMap<String, LudusaviPath>,
     steam: Option<LudusaviSteamRef>,
     gog: Option<LudusaviStoreRef>,
+    cloud: Option<LudusaviCloud>,
     notes: Option<String>,
+}
+
+/// `cloud:` — which storefronts sync this game themselves. Distinct from
+/// `steam:`/`gog:`, which only say the game is *sold* there. Deriving the
+/// former from the latter is what made the `games` table claim Steam Cloud
+/// for every game with an appid.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct LudusaviCloud {
+    steam: bool,
+    gog: bool,
+}
+
+impl LudusaviEntry {
+    /// `(steam, gog)` — whether each storefront syncs this game itself. A
+    /// missing `cloud:` block means neither does.
+    fn cloud_flags(&self) -> (bool, bool) {
+        self.cloud
+            .as_ref()
+            .map_or((false, false), |c| (c.steam, c.gog))
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -205,8 +227,9 @@ async fn do_import(
         seen_slugs.push(slug.clone());
 
         let paths_json = serde_json::to_string(&paths)?;
-        let cloud_steam = i64::from(entry.steam.is_some());
-        let cloud_gog = i64::from(entry.gog.is_some());
+        let (has_steam_cloud, has_gog_cloud) = entry.cloud_flags();
+        let cloud_steam = i64::from(has_steam_cloud);
+        let cloud_gog = i64::from(has_gog_cloud);
         let steam_app_id = entry.steam.as_ref().map(|s| s.id as i64);
 
         if dry_run {
@@ -513,6 +536,34 @@ mod tests {
         assert_eq!(out.windows.len(), 1);
         assert!(out.linux.is_empty());
         assert!(out.mac.is_empty());
+    }
+
+    #[test]
+    fn cloud_flags_come_from_the_cloud_block_not_the_store_id() {
+        // Sold on Steam, synced by nobody: the row the old derivation got
+        // wrong, and the one the restore path would have to trust.
+        let yaml = "
+Some Game:
+  steam:
+    id: 1245620
+  gog:
+    id: 1207666283
+";
+        let m: LudusaviManifest = serde_yaml::from_str(yaml).unwrap();
+        let entry = &m.0["Some Game"];
+        assert!(entry.steam.is_some());
+        assert!(entry.gog.is_some());
+        assert_eq!(entry.cloud_flags(), (false, false));
+
+        let yaml = "
+Cloudy Game:
+  steam:
+    id: 1245620
+  cloud:
+    steam: true
+";
+        let m: LudusaviManifest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(m.0["Cloudy Game"].cloud_flags(), (true, false));
     }
 
     #[test]

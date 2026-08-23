@@ -147,6 +147,42 @@ pub fn no_cover(slug: &str, source: &str) {
     );
 }
 
+/// P1: for a slug with several candidate folders, which one led `found_paths`
+/// and why. This is the answer to "why did it pick THIS folder?" — the
+/// breakdown was already computed during ranking and died there. Once per
+/// process and (slug, path): every tick would repeat an identical verdict.
+pub fn ranked_choice(slug: &str, chosen: &Path, reason: &str) {
+    if !first_time(format!("ranked_choice|{slug}|{}", chosen.display())) {
+        return;
+    }
+    tracing::info!(
+        target: TELEMETRY_TARGET,
+        verdict = "ranked_choice",
+        slug = %slug,
+        chosen = %chosen.display(),
+        because = %reason,
+        "telemetry: detection led with this folder"
+    );
+}
+
+/// P9: an ALREADY-tracked folder looks like the game's own backup mirror,
+/// with what looks like the real save sitting next to it. Repoints nothing —
+/// the warning is the whole act. Once per process and save, like
+/// [`no_snapshots`].
+pub fn tracked_mirror(slug: &str, save_id: &str, tracked: &Path, suggested: &Path) {
+    if !first_time(format!("tracked_mirror|{save_id}|{}", tracked.display())) {
+        return;
+    }
+    tracing::info!(
+        target: TELEMETRY_TARGET,
+        verdict = "tracked_mirror",
+        slug = %slug,
+        path = %tracked.display(),
+        to = %suggested.display(),
+        "telemetry: tracked folder looks like the game's own backup mirror"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::first_time;

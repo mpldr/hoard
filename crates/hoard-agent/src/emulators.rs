@@ -111,11 +111,20 @@ pub const CATALOG: &[EmulatorDef] = &[
             "duckstation-qt",
             "duckstation",
         ],
+        // Windows moved to Local AppData; the README keeps Documents only for
+        // "old installs", so it stays listed but never first — an install that
+        // predates the move still has the folder, and existence filtering
+        // picks whichever is real. Linux is the data dir, not config: the
+        // official migration command moves the Flatpak tree *into*
+        // `~/.local/share`, and the Flatpak itself has been seen under both
+        // `config/` and `data/`, so both are offered and the one that exists
+        // wins.
         save_templates: &[
+            "<winLocalAppData>/DuckStation/memcards",
             "<winDocuments>/DuckStation/memcards",
             "<xdgData>/duckstation/memcards",
-            "<xdgConfig>/duckstation/memcards",
             "<home>/.var/app/org.duckstation.DuckStation/data/duckstation/memcards",
+            "<home>/.var/app/org.duckstation.DuckStation/config/duckstation/memcards",
         ],
         title_layout: None,
     },
@@ -305,8 +314,14 @@ pub const CATALOG: &[EmulatorDef] = &[
         display_name: "Flycast",
         system: "Dreamcast",
         processes: &["flycast.exe", "flycast"],
+        // No Windows template on purpose: the standalone build ships as a zip
+        // with no installer and locates its own folder from the executable
+        // path, so nothing ever lands in `%APPDATA%\flycast`. Offering it made
+        // the dialog point at a folder that cannot exist. Windows installs are
+        // found by `portable_save_paths`, which reuses the `flycast`/`data`
+        // pair from the Linux template below — that row is load-bearing for
+        // Windows detection even though it never expands there.
         save_templates: &[
-            "<winAppData>/flycast/data",
             "<xdgData>/flycast/data",
             "<home>/.var/app/org.flycast.Flycast/data/flycast/data",
         ],
@@ -347,6 +362,15 @@ pub const CATALOG: &[EmulatorDef] = &[
         display_name: "Project64",
         system: "Nintendo 64",
         processes: &["Project64.exe"],
+        // Project64 is portable by design: the manual puts auto saves in the
+        // `Save` subfolder of the program folder, and nothing is written to
+        // `%APPDATA%`. The template is kept anyway because it is the only
+        // source of the `Project64`/`Save` pair that `portable_save_paths`
+        // reanchors onto a real install — delete it and Windows detection goes
+        // to zero. What is still wrong is the fallback: with no folder found,
+        // `resolve_save_paths` offers this path, which will never exist. That
+        // needs the entry to be able to say "portable only", not a different
+        // template.
         save_templates: &["<winAppData>/Project64/Save"],
         title_layout: None,
     },
@@ -690,6 +714,23 @@ mod tests {
         // Documentos y Saved Games no se reanclan.
         assert_eq!(app_dir_and_tail("<winDocuments>/PCSX2/memcards"), None);
         assert_eq!(app_dir_and_tail("<home>/.config/retroarch/saves"), None);
+    }
+
+    #[test]
+    fn portable_only_emulators_keep_a_reanchorable_template() {
+        // Flycast and Project64 write next to their executable on Windows, so
+        // neither has a correct `%APPDATA%` path to offer. Detection there
+        // runs entirely through `portable_save_paths`, which needs some
+        // template with an app-rooted shape to borrow the folder name and
+        // tail from. Drop the last one and Windows detection silently goes to
+        // zero, which is why these two rows cannot be trimmed to nothing.
+        for id in ["flycast", "project64"] {
+            let def = find(id).unwrap();
+            assert!(
+                def.save_templates.iter().any(|t| app_dir_and_tail(t).is_some()),
+                "{id} lost the template that feeds portable detection"
+            );
+        }
     }
 
     #[test]

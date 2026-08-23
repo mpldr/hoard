@@ -277,6 +277,41 @@ pub enum AgentEvent {
         /// just "it's broken".
         error: String,
     },
+    /// The upload for this save has hit a conflict it cannot resolve on its own
+    /// once too often: **it has stopped retrying** and needs a person.
+    ///
+    /// The conflict is the 409 non-fast-forward whose reconcile finds nothing to
+    /// pull — the server says this device is behind, but there is no newer
+    /// version to merge from (the remote head was purged, or raced backwards).
+    /// No amount of waiting fixes that: every retry asks the same question.
+    ///
+    /// Exists because the retry was previously silent *and* unbounded: 1,701
+    /// events across 5 users, one save stuck at ~4.5 attempts an hour for 14
+    /// days, surviving three app versions without anything ever saying so. The
+    /// frontends turn this into a persistent state on the save's card — like
+    /// [`AgentEvent::SaveAutoRestoreStuck`], a toast structurally cannot carry
+    /// "this has been broken for two weeks".
+    ///
+    /// Cleared by [`AgentEvent::BackupAttentionCleared`] when a backup finally
+    /// lands, the user forces one by hand, or the cloud publishes a different
+    /// head (which makes the conflict resolvable again).
+    BackupNeedsAttention {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        /// Consecutive unresolvable conflicts at the moment we gave up.
+        conflicts: u32,
+        /// The last error chain, so the card says *why*.
+        error: String,
+    },
+    /// A save that had emitted [`AgentEvent::BackupNeedsAttention`] is uploading
+    /// again (or has a fresh reason to try). Lets the frontends drop the
+    /// persistent warning instead of leaving a stale "this is broken" badge on a
+    /// save that now works.
+    BackupAttentionCleared {
+        save_id: String,
+        game_slug: String,
+    },
     /// A save that had emitted [`AgentEvent::SaveAutoRestoreStuck`] restored
     /// successfully (or the cloud moved to a new version, giving it a fresh
     /// reason to try). Lets the frontends drop the persistent warning instead

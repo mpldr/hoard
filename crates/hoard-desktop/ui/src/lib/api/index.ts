@@ -677,6 +677,23 @@ export type AgentEvent =
       type: "save_auto_restore_recovered";
       save_id: string;
       game_slug: string;
+    }
+  | {
+      /** The upload keeps hitting a conflict it can't resolve, so it has
+       *  STOPPED retrying and needs a person. Persistent state on the save's
+       *  card until `backup_attention_cleared`. */
+      type: "backup_needs_attention";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      conflicts: number;
+      error: string;
+    }
+  | {
+      /** The blocked save is uploading again: drop the warning. */
+      type: "backup_attention_cleared";
+      save_id: string;
+      game_slug: string;
     };
 
 /** Ensure the sync service is up and report its engine status. */

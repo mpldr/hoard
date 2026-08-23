@@ -210,6 +210,9 @@ impl Journal {
 ///   incidente de julio-2026).
 /// - `SaveAutoRestoreStuck` — de por sí one-shot por (save, versión); el
 ///   colapso lo hace idempotente si el shell lo re-emite.
+/// - `BackupNeedsAttention` — igual: one-shot por flanco, y el colapso lo hace
+///   idempotente si el flanco se repite (un reinicio del motor rehace el estado
+///   del slot desde cero y puede volver a cruzarlo).
 /// - `BackupThrottled` — esperas por la ventana de banda del server. Reposo con
 ///   motivo; sólo cambia de fila si cambia el `retry_after_secs`.
 /// - `BackupQuotaFull` — la cuenta está llena. Cada save lo descubre por su
@@ -252,6 +255,7 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
             | AgentEvent::SaveAutoRestoreStuck { .. }
             | AgentEvent::BackupThrottled { .. }
             | AgentEvent::BackupFilesUnreadable { .. }
+            | AgentEvent::BackupNeedsAttention { .. }
             | AgentEvent::HeavyProcessDetected { .. }
     );
     if !restful {

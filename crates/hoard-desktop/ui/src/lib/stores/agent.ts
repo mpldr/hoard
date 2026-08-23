@@ -142,6 +142,26 @@ export type UnreadableFiles = {
  * lo vuelve a poner en el mismo tick). */
 export const filesUnreadable: Writable<Record<string, UnreadableFiles>> =
   writable({});
+
+/** Un save cuya subida se rindió ante un conflicto que no sabe resolver. */
+export type BlockedBackup = {
+  /** Conflictos seguidos al rendirse, para que el aviso lea como un patrón. */
+  conflicts: number;
+  /** La última cadena de error: el tooltip. */
+  error: string;
+};
+
+/** Saves cuya subida **ha dejado de reintentar** y espera al usuario, por
+ * `save_id`.
+ *
+ * Pegajoso como `restoreStuck`, y por la misma razón exacta: el caso que lo
+ * motivó llevaba 14 días reintentando cada 13 minutos sin que nada lo dijera.
+ * La diferencia con un fallo normal es que aquí ya no hay reintento que
+ * esperar — hace falta pulsar "copiar ahora", o que otro equipo publique una
+ * versión nueva. Lo limpia `backup_attention_cleared`. */
+export const backupBlocked: Writable<Record<string, BlockedBackup>> = writable(
+  {},
+);
 export const status: Writable<AgentStatus> = writable({
   running: false,
   watched_count: 0,
@@ -373,6 +393,41 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
       }
       break;
     }
+    case "backup_needs_attention": {
+      backupBlocked.update((m) => ({
+        ...m,
+        [ev.save_id]: { conflicts: ev.conflicts, error: ev.error },
+      }));
+      patch(ev.save_id, {
+        state: "failed",
+        error: ev.error,
+        // Lo que separa esto de un fallo cualquiera: no hay reintento en
+        // camino. Decir "reintentando" sería exactamente la mentira que
+        // mantuvo el caso real invisible dos semanas.
+        will_retry: false,
+      });
+      // Una sola vez por atasco (el motor lo emite por flanco), así que sí
+      // merece notificación. Mismo pref que el resto de fallos.
+      const $prefs = get(prefs);
+      if ($prefs?.notify_on_failure) {
+        const t = get(i18n);
+        notify(
+          t("library.backup_blocked_notify_title"),
+          t("library.backup_blocked_notify_body", {
+            values: { name: ev.game_slug, count: ev.conflicts },
+          }),
+        );
+      }
+      break;
+    }
+    case "backup_attention_cleared": {
+      backupBlocked.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const { [ev.save_id]: _gone, ...rest } = m;
+        return rest;
+      });
+      break;
+    }
     case "save_auto_restore_recovered": {
       restoreStuck.update((m) => {
         if (!(ev.save_id in m)) return m;
@@ -513,6 +568,8 @@ export async function subscribeAgent() {
     "agent://backup-too-large",
     "agent://backup-trimmed",
     "agent://backup-files-unreadable",
+    "agent://backup-needs-attention",
+    "agent://backup-attention-cleared",
     "agent://save-auto-restored",
     "agent://save-auto-restore-failed",
     "agent://save-auto-restore-stuck",

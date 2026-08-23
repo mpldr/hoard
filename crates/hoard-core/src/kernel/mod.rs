@@ -86,6 +86,37 @@ pub struct RestoreFailures {
     pub stuck_notified: bool,
 }
 
+/// La escalada de un backup que choca contra un conflicto **irresoluble**: el
+/// server dice 409 «vas por detrás» y la reconciliación no encuentra nada que
+/// bajar (la cabeza remota se purgó, o retrocedió). Ninguna de las dos partes
+/// puede ceder sola, así que reintentar es repetir la misma pregunta.
+///
+/// Existe porque el shell contestaba a ese caso re-armando el reintento sin
+/// contador ni escalada: 1.701 eventos, 5 usuarios, y un save clavado 14 días a
+/// ~4,5 intentos/h que sobrevivió a tres versiones de la app. El comentario que
+/// había encima decía "surface the conflict rather than risk a loop" y justo
+/// debajo montaba el bucle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConflictStall {
+    /// Conflictos irresolubles seguidos contra `version`.
+    pub consecutive: u32,
+    /// La cabeza de nube contra la que se cuentan. Una versión distinta es
+    /// información nueva —quizá ahora **sí** hay algo que bajar— y resetea la
+    /// escalada entera.
+    pub version: Option<i64>,
+    /// Se agotó el presupuesto: no se reintenta más solo. Sale de aquí por una
+    /// acción del usuario (una copia manual), por un backup con éxito, o porque
+    /// la nube publique otra versión.
+    ///
+    /// Hace dos trabajos a la vez y a propósito: es la puerta que `decide_backup`
+    /// mira para no volver a emitir la subida, y es el flanco del que el shell
+    /// deriva el aviso de UI (igual que [`RestoreFailures::stuck_notified`], se
+    /// compara antes/después del reductor). Un flag aparte para el aviso podría
+    /// desincronizarse del freno, y entonces la UI diría "atascado" de un save
+    /// que sí sube, o callaría el que no.
+    pub needs_attention: bool,
+}
+
 /// Cómo terminó la última operación de IO, reportado por el shell como parte de
 /// la [`Observation`] del tick siguiente. En el modelo invertido la finalización
 /// de una op es una *entrada* del reductor (no un evento que muta estado por su
@@ -133,6 +164,15 @@ pub enum OpResult {
     /// pisara— y **no** toca el contador de fallos: la cuenta llena no es un
     /// save roto.
     QuotaFull,
+    /// 409 **sin salida**: el server dice que vamos por detrás y la
+    /// reconciliación no encuentra nada que bajar. Distinto de [`Self::Failed`]
+    /// porque el remedio es distinto: un fallo normal se cura solo con tiempo
+    /// (vuelve la red, arranca el server) y merece un backoff plano; esto no se
+    /// cura con tiempo ninguno, así que escala por [`ConflictStall`] y a partir
+    /// de [`reconcile::CONFLICT_STALL_GIVE_UP_AFTER`] deja de reintentar y pide
+    /// una persona. Como [`Self::Failed`] en una subida, **conserva**
+    /// `has_pending`: los cambios siguen sin versionar.
+    ConflictStalled,
     /// Cualquier otro error (red, sha, permisos, timeout), tras agotar los
     /// reintentos internos del ejecutor. Su efecto depende de la op en vuelo: en
     /// una **bajada** escala el contador de fallos por versión cloud y el
@@ -231,6 +271,11 @@ pub struct State {
 
     // ---- Escalada de fallos de restore ---------------------------------
     pub restore_failures: RestoreFailures,
+
+    // ---- Escalada de conflictos de subida irresolubles -------------------
+    /// Contador + escalada del 409 que la reconciliación no puede resolver. Es
+    /// el freno que impide que ese caso reintente para siempre.
+    pub backup_conflict: ConflictStall,
 }
 
 /// El mundo muestreado este tick (ADR C.1): datos leídos del disco/SO/servidor

@@ -141,6 +141,12 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
       });
     case "auto_restore_recovered":
       return $_("activity.auto_restore_recovered", { values: { name } });
+    case "backup_blocked":
+      return $_("activity.backup_blocked", {
+        values: { name, count: e.failures ?? 0, error: e.error ?? "" },
+      });
+    case "backup_unblocked":
+      return $_("activity.backup_unblocked", { values: { name } });
     case "storage_purging":
       return $_("activity.storage_purging");
     case "storage_full":

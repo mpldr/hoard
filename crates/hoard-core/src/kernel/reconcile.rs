@@ -28,7 +28,10 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use time::{Duration, OffsetDateTime};
 
-use super::{session, Action, Decision, Observation, Op, OpResult, RestoreFailures, State, World};
+use super::{
+    session, Action, ConflictStall, Decision, Observation, Op, OpResult, RestoreFailures, State,
+    World,
+};
 
 // ---- Constantes de ritmo (réplica sans-IO de las de `agent.rs`) ------------
 
@@ -57,6 +60,31 @@ pub const STUCK_AFTER: u32 = 3;
 /// sea desatendida. Era `agent::BACKUP_RETRY_BACKOFF`, política en el shell
 /// (ADR 0021 D.8.2).
 pub const BACKUP_FAILURE_BACKOFF_SECS: i64 = 10 * 60;
+
+/// Escalada de la subida que choca contra un conflicto **irresoluble** (409 «vas
+/// por detrás» + reconciliación sin nada que bajar): 10 min → 20 → 40 → 80.
+///
+/// Exponencial y no plana como [`BACKUP_FAILURE_BACKOFF_SECS`] porque no es la
+/// misma avería. Un fallo normal se cura solo —vuelve la red, arranca el
+/// server— y el backoff sólo tiene que no martillear mientras tanto. Un
+/// conflicto sin salida no se cura con tiempo: cada reintento vuelve a hacer la
+/// misma pregunta y recibe la misma respuesta. Reintentar sirve por si la nube
+/// se mueve, y eso pasa en la escala de una sesión de juego, no de diez minutos.
+pub const CONFLICT_STALL_BACKOFF_SECS: [i64; 4] = [10 * 60, 20 * 60, 40 * 60, 80 * 60];
+
+/// Conflictos irresolubles seguidos contra la misma cabeza de nube tras los
+/// cuales se deja de reintentar y el save pasa a pedir una persona.
+///
+/// Cinco: los cuatro escalones de arriba (dos horas y media en total) y basta.
+/// El caso real llevaba 14 días a ~4,5 intentos/h y sobrevivió a tres versiones
+/// de la app sin que nadie lo mirara, porque nada lo enseñaba. Un reintento
+/// silencioso infinito no es tolerancia a fallos: es un fallo escondido.
+pub const CONFLICT_STALL_GIVE_UP_AFTER: u32 = 5;
+
+/// Motivo del `Hold` de una subida que agotó su presupuesto de conflictos. La
+/// UI lo enseña como "necesita que mires esto", así que es una constante y no un
+/// literal (mismo trato que [`HOLD_BACKUP_MIN_INTERVAL`]).
+pub const HOLD_BACKUP_NEEDS_ATTENTION: &str = "backup conflict needs the user";
 
 /// Reposo tras un 402 (cuenta llena). Mucho más largo que el de un fallo
 /// normal: liberar espacio es una acción humana —archivar juegos, subir a
@@ -166,6 +194,7 @@ pub fn reconcile(state: &State, obs: &Observation, world: World) -> (State, Vec<
     // el freno se suelta (D.8.2). Antes lo hacía el shell al recibir
     // `SetCloudVersions` — política fuera del kernel, invisible al replay de C.5.
     clear_restore_backoff_on_new_version(&mut next, obs);
+    clear_conflict_stall_on_new_version(&mut next, obs);
 
     // Ingerir el resultado de una op en vuelo que acaba de terminar. Limpia
     // `in_flight` y actualiza contabilidad/backoff. Puede emitir `Throttle`.
@@ -288,6 +317,13 @@ fn decide_backup(
 ) -> Option<Decision> {
     if !(next.has_pending && local_diverged(next, obs)) {
         return None;
+    }
+    // La subida agotó su presupuesto de conflictos irresolubles: se para y se
+    // pide una persona. Antes que cualquier freno de ritmo porque no es un
+    // freno de ritmo — no hay deadline que cruzar que lo levante, sólo una
+    // acción del usuario, un backup con éxito o una cabeza de nube nueva.
+    if next.backup_conflict.needs_attention {
+        return Some(hold(HOLD_BACKUP_NEEDS_ATTENTION));
     }
     // El juego está escribiendo el save ahora mismo: subirlo capturaría un
     // fichero a medias. Es un freno de ritmo, no un error — en cuanto suelte
@@ -540,6 +576,10 @@ fn ingest_op_result(
                     // El contenido llegó a una versión (o ya estaba en una): los
                     // cambios dejan de estar sin versionar en ambos casos.
                     next.has_pending = false;
+                    // Y sea commit o no-op, la subida ya no está atascada: el
+                    // 409 irresoluble se resolvió. Se suelta la escalada entera,
+                    // que es también lo que apaga el aviso en la UI.
+                    next.backup_conflict = ConflictStall::default();
                     if wrote {
                         // Commit real: mueve el ancla del min-interval (ADR 0018).
                         // El suelo se deriva de ella ([`backup_floor`]); no hace
@@ -621,6 +661,16 @@ fn ingest_op_result(
                 next.next_backup_at = Some(now + Duration::seconds(QUOTA_FULL_BACKOFF_SECS));
             }
         }
+        // 409 sin salida: el server dice que vamos por detrás y no hay nada que
+        // bajar. Escala por su propia escalera y, agotada, deja de reintentar:
+        // `needs_attention` es lo que `decide_backup` mira para no volver a
+        // emitir la subida. Como el `Failed` de una subida, conserva
+        // `has_pending` — los cambios locales siguen sin versionar.
+        OpResult::ConflictStalled => {
+            if let Some(delay) = record_conflict(&mut next.backup_conflict, obs.cloud_version) {
+                next.next_backup_at = Some(now + Duration::seconds(delay));
+            }
+        }
         // Otro error, según la op:
         // - subida: agotó su presupuesto de reintentos internos → se re-arma en
         //   el backoff largo y **conserva** `has_pending` (los cambios nunca
@@ -658,6 +708,43 @@ fn record_failure(f: &mut RestoreFailures, latest: Option<i64>) -> i64 {
         f.stuck_notified = true;
     }
     backoff_secs(f.consecutive)
+}
+
+/// Registra un conflicto irresoluble contra la cabeza de nube observada y
+/// devuelve el backoff a aplicar, o `None` cuando el presupuesto se agotó y hay
+/// que dejar de reintentar.
+///
+/// Una cabeza distinta de la contada resetea la escalada, por el mismo motivo
+/// que en [`record_failure`]: la nube se movió, así que la pregunta ya no es la
+/// misma y quizá ahora sí haya algo que bajar.
+fn record_conflict(c: &mut ConflictStall, latest: Option<i64>) -> Option<i64> {
+    if c.version != latest {
+        *c = ConflictStall {
+            version: latest,
+            ..ConflictStall::default()
+        };
+    }
+    c.consecutive = c.consecutive.saturating_add(1);
+    if c.consecutive >= CONFLICT_STALL_GIVE_UP_AFTER {
+        c.needs_attention = true;
+        return None;
+    }
+    let idx = (c.consecutive as usize - 1).min(CONFLICT_STALL_BACKOFF_SECS.len() - 1);
+    Some(CONFLICT_STALL_BACKOFF_SECS[idx])
+}
+
+/// Suelta la escalada de conflictos cuando la nube publica una cabeza distinta
+/// de aquella contra la que se atascó. Gemelo de
+/// [`clear_restore_backoff_on_new_version`], y hace falta por separado: un save
+/// que ya se rindió no vuelve a ingerir un `ConflictStalled` —deja de
+/// reintentar—, así que sin esto nada podría desatascarlo salvo el usuario, ni
+/// siquiera el otro dispositivo publicando la versión que faltaba.
+fn clear_conflict_stall_on_new_version(next: &mut State, obs: &Observation) {
+    let active = next.backup_conflict.consecutive > 0 || next.backup_conflict.needs_attention;
+    if active && next.backup_conflict.version != obs.cloud_version {
+        next.backup_conflict = ConflictStall::default();
+        next.next_backup_at = None;
+    }
 }
 
 /// Backoff dado el nº de fallos consecutivos (1-based). Satura en el último
@@ -1289,6 +1376,209 @@ mod tests {
         assert_eq!(acts(&ds_after), vec![&Action::Backup]);
     }
 
+    /// **El bug del 409 sin salida**: el shell contestaba a "vas por detrás,
+    /// pero no hay nada que bajar" reponiendo el reintento cada diez minutos,
+    /// sin contador y sin escalada. 1.701 eventos, 5 usuarios, y un save clavado
+    /// 14 días a ~4,5 intentos/h que sobrevivió a tres versiones de la app.
+    ///
+    /// Ahora escala 10 → 20 → 40 → 80 min y, al quinto, para: `needs_attention`
+    /// y ni una `Act(Backup)` más por su cuenta.
+    #[test]
+    fn an_unresolvable_conflict_escalates_and_then_stops() {
+        let mut state = State {
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            ..base_state()
+        };
+        let mut clock = 0i64;
+        for (attempt, backoff) in CONFLICT_STALL_BACKOFF_SECS.iter().enumerate() {
+            // La subida sale, choca contra el conflicto y vuelve con él.
+            state.in_flight = Some(Op::Backup);
+            let obs = Observation {
+                local_fingerprint: Some(2),
+                op_result: Some(OpResult::ConflictStalled),
+                ..quiet_obs()
+            };
+            let (next, ds) = reconcile(&state, &obs, world(clock));
+            assert_eq!(
+                next.backup_conflict.consecutive,
+                attempt as u32 + 1,
+                "el contador tiene que ir subiendo"
+            );
+            assert!(
+                !next.backup_conflict.needs_attention,
+                "aún queda presupuesto en el intento {}",
+                attempt + 1
+            );
+            assert_eq!(
+                next.next_backup_at,
+                Some(at(clock + backoff)),
+                "cada choque espera más que el anterior"
+            );
+            assert!(next.has_pending, "los cambios siguen sin versionar");
+            assert!(
+                !acts(&ds).contains(&&Action::Backup),
+                "no se relanza dentro del backoff: {ds:?}"
+            );
+            // Y dentro del backoff sigue callado, aunque pase el tiempo.
+            let quiet = Observation {
+                local_fingerprint: Some(2),
+                ..quiet_obs()
+            };
+            let (_m, mid) = reconcile(&next, &quiet, world(clock + backoff / 2));
+            assert!(
+                !acts(&mid).contains(&&Action::Backup),
+                "el backoff manda hasta que vence: {mid:?}"
+            );
+            // Vencido, sí reintenta: `now` cruzando el deadline ES delta.
+            clock += backoff + 1;
+            let (after, retried) = reconcile(&next, &quiet, world(clock));
+            assert!(
+                acts(&retried).contains(&&Action::Backup),
+                "vencido el backoff hay que volver a intentarlo: {retried:?}"
+            );
+            state = after;
+        }
+
+        // Quinto choque: se acabó el presupuesto.
+        state.in_flight = Some(Op::Backup);
+        let obs = Observation {
+            local_fingerprint: Some(2),
+            op_result: Some(OpResult::ConflictStalled),
+            ..quiet_obs()
+        };
+        let (given_up, ds) = reconcile(&state, &obs, world(clock));
+        assert_eq!(given_up.backup_conflict.consecutive, CONFLICT_STALL_GIVE_UP_AFTER);
+        assert!(
+            given_up.backup_conflict.needs_attention,
+            "al quinto, el save pide una persona"
+        );
+        assert_eq!(ds.last(), Some(&hold(HOLD_BACKUP_NEEDS_ATTENTION)));
+
+        // Y ya no reintenta **nunca** solo: ni al minuto ni a la semana.
+        let quiet = Observation {
+            local_fingerprint: Some(2),
+            ..quiet_obs()
+        };
+        for later in [clock + 60, clock + 86_400, clock + 7 * 86_400] {
+            let (_n, ds) = reconcile(&given_up, &quiet, world(later));
+            assert!(
+                !acts(&ds).contains(&&Action::Backup),
+                "un save rendido no puede volver a reintentar solo (t={later}): {ds:?}"
+            );
+            assert_eq!(ds.last(), Some(&hold(HOLD_BACKUP_NEEDS_ATTENTION)));
+        }
+    }
+
+    /// El número que lo destapó, puesto a prueba: catorce días de reloj con el
+    /// conflicto respondiendo siempre lo mismo. Antes eran ~1.500 intentos (uno
+    /// cada diez minutos, para siempre); ahora son cinco y se acabó.
+    ///
+    /// Se simula tick a tick en vez de razonar sobre el backoff porque el bucle
+    /// vivía precisamente en la costura entre "el reductor arma el deadline" y
+    /// "el tick siguiente lo cruza".
+    #[test]
+    fn fourteen_days_of_the_same_conflict_cost_five_attempts() {
+        let mut state = State {
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            ..base_state()
+        };
+        let quiet = Observation {
+            local_fingerprint: Some(2),
+            ..quiet_obs()
+        };
+        let conflicted = Observation {
+            op_result: Some(OpResult::ConflictStalled),
+            ..quiet.clone()
+        };
+
+        let mut attempts = 0;
+        let mut in_flight = false;
+        // Un tick por minuto durante 14 días.
+        for minute in 0..(14 * 24 * 60) {
+            let now = minute * 60;
+            let obs = if in_flight { &conflicted } else { &quiet };
+            let (next, ds) = reconcile(&state, obs, world(now));
+            in_flight = false;
+            if acts(&ds).contains(&&Action::Backup) {
+                attempts += 1;
+                // La subida sale y vuelve con el mismo conflicto de siempre.
+                in_flight = true;
+            }
+            state = next;
+        }
+
+        assert_eq!(
+            attempts, CONFLICT_STALL_GIVE_UP_AFTER,
+            "el 409 sin salida sólo puede costar el presupuesto, no catorce días de intentos"
+        );
+        assert!(state.backup_conflict.needs_attention, "y acaba pidiendo una persona");
+        assert!(state.has_pending, "sin perder los cambios locales por el camino");
+    }
+
+    /// Rendirse no puede ser una condena: si la nube publica otra cabeza, la
+    /// pregunta ya no es la misma —quizá ahora sí hay algo que bajar— y el save
+    /// vuelve a intentarlo solo. Sin esto nada podría desatascarlo salvo el
+    /// usuario, ni siquiera el otro dispositivo subiendo lo que faltaba.
+    #[test]
+    fn a_new_cloud_head_un_stalls_a_save_that_gave_up() {
+        let state = State {
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            known_version: Some(4),
+            backup_conflict: ConflictStall {
+                consecutive: CONFLICT_STALL_GIVE_UP_AFTER,
+                version: Some(4),
+                needs_attention: true,
+            },
+            next_backup_at: Some(at(9_000)),
+            ..base_state()
+        };
+        let obs = Observation {
+            local_fingerprint: Some(2),
+            cloud_version: Some(5),
+            ..quiet_obs()
+        };
+        let (next, ds) = reconcile(&state, &obs, world(0));
+        assert_eq!(
+            next.backup_conflict,
+            ConflictStall::default(),
+            "la escalada muere con la cabeza contra la que se contaba"
+        );
+        // La nube va por delante, así que este tick toca bajar; lo que importa
+        // es que el freno de la subida se soltó.
+        assert!(next.next_backup_at.is_none(), "y su freno con ella");
+        assert!(!ds.is_empty());
+    }
+
+    /// Una copia que sale bien suelta la escalada entera — incluido el no-op,
+    /// que también significa que el conflicto se resolvió.
+    #[test]
+    fn a_backup_that_lands_clears_the_conflict_escalation() {
+        let state = State {
+            in_flight: Some(Op::Backup),
+            has_pending: true,
+            backup_conflict: ConflictStall {
+                consecutive: 3,
+                version: Some(4),
+                needs_attention: false,
+            },
+            ..base_state()
+        };
+        let obs = Observation {
+            cloud_version: Some(4),
+            op_result: Some(OpResult::Ok {
+                version: Some(5),
+                fingerprint: Some(2),
+                wrote: true,
+            }),
+            ..quiet_obs()
+        };
+        let (next, _ds) = reconcile(&state, &obs, world(0));
+        assert_eq!(next.backup_conflict, ConflictStall::default());
+    }
+
     /// D.8.2 — commit vs no-op en `OpResult::Ok`. **La** regresión R.E.P.O.: un
     /// pase no-op no es un backup y no debe mover el ancla del min-interval, o
     /// la siguiente subida real se empuja un intervalo entero (y con la carpeta
@@ -1876,6 +2166,19 @@ mod tests {
     }
 
     prop_compose! {
+        /// Escalada de conflictos arbitraria. Entra en el generador porque su
+        /// `needs_attention` **frena la subida**: los invariantes tienen que
+        /// aguantar un slot rendido igual que uno sano.
+        fn arb_conflicts()(
+            consecutive in 0u32..8,
+            version in prop::option::of(0i64..20),
+            needs_attention in any::<bool>(),
+        ) -> ConflictStall {
+            ConflictStall { consecutive, version, needs_attention }
+        }
+    }
+
+    prop_compose! {
         /// Estado arbitrario con tiempos anclados a `BASE` (offsets acotados).
         fn arb_state()(
             track_only in any::<bool>(),
@@ -1900,6 +2203,7 @@ mod tests {
             burst_since in prop::option::of(-1200i64..0),
             burst_backups in 0u32..8,
             failures in arb_failures(),
+            conflicts in arb_conflicts(),
         ) -> State {
             State {
                 track_only,
@@ -1921,6 +2225,7 @@ mod tests {
                 burst_since: burst_since.map(at),
                 burst_backups,
                 restore_failures: failures,
+                backup_conflict: conflicts,
             }
         }
     }
@@ -2046,6 +2351,12 @@ mod tests {
         /// emite la subida — la única forma de limpiar `has_pending`. Ninguna
         /// rama de restore (cooldown, veto, pull diferido) puede tragársela: eso
         /// era el deadlock que el shell desatascaba a mano.
+        ///
+        /// La **única** excepción es un save rendido (`needs_attention`): ahí no
+        /// emitir la subida es la decisión, no un descuido. Es la diferencia
+        /// entre las dos formas de estar parado — encallado sin que nada lo diga
+        /// (el bug) frente a parado, dicho en voz alta y con tres salidas
+        /// (copia manual, copia con éxito, cabeza de nube nueva).
         #[test]
         fn inv_pending_local_changes_always_get_a_backup(
             state in arb_state(), obs in arb_obs(false), w in arb_world()
@@ -2054,6 +2365,7 @@ mod tests {
             let eligible = !state.track_only
                 && state.in_flight.is_none()
                 && obs.op_result.is_none()
+                && !state.backup_conflict.needs_attention
                 && (state.has_pending || obs.fs_event)
                 && local_diverged(&state, &obs)
                 && state.next_backup_at.is_none_or(|t| w.now >= t)

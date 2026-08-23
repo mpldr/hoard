@@ -64,7 +64,11 @@
     reactivateAndRefresh,
   } from "../lib/stores/cloud";
   import { cardWidth } from "../lib/stores/cardSizes.svelte";
-  import { filesUnreadable, wrongPathSuspected } from "../lib/stores/agent";
+  import {
+    backupBlocked,
+    filesUnreadable,
+    wrongPathSuspected,
+  } from "../lib/stores/agent";
   import CardResizeHandle from "../lib/components/CardResizeHandle.svelte";
 
   let report = $state<DetectionReport | null>(null);
@@ -1451,6 +1455,27 @@
                          solo con la primera copia completa. El error del
                          sistema va en el `title` porque es lo único que dice
                          qué hay que arreglar. -->
+                    <!-- La subida se rindió: el 409 que la reconciliación no
+                         sabe resolver, cinco veces seguidas. Rojo y no ámbar
+                         porque no hay reintento en camino — hasta que el
+                         usuario pulse "copiar ahora" (o otro equipo publique
+                         una versión), este save no sube. Es el aviso que faltó
+                         durante 14 días en el caso que lo destapó. -->
+                    {#if $backupBlocked[save.save_id]}
+                      {@const blocked = $backupBlocked[save.save_id]}
+                      <p
+                        class="flex items-start gap-1 text-[10px] text-rose-400/90"
+                        title={`${$_("library.backup_blocked_help")}\n\n${blocked.error}`}
+                      >
+                        <AlertTriangle size={10} class="mt-px shrink-0" />
+                        <span>
+                          {$_("library.backup_blocked_hint", {
+                            values: { count: blocked.conflicts },
+                          })}
+                        </span>
+                      </p>
+                    {/if}
+
                     {#if $filesUnreadable[save.save_id]}
                       {@const bad = $filesUnreadable[save.save_id]}
                       <p

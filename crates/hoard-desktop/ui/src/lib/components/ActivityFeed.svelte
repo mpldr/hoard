@@ -64,6 +64,8 @@
     auto_restore_failed: XCircle,
     auto_restore_stuck: AlertTriangle,
     auto_restore_recovered: CheckCircle2,
+    backup_blocked: AlertTriangle,
+    backup_unblocked: CheckCircle2,
     storage_purging: Trash2,
     storage_full: AlertTriangle,
     storage_grace: Clock,
@@ -92,6 +94,8 @@
     auto_restore_failed: "text-rose-400",
     auto_restore_stuck: "text-amber-400",
     auto_restore_recovered: "text-emerald-400",
+    backup_blocked: "text-rose-400",
+    backup_unblocked: "text-emerald-400",
     storage_purging: "text-amber-400",
     storage_full: "text-rose-400",
     storage_grace: "text-sky-300",
@@ -111,6 +115,9 @@
     auto_restore_stuck:
       "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_full: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
+    // Rojo, no ámbar: a diferencia del `auto_restore_stuck`, aquí ya no hay
+    // reintento esperando. Sin una persona, este save no vuelve a subir.
+    backup_blocked: "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     backup_quota_full:
       "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     backup_trimmed: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",

@@ -401,6 +401,25 @@ enum AgentCommand {
     /// on [`kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS`] — the recovery path
     /// that doesn't depend on a new fs event.
     RetryBackupAfterFailure(String),
+    /// Internal: the upload hit a 409 the reconcile couldn't resolve — the
+    /// server says we're behind, yet there is nothing newer to pull. Same
+    /// wedge-avoidance contract as [`AgentCommand::RetryBackupAfterFailure`] (no
+    /// `BackupDone`, `has_pending` survives), but fed to the reducer as
+    /// [`kernel::OpResult::ConflictStalled`] so it escalates on
+    /// [`kernel::reconcile::CONFLICT_STALL_BACKOFF_SECS`] and, after
+    /// [`kernel::reconcile::CONFLICT_STALL_GIVE_UP_AFTER`] of them, stops
+    /// retrying and asks for a human.
+    ///
+    /// It used to send `RetryBackupAfterFailure`, which re-armed the upload on a
+    /// flat ten-minute backoff with no counter: 1,701 events across 5 users, and
+    /// one save stuck at ~4.5 attempts/h for 14 days through three app versions.
+    ParkBackupConflict {
+        id: String,
+        /// La cadena del 409, para el aviso que la UI enseña si el presupuesto
+        /// se agota. El reductor no la transporta (su `ConflictStalled` no lleva
+        /// texto), así que la guarda el shell — igual que `last_restore_error`.
+        error: String,
+    },
     /// Internal: the upload hit a 402 — the whole account is out of storage.
     /// Same wedge-avoidance contract as `RetryBackupAfterFailure` (no
     /// `BackupDone`, `has_pending` survives), but fed to the reductor as
@@ -725,6 +744,12 @@ struct SaveSlot {
     /// Antes `AutoRestoreFailures` (con métodos en el shell); ahora el tipo puro
     /// del kernel [`kernel::RestoreFailures`] — la lógica vive en el reductor.
     restore_failures: kernel::RestoreFailures,
+    /// Escalada del 409 que la reconciliación no puede resolver (el server dice
+    /// "vas por detrás" y no hay nada que bajar). El reductor la escala, la
+    /// resetea y decide cuándo se acaba el presupuesto; el shell lee el flanco
+    /// de `needs_attention` para avisar al usuario. Mapea a
+    /// [`kernel::State::backup_conflict`].
+    backup_conflict: kernel::ConflictStall,
     /// Skip-by-set-hash signature of the last successful upload this session
     /// (ADR 0019). Compared against the freshly-walked signature before each
     /// backup; an unchanged signature means the watcher fired on a no-op
@@ -775,6 +800,11 @@ struct SaveSlot {
     /// `OpResult::Failed` no lleva string), así que el shell la guarda para el
     /// evento [`AgentEvent::SaveAutoRestoreStuck`] que emite al cruzar el umbral.
     last_restore_error: Option<String>,
+    /// La cadena del último 409 irresoluble, en cola junto a un
+    /// `pending_op_result` = `ConflictStalled`. Igual que
+    /// [`Self::last_restore_error`]: el reductor no transporta texto, y el
+    /// evento `BackupNeedsAttention` tiene que decir por qué.
+    last_conflict_error: Option<String>,
     /// Cloud version this slot is known to be synced to — advanced on a genuine
     /// upload commit and after a successful auto-restore. The reconciliation
     /// sweep passes it to `run_auto_restore`, which skips the download-to-diff
@@ -886,6 +916,7 @@ fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -
         pull_pending: slot.pull_pending,
         deferred_notified: slot.deferred_notified,
         restore_failures: slot.restore_failures,
+        backup_conflict: slot.backup_conflict,
     }
 }
 
@@ -907,6 +938,7 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.pull_pending = next.pull_pending;
     slot.deferred_notified = next.deferred_notified;
     slot.restore_failures = next.restore_failures;
+    slot.backup_conflict = next.backup_conflict;
 }
 
 /// La caché de cabezas de nube, **con la marca de cuándo llegó**. El par va
@@ -1180,6 +1212,8 @@ fn reconcile_all(
         // (stuck/recovered) del delta de `restore_failures`.
         let was_stuck = slot.restore_failures.stuck_notified;
         let err_for_stuck = slot.last_restore_error.take();
+        let was_blocked = slot.backup_conflict.needs_attention;
+        let err_for_conflict = slot.last_conflict_error.take();
 
         let world = kernel::World {
             now,
@@ -1216,6 +1250,39 @@ fn reconcile_all(
                 "agent: auto-restore escalation cleared — save recovered"
             );
             let _ = events_tx.try_send(AgentEvent::SaveAutoRestoreRecovered {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+            });
+        }
+
+        // Y lo mismo para la subida atascada en un conflicto sin salida: el
+        // reductor decide cuándo se agota el presupuesto y cuándo se suelta (una
+        // copia con éxito, una cabeza de nube nueva, o el usuario pidiéndola a
+        // mano); el shell sólo traduce el flanco a eventos. Que el aviso salga
+        // del MISMO flag que frena la subida es lo que impide que la UI diga
+        // "atascado" de un save que sí sube — o que se calle el que no.
+        let now_blocked = slot.backup_conflict.needs_attention;
+        if !was_blocked && now_blocked {
+            tracing::warn!(
+                save_id = %id,
+                game_slug = %slot.save.game_slug,
+                conflicts = slot.backup_conflict.consecutive,
+                "agent: giving up on this upload — the conflict needs the user"
+            );
+            let _ = events_tx.try_send(AgentEvent::BackupNeedsAttention {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+                label: slot.save.label.clone(),
+                conflicts: slot.backup_conflict.consecutive,
+                error: err_for_conflict.unwrap_or_default(),
+            });
+        }
+        if was_blocked && !now_blocked {
+            tracing::info!(
+                save_id = %id,
+                "agent: upload conflict cleared — this save can sync again"
+            );
+            let _ = events_tx.try_send(AgentEvent::BackupAttentionCleared {
                 save_id: id.clone(),
                 game_slug: slot.save.game_slug.clone(),
             });
@@ -1788,6 +1855,18 @@ async fn run_agent(
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.needs_l1 = true;
                             slot.manual_requested = true;
+                            // Pulsar "copiar ahora" ES la intervención que el
+                            // save pedía: suelta la escalada de conflictos y su
+                            // freno, o el botón no haría nada y el usuario no
+                            // tendría forma de contestar al aviso.
+                            if slot.backup_conflict != kernel::ConflictStall::default() {
+                                tracing::info!(
+                                    save_id = %id,
+                                    "agent: manual backup — clearing the conflict escalation"
+                                );
+                                slot.backup_conflict = kernel::ConflictStall::default();
+                                slot.next_backup_at = None;
+                            }
                             mark_pending_if_diverged(slot);
                         }
                         reconcile_all(
@@ -1811,6 +1890,30 @@ async fn run_agent(
                                 save_id = %id,
                                 backoff_secs = kernel::reconcile::BACKUP_FAILURE_BACKOFF_SECS,
                                 "agent: backup retries exhausted — re-arming on the long backoff"
+                            );
+                        }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads,
+                        );
+                    }
+                    Some(AgentCommand::ParkBackupConflict { id, error }) => {
+                        // Conflicto que la reconciliación no sabe resolver. Como
+                        // los de arriba es una entrada del reductor, con su
+                        // propia disposición: escala el contador del slot y, en
+                        // cuanto se agota el presupuesto, deja de reintentar y
+                        // marca el save como que necesita al usuario. El aviso a
+                        // la UI sale del flanco de `needs_attention` en
+                        // `reconcile_all`, no de aquí.
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.next_scheduled_backup_at = None;
+                            slot.pending_op_result = Some(kernel::OpResult::ConflictStalled);
+                            slot.last_conflict_error = Some(error);
+                            tracing::info!(
+                                save_id = %id,
+                                conflicts = slot.backup_conflict.consecutive + 1,
+                                give_up_after = kernel::reconcile::CONFLICT_STALL_GIVE_UP_AFTER,
+                                "agent: upload conflict has no resolution — escalating the backoff"
                             );
                         }
                         reconcile_all(
@@ -2203,6 +2306,7 @@ fn handle_add(
         next_backup_at: None,
         next_restore_at: None,
         restore_failures: kernel::RestoreFailures::default(),
+        backup_conflict: kernel::ConflictStall::default(),
         last_set_hash,
         synced_fingerprint,
         last_l0_mtime: None,
@@ -2210,6 +2314,7 @@ fn handle_add(
         pending_op_result: None,
         pending_upload_landed: None,
         last_restore_error: None,
+        last_conflict_error: None,
         known_version,
         pull_pending: false,
         deferred_notified: false,
@@ -3805,7 +3910,7 @@ async fn run_backup_with_retry(
                                 .send(AgentEvent::BackupFailed {
                                     save_id: save.save_id.clone(),
                                     game_slug: save.game_slug.clone(),
-                                    error: chain,
+                                    error: chain.clone(),
                                     will_retry: false,
                                 })
                                 .await;
@@ -3813,8 +3918,19 @@ async fn run_backup_with_retry(
                             // repone `next_backup_at` (conserva has_pending — los
                             // cambios locales nunca llegaron a una versión). Sin
                             // esto la op quedaría "in flight" para siempre.
+                            //
+                            // Por su carril propio, no por el de un fallo
+                            // cualquiera: esto no es una avería que el tiempo
+                            // cure, así que el reductor lo escala y termina
+                            // parando. El `RetryBackupAfterFailure` que había
+                            // aquí reponía el intento cada diez minutos sin
+                            // contador ninguno, justo debajo de un comentario que
+                            // decía evitar el bucle.
                             let _ = cmd_tx
-                                .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                                .send(AgentCommand::ParkBackupConflict {
+                                    id: save.save_id.clone(),
+                                    error: chain,
+                                })
                                 .await;
                             return;
                         }
@@ -5355,6 +5471,7 @@ mod tests {
             next_backup_at: None,
             next_restore_at: None,
             restore_failures: kernel::RestoreFailures::default(),
+            backup_conflict: kernel::ConflictStall::default(),
             last_set_hash: None,
             synced_fingerprint: None,
             last_l0_mtime: None,
@@ -5363,6 +5480,7 @@ mod tests {
             pending_op_result: None,
             pending_upload_landed: None,
             last_restore_error: None,
+            last_conflict_error: None,
             known_version: None,
             pull_pending: false,
             deferred_notified: false,

@@ -69,6 +69,10 @@ export type FeedEntry = {
     // failing and it won't fix itself" row, pushed once per (save, version).
     | "auto_restore_stuck"
     | "auto_restore_recovered"
+    // La subida se rindió ante un conflicto que no sabe resolver: ya no hay
+    // reintento en camino, hace falta el usuario.
+    | "backup_blocked"
+    | "backup_unblocked"
     // Account-wide storage pressure, driven off the cloud account's
     // `storage_status` (`purging` → amber, `full` → red).
     | "storage_purging"
@@ -297,6 +301,20 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
     case "save_auto_restore_recovered":
       return {
         kind: "auto_restore_recovered",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+      };
+    case "backup_needs_attention":
+      return {
+        kind: "backup_blocked",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        failures: p.conflicts,
+        error: p.error,
+      };
+    case "backup_attention_cleared":
+      return {
+        kind: "backup_unblocked",
         save_id: p.save_id,
         game_slug: p.game_slug,
       };
@@ -636,6 +654,32 @@ export async function subscribeLive() {
         game_slug: p.game_slug,
         failures: p.failures,
         error: p.error,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-needs-attention", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_needs_attention") return;
+      pushEntry({
+        kind: "backup_blocked",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        failures: p.conflicts,
+        error: p.error,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-attention-cleared", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_attention_cleared") return;
+      pushEntry({
+        kind: "backup_unblocked",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
       });
     }),
   );

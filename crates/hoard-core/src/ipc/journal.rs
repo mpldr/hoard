@@ -216,6 +216,11 @@ impl Journal {
 ///   cuenta y el park lo re-emite cada hora: son N informes del mismo hecho,
 ///   no N incidencias. Colapsa por cifras, así que la fila se refresca cuando
 ///   el usuario libera algo y sigue sin llegar.
+/// - `BackupFilesUnreadable` — el mismo fichero que no se deja leer sale otra
+///   vez en cada copia mientras dure la causa (un proveedor de ficheros bajo
+///   demanda parado puede durar semanas). Un aviso, no uno por copia. Colapsa
+///   por contenido, así que si aparece otro fichero —o cambia el error— la fila
+///   es nueva.
 /// - `HeavyProcessDetected` — el mismo proceso pesado visto otra vez no es un
 ///   descubrimiento nuevo.
 ///
@@ -246,6 +251,7 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
             | AgentEvent::SaveAutoRestoreFailed { .. }
             | AgentEvent::SaveAutoRestoreStuck { .. }
             | AgentEvent::BackupThrottled { .. }
+            | AgentEvent::BackupFilesUnreadable { .. }
             | AgentEvent::HeavyProcessDetected { .. }
     );
     if !restful {

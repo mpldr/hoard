@@ -60,6 +60,9 @@ export type FeedEntry = {
     // and the row carries the action that opens "liberar espacio".
     | "backup_quota_full"
     | "backup_trimmed"
+    // La copia subió sin ficheros que no se dejaron leer (o no subió nada
+    // porque no se dejó leer ninguno). Parcial, dicho en voz alta.
+    | "backup_files_unreadable"
     | "auto_restore_failed"
     // Auto-restore has failed repeatedly on the same cloud version. Distinct
     // from `auto_restore_failed` (one row per attempt): this is the "it's been
@@ -267,6 +270,14 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         game_slug: p.game_slug,
         count: p.omitted_files,
         bytes: p.omitted_bytes,
+      };
+    case "backup_files_unreadable":
+      return {
+        kind: "backup_files_unreadable",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.count,
+        error: p.sample_error,
       };
     case "save_auto_restore_failed":
       return {
@@ -584,6 +595,20 @@ export async function subscribeLive() {
         game_slug: p.game_slug,
         count: p.omitted_files,
         bytes: p.omitted_bytes,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-files-unreadable", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_files_unreadable") return;
+      pushEntry({
+        kind: "backup_files_unreadable",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.count,
+        error: p.sample_error,
       });
     }),
   );

@@ -127,6 +127,10 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
           size: formatBytes(e.bytes ?? 0),
         },
       });
+    case "backup_files_unreadable":
+      return $_("activity.backup_files_unreadable", {
+        values: { name, count: e.count ?? 0, error: e.error ?? "" },
+      });
     case "auto_restore_failed":
       return $_("activity.auto_restore_failed", {
         values: { name, error: e.error ?? "" },

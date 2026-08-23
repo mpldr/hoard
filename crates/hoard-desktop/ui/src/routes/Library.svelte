@@ -64,7 +64,7 @@
     reactivateAndRefresh,
   } from "../lib/stores/cloud";
   import { cardWidth } from "../lib/stores/cardSizes.svelte";
-  import { wrongPathSuspected } from "../lib/stores/agent";
+  import { filesUnreadable, wrongPathSuspected } from "../lib/stores/agent";
   import CardResizeHandle from "../lib/components/CardResizeHandle.svelte";
 
   let report = $state<DetectionReport | null>(null);
@@ -1441,6 +1441,32 @@
                       >
                         <AlertTriangle size={10} class="mt-px shrink-0" />
                         <span>{$_("library.wrong_path_hint")}</span>
+                      </p>
+                    {/if}
+
+                    <!-- La última copia se dejó ficheros fuera porque no se
+                         dejaron leer (un placeholder de OneDrive sin hidratar,
+                         un permiso). Pegajoso y sin toast: la causa dura
+                         mientras dure, y el aviso sonaría en cada copia. Se va
+                         solo con la primera copia completa. El error del
+                         sistema va en el `title` porque es lo único que dice
+                         qué hay que arreglar. -->
+                    {#if $filesUnreadable[save.save_id]}
+                      {@const bad = $filesUnreadable[save.save_id]}
+                      <p
+                        class="flex items-start gap-1 text-[10px] {bad.uploaded
+                          ? 'text-amber-400/90'
+                          : 'text-rose-400/90'}"
+                        title={`${bad.path} — ${bad.error}`}
+                      >
+                        <AlertTriangle size={10} class="mt-px shrink-0" />
+                        <span>
+                          {bad.uploaded
+                            ? $_("library.files_unreadable_hint", {
+                                values: { count: bad.count },
+                              })
+                            : $_("library.files_unreadable_none_hint")}
+                        </span>
                       </p>
                     {/if}
 

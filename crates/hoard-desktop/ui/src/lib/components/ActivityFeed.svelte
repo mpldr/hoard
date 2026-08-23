@@ -26,6 +26,7 @@
     Ban,
     WifiOff,
     Scissors,
+    FileWarning,
     Trash2,
     HardDrive,
     AlertTriangle,
@@ -59,6 +60,7 @@
     backup_too_large: XCircle,
     backup_quota_full: HardDrive,
     backup_trimmed: Scissors,
+    backup_files_unreadable: FileWarning,
     auto_restore_failed: XCircle,
     auto_restore_stuck: AlertTriangle,
     auto_restore_recovered: CheckCircle2,
@@ -86,6 +88,7 @@
     backup_too_large: "text-rose-400",
     backup_quota_full: "text-rose-400",
     backup_trimmed: "text-amber-300",
+    backup_files_unreadable: "text-amber-300",
     auto_restore_failed: "text-rose-400",
     auto_restore_stuck: "text-amber-400",
     auto_restore_recovered: "text-emerald-400",
@@ -111,6 +114,10 @@
     backup_quota_full:
       "my-1 rounded-md border border-rose-500/60 bg-rose-500/10",
     backup_trimmed: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
+    // Ámbar: la copia sirve, le falta un trozo. El día que no suba nada, la
+    // fila roja de `upload_failed` sale a su lado y ésa manda.
+    backup_files_unreadable:
+      "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_grace: "my-1 rounded-md border border-sky-500/60 bg-sky-500/10",
   };

@@ -832,6 +832,7 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::BackupTooLarge { .. } => "agent://backup-too-large",
         AgentEvent::BackupQuotaFull { .. } => "agent://backup-quota-full",
         AgentEvent::BackupTrimmed { .. } => "agent://backup-trimmed",
+        AgentEvent::BackupFilesUnreadable { .. } => "agent://backup-files-unreadable",
         AgentEvent::SaveAutoRestored { .. } => "agent://save-auto-restored",
         AgentEvent::SaveAutoRestoreFailed { .. } => "agent://save-auto-restore-failed",
         AgentEvent::BackupSkippedEmpty { .. } => "agent://backup-skipped-empty",

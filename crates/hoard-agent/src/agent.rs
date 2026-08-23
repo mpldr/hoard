@@ -3607,6 +3607,34 @@ async fn run_backup_with_retry(
                         })
                         .await;
                 }
+                // Parcial por otra razón: había ficheros cuyos bytes no se
+                // dejaron leer y la subida siguió sin ellos. Se cuenta igual que
+                // el recorte de plan —después del éxito, para que el ámbar gane
+                // al verde— porque el trato es el mismo: la copia sirve, pero al
+                // usuario no se le puede ocultar lo que no está dentro.
+                if let Some(first) = o.unreadable.first() {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        count = o.unreadable.len(),
+                        kept_files = o.file_count,
+                        path = %first.relative_path,
+                        error = %first.error,
+                        "agent: snapshot uploaded without files it couldn't read"
+                    );
+                    let _ = events_tx
+                        .send(AgentEvent::BackupFilesUnreadable {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            count: o.unreadable.len() as u64,
+                            kept_files: o.file_count as u64,
+                            sample_path: first.relative_path.clone(),
+                            sample_error: first.error.clone(),
+                            uploaded: true,
+                        })
+                        .await;
+                }
                 // Tell the agent loop to clear has_pending and cache the new
                 // signature. If the channel is full or the agent is shutting
                 // down we just drop the signal — worst case we re-upload an
@@ -3892,6 +3920,48 @@ async fn run_backup_with_retry(
                             game_slug: save.game_slug.clone(),
                             likely_wrong_path,
                         })
+                        .await;
+                    return;
+                }
+                // Ni un fichero de la carpeta se dejó leer, así que no hay
+                // snapshot que subir: una versión vacía borraría en la nube la
+                // última copia buena. **No** se manda `BackupDone` —los cambios
+                // locales siguen sin versionar y limpiar `has_pending` dejaría
+                // que un restore los pisara— y se re-arma en el backoff largo,
+                // que es exactamente lo que hace falta: el disparador conocido
+                // (un proveedor de ficheros bajo demanda parado) se cura solo en
+                // cuanto el proveedor arranca, y entonces la siguiente pasada
+                // sube. Lo que ya no pasa es que lo haga en silencio: el evento
+                // deja un aviso persistente en la tarjeta del juego.
+                // Se copia fuera de la cadena antes de esperar a nada: un
+                // `anyhow::Chain` no es `Send` y este futuro va a `tokio::spawn`.
+                let unreadable_src = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<crate::backup::UnreadableSource>())
+                    .map(|src| (src.path.clone(), src.count, src.first.clone()));
+                if let Some((path, count, first)) = unreadable_src {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        path = %path.display(),
+                        count,
+                        error = %first,
+                        "agent: nothing backed up — not one file in the save folder could be read"
+                    );
+                    let _ = events_tx
+                        .send(AgentEvent::BackupFilesUnreadable {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            count: count as u64,
+                            kept_files: 0,
+                            sample_path: path.display().to_string(),
+                            sample_error: first,
+                            uploaded: false,
+                        })
+                        .await;
+                    let _ = cmd_tx
+                        .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
                         .await;
                     return;
                 }

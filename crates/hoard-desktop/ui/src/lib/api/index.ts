@@ -624,6 +624,20 @@ export type AgentEvent =
       limit_bytes: number;
     }
   | {
+      /** The snapshot went up without files whose bytes couldn't be read —
+       *  a partial version, said out loud. `uploaded: false` means not one
+       *  file was readable, so nothing was backed up at all. */
+      type: "backup_files_unreadable";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      count: number;
+      kept_files: number;
+      sample_path: string;
+      sample_error: string;
+      uploaded: boolean;
+    }
+  | {
       type: "save_auto_restored";
       save_id: string;
       game_slug: string;

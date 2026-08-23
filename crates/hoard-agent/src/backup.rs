@@ -183,6 +183,26 @@ pub struct UnsafeSource {
     pub reason: String,
 }
 
+/// Ni un solo fichero de la carpeta se dejó leer.
+///
+/// El backup salta los ficheros ilegibles uno a uno ([`split_unreadable`]), pero
+/// cuando no queda ninguno no hay snapshot que subir: publicar una versión vacía
+/// borraría en la nube la última copia buena, igual que en [`EmptySource`]. La
+/// diferencia con ése es el motivo, y el motivo es lo único accionable: "está
+/// vacía" manda a mirar la ruta, "no se deja leer" manda a mirar el proveedor de
+/// archivos —el disparador conocido es OneDrive Files On-Demand con el
+/// proveedor parado, que deja los ficheros ahí, con su tamaño, y niega los
+/// bytes.
+#[derive(Debug, thiserror::Error)]
+#[error("none of the {count} files in {path} could be read: {first}")]
+pub struct UnreadableSource {
+    pub path: PathBuf,
+    /// Cuántos ficheros enumeró el recorrido (todos ilegibles).
+    pub count: usize,
+    /// El error del primero, que es el que explica al resto.
+    pub first: String,
+}
+
 /// One file enumerated from the source directory.
 #[derive(Debug, Clone)]
 pub struct UploadFile {
@@ -215,12 +235,33 @@ pub struct TrimInfo {
     pub limit_bytes: u64,
 }
 
+/// Un fichero que el recorrido enumeró pero cuyos bytes no se pueden leer.
+///
+/// No es un fallo del backup: es contenido que **esta** copia no puede llevarse.
+/// Viaja hasta el llamante porque una versión a la que le falta un fichero sin
+/// que el usuario se entere es peor que un error a la cara — se sube lo que se
+/// puede y se dice en voz alta lo que se ha quedado en tierra.
+#[derive(Debug, Clone)]
+pub struct UnreadableFile {
+    /// Ruta relativa dentro del save, con la misma forma que en [`UploadFile`].
+    pub relative_path: String,
+    /// El error del sistema tal cual. Es lo único que distingue un placeholder
+    /// de OneDrive sin hidratar de un permiso denegado o de un disco muriéndose,
+    /// así que se transporta entero hasta la UI.
+    pub error: String,
+}
+
 /// Result of a successful upload.
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
     pub snapshot: Snapshot,
     pub file_count: usize,
     pub total_bytes: u64,
+    /// Ficheros que el recorrido vio y la subida **no** pudo llevarse porque sus
+    /// bytes no se dejaron leer. Vacío en el caso normal. Que no esté vacío
+    /// significa que esta versión es parcial, y el llamante tiene que decirlo:
+    /// ver `AgentEvent::BackupFilesUnreadable`.
+    pub unreadable: Vec<UnreadableFile>,
     /// `Some` when the save was too big for the plan's per-save cap and only
     /// its newest files were uploaded; `None` when the whole save went up.
     pub trimmed: Option<TrimInfo>,
@@ -338,6 +379,11 @@ pub fn manifest_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, i64)>)
     hex::encode(h.finalize())
 }
 
+/// Lo que entra en el digest de contenido en el sitio de los bytes de un fichero
+/// que no se deja leer. Un valor cualquiera que no puede ser un prefijo de
+/// contenido real, para que "ilegible" y "vacío" nunca den el mismo digest.
+const UNREADABLE_MARKER: &[u8] = b"\x01hoard:unreadable\x01";
+
 /// Content signature over the sorted `(relative_path, bytes)` set.
 ///
 /// Unlike [`compute_set_signature`] this *reads every file*, so it's only used
@@ -346,29 +392,128 @@ pub fn manifest_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, i64)>)
 /// bumping the mtime without changing a single byte. The cheap check would
 /// treat that as a change and cut a redundant snapshot every few hours; this
 /// confirms whether the bytes actually moved before we upload.
-async fn compute_content_signature(files: &[UploadFile]) -> Result<String> {
+///
+/// **Un fichero ilegible no tumba la pasada**: se salta con un aviso y entra en
+/// el digest por [`UNREADABLE_MARKER`] en vez de por sus bytes. La asimetría
+/// anterior era el bug: [`walk_source`] ya salta a propósito lo que no puede
+/// interrogar —"one unreadable transient file shouldn't lose the backup of
+/// everything else"— y esta pasada propagaba cualquier error de lectura con `?`,
+/// así que un solo fichero perdía el snapshot entero. Caso real: un placeholder
+/// de OneDrive Files On-Demand ("the cloud file provider is not running") dentro
+/// de un save de GTA San Andreas Definitive; 3.934 intentos en 13 días y ni una
+/// versión subida.
+///
+/// El marcador —y no simplemente omitir la ruta— mantiene el digest **estable**
+/// mientras el fichero siga ilegible, que es lo que hace que no se reintente en
+/// bucle, y lo cambia en cuanto vuelve a leerse, que es exactamente cuando hay
+/// que volver a subir.
+async fn compute_content_signature(files: &[UploadFile]) -> String {
     use tokio::io::AsyncReadExt;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
     for f in files {
         h.update(f.relative_path.as_bytes());
         h.update([0u8]);
-        let mut file = tokio::fs::File::open(&f.absolute_path)
-            .await
-            .with_context(|| format!("hashing {}", f.absolute_path.display()))?;
-        loop {
-            let n = file
-                .read(&mut buf)
+        // Los bytes se vuelcan al hash según llegan, igual que siempre: un save
+        // de 2 GB no se materializa en RAM para firmarlo. Un fallo a mitad deja
+        // en `h` el trozo que sí se leyó y luego el marcador, y eso no encalla
+        // nada: quien decide si hay que re-leer es la firma *barata*, que sólo
+        // mira rutas, tamaños y mtimes y no depende de esto.
+        let read = async {
+            let mut file = tokio::fs::File::open(&f.absolute_path)
                 .await
-                .with_context(|| format!("reading {}", f.absolute_path.display()))?;
-            if n == 0 {
-                break;
+                .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .with_context(|| format!("reading {}", f.absolute_path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
             }
-            h.update(&buf[..n]);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = read {
+            tracing::warn!(
+                path = %f.relative_path,
+                error = %format!("{e:#}"),
+                "hashing: skipping unreadable file"
+            );
+            h.update(UNREADABLE_MARKER);
         }
         h.update([0u8]);
     }
-    Ok(hex::encode(h.finalize()))
+    hex::encode(h.finalize())
+}
+
+/// Aparta los ficheros cuyos bytes no se pueden leer **ahora mismo**, para que
+/// la subida se lleve todo lo demás.
+///
+/// Es la otra mitad de la tolerancia de [`compute_content_signature`]: aquélla
+/// evita que un ilegible tumbe la firma, y ésta evita que tumbe la
+/// transferencia. Sin ella el fichero seguiría en la lista y reventaría más
+/// abajo, en el tar del camino de nube o en el hasheo del CAS, que es donde
+/// estaba media avería.
+///
+/// Se comprueba abriendo **y leyendo** el primer bloque, no sólo abriendo:
+/// algunos proveedores de ficheros bajo demanda dejan abrir el handle y fallan
+/// en la primera lectura. Cuesta un `open` por fichero encima del que hará la
+/// subida, y sólo en el camino de subida —nunca en el muestreo L1 del motor, ni
+/// en el restore, ni en la vista previa—, porque abrir un placeholder es lo que
+/// dispara su hidratación: forzar eso en cada tick bajaría la carpeta entera
+/// desde la nube del usuario para calcular un fingerprint.
+///
+/// Conserva el orden de entrada (`buffered`, no `buffer_unordered`): la lista
+/// viene ordenada por ruta desde [`walk_source`] y el digest del manifiesto
+/// depende de ese orden.
+async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<UnreadableFile>) {
+    let probes = files.into_iter().map(|f| {
+        async move {
+            match probe_readable(&f.absolute_path).await {
+                Ok(()) => Ok(f),
+                Err(e) => Err(UnreadableFile {
+                    relative_path: f.relative_path.clone(),
+                    error: format!("{e:#}"),
+                }),
+            }
+        }
+        .boxed()
+    });
+    let probed: Vec<_> = stream::iter(probes)
+        .buffered(TRANSFER_CONCURRENCY)
+        .collect()
+        .await;
+    let mut readable = Vec::with_capacity(probed.len());
+    let mut unreadable = Vec::new();
+    for outcome in probed {
+        match outcome {
+            Ok(f) => readable.push(f),
+            Err(u) => {
+                tracing::warn!(
+                    path = %u.relative_path,
+                    error = %u.error,
+                    "upload: leaving out a file whose bytes can't be read"
+                );
+                unreadable.push(u);
+            }
+        }
+    }
+    (readable, unreadable)
+}
+
+/// ¿Se pueden leer los bytes de este fichero? Abre y lee un byte.
+async fn probe_readable(path: &Path) -> Result<()> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut byte = [0u8; 1];
+    file.read(&mut byte)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(())
 }
 
 /// Persisted skip signature is a composite `"<cheap>:<content>"`. We split it
@@ -513,6 +658,25 @@ pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
 /// `game_slug` and `label` are only consulted on the Hoard Cloud path, where
 /// the server keys the save row on `(user_id, game_slug, label)` and the
 /// snapshot list endpoints don't exist. They're ignored self-hosted.
+///
+/// **Un fichero cuyos bytes no se dejan leer se queda fuera y se reporta**, en
+/// vez de perder el snapshot entero. De las dos salidas posibles —saltar el
+/// fichero o aparcar el save— se elige saltar, porque aparcar es exactamente el
+/// estado del que se viene: el caso que lo destapó (un placeholder de OneDrive
+/// Files On-Demand con el proveedor parado, dentro de un save de GTA San Andreas
+/// Definitive) llevaba 13 días y 3.934 intentos sin subir **nada**, y la causa
+/// puede durar semanas. Vale más la partida entera menos un fichero que ninguna
+/// partida.
+///
+/// El precio de esa elección se paga entero en [`UploadOutcome::unreadable`]: la
+/// versión es parcial y quien la publica **tiene** que decirlo (el motor emite
+/// `AgentEvent::BackupFilesUnreadable` y la UI deja un aviso pegajoso en la
+/// tarjeta del juego). Una versión incompleta en silencio no es una opción: sólo
+/// se descubriría al restaurar.
+///
+/// Si no queda **ningún** fichero legible no se sube nada
+/// ([`UnreadableSource`]): publicar una versión vacía borraría en la nube la
+/// última copia buena.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_directory<F>(
     client: &ApiClient,
@@ -542,6 +706,26 @@ where
     let files = walk_source(&source, &crate::savefilter::shields_for_slug(game_slug))?;
     if files.is_empty() {
         return Err(EmptySource { path: source }.into());
+    }
+    // Un fichero que no se deja leer sale de la lista aquí, en el ÚNICO sitio por
+    // el que pasan los cuatro caminos de subida (nube, CAS, pack, multipart), de
+    // modo que ninguno se lo encuentra a mitad de la transferencia. Lo que se
+    // quede fuera viaja en el `UploadOutcome` para que el llamante lo cuente: una
+    // versión incompleta en silencio es el resultado que no vale.
+    let (files, unreadable) = split_unreadable(files).await;
+    if files.is_empty() {
+        // No queda nada legible: subir aquí publicaría una versión vacía y
+        // borraría en la nube la última copia buena.
+        let first = unreadable
+            .first()
+            .map(|u| u.error.clone())
+            .unwrap_or_default();
+        return Err(UnreadableSource {
+            path: source,
+            count: unreadable.len(),
+            first,
+        }
+        .into());
     }
     let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
     let file_count = files.len();
@@ -575,7 +759,7 @@ where
     // there. Pack the save into a single tar.zst, declare the upload, PUT the
     // bytes straight to R2 via a presigned URL, then commit.
     if is_cloud {
-        return upload_directory_cloud(
+        let mut outcome = upload_directory_cloud(
             client,
             save_id,
             game_slug,
@@ -587,7 +771,9 @@ where
             origin,
             progress,
         )
-        .await;
+        .await?;
+        outcome.unreadable = unreadable;
+        return Ok(outcome);
     }
 
     // Self-hosted que sepa negociar el contenido: se le declara el manifiesto y
@@ -597,7 +783,7 @@ where
     // La condición es `Some(true)`, no `unwrap_or(false)`: un `None` significa
     // que la sonda no ha resuelto, y ese caso ya lo cortó el `bail!` de arriba.
     if client.probed_supports_cas() == Some(true) {
-        return upload_directory_cas(
+        let mut outcome = upload_directory_cas(
             client,
             save_id,
             &files,
@@ -606,7 +792,9 @@ where
             origin,
             progress,
         )
-        .await;
+        .await?;
+        outcome.unreadable = unreadable;
+        return Ok(outcome);
     }
 
     // Ingesta adaptativa por forma del save (ADR 0019): muchos archivos
@@ -699,6 +887,7 @@ where
         snapshot: snap,
         file_count,
         total_bytes,
+        unreadable,
         // The self-hosted multipart path has no per-save cap trim.
         trimmed: None,
         landed: false,
@@ -892,6 +1081,8 @@ where
         snapshot,
         file_count: files.len(),
         total_bytes,
+        // Lo rellena `upload_directory`, que es quien aparta los ilegibles.
+        unreadable: Vec::new(),
         // Sin plan no hay tope por partida que recortar.
         trimmed: None,
         landed: false,
@@ -953,6 +1144,7 @@ where
                 snapshot: landed_snapshot(save_id, head, files.len(), total_bytes),
                 file_count: files.len(),
                 total_bytes,
+                unreadable: Vec::new(),
                 trimmed: None,
                 landed: true,
             });
@@ -1187,6 +1379,7 @@ where
         snapshot,
         file_count,
         total_bytes,
+        unreadable: Vec::new(),
         trimmed,
         landed: false,
     })
@@ -1402,7 +1595,7 @@ where
     // The cheap signature drifted. That's often just an mtime bump (a game or
     // background daemon rewriting save files on a timer), so confirm whether
     // the actual bytes changed before cutting a snapshot.
-    let content = compute_content_signature(&files).await?;
+    let content = compute_content_signature(&files).await;
     if !deliberate && prev_content == Some(content.as_str()) {
         return Ok(BackupResult::Unchanged {
             signature: join_signature(&cheap, &content),
@@ -1680,15 +1873,95 @@ mod tests {
         let b = vec![mk(999)];
         assert_ne!(compute_set_signature(&a), compute_set_signature(&b));
         assert_eq!(
-            compute_content_signature(&a).await.unwrap(),
-            compute_content_signature(&b).await.unwrap()
+            compute_content_signature(&a).await,
+            compute_content_signature(&b).await
         );
         // Changing the bytes does move the content signature.
-        let before = compute_content_signature(&a).await.unwrap();
+        let before = compute_content_signature(&a).await;
         std::fs::write(&path, b"hello WORLD").unwrap();
-        let after = compute_content_signature(&a).await.unwrap();
+        let after = compute_content_signature(&a).await;
         assert_ne!(before, after);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **El bug**: un solo fichero ilegible tumbaba la firma de contenido, y con
+    /// ella el snapshot entero. El recorrido ya saltaba lo que no podía
+    /// interrogar; la lectura propagaba el error con `?`. Un placeholder de
+    /// OneDrive dentro de un save de GTA San Andreas Definitive bastó para 3.934
+    /// intentos en 13 días sin subir una sola versión.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_unreadable_file_does_not_kill_the_signature() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("good.sav"), b"real save").unwrap();
+        let bad = root.join("bad.sav");
+        std::fs::write(&bad, b"placeholder").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let files = walk_source(root, &[]).unwrap();
+        assert_eq!(files.len(), 2, "el walk sí ve el fichero: puede hacerle stat");
+        let sig = compute_content_signature(&files).await;
+        // Y es estable mientras siga ilegible: si no lo fuera, cada pasada
+        // vería un cambio y volveríamos al bucle de subidas.
+        assert_eq!(sig, compute_content_signature(&files).await);
+
+        // Los bytes del legible sí cuentan.
+        std::fs::write(root.join("good.sav"), b"moved on").unwrap();
+        let moved = walk_source(root, &[]).unwrap();
+        assert_ne!(sig, compute_content_signature(&moved).await);
+
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// Un ilegible no debe confundirse con un vacío: si el marcador no entrase
+    /// en el digest, "no se deja leer" y "está vacío" firmarían igual y una
+    /// carpeta que recupera el acceso a un fichero vacío no se re-subiría.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_and_empty_do_not_sign_the_same() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = root.join("a.sav");
+        std::fs::write(&f, b"").unwrap();
+        let as_empty = compute_content_signature(&walk_source(root, &[]).unwrap()).await;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let as_unreadable = compute_content_signature(&walk_source(root, &[]).unwrap()).await;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_ne!(as_empty, as_unreadable);
+    }
+
+    /// El filtro de la subida: lo ilegible sale de la lista y se reporta, y lo
+    /// demás viaja. Es lo que impide que el fichero reaparezca dentro del tar
+    /// del camino de nube o del hasheo del CAS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_files_are_split_off_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.sav"), b"one").unwrap();
+        std::fs::write(root.join("c.sav"), b"three").unwrap();
+        let bad = root.join("b.sav");
+        std::fs::write(&bad, b"two").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (ok, skipped) = split_unreadable(walk_source(root, &[]).unwrap()).await;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            ok.iter().map(|f| f.relative_path.as_str()).collect::<Vec<_>>(),
+            ["a.sav", "c.sav"],
+            "el orden por ruta se conserva: el digest del manifiesto depende de él"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].relative_path, "b.sav");
+        assert!(
+            !skipped[0].error.is_empty(),
+            "el error del sistema es lo único accionable que ve el usuario"
+        );
     }
 
     /// Una subcarpeta sin permiso no puede tumbar el backup del juego entero:

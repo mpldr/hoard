@@ -117,6 +117,31 @@ export const restoreStuck: Writable<Record<string, StuckRestore>> = writable(
  * Library card carries an amber hint until a backup actually lands, which is
  * also the only thing that can clear it. */
 export const wrongPathSuspected: Writable<Record<string, true>> = writable({});
+
+/** Un save cuya última copia se dejó ficheros fuera por no poder leerlos. */
+export type UnreadableFiles = {
+  /** Cuántos se quedaron fuera, para que el aviso diga "3 ficheros". */
+  count: number;
+  /** Una ruta de ejemplo y su error del sistema: el tooltip, que es lo único
+   *  que distingue "arranca OneDrive" de "revisa los permisos". */
+  path: string;
+  error: string;
+  /** `false` = no se subió nada en absoluto (ni un fichero legible). */
+  uploaded: boolean;
+};
+
+/** Saves cuya última copia salió incompleta (o no salió), por `save_id`.
+ *
+ * Mismo trato pegajoso que `restoreStuck`: no es un parpadeo de actividad sino
+ * una condición que dura mientras dure la causa —un placeholder de OneDrive sin
+ * hidratar puede estar así semanas—, y una versión a la que le falta un fichero
+ * sin que nadie lo diga es justo el fallo que sólo se descubre al restaurar.
+ * Sin toast a propósito: la condición se repite en cada copia y el aviso
+ * sonaría sin parar. Lo limpia la primera copia completa (`backup_success`
+ * llega **antes** que este evento, así que una copia que sigue siendo parcial
+ * lo vuelve a poner en el mismo tick). */
+export const filesUnreadable: Writable<Record<string, UnreadableFiles>> =
+  writable({});
 export const status: Writable<AgentStatus> = writable({
   running: false,
   watched_count: 0,
@@ -224,6 +249,14 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
         const { [ev.save_id]: _gone, ...rest } = m;
         return rest;
       });
+      // Y una copia completa, la única prueba de que ya se lee todo. El motor
+      // manda `backup_files_unreadable` justo DESPUÉS del éxito cuando sigue
+      // faltando algo, así que limpiar aquí no borra un aviso vigente.
+      filesUnreadable.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const { [ev.save_id]: _gone, ...rest } = m;
+        return rest;
+      });
       patch(ev.save_id, {
         state: "ok",
         last_version: ev.version_num,
@@ -260,6 +293,28 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
           ev.will_retry ? "Backup failed (retrying)" : "Backup failed",
           ev.error,
         );
+      }
+      break;
+    }
+    case "backup_files_unreadable": {
+      filesUnreadable.update((m) => ({
+        ...m,
+        [ev.save_id]: {
+          count: ev.count,
+          path: ev.sample_path,
+          error: ev.sample_error,
+          uploaded: ev.uploaded,
+        },
+      }));
+      // Nada legible en toda la carpeta: eso no es una copia parcial, es una
+      // copia que no existe, y la fila tiene que verse rota aunque el motor
+      // vaya a reintentarlo solo.
+      if (!ev.uploaded) {
+        patch(ev.save_id, {
+          state: "failed",
+          error: ev.sample_error,
+          will_retry: true,
+        });
       }
       break;
     }
@@ -457,6 +512,7 @@ export async function subscribeAgent() {
     "agent://backup-failed",
     "agent://backup-too-large",
     "agent://backup-trimmed",
+    "agent://backup-files-unreadable",
     "agent://save-auto-restored",
     "agent://save-auto-restore-failed",
     "agent://save-auto-restore-stuck",

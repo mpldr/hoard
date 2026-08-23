@@ -187,6 +187,41 @@ pub enum AgentEvent {
         plan: String,
         limit_bytes: u64,
     },
+    /// The snapshot went up **without some of its files**: their bytes couldn't
+    /// be read, so the upload left them out rather than losing the backup of
+    /// everything else.
+    ///
+    /// Exists because the alternative was worse in both directions. Failing the
+    /// whole snapshot on one unreadable file is what actually happened until
+    /// ago-2026 — a OneDrive Files On-Demand placeholder ("the cloud file
+    /// provider is not running") inside a GTA San Andreas save meant 3,934
+    /// attempts across 13 days and not one version uploaded — and quietly
+    /// shipping an incomplete version is the failure nobody would ever notice
+    /// until a restore came back missing a file. So: upload what can be read,
+    /// and say out loud what was left behind.
+    ///
+    /// Fired right after the `BackupSuccess` for the same upload, so the UI's
+    /// amber "partial" state wins over the green "ok" — same ordering contract
+    /// as [`AgentEvent::BackupTrimmed`]. When `uploaded` is false nothing went
+    /// up at all (not a single file was readable) and there is no companion
+    /// success event.
+    BackupFilesUnreadable {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        /// How many files were left out.
+        count: u64,
+        /// How many did travel. `0` means nothing was uploaded.
+        kept_files: u64,
+        /// One of the offending paths, relative to the save folder.
+        sample_path: String,
+        /// The OS error behind it, verbatim. This is the only part that tells
+        /// the user whether to start their cloud-files provider, fix a
+        /// permission, or worry about the disk.
+        sample_error: String,
+        /// `false` = no version was created; the save is not backed up at all.
+        uploaded: bool,
+    },
     /// The agent detected that the save's local folder was missing or empty
     /// on add and `Prefs::auto_restore` was enabled, so it downloaded the
     /// latest server snapshot into the folder. The UI uses this to toast

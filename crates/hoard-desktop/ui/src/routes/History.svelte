@@ -45,6 +45,7 @@
   import Card from "../lib/components/Card.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import Input from "../lib/components/Input.svelte";
+  import Cover from "../lib/components/Cover.svelte";
   import * as api from "../lib/api";
   import { NEEDS_DESTINATION } from "../lib/api";
   import type {
@@ -601,12 +602,17 @@
       <div class="flex items-start justify-between gap-4">
         <div class="min-w-0 flex-1">
           <div class="flex items-center gap-3">
-            <span
-              class="font-display flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500/15 to-emerald-500/[0.04] text-lg font-semibold text-emerald-300 ring-1 ring-inset ring-emerald-500/20"
-              aria-hidden="true"
-            >
-              {save.game_slug.charAt(0).toUpperCase()}
-            </span>
+            <!-- The game's art, same thumbnail the Library and the dashboard
+                 show. It used to be a hand-drawn tile with the slug's initial,
+                 which meant the one page dedicated to a single game was also
+                 the only place that never showed which game it was. `Cover`
+                 keeps the initial as its fallback for games with no art. -->
+            <Cover
+              slug={save.game_slug}
+              name={save.game_slug}
+              class="h-11 w-11 shrink-0 rounded-xl"
+              initialClass="text-lg"
+            />
             <h1
               class="font-display min-w-0 truncate text-[28px] leading-tight font-semibold tracking-[-0.02em] text-zinc-50"
             >

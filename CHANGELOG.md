@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-08-24
+
 ### Added
 - **The server installs itself on a NAS.** An Unraid template ships in
   `templates/`, so Hoard can be installed from the Apps tab: the ports and
@@ -17,8 +19,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   token in the log, once, for the desktop app to paste. `HOARD_ADMIN_USERNAME`
   and `HOARD_ADMIN_PASSWORD` do the same for anyone running the container by
   hand; they are ignored from the second start on.
+- **An emulator is tracked one game at a time.** An emulator's save root is a
+  shelf with one folder per title on it, not a save, and tracking it whole broke
+  twice over: the name came off the emulator's own plumbing — rpcs3's
+  `dev_hdd0/home/<profile>/savedata` became a game called `dev-hdd0` — and the
+  backup could never run, because a shelf has no save files of its own. One
+  rpcs3 root logged "nothing to back up" 224 times and was still logging it this
+  month; RetroArch, Ryujinx, Dolphin and Yuzu have the same shape. Each title
+  inside is now offered as its own row, named the way the "add emulator" dialog
+  names them, and the root itself is offered only when it holds saves directly —
+  RetroArch's flat `.srm` files in `saves/` are the save. The roots are
+  recognised by the tail of their path rather than the whole of it, so an
+  emulator installed somewhere unexpected, or a second profile whose id isn't
+  the first one, is still identified. Pointing at a title folder and pointing at
+  the shelf above it now give the same answer.
+- **Appearance gets a gem, a backdrop and a size.** The accent used to be a bare
+  0–359 hue slider, which is not how anyone thinks about colour; it is now seven
+  named gems, each swatch drawn with the exact maths the app will apply, with
+  the wheel one click away behind Custom for anyone who wants it (and opening by
+  itself if your saved hue matches no gem). The pure-black canvas was a
+  deliberate call for WOLED panels — no glow, so black stays genuinely off — and
+  a good default is a bad decree: there are now four backdrops, with today's
+  look still selected for everyone who never opens the setting. And the whole
+  interface scales, from the slider or with Ctrl + wheel / Ctrl +/- / Ctrl+0.
+  All three are per-machine, like the theme.
+- **A game's history page shows its cover.** The one page dedicated to a single
+  game was the only place that never showed which game it was, drawing a tile
+  with the first letter of its name while the Library and the dashboard both
+  showed the art. The initial stays as the fallback for a game with no cover.
+
+### Changed
+- **The mode is called Self-Host, everywhere.** Onboarding said "Self-hosted",
+  the guides said "Autohost" and the Unraid page said something else again —
+  three names for the one card you have to click. One name now, in the app and
+  in all eight translations of the guides.
+- **Self-hosting no longer reads as "clone the repo and build it".** Every
+  release tag publishes a multi-arch server image, so the short way goes first
+  in the guide: one `curl` for the compose file, one command to start it, and
+  the container writes its own config. Cloning stays as the alternative. How to
+  update is written down too, which is the half that silently doesn't happen —
+  `pull` without `up -d` leaves the old container running and the health
+  endpoint still reporting the old version, and `git pull` updates nothing at
+  all, since what runs is the published image and not the checkout.
 
 ### Fixed
+- **One save folder could be backed up twice, every time it changed.** The same
+  directory can end up tracked under two save ids — the one this machine minted
+  and the one the server considers canonical for that game — and nothing ever
+  collapsed them: both got a watcher, both hashed the folder, both uploaded the
+  same bytes. Nothing looked wrong on the server, because the upload path
+  already redirects both to the canonical id; the whole cost landed on the
+  machine doing the work and the connection carrying it. A folder is now watched
+  once no matter how many rows name it. Deliberately narrow, so it cannot take
+  anything real with it: the same game tracked in two different folders is a
+  slot and keeps both, and two different games sharing one folder keep both too.
+- **A game you had frozen went on being backed up, hourly, saying nothing.**
+  Parking a game in the archive frees its space on the server and the server
+  then refuses to accept new versions of it — which is the point. The client
+  never learned that, so every reconcile decided to back the game up, hashed the
+  whole save folder, sent it and got turned away: 30 times in two days in the
+  report that found this, with "Backing up…" appearing in the activity feed each
+  time and nothing ever following it, because that particular refusal was the
+  one outcome that told the app nothing. Frozen games are now left alone, the
+  same way a paused one is — no hashing, no attempt, no line in the feed.
+  Freezing or restoring a game takes effect immediately instead of at the next
+  restart. If the server can't be asked which games are frozen, everything stays
+  watched exactly as before.
+- **Accent colours left a green square in the middle of the ramp.** The chosen
+  gem repointed most of the emerald scale but not all of it, so anything using
+  one of the shades it missed stayed green while everything around it turned
+  purple, amber or blue. Most visible in the playtime heatmap, whose lowest
+  level is one of those shades: four squares followed the gem and the fifth did
+  not. The whole scale follows now, which also fixes the selected chips in the
+  recap and the overlay, the toasts, and the badge counters.
 - **A game with many save files could never finish uploading to a self-hosted
   server.** A save folder travels as one request per file, so a game keeping
   dozens of slots — 46 in the report that found this — sends more requests
@@ -32,12 +105,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   never. Size was never the problem: the same server had accepted a 3.8 GB game
   the day before, because a few big files arrive slowly enough to stay under the
   limit.
+- **An account that was out of space kept trying forever, and stopped saying
+  so.** After a handful of refusals the server asks that account to stand down
+  for an hour, which is the polite version of the same "you are out of space"
+  message. The client answered that pause with a five-minute one of its own,
+  came back twelve times before it was welcome, and — because the pause arrives
+  in a different shape from the first refusals — stopped showing the "free up
+  space or go Pro" prompt at exactly the point the problem started repeating. So
+  the wall went up and the sign explaining it came down. One account spent four
+  days bouncing off it at around 170 refusals an hour, day and night, without
+  ever completing a backup. The wait the server asks for is now the wait that is
+  taken, the prompt stays on screen with the plan and the numbers behind it, and
+  twenty games hitting one wall still read as one message. The same cap comes
+  off restores, which can ask for anything from fifteen minutes to a day.
+- **One unreadable file lost the entire backup.** A file the system refuses to
+  hand over — most often a cloud-storage placeholder that hasn't been downloaded
+  — aborted the whole snapshot instead of being skipped, so a single stray file
+  inside a GTA San Andreas Definitive save meant 3,934 attempts across 13 days
+  and not one version uploaded. The rest of the save is worth more than nothing
+  at all, so the file is skipped and the backup goes through — out loud: the
+  game's card carries an amber warning naming how many files were left out, and
+  keeps it until a complete backup lands. A save where nothing at all is
+  readable still uploads nothing, because an empty version would bury the last
+  good copy.
+- **A save could give itself up and go on retrying for weeks, with nothing on
+  screen.** When the server says "you're behind" but there is nothing newer to
+  pull — the version it was pointing at was deleted, or two machines raced — the
+  answer to the question never changes, and asking again on a flat ten-minute
+  timer is just noise. Production had 1,701 of those, one save stuck at roughly
+  four and a half attempts an hour for 14 days, across three app versions, and
+  never a word about it. The wait now backs off (10 → 20 → 40 → 80 minutes), and
+  after five of them the save stops and says so: a red state on its card with
+  what to try next. Anything that could actually change the answer clears it —
+  the cloud moving on, a successful backup, or pressing "back up now". Nothing
+  is lost while it waits; the pending changes stay pending, so a restore can't
+  overwrite them.
+- **Settings and tracked games could vanish after a hard shutdown.** Both files
+  were written by emptying them first and filling them afterwards, so a process
+  that died in that window — a closing laptop lid, an update replacing the
+  binary — left a zero-byte file that reads exactly like a file that was never
+  valid. One user's telemetry carries 917 "settings were corrupt, resetting to
+  defaults": 917 times losing every preference they had set. On the state files
+  the same accident costs the manual paths and exclusions, or the entire list of
+  tracked saves — the app opens to an empty library and every game has to be
+  adopted again. Those files are now replaced whole or not at all: the new
+  contents are written beside the old ones, flushed to the disk, and only then
+  swapped in.
+- **What was being backed up was the game's own backup copy.** Some games mirror
+  their save into a sibling folder every few minutes (`SaveGamesBackup`,
+  `SavesOld`, `…-bak`), and detection was happy to pick the mirror — so the only
+  thing syncing was the game's private archive, and because every copy counts as
+  new content, none of it deduplicated and the quota drained. A folder whose
+  name ends in a backup suffix is now graded down, but only when it also looks
+  like a rotating mirror, so a real save folder with an unlucky name doesn't get
+  punished for it — and the suffix has to be at the end: `BackupSaves` is a save
+  folder with an odd name. Games already tracked that way get a warning naming
+  the sibling that looks like the real save and what the mirror is costing in
+  the cloud, with an offer to repoint or archive; moving a save stays your call.
+  The reason a folder was picked now reaches the screen, so "why THIS folder?"
+  has an answer.
+- **63 games came back with no save folder at all.** The catalog writes some
+  save paths relative to "wherever the store put it", and the only store Hoard
+  knew how to resolve was Steam — so every Ubisoft launcher title looked inside
+  Steam's folder, found nothing, and reported no saves: the Assassin's Creed,
+  Far Cry and Watch Dogs lines among them, leaving the folder to be found by
+  hand. Non-Steam storefronts are resolved now, natively and inside a Proton
+  prefix, and adding another one is a single line.
+- **Saves named `user`, `steam`, `cd` or a bare number.** When a save's own
+  folder is a plumbing directory, the name was taken from whatever sat above it,
+  and the climb could land on a path segment that names nothing: production
+  carries saves called `user` on 13 accounts, `steam` on 11, plus loose
+  `settings`, `local`, `logs`, `game` and raw Steam ids. The single biggest
+  source was a Windows machine whose account is literally named `user`. Those
+  names are now refused at the moment of naming rather than quarantined later,
+  and the check reads your own home path as well as a fixed list, so it also
+  catches the segment that only means something on your machine.
+- **A phantom game called "storage" on a Linux handheld, always running and
+  impossible to close.** A front-end keeps its emulator trees under a folder by
+  that name, so a save was minted from it — and on an image-based distro, every
+  containerised process also runs out of a path containing `storage`, so that
+  name then matched half the process table and the game never stopped playing.
+  Names like that can no longer be minted, are quarantined if already on disk,
+  and never count as evidence that a game is running.
+- **Blacklisting a game left it being backed up.** The button filtered the game
+  out of future scans and did nothing about the save already tracked under that
+  name, which went on being watched, synced and counted as playing — so the
+  user who blacklisted a phantom game saw nothing change and had no way to tell
+  why. It now stops tracking it too, in one step, and the confirmation says how
+  many tracked saves that will be before the click rather than afterwards.
+  Nothing is deleted from the server: the versions stay and the game can be
+  tracked again from the Library.
+- **A game tracked for months kept being offered as a new find, every ten
+  minutes.** Two unrelated causes. Certain repacks leave a bookkeeping file in
+  the folder that would hold cloud saves, and a folder with a file in it isn't
+  empty, so it passed the only test there was — the folder now has to hold
+  something that isn't known bookkeeping. And the warning that fires when a busy
+  program looks like a game asked "is this executable listed on a tracked save?"
+  of saves that were tracked by folder and so list no programs at all; it
+  corroborates by the game's identity now, before deciding anyone needs
+  bothering.
+- **Start-at-login asked for an administrator, or was refused outright.** 142
+  reports across 14 users where the sync service never got registered to start
+  with the machine. On Windows, registering the scheduled task can be refused
+  without an elevated console, and all Hoard had to offer was "re-run this from
+  an administrator PowerShell" — which is asking someone to open an admin shell
+  so their game can save itself. The task is still tried first, since it is the
+  better mechanism, but when it is refused a normal per-user startup entry is
+  written instead, which never needs elevation. On an AppImage there was no way
+  in at all, because the program runs from a mount that is gone by the next
+  login; it now points at an installed copy of the engine when there is one, and
+  otherwise stages its own. And when there is genuinely no way in, the switch
+  says so under itself instead of reading "on" while the sync only ever ran with
+  the window open.
+- **The sync service could die on every single launch at login.** Priming its
+  clock did arithmetic that doesn't exist on a computer that has been on for
+  less than a minute, so the loop crashed, was restarted, and crashed again on
+  the same sum — which is exactly the machine that starts Hoard at login.
+  Telemetry caught four of those with the loop having run for zero seconds.
+- **A Linux keyring that misbehaved could take the session with it.** Seven
+  users signed out of Cloud with nothing to go on: no keyring daemon at all, a
+  locked one, a damaged entry, and Hoard's own five-second timeout all produced
+  the same blank "the sync service is offline". Each of those now says which one
+  it was and what to do about it. More seriously, saving the session trusted the
+  keyring's word: a keyring that accepts a write and then can't decrypt what it
+  holds left the machine with its only copy in a store that would never give it
+  back, and nothing on disk to fall back to. Every write is now read back before
+  the on-disk copy is dropped, which is what makes "sign in again" real advice
+  instead of another lap of the same loop.
+- **The dashboard undercounted what a game was costing.** It showed the size of
+  the newest version and called it the total, while the storage bar beside it
+  showed real usage — so a game with history disagreed with itself on screen,
+  35 MB of saves reporting 79 MB of quota, with nothing explaining the gap. Both
+  numbers now come from the game's whole deduplicated footprint, and sorting by
+  size ranks on that, since "biggest" has to mean "what is eating the quota".
+  The newest version's size is still worth knowing — it is what a fresh restore
+  would pull — so it stays as a subtitle when history makes the two differ.
 - **"You've hit the bandwidth limit" when nothing had hit any limit.** The
   client treated every kind of "too many requests" as the account running out
   of bandwidth, so a server merely asking it to slow down produced a message
   that sent people looking at their plan for a problem that was not there, and
   a wait of a fabricated 60 seconds — the real wait was a fraction of a second.
   The two are now told apart and each says what it actually is.
+- **Storage that couldn't be reached read as though Hoard was down.** On Cloud
+  the files go straight to storage and never through Hoard's server, so when
+  that address stops answering the failure has nothing to do with Hoard — but
+  the message was the raw network error wrapped around a 400-character signed
+  URL, with Hoard's own name nowhere in it. It now names the host that wouldn't
+  answer and says the server itself replied fine. It also stops retrying: a
+  connection that cannot be opened will not open on the next attempt either, and
+  six timeouts a round, four minutes at a time, only delayed the moment anyone
+  found out. Found on a machine whose internet provider had stopped routing to
+  the storage endpoint while every other address at the same provider answered
+  in 20 ms.
+- **An unplugged Steam library filled the log with the same line.** One user
+  produced 553 entries in 48 hours, every one of them the same "no such device"
+  about a different game on the same absent external drive. The drive is asked
+  once now, before anything inside it is opened, and the first device-level
+  failure abandons that library instead of asking it about the next thirty
+  games — one line per library per sweep, saying how many were skipped.
+- **Uploads that started and never finished were charged for, forever.** An
+  upload that gives up halfway is invisible and harmless to look at, and nothing
+  ever cleaned up behind one: production was carrying 22 of them across 14
+  accounts, 45,506 database rows describing versions that will never exist, plus
+  whatever files each had managed to send — bytes on the meter that belonged to
+  nobody and no cleanup could see. Both are swept now, and only for an account
+  with nothing in flight, so a healthy upload in progress can't be mistaken for
+  an abandoned one.
 - **A container on a NAS could never write its own data.** Bind-mounted folders
   arrive owned by root and the server does not run as root, so the very first
   write failed and the container restarted forever. It now takes ownership of

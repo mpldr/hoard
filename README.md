@@ -47,6 +47,8 @@ Decks. No desktop required, just set it and forget it.
 
 One codebase, two ways to run it:
 
+![Hoard server photo](web/static/cloud.png)
+
 - **Hoard Cloud** — the hosted service at [hoard.services](https://hoard.services).
   Sign in with Google, install the app, done. Free tier: 2 GB, 3 devices,
   full version history — free forever.

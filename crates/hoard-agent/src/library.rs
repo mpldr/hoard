@@ -598,6 +598,81 @@ pub fn derive_playtime_saves(
         .collect()
 }
 
+/// Comparison key for "the same folder on disk".
+///
+/// Windows is case-insensitive and the paths in `state.json` mix separators —
+/// `C:\Users\x\Documents\My Games/Fallout4/Saves` is one real directory
+/// written two ways — so comparing the strings would read two spellings of one
+/// folder as two folders. Only normalised on Windows: a backslash is a legal
+/// character in a Unix filename, and folding it there would merge folders that
+/// really are different.
+fn folder_key(p: &Path) -> String {
+    let raw = p.to_string_lossy();
+    let s = if cfg!(windows) {
+        raw.replace('\\', "/").to_lowercase()
+    } else {
+        raw.into_owned()
+    };
+    match s.trim_end_matches('/') {
+        "" => s,
+        trimmed => trimmed.to_string(),
+    }
+}
+
+/// The rows of `state.json` that deserve a watcher, one per folder.
+///
+/// Two rows can name the same directory under two save ids: the local one and
+/// the id the server considers canonical for that `(slug, label)`. The upload
+/// path already knows they are the same — it redirects the commit to the
+/// canonical id rather than 404ing — but nothing upstream ever collapsed them,
+/// so both got a watcher, both hashed the folder and both uploaded the same
+/// bytes on every change. Seen ago-2026 on Jurassic World Evolution 3: two
+/// watchers armed on one path 70 ms apart, 5.7 MB sent twice.
+///
+/// The key is (folder, slug, label), the tightest one that fixes that: a game
+/// tracked in two different folders is a deliberate slot and stays, and two
+/// different games sharing one folder stay too — collapsing those would stop
+/// backing one of them up.
+///
+/// Which twin wins barely matters for the bytes, since the commit is redirected
+/// either way; it matters for the work. A row carrying a set-hash knows what is
+/// already synced, so it will not re-upload a baseline — that is the one to
+/// keep. `save_id` breaks the remaining ties so a `HashMap`'s order cannot make
+/// this pick a different winner on every pass.
+fn rows_one_per_folder(cli_state: &CliState) -> Vec<(&String, &SaveState)> {
+    let mut rows: Vec<(&String, &SaveState)> = cli_state
+        .saves
+        .iter()
+        .filter(|(_, s)| !s.paused)
+        .collect();
+    rows.sort_by(|(a_id, a), (b_id, b)| {
+        (a.set_hash.is_none(), a.last_version_num.is_none(), *a_id)
+            .cmp(&(b.set_hash.is_none(), b.last_version_num.is_none(), *b_id))
+    });
+
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let mut kept = Vec::with_capacity(rows.len());
+    for (id, s) in rows {
+        let key = (
+            folder_key(&s.local_path),
+            s.game_slug.clone(),
+            s.label.clone(),
+        );
+        if seen.insert(key) {
+            kept.push((id, s));
+        } else {
+            tracing::warn!(
+                save_id = %id,
+                game_slug = %s.game_slug,
+                label = %s.label,
+                path = %s.local_path.display(),
+                "state: two rows name the same folder; watching it once"
+            );
+        }
+    }
+    kept
+}
+
 /// Construye la lista de vigilancia desde `state.json`: saves reales (enriquecidos
 /// con su dir de Steam) + slots playtime-only. Salta los pausados. ÚNICA fuente:
 /// antes el desktop (`hydrate_watched_saves`) y el daemon (`watched_from_state`)
@@ -613,11 +688,9 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
         .collect();
     let playtime_saves = derive_playtime_saves(cli_state, &tracked_slugs);
 
-    let mut out = Vec::with_capacity(cli_state.saves.len() + playtime_saves.len());
-    for (save_id, s) in &cli_state.saves {
-        if s.paused {
-            continue;
-        }
+    let rows = rows_one_per_folder(cli_state);
+    let mut out = Vec::with_capacity(rows.len() + playtime_saves.len());
+    for (save_id, s) in rows {
         let steam_install_dir = steam_apps
             .iter()
             .find(|a| name_matches(&a.name, &s.game_slug))
@@ -797,12 +870,13 @@ fn row_for_same_folder<'a>(state: &'a CliState, local_path: &Path) -> Option<&'a
 /// Misma carpeta, con la caja de Windows en cuenta (`C:\Users` y `c:\users` son
 /// la misma). Espeja el criterio de [`crate::detection::paths_overlap`], que ya
 /// baja a minúsculas en Windows por la misma razón.
+///
+/// Delega en [`folder_key`] para que no haya dos reglas de "misma carpeta" en
+/// este fichero: ésta comparaba las cadenas tal cual y por tanto leía
+/// `…\My Games/Fallout4/Saves` y `…\My Games\Fallout4\Saves` como dos sitios
+/// distintos, que es una forma que `state.json` trae de verdad.
 fn same_folder(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
-        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-    } else {
-        a == b
-    }
+    folder_key(a) == folder_key(b)
 }
 
 /// El juego —distinto de `slug`— que ya reclama `path`, si lo hay. `None` = el
@@ -2267,10 +2341,10 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
 mod tests {
     use super::{
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in,
-        local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
-        reconcile_plan, resolve_processes, row_for_same_folder, rows_unknown_to_server,
-        spread_allow_device_local, superseded_rows, AutoTrack, CachedDetection, ServerRow,
-        ERR_SLOT_OCCUPIED,
+        folder_key, local_detection, manual_override_conflict, occupied_slot,
+        prune_poisoned_rows, reconcile_plan, resolve_processes, row_for_same_folder,
+        rows_one_per_folder, rows_unknown_to_server, spread_allow_device_local, superseded_rows,
+        AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
@@ -2292,6 +2366,122 @@ mod tests {
             set_hash: None,
             processes: Vec::new(),
             shared_processes: false,
+        }
+    }
+
+
+    // ---- one folder, one watcher --------------------------------------
+
+    /// The bug this exists for (ago-2026, Jurassic World Evolution 3): the same
+    /// folder tracked under two save ids — the local one and the id the server
+    /// calls canonical for that `(slug, label)` — armed two watchers 70 ms
+    /// apart and uploaded the same 5.7 MB twice on every change. The commit
+    /// path already redirected both to the canonical id, so nothing looked
+    /// broken on the server; the cost was all on the client.
+    #[test]
+    fn one_folder_gets_one_row_even_under_two_save_ids() {
+        let mut state = CliState::default();
+        let path = "/home/u/Saved Games/Jurassic World Evolution 3/76561197960287930/Saves";
+        state
+            .saves
+            .insert("34fb6027".into(), save_state("jurassic-world-evolution-3", path));
+        let mut local = save_state("jurassic-world-evolution-3", path);
+        local.set_hash = Some("abc:def".into());
+        local.last_version_num = Some(1);
+        state.saves.insert("b3ebb909".into(), local);
+
+        let kept = rows_one_per_folder(&state);
+        assert_eq!(kept.len(), 1, "one folder must not produce two watchers");
+        // The row carrying a set-hash wins: it knows what is already synced, so
+        // keeping it avoids re-uploading a baseline that is already up there.
+        assert_eq!(kept[0].0, "b3ebb909");
+    }
+
+    /// The other half of the same rule: a game deliberately tracked in two
+    /// different folders is a slot, not a duplicate. This is what the fix must
+    /// not break — the report that found the bug came from a machine that has
+    /// exactly this (Factorio in `Desktop/saves` and in `AppData/Factorio`).
+    #[test]
+    fn the_same_game_in_two_folders_keeps_both_rows() {
+        let mut state = CliState::default();
+        let mut a = save_state("factorio", "/home/u/Desktop/saves");
+        a.label = "2".into();
+        state.saves.insert("row-a".into(), a);
+        state
+            .saves
+            .insert("row-b".into(), save_state("factorio", "/home/u/.factorio/saves"));
+
+        assert_eq!(rows_one_per_folder(&state).len(), 2);
+    }
+
+    /// And two *different* games that share one folder both keep their row.
+    /// Collapsing on the path alone would have stopped backing one of them up,
+    /// which is a worse bug than the one being fixed.
+    #[test]
+    fn two_games_sharing_a_folder_keep_both_rows() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("row-a".into(), save_state("game-one", "/home/u/shared/saves"));
+        state
+            .saves
+            .insert("row-b".into(), save_state("game-two", "/home/u/shared/saves"));
+
+        assert_eq!(rows_one_per_folder(&state).len(), 2);
+    }
+
+    /// A `HashMap`'s iteration order is not stable, so without an explicit
+    /// ordering the surviving twin would differ between two passes over the
+    /// same file — and the engine would drop and re-arm a different watcher on
+    /// every reload. Ordering by `save_id` after the set-hash preference makes
+    /// the answer the same every time.
+    #[test]
+    fn the_surviving_twin_is_the_same_on_every_pass() {
+        let path = "/home/u/saves";
+        let winner = |ids: [&str; 3]| {
+            let mut state = CliState::default();
+            for id in ids {
+                state.saves.insert(id.to_string(), save_state("g", path));
+            }
+            let kept = rows_one_per_folder(&state);
+            assert_eq!(kept.len(), 1);
+            kept[0].0.clone()
+        };
+        assert_eq!(winner(["ccc", "aaa", "bbb"]), "aaa");
+        assert_eq!(winner(["aaa", "bbb", "ccc"]), "aaa");
+    }
+
+    /// A paused row is not watched, so it must not be the twin that survives —
+    /// otherwise pausing one of two rows on a folder would stop the folder
+    /// being backed up at all.
+    #[test]
+    fn a_paused_twin_never_wins_over_a_live_one() {
+        let mut state = CliState::default();
+        let path = "/home/u/saves";
+        let mut paused = save_state("g", path);
+        paused.paused = true;
+        paused.set_hash = Some("abc:def".into());
+        state.saves.insert("aaa".into(), paused);
+        state.saves.insert("zzz".into(), save_state("g", path));
+
+        let kept = rows_one_per_folder(&state);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "zzz");
+    }
+
+    /// `state.json` really does carry both separators in one path — the rows
+    /// this machine wrote include `C:\Users\u\Documents\My Games/Fallout4/Saves`.
+    /// On Windows that is one directory spelled two ways and must key the same.
+    #[test]
+    fn mixed_separators_name_the_same_folder_on_windows() {
+        let a = Path::new(r"C:\Users\u\Documents\My Games\Fallout4\Saves");
+        let b = Path::new(r"C:\Users\u\Documents\My Games/Fallout4/Saves");
+        if cfg!(windows) {
+            assert_eq!(folder_key(a), folder_key(b));
+        } else {
+            // On Unix a backslash is a legal filename character, so these are
+            // genuinely two different names and folding them would be wrong.
+            assert_ne!(folder_key(a), folder_key(b));
         }
     }
 

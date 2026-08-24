@@ -16,7 +16,7 @@ This is the server half. The machines you play on need the Hoard desktop app (Wi
 Setup:
 1. Type an admin username and password below, then press Apply.
 2. Open the container log. The device token for your first PC is printed there, once.
-3. In the desktop app choose "Self-hosted", enter http://TOWER-IP:12421 and paste the token.
+3. In the desktop app choose "Self-Host", enter http://TOWER-IP:12421 and paste the token.
 4. WebUI opens the web panel. Log in with the same username and password to see your saves, devices and users.
 
 To add another PC later, open this container's Console and run:

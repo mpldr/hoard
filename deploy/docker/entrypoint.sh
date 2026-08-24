@@ -96,7 +96,7 @@ hoard-server | /usr/local/bin/hoard-server)
         echo "  │" >&2
         echo "  │   $token" >&2
         echo "  │" >&2
-        echo "  │ In the desktop app pick \"Self-hosted\", give it this server's" >&2
+        echo "  │ In the desktop app pick \"Self-Host\", give it this server's" >&2
         echo "  │ address and paste the token. The web panel at /panel takes the" >&2
         echo "  │ username and password instead." >&2
         echo "  └───────────────────────────────────────────────────────────────" >&2

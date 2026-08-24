@@ -77,16 +77,31 @@ export function applyTheme(id: ThemeId): void {
  * Lightness/chroma track Obsidian's emerald so it reads well on dark themes; on
  * Quartz (light) it's an approximation — the picker is a power-user touch.
  *
+ * The scale is covered end to end, not just the shades that carry most of the
+ * UI. A shade left out doesn't fall back to something neutral — it keeps
+ * Tailwind's own emerald, so it stays green while everything around it turns
+ * the chosen hue. That is how the playtime heatmap ended up with a green square
+ * in the middle of a purple ramp: its lowest level is `emerald-900`, and only
+ * 300-700 were being repointed. Chroma tapers at both ends because the mid-ramp
+ * 0.15 is not reachable at those lightnesses for every hue, and a value outside
+ * the gamut gets clipped — which shifts the hue, the one thing this must hold.
+ *
  * The mark's gem (`--logo-gem-*`, drawn by `Logo.svelte`) follows along, but on
  * its own lightness/chroma: the logo always sits on a near-black tile, so it
  * can't borrow the emerald ramp, which Quartz darkens for paper.
  */
 const ACCENT_STOPS: [string, number, number][] = [
+  ["--color-emerald-50", 0.95, 0.04],
+  ["--color-emerald-100", 0.89, 0.09],
+  ["--color-emerald-200", 0.82, 0.13],
   ["--color-emerald-300", 0.75, 0.15],
   ["--color-emerald-400", 0.7, 0.16],
   ["--color-emerald-500", 0.64, 0.15],
   ["--color-emerald-600", 0.58, 0.16],
   ["--color-emerald-700", 0.5, 0.15],
+  ["--color-emerald-800", 0.44, 0.13],
+  ["--color-emerald-900", 0.37, 0.1],
+  ["--color-emerald-950", 0.27, 0.06],
 ];
 
 /** The mark's gem: lightness, chroma and a hue offset from the chosen accent.

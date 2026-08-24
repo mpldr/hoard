@@ -44,7 +44,7 @@
             class="overflow-x-auto rounded-xl border border-pine-line bg-black/30 p-5 font-mono text-[13px] leading-relaxed text-white/80"><code
               >git clone https://github.com/rleeon/hoard.git
 cd hoard/deploy/docker
-docker compose up -d --build</code
+docker compose up -d</code
             ></pre>
         </div>
       </div>

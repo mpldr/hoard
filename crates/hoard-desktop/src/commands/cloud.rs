@@ -813,22 +813,39 @@ pub async fn cloud_storage_games(app: AppHandle) -> Result<StorageGames, String>
 /// quota now, keeps it downloadable for 7 days, then a cron purges it. The local
 /// save on disk is never touched.
 #[tauri::command]
-pub async fn cloud_archive_save(app: AppHandle, save_id: String) -> Result<ArchiveResult, String> {
+pub async fn cloud_archive_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    save_id: String,
+) -> Result<ArchiveResult, String> {
     let creds = active_creds_or_msg(&app).await?;
-    cloud_account::archive_save(&creds.server_url, &creds.access_token, &save_id)
+    let out = cloud_account::archive_save(&creds.server_url, &creds.access_token, &save_id)
         .await
-        .map_err(cloud_err_to_string)
+        .map_err(cloud_err_to_string)?;
+    // Congelar es dejar de vigilar. Sin este aviso el motor seguiría con el save
+    // en su conjunto hasta el siguiente arranque, re-hasheando la carpeta cada
+    // reconcile para que el servidor la rechace con un 403 — que es exactamente
+    // el "Subiendo…" perpetuo que esto viene a matar.
+    state.daemon.notify_reload().await;
+    Ok(out)
 }
 
 /// `POST /v1/cloud/saves/:id/reactivate` — bring an archived game back (after
 /// upgrading to Pro / freeing space). Re-references its blobs; errors if it no
 /// longer fits the plan or the 7-day window already elapsed.
 #[tauri::command]
-pub async fn cloud_reactivate_save(app: AppHandle, save_id: String) -> Result<(), String> {
+pub async fn cloud_reactivate_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    save_id: String,
+) -> Result<(), String> {
     let creds = active_creds_or_msg(&app).await?;
     cloud_account::reactivate_save(&creds.server_url, &creds.access_token, &save_id)
         .await
-        .map_err(cloud_err_to_string)
+        .map_err(cloud_err_to_string)?;
+    // Y descongelar es volver a vigilarlo, sin reiniciar nada.
+    state.daemon.notify_reload().await;
+    Ok(())
 }
 
 /// Record that this user accepted the Terms, and report what the server has on

@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hoard_core::ids::GameSlug;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -811,6 +812,45 @@ impl ApiClient {
             .await?;
         let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
         Ok(resp.json().await?)
+    }
+
+    /// The save ids parked in the server-side archive ("caja negra").
+    ///
+    /// Reads the same `/v1/cloud/storage/games` the desktop's storage screen
+    /// uses, and keeps only the one field the engine needs. A frozen save
+    /// refuses every upload with a 403 by design, so the watch set has to know
+    /// which ones they are *before* deciding to back one up — otherwise the
+    /// folder is re-hashed on every reconcile to be turned away at `cas_init`.
+    ///
+    /// Deserialised structurally rather than through `cloud_account`'s
+    /// `StorageGames`: this only needs two fields, and staying off that type
+    /// keeps a change to the quota figures from breaking the watch set.
+    pub async fn cloud_archived_save_ids(&self) -> Result<HashSet<String>> {
+        #[derive(serde::Deserialize)]
+        struct Game {
+            save_id: String,
+            #[serde(default)]
+            archived: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Games {
+            #[serde(default)]
+            games: Vec<Game>,
+        }
+        let resp = self
+            .http
+            .get(self.url("/v1/cloud/storage/games"))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await.map_err(|e| anyhow!(e))?;
+        let games: Games = resp.json().await?;
+        Ok(games
+            .games
+            .into_iter()
+            .filter(|g| g.archived)
+            .map(|g| g.save_id)
+            .collect())
     }
 
     /// `GET /v1/cloud/saves/:save_id/versions` — the full version history of a

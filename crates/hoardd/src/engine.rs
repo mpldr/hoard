@@ -27,6 +27,7 @@
 //! Por eso [`Running`] ya no guarda ningún lock: lo único que impide dos motores
 //! es que sólo hay un daemon, y de eso responde el bind (`transport::Listener`).
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,12 @@ struct Running {
     handle: AgentHandle,
     task: JoinHandle<()>,
     presence: PresenceHandle,
+    /// El cliente del motor vivo. `Reload` reconstruye el conjunto vigilado y
+    /// para eso necesita volver a preguntar qué saves están archivados: sin
+    /// esto, archivar una partida no surtiría efecto hasta el siguiente
+    /// arranque. Comparte la celda del token con el resto de clones, así que
+    /// el JWT que rote el refresher también vale aquí.
+    client: ApiClient,
     /// Tareas auxiliares del motor (presencia, empuje Cloud, refresher del JWT).
     aux: Vec<JoinHandle<()>>,
 }
@@ -154,6 +161,11 @@ impl Engine {
 
     pub fn presence(&self) -> Option<PresenceHandle> {
         self.lock().running.as_ref().map(|r| r.presence.clone())
+    }
+
+    /// Cliente del motor vivo, si lo hay.
+    pub fn client(&self) -> Option<ApiClient> {
+        self.lock().running.as_ref().map(|r| r.client.clone())
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -514,10 +526,11 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
         Err(e) => tracing::warn!(error = %e, "hoardd: couldn't reconcile with the server"),
     }
     let (state, _path) = CliState::load_default()?;
+    let archived = archived_save_ids(&active.client).await;
     // Sin saves rastreados el motor arranca igual (a diferencia de `hoard sync`,
     // que es un comando y puede abortar): un servicio residente tiene que estar
     // ahí cuando el usuario rastree el primero, y `Request::Reload` lo recoge.
-    let saves = library::watched_saves_from_state(&state);
+    let saves = library::watched_saves_from_state(&state, &archived);
     let watched = saves.len();
     let config = engine_config();
 
@@ -527,6 +540,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
     // refresher llega también al motor y al empuje Cloud.
     let live_client = active.client.clone();
     let refresh_client = active.client.clone();
+    let reload_client = active.client.clone();
     let global_sync = config.global_sync;
     let (handle, task) = agent::spawn(active.client, config, saves, events_tx);
 
@@ -551,12 +565,44 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
             handle,
             task,
             presence: presence_handle,
+            client: reload_client,
             aux,
         },
         server: active.server,
         is_cloud: active.is_cloud,
         watched,
     })
+}
+
+/// Los saves congelados en la caja negra del servidor, para dejarlos fuera del
+/// conjunto vigilado.
+///
+/// **Nunca falla hacia arriba.** Un servidor que no contesta, un self-hosted que
+/// no tiene caja negra, una versión vieja sin ese endpoint: todos significan
+/// aquí "no sé de ninguno archivado", que es el comportamiento de siempre.
+/// Devolver un error en su lugar dejaría al motor sin arrancar por una consulta
+/// accesoria, y devolver un conjunto a medias dejaría de vigilar saves que están
+/// perfectamente vivos — de los dos errores posibles, vigilar de más es el
+/// barato: un save archivado que se cuele lo para el 403 como hasta ahora.
+async fn archived_save_ids(client: &ApiClient) -> HashSet<String> {
+    if !client.is_cloud().await {
+        return HashSet::new();
+    }
+    match client.cloud_archived_save_ids().await {
+        Ok(ids) => {
+            if !ids.is_empty() {
+                tracing::info!(count = ids.len(), "hoardd: saves archived on the server");
+            }
+            ids
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "hoardd: couldn't ask which saves are archived; watching them all"
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// Config del motor a partir de las preferencias del usuario.
@@ -780,7 +826,11 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
         anyhow::bail!("the engine isn't running");
     };
     let (state, _path) = CliState::load_default()?;
-    let desired = library::watched_saves_from_state(&state);
+    let archived = match engine.client() {
+        Some(client) => archived_save_ids(&client).await,
+        None => HashSet::new(),
+    };
+    let desired = library::watched_saves_from_state(&state, &archived);
     let current: std::collections::HashSet<String> =
         tokio::time::timeout(STATUS_TIMEOUT, handle.status())
             .await

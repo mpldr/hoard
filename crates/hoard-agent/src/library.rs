@@ -674,10 +674,20 @@ fn rows_one_per_folder(cli_state: &CliState) -> Vec<(&String, &SaveState)> {
 }
 
 /// Construye la lista de vigilancia desde `state.json`: saves reales (enriquecidos
-/// con su dir de Steam) + slots playtime-only. Salta los pausados. ÚNICA fuente:
-/// antes el desktop (`hydrate_watched_saves`) y el daemon (`watched_from_state`)
-/// tenían dos copias que ya divergían.
-pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
+/// con su dir de Steam) + slots playtime-only. Salta los pausados y los
+/// archivados. ÚNICA fuente: antes el desktop (`hydrate_watched_saves`) y el
+/// daemon (`watched_from_state`) tenían dos copias que ya divergían.
+///
+/// `archived` are the save ids parked in the server-side black box. A frozen
+/// save is refused at upload (403) by design, so watching one buys nothing and
+/// costs a full re-hash of its folder on every reconcile plus a "Backing up…"
+/// in the feed for work that was never going to happen. Treated exactly like
+/// `paused`: not watched at all. An empty set is the honest answer when the
+/// server could not be asked — never watch less because a request failed.
+pub fn watched_saves_from_state(
+    cli_state: &CliState,
+    archived: &HashSet<String>,
+) -> Vec<WatchedSave> {
     // Cachea los juegos de Steam una vez (no reescanear `.acf` por save).
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
 
@@ -691,6 +701,14 @@ pub fn watched_saves_from_state(cli_state: &CliState) -> Vec<WatchedSave> {
     let rows = rows_one_per_folder(cli_state);
     let mut out = Vec::with_capacity(rows.len() + playtime_saves.len());
     for (save_id, s) in rows {
+        if archived.contains(save_id) {
+            tracing::info!(
+                save_id = %save_id,
+                game_slug = %s.game_slug,
+                "state: save is archived on the server; not watching it"
+            );
+            continue;
+        }
         let steam_install_dir = steam_apps
             .iter()
             .find(|a| name_matches(&a.name, &s.game_slug))
@@ -2344,7 +2362,7 @@ mod tests {
         folder_key, local_detection, manual_override_conflict, occupied_slot,
         prune_poisoned_rows, reconcile_plan, resolve_processes, row_for_same_folder,
         rows_one_per_folder, rows_unknown_to_server, spread_allow_device_local, superseded_rows,
-        AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
+        watched_saves_from_state, AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
@@ -2483,6 +2501,47 @@ mod tests {
             // genuinely two different names and folding them would be wrong.
             assert_ne!(folder_key(a), folder_key(b));
         }
+    }
+
+    // ---- archived saves are not watched --------------------------------
+
+    /// A save parked in the server-side black box refuses every upload with a
+    /// 403 by design. Watching one bought nothing and cost a full re-hash of
+    /// its folder on every reconcile — 30 of them in two days on the machine
+    /// that reported this — plus a "Backing up…" in the feed that never
+    /// resolved, because the archived branch is the one terminal outcome that
+    /// emits no event. Treated like `paused`: not watched at all.
+    #[test]
+    fn an_archived_save_is_not_watched() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("frozen".into(), save_state("fallout-4", "/home/u/fallout4/Saves"));
+        state
+            .saves
+            .insert("live".into(), save_state("stellaris", "/home/u/stellaris/save games"));
+
+        let archived = std::collections::HashSet::from(["frozen".to_string()]);
+        let watched = watched_saves_from_state(&state, &archived);
+        assert!(watched.iter().all(|w| w.save_id != "frozen"));
+        assert!(watched.iter().any(|w| w.save_id == "live"));
+    }
+
+    /// The engine asks the server which saves are frozen, and that question can
+    /// go unanswered — no network, a self-hosted server with no black box, a
+    /// version that predates the endpoint. All of those mean "I don't know of
+    /// any", never "watch nothing": of the two possible mistakes, watching too
+    /// much is the cheap one, since a frozen save that slips through is stopped
+    /// by the same 403 as before.
+    #[test]
+    fn an_unanswered_archive_query_watches_everything() {
+        let mut state = CliState::default();
+        state
+            .saves
+            .insert("a".into(), save_state("fallout-4", "/home/u/fallout4/Saves"));
+
+        let watched = watched_saves_from_state(&state, &std::collections::HashSet::new());
+        assert!(watched.iter().any(|w| w.save_id == "a"));
     }
 
     /// Blacklisting is what a user reaches for when a bogus game appears, and

@@ -1,8 +1,8 @@
 name: Publish container image
 
 # Builds the self-hosted server image and pushes it to GitHub Container
-# Registry so operators can `docker pull ghcr.io/rleeon/hoard:<tag>` (and update
-# with Dockge/dockhand/Watchtower) instead of building from source on their NAS.
+# Registry and Docker Hub so operators can `docker pull` it (and update with
+# Dockge/dockhand/Watchtower) instead of building from source on their NAS.
 #
 # Runs only on a version tag — same cadence as the desktop/server release
 # workflows — so it never spends Actions minutes on routine pushes. First image
@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   image:
-    name: build + push (ghcr.io)
+    name: build + push
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -40,11 +40,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub mirror, enabled by adding the DOCKERHUB_USERNAME and
+      # DOCKERHUB_TOKEN repository secrets. Until then only GHCR gets the
+      # image, so a release never fails for want of a token.
+      #
+      # The image list has to be newline-separated: metadata-action reads
+      # `images` with ignoreComma, because a comma is how an entry carries its
+      # own options (`name=...,enable=...`). Comma-joining two registries here
+      # yields one image called `a,b` and buildx rejects the reference.
+      #
+      # The Hub namespace is the login user, so one secret cannot disagree with
+      # the other.
+      - name: Decide registries
+        id: registries
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          {
+            echo "images<<IMAGES_EOF"
+            echo "ghcr.io/${GITHUB_REPOSITORY}"
+            if [ -n "$DOCKERHUB_USERNAME" ]; then
+              echo "docker.io/${DOCKERHUB_USERNAME}/hoard"
+            fi
+            echo "IMAGES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            echo "hub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hub=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.registries.outputs.hub == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Derive tags + labels
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.registries.outputs.images }}
           # v1.2.3 -> :1.2.3, :1.2, and :latest (default flavor latest=auto).
           #
           # `semver` only matches on a tag ref, so a manual `workflow_dispatch`

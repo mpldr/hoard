@@ -11,8 +11,9 @@ your own server, not someone else's cloud.
 
 ### Docker
 
-The server is a prebuilt multi-arch image — `ghcr.io/rleeon/hoard`, amd64 and
-arm64, published on every release tag. It needs no compiler and no clone:
+The server is a prebuilt multi-arch image — `ghcr.io/rleeon/hoard` (also
+mirrored to Docker Hub as `rleeon/hoard`), amd64 and arm64, published on every
+release tag. It needs no compiler and no clone:
 
 ```sh
 mkdir hoard && cd hoard

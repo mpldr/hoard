@@ -56,8 +56,8 @@ One codebase, two ways to run it:
   point the app at it. No account, no quota — just your cloud. On a NAS it is
   two boxes to fill in: the [Unraid template](Unraid.md), or the
   [Docker image](https://github.com/rleeon/hoard/pkgs/container/hoard) —
-  `docker pull ghcr.io/rleeon/hoard` (amd64 and arm64, published on every
-  release). [Self-hosting guide](SELF-HOST_GUIDE.md) for the rest.
+  `docker pull ghcr.io/rleeon/hoard`, mirrored to Docker Hub as `rleeon/hoard`
+  (amd64 and arm64, published on every release). [Self-hosting guide](SELF-HOST_GUIDE.md) for the rest.
 
 Pro (from 1.99 €/month) gives you 100 GB — [I don't profit from it](https://github.com/rleeon/hoard). It unlocks
 **Hoard Screen**, an in-game overlay to browse and roll back snapshots without

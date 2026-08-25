@@ -23,10 +23,16 @@ the desktop app, pick *Self-Host*, and give it `http://TOWER-IP:12421` plus
 that token. The *WebUI* button opens the web panel, where the username and
 password you typed get you in.
 
-To add another PC later, open the container's *Console*:
+To add another PC later, or to give someone else an account, open the *WebUI*
+and use the **Users** tab: *New token* issues one for a machine, *New user*
+creates an account and offers its first token straight afterwards. A token is
+shown once, so copy it before closing.
+
+The same jobs from the container's *Console*, if you prefer a terminal:
 
 ```sh
 hoard-admin token create YOUR-USER --device 'living-room PC'
+hoard-admin user create SOMEONE
 ```
 
 ## What ends up on your disk
@@ -54,10 +60,12 @@ image. To test one before then, run the *Publish container image* workflow by
 hand (it pushes `:edge`) and point a scratch copy of the template at that tag.
 
 The install path can be tried without a NAS. Docker creates missing bind mounts
-owned by root, which is the part that used to break:
+owned by root, which is the part that used to break. The host port is 12431 so
+the test does not collide with a real server already on 12421 — the panel is at
+<http://127.0.0.1:12431/panel>:
 
 ```sh
-docker run -d --name hoard-unraid -p 12421:12421 -v /tmp/hoard-unraid/data:/var/lib/hoard -v /tmp/hoard-unraid/config:/etc/hoard -e PUID=99 -e PGID=100 -e HOARD_ADMIN_USERNAME=alice -e HOARD_ADMIN_PASSWORD=hunter2hunter2 ghcr.io/rleeon/hoard:latest
+docker run -d --name hoard-unraid -p 12431:12421 -v /tmp/hoard-unraid/data:/var/lib/hoard -v /tmp/hoard-unraid/config:/etc/hoard -e PUID=99 -e PGID=100 -e HOARD_ADMIN_USERNAME=alice -e HOARD_ADMIN_PASSWORD=hunter2hunter2 ghcr.io/rleeon/hoard:latest
 docker logs hoard-unraid
 ```
 

@@ -2,20 +2,11 @@
   <!-- Required. Shown when someone clicks the maintainer's name in Community
        Applications. Markdown is supported. -->
   <Profile>
-I'm rleeon, and I write [Hoard](https://hoard.services): a backup and sync tool
-for game saves.
+I'm rleeon, and I write [Hoard](https://hoard.services): a backup and sync tool for game saves.
 
-It watches the save folders of the games you play, keeps every version, and puts
-the newest one back on whichever PC you sit down at next. The template in this
-repository installs the self-hosted server, so the saves stay on your NAS and
-nothing needs an account. Your gaming machines run the desktop app or the CLI
-and point at it.
+It watches the save folders of the games you play, keeps every version, and puts the newest one back on whichever PC you sit down at next. The template in this repository installs the self-hosted server, so the saves stay on your NAS and nothing needs an account. Your gaming machines run the desktop app or the CLI and point at it.
 
-It is AGPL-3.0 and the code is at
-[github.com/rleeon/hoard](https://github.com/rleeon/hoard). Bugs and questions go
-in the [issue tracker](https://github.com/rleeon/hoard/issues), which is where I
-answer. Reverse proxies, S3-compatible storage and the headless CLI are covered
-in the [self-hosting guide](https://github.com/rleeon/hoard/blob/main/SELF-HOST_GUIDE.md).
+It is AGPL-3.0 and the code is at [github.com/rleeon/hoard](https://github.com/rleeon/hoard). Bugs and questions go in the [issue tracker](https://github.com/rleeon/hoard/issues), which is where I answer. Reverse proxies, S3-compatible storage and the headless CLI are covered in the [self-hosting guide](https://github.com/rleeon/hoard/blob/main/SELF-HOST_GUIDE.md).
   </Profile>
   <Icon>https://raw.githubusercontent.com/rleeon/hoard/main/web/static/icon-512.png</Icon>
   <WebPage>https://hoard.services</WebPage>

@@ -2,13 +2,13 @@
 <Container version="2">
   <Name>Hoard</Name>
   <Repository>ghcr.io/rleeon/hoard:latest</Repository>
-  <Registry>https://github.com/rleeon/hoard/pkgs/container/hoard</Registry>
+  <Registry>https://hoard.services</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
   <Support>https://github.com/rleeon/hoard/issues</Support>
-  <Project>https://hoard.services</Project>
+  <Project>https://github.com/rleeon/hoard</Project>
   <Overview>Hoard backs up and syncs your game saves. It watches the save folders on your gaming PCs, keeps every version so you can go back to yesterday's run, and puts the newest one on whichever PC you sit down at next. With this container the saves stay on your NAS.
 
 This is the server half. The machines you play on need the Hoard desktop app (Windows, Linux, macOS, Steam Deck) or the CLI: hoard.services/download
@@ -19,8 +19,7 @@ Setup:
 3. In the desktop app choose "Self-Host", enter http://TOWER-IP:12421 and paste the token.
 4. WebUI opens the web panel. Log in with the same username and password to see your saves, devices and users.
 
-To add another PC later, open this container's Console and run:
-  hoard-admin token create YOUR-USER --device "living-room PC"
+To add another PC later, or an account for someone else, open the WebUI and go to Users: "New token" issues one for a machine, "New user" creates an account. A token is shown once, so copy it before you close the dialog.
 
 Everything is stored in the two appdata folders below. Back up data/ and you have your saves. Free and open source (AGPL-3.0), with no account and no telemetry when self-hosted.</Overview>
   <Category>Backup: Cloud: Tools:Utilities</Category>

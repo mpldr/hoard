@@ -3,26 +3,12 @@
        Applications. Plain text only: no Markdown, and line breaks are
        collapsed by the parser, so keep it one flowing paragraph. -->
   <Profile>
-    I'm rleeon, and I write Hoard (hoard.services), a backup and sync tool for
-    game saves. 
-    
-    It watches the save folders of the games you play, keeps every
-    version, and puts the newest one back on whichever PC you sit down at next.
-
-    The template in this repository installs the self-hosted server, so the saves
-    stay on your NAS and nothing needs an account. 
-    
-    Your gaming machines run the desktop app or the CLI and point at it. AGPL-3.0, 
-    code at github.com/rleeon/hoard. 
-    
-    Bugs and questions go in the GitHub issue tracker, where I answer. Reverse proxies,
-    S3-compatible storage and the headless CLI are covered in the self-hosting guide there.
-
-    Any issue or something you can open a Github issue or join discord server, you have the discord server button inside the app or in the web.
+    I'm rleeon, and I write Hoard (hoard.services), a backup and sync tool for game saves. It watches the save folders of the games you play, keeps every version, and puts the newest one back on whichever PC you sit down at next. The template in this repository installs the self-hosted server, so the saves stay on your NAS and nothing needs an account. Your gaming machines run the desktop app or the CLI and point at it. AGPL-3.0, code at github.com/rleeon/hoard. Bugs and questions go in the GitHub issue tracker, where I answer. Reverse proxies, S3-compatible storage and the headless CLI are covered in the self-hosting guide there.
   </Profile>
   <Icon>https://raw.githubusercontent.com/rleeon/hoard/main/web/static/icon-512.png</Icon>
   <WebPage>https://hoard.services</WebPage>
   <Forum>https://github.com/rleeon/hoard/issues</Forum>
+  <Discord>https://discord.gg/BYpXT8v4rh</Discord>
   <DonateLink>https://github.com/sponsors/rleeon</DonateLink>
   <DonateText>Sponsor development</DonateText>
 </CommunityApplications>

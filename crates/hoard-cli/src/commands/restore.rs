@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,59 @@ use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::restore::{download_snapshot, resolve_version, RestoreOptions};
 use hoard_agent::state::CliState;
+
+use crate::output;
+
+/// What restoring this version would do to the folder, file by file.
+#[derive(Serialize)]
+pub struct PreviewOut {
+    /// Files the version brings with different bytes: these get overwritten.
+    /// Listed individually — a count is not enough when the answer decides
+    /// whether someone loses a session.
+    pub modified: Vec<String>,
+    pub added: Vec<String>,
+    /// On disk and not in the version. **Nothing deletes them**, but they are
+    /// the saves made *after* the version being restored, so they are the ones
+    /// worth reading before saying yes.
+    pub local_only: Vec<String>,
+    /// Real totals. The lists above stop at 200 entries; these never do.
+    pub modified_count: usize,
+    pub added_count: usize,
+    pub local_only_count: usize,
+    pub unchanged: usize,
+    pub bytes_to_write: u64,
+    /// False on versions that don't publish per-file hashes: then modified and
+    /// unchanged can't be told apart and the numbers are an upper bound.
+    pub comparable: bool,
+}
+
+#[derive(Serialize)]
+pub struct RestoredOut {
+    pub files_extracted: u64,
+    pub bytes_extracted: u64,
+    /// Files that were already byte-identical on disk: copied locally instead
+    /// of downloaded.
+    pub files_reused: u64,
+    pub bytes_reused: u64,
+    pub destination: String,
+}
+
+#[derive(Serialize)]
+pub struct RestoreOut {
+    pub save_id: String,
+    pub version: i64,
+    pub destination: String,
+    pub dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewOut>,
+    /// Why the preview is missing, when it is. Not being able to look is never
+    /// a reason to block a restore, but it is a reason to say so out loud.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_error: Option<String>,
+    /// Absent on `--dry-run`: nothing was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored: Option<RestoredOut>,
+}
 
 pub async fn apply(
     save_id: String,
@@ -24,7 +78,7 @@ pub async fn apply(
     allow_ini: bool,
 ) -> Result<()> {
     let (cfg, _) = CliConfig::load_default()?;
-    let token = cfg.require_token()?;
+    let token = output::require_token(&cfg)?;
     let client = ApiClient::new(cfg.server.url.clone(), token)?;
 
     let version = resolve_version(&client, &save_id, version).await?;
@@ -62,37 +116,70 @@ pub async fn apply(
     // la versión con lo que hay en disco. Se enseña siempre, porque restaurar
     // sobrescribe y merece decir antes qué sobrescribe; con `--dry-run` es todo
     // lo que hace el comando.
-    match hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate).await {
-        Ok(p) if !p.comparable => {
-            println!("this version doesn't list its files one by one, so there's nothing to compare against the folder");
-        }
-        Ok(p) => {
-            println!(
-                "{} file(s) overwritten, {} created, {} already match, {} only here ({} to write)",
-                p.modified.len(),
-                p.added.len(),
-                p.unchanged,
-                p.local_only.len(),
-                indicatif::HumanBytes(p.bytes_to_write),
-            );
-        }
-        // No poder mirar qué cambia no es motivo para bloquear el restore.
-        Err(e) => println!("couldn't check what changes ({e})"),
-    }
+    let (preview, preview_error) =
+        match hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate).await
+        {
+            Ok(p) => (
+                Some(PreviewOut {
+                    modified: p.modified,
+                    added: p.added,
+                    local_only: p.local_only,
+                    modified_count: p.modified_count,
+                    added_count: p.added_count,
+                    local_only_count: p.local_only_count,
+                    unchanged: p.unchanged,
+                    bytes_to_write: p.bytes_to_write,
+                    comparable: p.comparable,
+                }),
+                None,
+            ),
+            // No poder mirar qué cambia no es motivo para bloquear el restore.
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+
     if dry_run {
-        return Ok(());
+        let out = RestoreOut {
+            save_id: save_id.clone(),
+            version,
+            destination: dest.display().to_string(),
+            dry_run: true,
+            preview,
+            preview_error,
+            restored: None,
+        };
+        return output::emit(&out, |out| print_preview(out, true));
     }
 
-    println!(
-        "restoring v{} of {} to {}",
-        version,
-        save_id,
-        dest.display()
-    );
+    if !output::json() {
+        let out = RestoreOut {
+            save_id: save_id.clone(),
+            version,
+            destination: dest.display().to_string(),
+            dry_run: false,
+            preview: None,
+            preview_error: None,
+            restored: None,
+        };
+        // Se enseña siempre, porque restaurar sobrescribe y merece decir antes
+        // qué sobrescribe.
+        let shown = RestoreOut {
+            preview: preview.as_ref().map(clone_preview),
+            preview_error: preview_error.clone(),
+            ..out
+        };
+        print_preview(&shown, false);
+        println!("restoring v{} of {} to {}", version, save_id, dest.display());
+    }
 
     let pb = Arc::new(Mutex::new(ProgressBar::new_spinner()));
     {
         let bar = pb.lock().unwrap();
+        // indicatif draws on stderr, so it never reaches the JSON envelope;
+        // hidden under `--json` anyway, because a spinner nobody watches is
+        // just noise in a log.
+        if output::json() {
+            bar.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
         bar.set_style(
             ProgressStyle::with_template("{spinner} {wide_bar} {bytes} ({bytes_per_sec})")
                 .unwrap()
@@ -125,20 +212,114 @@ pub async fn apply(
         bar.finish_with_message("done");
     }
 
-    println!(
-        "restored {} files ({}) to {}",
-        outcome.files_extracted,
-        fmt_bytes(outcome.bytes_extracted),
-        outcome.destination.display()
-    );
-    if outcome.files_reused > 0 {
+    let out = RestoreOut {
+        save_id,
+        version,
+        destination: outcome.destination.display().to_string(),
+        dry_run: false,
+        preview,
+        preview_error,
+        restored: Some(RestoredOut {
+            files_extracted: outcome.files_extracted as u64,
+            bytes_extracted: outcome.bytes_extracted,
+            files_reused: outcome.files_reused as u64,
+            bytes_reused: outcome.bytes_reused,
+            destination: outcome.destination.display().to_string(),
+        }),
+    };
+
+    output::emit(&out, |out| {
+        let Some(r) = &out.restored else { return };
         println!(
-            "  {} of them ({}) were already on disk — copied, not downloaded",
-            outcome.files_reused,
-            fmt_bytes(outcome.bytes_reused)
+            "restored {} files ({}) to {}",
+            r.files_extracted,
+            fmt_bytes(r.bytes_extracted),
+            r.destination
         );
+        if r.files_reused > 0 {
+            println!(
+                "  {} of them ({}) were already on disk — copied, not downloaded",
+                r.files_reused,
+                fmt_bytes(r.bytes_reused)
+            );
+        }
+    })
+}
+
+fn clone_preview(p: &PreviewOut) -> PreviewOut {
+    PreviewOut {
+        modified: p.modified.clone(),
+        added: p.added.clone(),
+        local_only: p.local_only.clone(),
+        modified_count: p.modified_count,
+        added_count: p.added_count,
+        local_only_count: p.local_only_count,
+        unchanged: p.unchanged,
+        bytes_to_write: p.bytes_to_write,
+        comparable: p.comparable,
     }
-    Ok(())
+}
+
+/// The human rendering of what a restore would do.
+///
+/// `full` (i.e. `--dry-run`) names every file, because the whole point of the
+/// dry run is to decide, and "3 files overwritten" doesn't say whether one of
+/// them is the campaign you played last night. Without it, the same figures
+/// stay on one line above the restore that follows.
+fn print_preview(out: &RestoreOut, full: bool) {
+    if let Some(e) = &out.preview_error {
+        println!("couldn't check what changes ({e})");
+        return;
+    }
+    let Some(p) = &out.preview else { return };
+
+    if !p.comparable {
+        println!(
+            "v{} of {} doesn't list its files one by one, so there is nothing to \
+             compare against {} — the restore would overwrite the folder without a preview",
+            out.version, out.save_id, out.destination
+        );
+        return;
+    }
+
+    println!(
+        "{} file(s) overwritten, {} created, {} already match, {} only here ({} to write)",
+        p.modified_count,
+        p.added_count,
+        p.unchanged,
+        p.local_only_count,
+        indicatif::HumanBytes(p.bytes_to_write),
+    );
+
+    if !full {
+        return;
+    }
+
+    let listed = |label: &str, files: &[String], total: usize| {
+        if total == 0 {
+            return;
+        }
+        println!();
+        println!("{label} ({total}):");
+        for f in files {
+            println!("  {f}");
+        }
+        if total > files.len() {
+            println!("  … and {} more not listed", total - files.len());
+        }
+    };
+    listed("overwritten", &p.modified, p.modified_count);
+    listed("created", &p.added, p.added_count);
+    listed(
+        "only on disk (kept, but newer than this version)",
+        &p.local_only,
+        p.local_only_count,
+    );
+    println!();
+    println!(
+        "dry run: nothing was written to {}. Re-run without --dry-run to restore.",
+        out.destination
+    );
 }
 
 fn fmt_bytes(b: u64) -> String {

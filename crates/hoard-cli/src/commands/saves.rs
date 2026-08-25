@@ -1,11 +1,39 @@
 use anyhow::Result;
 use clap::Subcommand;
+use serde::Serialize;
 
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::library;
+use hoard_agent::state::CliState;
 
 use crate::commands::link;
+use crate::output;
+
+/// The result of a local mutation, so an agent can confirm what it changed
+/// instead of parsing a sentence.
+#[derive(Serialize)]
+pub struct MutationOut {
+    pub save_id: String,
+    /// Which mutation ran.
+    pub action: &'static str,
+    /// What the resident service said when told to reload.
+    pub applied: String,
+}
+
+/// A save as the server knows it. Shared by `save list` and `save show`: the
+/// same row, so an agent parses one shape.
+#[derive(Serialize)]
+pub struct SaveInfo {
+    pub save_id: String,
+    pub game_slug: String,
+    pub label: String,
+    pub latest_version_num: Option<i64>,
+    pub snapshot_count: Option<i64>,
+    pub total_size_bytes: Option<i64>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
 
 #[derive(Subcommand)]
 pub enum SaveCommand {
@@ -51,6 +79,13 @@ pub enum SaveCommand {
         /// Preset id (see `hoard save preset --help`); omit to clear the override.
         #[arg(long)]
         preset: Option<String>,
+    },
+    /// Stop watching a save on THIS machine. The cloud copy and its whole
+    /// version history stay untouched — this is not `delete`. Re-add it later
+    /// from the Library or with `hoard track`. Local-only.
+    Untrack {
+        /// Save id (UUID) — see `hoard saves`
+        id: String,
     },
     /// Change the local save folder for a save (moved install, new drive). The
     /// folder is created if missing. Local-only.
@@ -98,11 +133,40 @@ pub async fn run(cmd: SaveCommand) -> Result<()> {
             println!("path for {id} set to {path} ({applied})");
             return Ok(());
         }
+        SaveCommand::Untrack { id } => {
+            // `library::untrack` drops the row whether or not it was there. For
+            // a person that is harmless; for a caller that got the id wrong, a
+            // silent Ok reads as "stopped tracking" while the real save goes on
+            // being watched.
+            let (state, _) = CliState::load_default()?;
+            if !state.saves.contains_key(id) {
+                return Err(output::err(
+                    "not_tracked",
+                    format!(
+                        "no save with id {id} is tracked on this machine — \
+                         see `hoard saves --json`"
+                    ),
+                ));
+            }
+            library::untrack(id)?;
+            let applied = link::notify_reload().await;
+            let out = MutationOut {
+                save_id: id.clone(),
+                action: "untrack",
+                applied: applied.to_string(),
+            };
+            return output::emit(&out, |o| {
+                println!(
+                    "stopped tracking {} here ({}). The cloud copy is untouched.",
+                    o.save_id, o.applied
+                );
+            });
+        }
         _ => {}
     }
 
     let (cfg, _) = CliConfig::load_default()?;
-    let token = cfg.require_token()?;
+    let token = output::require_token(&cfg)?;
     let client = ApiClient::new(cfg.server.url.clone(), token)?;
 
     match cmd {
@@ -112,37 +176,75 @@ pub async fn run(cmd: SaveCommand) -> Result<()> {
         }
         SaveCommand::List { game } => {
             let saves = client.list_saves(game.as_deref()).await?;
-            if saves.is_empty() {
-                println!("(no saves)");
-                return Ok(());
-            }
-            println!(
-                "{:<38} {:<24} {:<16} {:>5} {:>10}",
-                "ID", "GAME", "LABEL", "VERS", "SIZE"
-            );
-            for s in saves {
+            let rows: Vec<SaveInfo> = saves
+                .into_iter()
+                .map(|s| SaveInfo {
+                    save_id: s.id.to_string(),
+                    game_slug: s.game_slug.to_string(),
+                    label: s.label,
+                    latest_version_num: s.latest_version_num,
+                    snapshot_count: None,
+                    total_size_bytes: s.total_size_bytes,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .collect();
+            output::emit(&rows, |rows| {
+                if rows.is_empty() {
+                    println!("(no saves)");
+                    return;
+                }
                 println!(
                     "{:<38} {:<24} {:<16} {:>5} {:>10}",
-                    s.id,
-                    s.game_slug,
-                    s.label,
-                    s.latest_version_num.unwrap_or(0),
-                    fmt_size(s.total_size_bytes.unwrap_or(0))
+                    "ID", "GAME", "LABEL", "VERS", "SIZE"
                 );
-            }
+                for s in rows {
+                    println!(
+                        "{:<38} {:<24} {:<16} {:>5} {:>10}",
+                        s.save_id,
+                        s.game_slug,
+                        s.label,
+                        s.latest_version_num.unwrap_or(0),
+                        fmt_size(s.total_size_bytes.unwrap_or(0))
+                    );
+                }
+            })?;
         }
         SaveCommand::Show { id } => {
             let s = client.get_save(&id).await?;
-            println!("id:        {}", s.id);
-            println!("game:      {}", s.game_slug);
-            println!("label:     {}", s.label);
-            println!("snapshots: {}", s.snapshot_count.unwrap_or(0));
-            println!("latest:    v{}", s.latest_version_num.unwrap_or(0));
-            println!("size:      {}", fmt_size(s.total_size_bytes.unwrap_or(0)));
-            println!("created:   {}", s.created_at);
-            println!("updated:   {}", s.updated_at);
+            let info = SaveInfo {
+                save_id: s.id.to_string(),
+                game_slug: s.game_slug.to_string(),
+                label: s.label,
+                latest_version_num: s.latest_version_num,
+                snapshot_count: s.snapshot_count,
+                total_size_bytes: s.total_size_bytes,
+                created_at: Some(s.created_at.to_string()),
+                updated_at: Some(s.updated_at.to_string()),
+            };
+            output::emit(&info, |s| {
+                println!("id:        {}", s.save_id);
+                println!("game:      {}", s.game_slug);
+                println!("label:     {}", s.label);
+                println!("snapshots: {}", s.snapshot_count.unwrap_or(0));
+                println!("latest:    v{}", s.latest_version_num.unwrap_or(0));
+                println!("size:      {}", fmt_size(s.total_size_bytes.unwrap_or(0)));
+                println!("created:   {}", s.created_at.as_deref().unwrap_or("—"));
+                println!("updated:   {}", s.updated_at.as_deref().unwrap_or("—"));
+            })?;
         }
         SaveCommand::Delete { id, yes } => {
+            if !yes && !output::interactive() {
+                return Err(output::err(
+                    "needs_confirmation",
+                    format!(
+                        "deleting save {id} destroys it and ALL its stored versions, \
+                         and there is no terminal to confirm it. Pass --yes if you \
+                         mean it. To stop watching the folder while keeping every \
+                         version, use `hoard save untrack {id}` instead."
+                    ),
+                ));
+            }
             if !yes {
                 use std::io::Write;
                 print!("delete save {} and ALL its snapshots? [y/N] ", id);
@@ -161,6 +263,7 @@ pub async fn run(cmd: SaveCommand) -> Result<()> {
         SaveCommand::Pause { .. }
         | SaveCommand::Resume { .. }
         | SaveCommand::Preset { .. }
+        | SaveCommand::Untrack { .. }
         | SaveCommand::Path { .. } => unreachable!("handled before the client is built"),
     }
     Ok(())

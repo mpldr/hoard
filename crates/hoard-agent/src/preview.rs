@@ -51,13 +51,28 @@ pub struct RestorePreview {
     /// Ficheros que la versión trae idénticos a los que ya hay: no se tocan.
     pub unchanged: usize,
     /// Están en los dos lados con contenido distinto: se sobrescriben.
+    ///
+    /// Enumerada hasta [`MAX_LISTED`]; el total real está en
+    /// [`Self::modified_count`]. Contar por `len()` decía "200 ficheros" de un
+    /// save de ochocientos, y lo decía justo en la frase que el usuario lee
+    /// antes de sobrescribir sus partidas.
     pub modified: Vec<String>,
-    /// Sólo están en la versión: se crean.
+    /// Cuántos se sobrescriben en total, enumerados o no.
+    #[serde(default)]
+    pub modified_count: usize,
+    /// Sólo están en la versión: se crean. Enumerada hasta [`MAX_LISTED`].
     pub added: Vec<String>,
+    /// Cuántos se crean en total, enumerados o no.
+    #[serde(default)]
+    pub added_count: usize,
     /// Sólo están en el disco. **No se borran** — la restauración escribe
     /// encima, no sincroniza en espejo — pero el usuario merece verlos: son
     /// las partidas que hizo después de la versión que está a punto de traer.
+    /// Enumerada hasta [`MAX_LISTED`].
     pub local_only: Vec<String>,
+    /// Cuántos hay sólo en disco en total, enumerados o no.
+    #[serde(default)]
+    pub local_only_count: usize,
     /// Bytes que hay que escribir (lo modificado más lo añadido).
     pub bytes_to_write: u64,
     /// `false` cuando la versión no publica hashes por fichero (las legacy de
@@ -98,10 +113,12 @@ pub fn diff(
         match local_by_path.get(r.relative_path.as_str()) {
             None => {
                 out.bytes_to_write += r.size_bytes;
+                out.added_count += 1;
                 push_capped(&mut out.added, &r.relative_path);
             }
             Some(l) if l.size_bytes != r.size_bytes => {
                 out.bytes_to_write += r.size_bytes;
+                out.modified_count += 1;
                 push_capped(&mut out.modified, &r.relative_path);
             }
             Some(_) => {
@@ -113,6 +130,7 @@ pub fn diff(
                     out.unchanged += 1;
                 } else {
                     out.bytes_to_write += r.size_bytes;
+                    out.modified_count += 1;
                     push_capped(&mut out.modified, &r.relative_path);
                 }
             }
@@ -121,6 +139,7 @@ pub fn diff(
 
     for l in local {
         if !remote_paths.contains(l.relative_path.as_str()) {
+            out.local_only_count += 1;
             push_capped(&mut out.local_only, &l.relative_path);
         }
     }
@@ -131,9 +150,8 @@ pub fn diff(
     out
 }
 
-/// Añade a la lista hasta el tope. Pasado el tope se deja de enumerar, pero el
-/// contador de la lista se sigue incrementando por fuera (ver `len` vs lo que
-/// se enseña): aquí simplemente no crece más.
+/// Añade a la lista hasta el tope. Pasado el tope se deja de enumerar; el
+/// total lo llevan los `*_count`, que el llamador incrementa siempre.
 fn push_capped(list: &mut Vec<String>, path: &str) {
     if list.len() < MAX_LISTED {
         list.push(path.to_string());
@@ -273,6 +291,24 @@ pub async fn restore_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past the cap the lists stop growing, so `len()` under-reports. The
+    /// counts are what the "N files overwritten" line must use: saying 200 of
+    /// a 250-file save, right before overwriting someone's saves, is the one
+    /// place a rounded number is not acceptable.
+    #[test]
+    fn counts_survive_the_listing_cap() {
+        let remote: Vec<RemoteFile> = (0..MAX_LISTED + 50)
+            .map(|i| RemoteFile {
+                relative_path: format!("save{i:04}.dat"),
+                size_bytes: 10,
+                sha256: Some(format!("{i:064x}")),
+            })
+            .collect();
+        let p = diff(&remote, &[], |_| false);
+        assert_eq!(p.added.len(), MAX_LISTED, "the listing is still capped");
+        assert_eq!(p.added_count, MAX_LISTED + 50, "the count is the real one");
+    }
 
     fn r(path: &str, size: u64, sha: Option<&str>) -> RemoteFile {
         RemoteFile {

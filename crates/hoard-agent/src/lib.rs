@@ -18,6 +18,7 @@ pub mod config;
 pub mod correlation;
 pub mod credentials;
 pub mod detection;
+pub mod doctor;
 pub mod emulators;
 pub mod install;
 pub mod junkdirs;

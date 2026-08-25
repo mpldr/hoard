@@ -9,7 +9,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use hoard_agent::api::ApiClient;
 use hoard_agent::cloud_auth;
@@ -322,8 +322,29 @@ pub async fn logout() -> Result<()> {
     Ok(())
 }
 
+/// The signed-in session. Two shapes, tagged: an agent branches on `kind`
+/// instead of guessing from which fields happen to be present.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WhoamiOut {
+    Cloud {
+        email: String,
+        user_id: String,
+        plan: String,
+        /// Raw bytes, not the human "1,2 GB": agents compare numbers.
+        storage_used_bytes: i64,
+        storage_limit_bytes: i64,
+    },
+    SelfHost {
+        server: String,
+        username: String,
+        user_id: String,
+        is_admin: bool,
+    },
+}
+
 pub async fn whoami() -> Result<()> {
-    if cloud_auth::load_session()?.is_some() {
+    let out = if cloud_auth::load_session()?.is_some() {
         // Token prestado por el servicio, no refrescado aquí: dos procesos
         // rotando el mismo refresh token es la reuse-detection que revoca la
         // sesión entera (ADR 0021, Parte A).
@@ -332,28 +353,51 @@ pub async fn whoami() -> Result<()> {
             bail!("the stored Cloud session is unreadable — run `hoard login`");
         };
         let me = cloud_auth::fetch_me(&sess.server_url, &sess.access).await?;
-        println!(
-            "Hoard Cloud\n  email:   {}\n  user_id: {}\n  plan:    {}\n  usage:   {} / {}",
-            me.email,
-            me.user_id,
-            me.plan,
-            fmt_bytes(me.storage_used_bytes),
-            fmt_bytes(me.storage_limit_bytes),
-        );
-        return Ok(());
-    }
+        WhoamiOut::Cloud {
+            email: me.email,
+            user_id: me.user_id.to_string(),
+            plan: me.plan,
+            storage_used_bytes: me.storage_used_bytes,
+            storage_limit_bytes: me.storage_limit_bytes,
+        }
+    } else {
+        let (cfg, _) = CliConfig::load_default()?;
+        let token = crate::output::require_token(&cfg)?;
+        let client = ApiClient::new(cfg.server.url.clone(), token)?;
+        let me = client.whoami().await?;
+        WhoamiOut::SelfHost {
+            server: cfg.server.url.clone(),
+            username: me.username.to_string(),
+            user_id: me.user_id.to_string(),
+            is_admin: me.is_admin,
+        }
+    };
 
-    let (cfg, _) = CliConfig::load_default()?;
-    let token = cfg
-        .require_token()
-        .context("no session. Sign in with `hoard login` or `hoard login --token <token>`.")?;
-    let client = ApiClient::new(cfg.server.url.clone(), token)?;
-    let me = client.whoami().await?;
-    println!(
-        "self-host ({})\n  username: {}\n  user_id:  {}\n  admin:    {}",
-        cfg.server.url, me.username, me.user_id, me.is_admin
-    );
-    Ok(())
+    crate::output::emit(&out, |out| match out {
+        WhoamiOut::Cloud {
+            email,
+            user_id,
+            plan,
+            storage_used_bytes,
+            storage_limit_bytes,
+        } => println!(
+            "Hoard Cloud\n  email:   {}\n  user_id: {}\n  plan:    {}\n  usage:   {} / {}",
+            email,
+            user_id,
+            plan,
+            fmt_bytes(*storage_used_bytes),
+            fmt_bytes(*storage_limit_bytes),
+        ),
+        WhoamiOut::SelfHost {
+            server,
+            username,
+            user_id,
+            is_admin,
+        } => println!(
+            "self-host ({})\n  username: {}\n  user_id:  {}\n  admin:    {}",
+            server, username, user_id, is_admin
+        ),
+    })
 }
 
 fn prompt(label: &str) -> Result<String> {

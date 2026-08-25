@@ -1147,9 +1147,14 @@ export function setMaxVersions(
  *  and the UI must say it can't preview rather than show an empty diff. */
 export type RestorePreview = {
   unchanged: number;
+  /** Capped at 200 entries — count with `modified_count`, never `.length`. */
   modified: string[];
   added: string[];
   local_only: string[];
+  /** Real totals, whatever the lists above had room for. */
+  modified_count: number;
+  added_count: number;
+  local_only_count: number;
   bytes_to_write: number;
   comparable: boolean;
 };

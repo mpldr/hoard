@@ -1064,21 +1064,21 @@
           <div class="text-zinc-500">{$_("history.preview_loading")}</div>
         {:else if !preview.comparable}
           <div class="text-zinc-400">{$_("history.preview_unavailable")}</div>
-        {:else if preview.modified.length === 0 && preview.added.length === 0}
+        {:else if preview.modified_count === 0 && preview.added_count === 0}
           <div class="text-zinc-400">{$_("history.preview_nothing")}</div>
         {:else}
           <ul class="space-y-1 text-zinc-300">
-            {#if preview.modified.length > 0}
+            {#if preview.modified_count > 0}
               <li class="text-amber-200">
                 {$_("history.preview_modified", {
-                  values: { count: preview.modified.length },
+                  values: { count: preview.modified_count },
                 })}
               </li>
             {/if}
-            {#if preview.added.length > 0}
+            {#if preview.added_count > 0}
               <li class="text-emerald-300">
                 {$_("history.preview_added", {
-                  values: { count: preview.added.length },
+                  values: { count: preview.added_count },
                 })}
               </li>
             {/if}
@@ -1091,10 +1091,10 @@
             {/if}
           </ul>
         {/if}
-        {#if preview && preview.local_only.length > 0}
+        {#if preview && preview.local_only_count > 0}
           <div class="mt-1.5 text-zinc-400">
             {$_("history.preview_local_only", {
-              values: { count: preview.local_only.length },
+              values: { count: preview.local_only_count },
             })}
           </div>
         {/if}

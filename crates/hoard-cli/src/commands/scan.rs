@@ -17,6 +17,52 @@ use anyhow::Result;
 use hoard_agent::detection::{self, Confidence};
 use hoard_agent::manifest::Os;
 use hoard_agent::state::CliState;
+use serde::Serialize;
+
+use crate::output;
+
+/// One detected game.
+#[derive(Serialize)]
+pub struct ScanGame {
+    pub slug: String,
+    pub display_name: String,
+    pub confidence: &'static str,
+    pub paths: Vec<String>,
+    /// Whether this machine already tracks it — the difference between "we
+    /// found 200 games" and the only question worth asking, which is which of
+    /// them are not being backed up yet.
+    pub tracked: bool,
+}
+
+#[derive(Serialize)]
+pub struct ScanOut {
+    pub elapsed_secs: f64,
+    /// The exhaustive pass (`--deep`), which walks arbitrary Wine prefixes and
+    /// Flatpak/Snap roots.
+    pub deep: bool,
+    pub catalog_entries: usize,
+    pub steam_apps_found: usize,
+    pub games_detected: usize,
+    pub high_confidence: usize,
+    pub medium_confidence: usize,
+    pub low_confidence: usize,
+    pub with_save_paths: usize,
+    /// Folders added to / removed from the exclusion list by this same
+    /// invocation, echoed back so the caller sees what its flags did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_added: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_removed: Vec<String>,
+    /// Only with `--verbose`: absent, not empty, when it wasn't asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub games: Option<Vec<ScanGame>>,
+}
+
+/// The exclusion list, for `--list-excluded`.
+#[derive(Serialize)]
+pub struct ExcludedOut {
+    pub excluded: Vec<String>,
+}
 
 pub async fn run(
     verbose: bool,
@@ -27,24 +73,35 @@ pub async fn run(
 ) -> Result<()> {
     // Gestión de carpetas descartadas. Va antes del escaneo para que un
     // `--exclude` y el escaneo de la misma invocación ya lo reflejen.
+    //
+    // These print nothing of their own under `--json`: stdout has to hold one
+    // envelope and nothing else, so what they did is echoed inside it instead.
     for p in &exclude {
         hoard_agent::library::exclude_path(std::path::Path::new(p.trim()))?;
-        println!("Excluded {p}");
+        if !output::json() {
+            println!("Excluded {p}");
+        }
     }
     for p in &unexclude {
         hoard_agent::library::unexclude_path(std::path::Path::new(p.trim()))?;
-        println!("No longer excluded: {p}");
+        if !output::json() {
+            println!("No longer excluded: {p}");
+        }
     }
     if list_excluded {
         let paths = hoard_agent::library::list_excluded_paths()?;
-        if paths.is_empty() {
-            println!("No folders are excluded from scanning.");
-        } else {
-            for p in paths {
-                println!("{}", p.display());
+        let out = ExcludedOut {
+            excluded: paths.iter().map(|p| p.display().to_string()).collect(),
+        };
+        return output::emit(&out, |out| {
+            if out.excluded.is_empty() {
+                println!("No folders are excluded from scanning.");
+            } else {
+                for p in &out.excluded {
+                    println!("{p}");
+                }
             }
-        }
-        return Ok(());
+        });
     }
 
     let os = Os::current();
@@ -76,33 +133,70 @@ pub async fn run(
         }
     }
 
-    println!("scan completed in {:.3}s", elapsed.as_secs_f64());
-    println!("  catalog entries:   {}", report.catalog_size);
-    println!("  steam apps found:  {}", report.steam_apps_found);
-    println!("  games detected:    {}", report.games.len());
-    println!("    high confidence: {high}");
-    println!("    medium:          {medium}");
-    println!("    low:             {low}");
-    println!("    with save paths: {with_paths}");
+    // A game counts as tracked if a save points at one of its folders, or if
+    // one carries its slug. Both, because the two can disagree: the slug is not
+    // stable across catalog revisions, and a folder can be tracked under a
+    // hand-typed name that no longer matches the detected slug.
+    let tracked_paths: Vec<&std::path::PathBuf> =
+        cli_state.saves.values().map(|s| &s.local_path).collect();
+    let is_tracked = |g: &hoard_agent::detection::DetectedGame| {
+        cli_state.saves.values().any(|s| s.game_slug == g.slug)
+            || g.found_paths.iter().any(|p| tracked_paths.contains(&p))
+    };
 
-    if verbose {
-        println!();
-        println!("{:<32} {:<7} PATHS", "SLUG", "CONF");
-        for g in &report.games {
-            let conf = match g.confidence {
-                Confidence::High => "high",
-                Confidence::Medium => "medium",
-                Confidence::Low => "low",
-            };
-            let paths = g
-                .found_paths
+    let out = ScanOut {
+        elapsed_secs: elapsed.as_secs_f64(),
+        deep,
+        catalog_entries: report.catalog_size,
+        steam_apps_found: report.steam_apps_found,
+        games_detected: report.games.len(),
+        high_confidence: high,
+        medium_confidence: medium,
+        low_confidence: low,
+        with_save_paths: with_paths,
+        excluded_added: exclude.clone(),
+        excluded_removed: unexclude.clone(),
+        games: verbose.then(|| {
+            report
+                .games
                 .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("{:<32} {:<7} {}", g.slug, conf, paths);
-        }
-    }
+                .map(|g| ScanGame {
+                    slug: g.slug.clone(),
+                    display_name: g.display_name.clone(),
+                    confidence: match g.confidence {
+                        Confidence::High => "high",
+                        Confidence::Medium => "medium",
+                        Confidence::Low => "low",
+                    },
+                    paths: g.found_paths.iter().map(|p| p.display().to_string()).collect(),
+                    tracked: is_tracked(g),
+                })
+                .collect()
+        }),
+    };
 
-    Ok(())
+    output::emit(&out, |out| {
+        println!("scan completed in {:.3}s", out.elapsed_secs);
+        println!("  catalog entries:   {}", out.catalog_entries);
+        println!("  steam apps found:  {}", out.steam_apps_found);
+        println!("  games detected:    {}", out.games_detected);
+        println!("    high confidence: {}", out.high_confidence);
+        println!("    medium:          {}", out.medium_confidence);
+        println!("    low:             {}", out.low_confidence);
+        println!("    with save paths: {}", out.with_save_paths);
+
+        if let Some(games) = &out.games {
+            println!();
+            println!("{:<32} {:<7} {:<8} PATHS", "SLUG", "CONF", "TRACKED");
+            for g in games {
+                println!(
+                    "{:<32} {:<7} {:<8} {}",
+                    g.slug,
+                    g.confidence,
+                    if g.tracked { "yes" } else { "no" },
+                    g.paths.join(", ")
+                );
+            }
+        }
+    })
 }

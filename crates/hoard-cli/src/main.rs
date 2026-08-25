@@ -1,4 +1,5 @@
 mod commands;
+mod output;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -13,6 +14,10 @@ struct Cli {
     // below.
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Machine-readable output: one JSON envelope on stdout, human logs on
+    /// stderr. What agents and scripts read — see `hoard agents`.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +86,11 @@ enum Commands {
     Status,
     /// List the machines on this account: which are on and what they're playing
     Devices,
+    /// Check this machine's tracked saves for the mistakes that break syncing —
+    /// folders that vanished, backup mirrors tracked instead of the real save,
+    /// rows named after an installer — and print the command that fixes each.
+    /// Local and offline; changes nothing.
+    Doctor,
     /// Configuration file management
     Config {
         #[command(subcommand)]
@@ -107,6 +117,15 @@ enum Commands {
     Logout,
     /// Show the current session (Cloud or self-host)
     Whoami,
+    /// Set up an AI assistant to drive Hoard: prints the skill file that
+    /// teaches it the commands, the safety rules and how to keep itself
+    /// current. The skill ships inside this binary, so it updates with Hoard.
+    Agents {
+        /// Print the skill file itself, for the assistant to save
+        /// (`hoard agents --skill > ~/.claude/skills/hoard/SKILL.md`)
+        #[arg(long)]
+        skill: bool,
+    },
     /// Browse the game catalog
     Games {
         #[command(subcommand)]
@@ -228,14 +247,16 @@ enum SnapshotCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before anything can print: every emitter reads this.
+    output::set_json(cli.json);
 
     // Hold the file writer's flush guard for the whole process so the sync
     // service's log file flushes on exit.
     let _file_guard = init_tracing(&cli);
 
     if let Err(e) = dispatch(cli).await {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+        let exit = output::emit_error(&e);
+        std::process::exit(exit);
     }
     Ok(())
 }
@@ -280,10 +301,47 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
     guard
 }
 
+/// Which commands actually honour `--json`.
+///
+/// The flag promises one envelope on stdout. A command that hasn't been
+/// converted would print its human table instead **and exit 0**, which is worse
+/// than refusing: the caller parses that as JSON, fails, and has no way to tell
+/// a malformed answer from a command that was never going to answer. So the
+/// ones that can't, say so.
+fn supports_json(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Saves
+        | Commands::Status
+        | Commands::Devices
+        | Commands::Doctor
+        | Commands::Whoami
+        | Commands::Scan { .. }
+        | Commands::Restore { .. } => true,
+        Commands::Save { action } => matches!(
+            action,
+            commands::saves::SaveCommand::List { .. }
+                | commands::saves::SaveCommand::Show { .. }
+                | commands::saves::SaveCommand::Untrack { .. }
+        ),
+        Commands::Snapshots { action } => matches!(action, SnapshotCommand::List { .. }),
+        _ => false,
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<()> {
     let Some(command) = cli.command else {
         return commands::banner::show(true).await;
     };
+
+    if output::json() && !supports_json(&command) {
+        return Err(output::err(
+            "json_unsupported",
+            "this command has no --json output yet. The ones that do: saves, \
+             doctor, status, devices, whoami, scan, restore, save list, \
+             save show, save untrack, snapshots list.",
+        ));
+    }
+
     match command {
         Commands::Install {
             headless,
@@ -321,6 +379,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
         Commands::Devices => commands::devices::run().await,
+        Commands::Doctor => commands::doctor::run().await,
         Commands::Config { action } => commands::config::run(action),
         Commands::Login {
             token,
@@ -329,6 +388,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => commands::auth::login(token, server, email).await,
         Commands::Logout => commands::auth::logout().await,
         Commands::Whoami => commands::auth::whoami().await,
+        Commands::Agents { skill } => commands::agents::run(skill),
         Commands::Games { action } => commands::games::run(action).await,
         Commands::Cloud { action } => commands::cloud::run(action).await,
         Commands::Scan {
@@ -362,7 +422,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
 async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
     let (cfg, _) = config::CliConfig::load_default()?;
-    let token = cfg.require_token()?;
+    let token = output::require_token(&cfg)?;
     let client = api::ApiClient::new(cfg.server.url.clone(), token)?;
     match cmd {
         SnapshotCommand::List { save_id, all } => list_snapshots(&client, save_id, all).await,
@@ -371,6 +431,15 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
             version,
             yes,
         } => {
+            if !yes && !output::interactive() {
+                return Err(output::err(
+                    "needs_confirmation",
+                    format!(
+                        "deleting v{version} of save {save_id} needs a confirmation \
+                         and there is no terminal to ask. Pass --yes if you mean it."
+                    ),
+                ));
+            }
             if !yes {
                 use std::io::Write;
                 print!("soft-delete v{} of save {}? [y/N] ", version, save_id);
@@ -437,42 +506,71 @@ async fn snapshots_dispatch(cmd: SnapshotCommand) -> Result<()> {
     }
 }
 
+/// One stored version of a save.
+#[derive(serde::Serialize)]
+struct SnapshotRow {
+    version_num: i64,
+    file_count: i64,
+    total_size_bytes: i64,
+    created_at: String,
+    /// Which machine made this copy. `None` on versions stored before the
+    /// server kept it — the table shows those as "—".
+    device_name: Option<String>,
+    /// `active`, `pinned` or `trash`. Tagged rather than left implicit: a
+    /// trashed version still lists, and restoring one by accident is exactly
+    /// the mistake worth making impossible to stumble into.
+    state: &'static str,
+}
+
 async fn list_snapshots(
     client: &api::ApiClient,
     save_id: String,
     include_deleted: bool,
 ) -> Result<()> {
     let snaps = client.list_snapshots(&save_id, include_deleted).await?;
-    if snaps.is_empty() {
-        println!("(no snapshots)");
-        return Ok(());
-    }
-    // La máquina va en la tabla por lo mismo que en la ventana: con una partida
-    // sincronizada en dos equipos, la fecha no dice cuál de las dos copias es.
-    // Las versiones anteriores a que el server lo guardara salen con "—".
-    println!(
-        "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  STATE",
-        "VER", "FILES", "SIZE", "CREATED", "DEVICE"
-    );
-    for s in snaps {
-        let state_label = if s.deleted_at.is_some() {
-            "TRASH"
-        } else if s.is_pinned {
-            "PINNED"
-        } else {
-            "active"
-        };
+    let rows: Vec<SnapshotRow> = snaps
+        .into_iter()
+        .map(|s| SnapshotRow {
+            version_num: s.version_num,
+            file_count: s.file_count,
+            total_size_bytes: s.total_size_bytes,
+            created_at: s.created_at.to_string(),
+            device_name: s.device_name,
+            state: if s.deleted_at.is_some() {
+                "trash"
+            } else if s.is_pinned {
+                "pinned"
+            } else {
+                "active"
+            },
+        })
+        .collect();
+
+    output::emit(&rows, |rows| {
+        if rows.is_empty() {
+            println!("(no snapshots)");
+            return;
+        }
+        // La máquina va en la tabla por lo mismo que en la ventana: con una
+        // partida sincronizada en dos equipos, la fecha no dice cuál de las dos
+        // copias es. Las versiones anteriores a que el server lo guardara salen
+        // con "—".
         println!(
-            "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  {}",
-            s.version_num,
-            s.file_count,
-            fmt_bytes(s.total_size_bytes as u64),
-            s.created_at,
-            s.device_name.as_deref().unwrap_or("—"),
-            state_label
+            "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  STATE",
+            "VER", "FILES", "SIZE", "CREATED", "DEVICE"
         );
-    }
-    Ok(())
+        for s in rows {
+            println!(
+                "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  {}",
+                s.version_num,
+                s.file_count,
+                fmt_bytes(s.total_size_bytes as u64),
+                s.created_at,
+                s.device_name.as_deref().unwrap_or("—"),
+                s.state.to_uppercase()
+            );
+        }
+    })
 }
 
 fn fmt_bytes(b: u64) -> String {

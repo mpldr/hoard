@@ -177,6 +177,19 @@ async fn resolve_target(args: &Args, state: &CliState) -> Result<Target> {
 async fn interactive_select(state: &CliState) -> Result<(Target, PathBuf)> {
     use std::io::{self, Write};
 
+    // Checked before the scan, not after: without a terminal this can only end
+    // in a prompt nobody answers, and making the caller wait through a full
+    // detection pass first to reach that dead end is the worst of both.
+    if !crate::output::interactive() {
+        return Err(crate::output::err(
+            "needs_choice",
+            "`hoard track` with no arguments asks which game to track, and there \
+             is no terminal to ask. Name the game (`hoard track \"<name>\"`), or \
+             pick one with --slug and --path. `hoard scan --verbose` lists what \
+             this machine detects.",
+        ));
+    }
+
     println!("Scanning games…");
     let report = detection::detect_all(Os::current(), state, |_, _| {}).await?;
 
@@ -249,6 +262,12 @@ async fn interactive_select(state: &CliState) -> Result<(Target, PathBuf)> {
 
 /// Reads a line from stdin and repeats until it's non-empty.
 fn prompt_nonempty(label: &str) -> Result<String> {
+    if !crate::output::interactive() {
+        return Err(crate::output::err(
+            "needs_input",
+            format!("this step asks for input ({label:?}) and there is no terminal to ask"),
+        ));
+    }
     use std::io::{self, Write};
     loop {
         print!("{label}");

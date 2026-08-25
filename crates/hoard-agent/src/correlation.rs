@@ -335,7 +335,7 @@ pub fn is_game_like(name: &str, exe: Option<&Path>) -> bool {
 /// substring "setup" (pescaría juegos con esa palabra dentro); aquí exigimos que
 /// sea el ÚLTIMO token del basename (o el propio nombre empiece por `unins`), lo
 /// que distingue un instalador de un juego que casualmente mencione la palabra.
-fn is_installer_like(name: &str) -> bool {
+pub(crate) fn is_installer_like(name: &str) -> bool {
     let stem = name.strip_suffix(".exe").unwrap_or(name).trim();
     if stem.starts_with("unins") {
         return true;

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod auth;
 pub mod backup;
 pub mod banner;
@@ -5,6 +6,7 @@ pub mod cloud;
 pub mod config;
 pub mod daemon;
 pub mod devices;
+pub mod doctor;
 pub mod games;
 pub mod install;
 pub mod launch;

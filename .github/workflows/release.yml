@@ -22,6 +22,13 @@ jobs:
           # other platforms ship the `hoard` CLI only — the server/admin are
           # meant to run on a Linux box. Every target builds on a NATIVE runner
           # so we never cross-compile the dbus/keyring/OpenSSL C deps.
+          # `ubuntu-latest` is 24.04, so the binaries this job produces need
+          # GLIBC 2.39 and refuse to start on anything older: Debian 12
+          # (bookworm) is out, trixie and Ubuntu 24.04+ are in. Nothing in the
+          # source asks for that — it is the runner image, and moving the job to
+          # an older one (or building against a lower floor) is what widens it.
+          # Left as-is deliberately; noted so the next person reading a "GLIBC
+          # 2.39 not found" report knows where it comes from.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: linux-x86_64

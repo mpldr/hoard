@@ -62,3 +62,97 @@ pub fn layer(cfg: &RateLimitConfig) -> Option<GovernorLayer<SmartIpKeyExtractor,
 
     Some(GovernorLayer { config: conf })
 }
+
+/// Mount the limiter over `app` and **then** merge `exempt`, which therefore
+/// never sees it.
+///
+/// A function rather than three loose lines in `main` because the ordering IS
+/// the fix and reads like nothing: `Router::layer` only wraps the routes
+/// already mounted, so merging before the `layer` instead of after quietly
+/// puts the exempt route back under the limiter — nothing fails, nothing warns.
+/// This way that mistake has a test that catches it.
+///
+/// `exempt`'s only tenant is `PUT /v1/cas/blobs/:upload_id/:sha256`; the why is
+/// in `main.rs`, where it is built.
+pub fn apply(cfg: &RateLimitConfig, app: axum::Router, exempt: axum::Router) -> axum::Router {
+    let app = match layer(cfg) {
+        Some(rl) => app.layer(rl),
+        None => app,
+    };
+    app.merge(exempt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::{get, put};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    /// A limiter tight enough that the second request no longer fits, so the
+    /// test measures the exemption and not the bucket's arithmetic.
+    fn one_request_only() -> RateLimitConfig {
+        RateLimitConfig {
+            enabled: true,
+            per_second: 1,
+            burst: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn hit(app: &Router, method: &str, uri: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            // `SmartIpKeyExtractor` falls back to the peer, which `oneshot`
+            // does not have; the header gives it a stable IP so every request
+            // in the test shares one bucket.
+            .header("x-real-ip", "203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    fn app_under_test() -> Router {
+        let limited = Router::new().route("/v1/saves", get(|| async { "ok" }));
+        let exempt = Router::new().route("/v1/cas/blobs/:id/:sha", put(|| async { "ok" }));
+        apply(&one_request_only(), limited, exempt)
+    }
+
+    /// An ordinary route is still limited: that is what the limiter exists to
+    /// do, and without this the test below would also pass with it switched
+    /// off.
+    #[tokio::test]
+    async fn an_ordinary_route_is_still_limited() {
+        let app = app_under_test();
+        assert_eq!(hit(&app, "GET", "/v1/saves").await, StatusCode::OK);
+        assert_eq!(
+            hit(&app, "GET", "/v1/saves").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the limiter must keep braking whatever is not exempt"
+        );
+    }
+
+    /// Issue #17: the blob upload is never limited, however many there are.
+    /// That is 173 PUTs for the issue's Teardown, and the count was fixed by
+    /// the server itself when it answered `cas/init` — limiting here is
+    /// fighting the batch we authorised ourselves.
+    #[tokio::test]
+    async fn the_blob_upload_is_never_limited() {
+        let app = app_under_test();
+        // Drain the bucket first, so the exemption is the only thing that can
+        // explain the PUTs getting through.
+        let _ = hit(&app, "GET", "/v1/saves").await;
+        assert_eq!(hit(&app, "GET", "/v1/saves").await, StatusCode::TOO_MANY_REQUESTS);
+
+        for i in 0..200 {
+            assert_eq!(
+                hit(&app, "PUT", "/v1/cas/blobs/abc/def").await,
+                StatusCode::OK,
+                "the blob PUT was limited on request {i}"
+            );
+        }
+    }
+}

@@ -111,6 +111,9 @@ ignored = ["aws-smithy-runtime-api"]
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# `ServiceExt::oneshot`, to exercise the router without opening a port. It is
+# what checks that the blob PUT stays outside the limiter (ratelimit::apply).
+tower = { workspace = true, features = ["util"] }
 # Used by the S3 backend integration test (tests/s3_backend.rs).
 uuid = { workspace = true }
 hex = { workspace = true }

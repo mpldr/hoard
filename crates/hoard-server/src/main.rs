@@ -317,13 +317,8 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         // lleva `cas: true` desde la 1.1.3.
         .route("/v1/saves/:save_id/cas/init", post(cas_routes::init))
         .route("/v1/saves/:save_id/cas/commit", post(cas_routes::commit))
-        // Fuera del árbol de `:save_id` a propósito: un blob es del usuario, no
-        // de una partida — el mismo contenido puede acabar referenciado por
-        // varias.
-        .route(
-            "/v1/cas/blobs/:upload_id/:sha256",
-            axum::routing::put(cas_routes::upload_blob),
-        )
+        // The blob PUT lives in `blob_upload` below: it is the one route that
+        // does not go through the per-IP limiter.
         // Censo de dispositivos + presencia en vivo (ver `routes::devices`).
         // Mismas rutas que en cloud a propósito: el cliente ya las hablaba, y
         // así no hay dos protocolos para lo mismo.
@@ -333,6 +328,36 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
             axum::routing::delete(device_routes::delete),
         )
         .route("/v1/presence/heartbeat", post(device_routes::heartbeat))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            (cfg.storage.max_snapshot_size_mb as usize) * 1024 * 1024 + 16 * 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(pool.clone(), require_auth));
+
+    // `PUT /v1/cas/blobs/:upload_id/:sha256`, held apart from the router above
+    // so the per-IP limiter does **not** cover it. Outside the `:save_id` tree
+    // on purpose: a blob belongs to the user, not to one save — the same
+    // content can end up referenced by several.
+    //
+    // Why this one is exempt when everything else is limited: the number of
+    // PUTs in an upload is not the client's choice, it was fixed by **this
+    // server** when `cas/init` answered with the list of blobs it is missing.
+    // Limiting them is fighting the batch we just authorised ourselves, and the
+    // count is the save's file count: 173 for the Teardown in issue #17,
+    // thousands for an emulator library. Any ceiling picked here is too low for
+    // someone, and one high enough never to break is already no ceiling.
+    //
+    // Worse, the limiter's 429 goes out without draining the request body: the
+    // client keeps writing a PUT nobody is reading, Windows sends RST and
+    // **discards the response already sitting in its buffer**, so the 429 never
+    // arrives and the client's pacer cannot react. See `put_blob_paced` in
+    // `hoard-agent`.
+    //
+    // What actually needs braking — login, panel, polling — stays inside.
+    let blob_upload = Router::new()
+        .route(
+            "/v1/cas/blobs/:upload_id/:sha256",
+            axum::routing::put(cas_routes::upload_blob),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             (cfg.storage.max_snapshot_size_mb as usize) * 1024 * 1024 + 16 * 1024 * 1024,
         ))
@@ -393,19 +418,27 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
             .route("/v1/auth/login", post(session_routes::login));
     }
 
-    let mut app = public.merge(authed).with_state(state);
+    let app = public.merge(authed).with_state(state.clone());
 
-    // Per-IP rate limiting (covers /v1/health and every authed route). Opt-out
-    // via [server.rate_limit]. SmartIpKeyExtractor needs ConnectInfo, which the
-    // `into_make_service_with_connect_info` below supplies.
-    if let Some(rl) = hoard_server::ratelimit::layer(&cfg.server.rate_limit) {
+    if cfg.server.rate_limit.enabled {
         info!(
             per_second = cfg.server.rate_limit.per_second,
             burst = cfg.server.rate_limit.burst,
-            "rate limiting enabled"
+            "rate limiting enabled (the CAS blob upload is exempt)"
         );
-        app = app.layer(rl);
     }
+    // Per-IP rate limiting (covers /v1/health and every authed route *except*
+    // the CAS blob upload). Opt-out via [server.rate_limit].
+    // SmartIpKeyExtractor needs ConnectInfo, which the
+    // `into_make_service_with_connect_info` below supplies.
+    //
+    // The order — limit first, **then** merge the exempt route — is the whole
+    // fix, and it lives inside `apply`, with a test that catches an inversion.
+    let app = hoard_server::ratelimit::apply(
+        &cfg.server.rate_limit,
+        app,
+        blob_upload.with_state(state),
+    );
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     info!(%addr, "listening");

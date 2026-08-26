@@ -28,6 +28,12 @@ pub struct ScanGame {
     pub display_name: String,
     pub confidence: &'static str,
     pub paths: Vec<String>,
+    /// The game is installed and its save folder was not located: `paths` is
+    /// empty and will stay empty until someone points at a folder. Named
+    /// instead of left to be inferred, so a caller can tell "installed, needs a
+    /// folder" from "detected with saves" without reading an empty array and
+    /// guessing what it means.
+    pub needs_folder: bool,
     /// Whether this machine already tracks it — the difference between "we
     /// found 200 games" and the only question worth asking, which is which of
     /// them are not being backed up yet.
@@ -47,6 +53,10 @@ pub struct ScanOut {
     pub medium_confidence: usize,
     pub low_confidence: usize,
     pub with_save_paths: usize,
+    /// Installed games whose save folder was not located — the ones a caller
+    /// can do something about, by picking a folder. The complement of
+    /// `with_save_paths`, spelled out so it does not have to be derived.
+    pub needing_folder: usize,
     /// Folders added to / removed from the exclusion list by this same
     /// invocation, echoed back so the caller sees what its flags did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -122,6 +132,7 @@ pub async fn run(
     hoard_agent::library::apply_excluded_paths(&mut report, &cli_state);
 
     let (mut high, mut medium, mut low, mut with_paths) = (0usize, 0usize, 0usize, 0usize);
+    let mut needing_folder = 0usize;
     for g in &report.games {
         match g.confidence {
             Confidence::High => high += 1,
@@ -130,6 +141,9 @@ pub async fn run(
         }
         if !g.found_paths.is_empty() {
             with_paths += 1;
+        }
+        if g.needs_folder {
+            needing_folder += 1;
         }
     }
 
@@ -154,6 +168,7 @@ pub async fn run(
         medium_confidence: medium,
         low_confidence: low,
         with_save_paths: with_paths,
+        needing_folder,
         excluded_added: exclude.clone(),
         excluded_removed: unexclude.clone(),
         games: verbose.then(|| {
@@ -169,6 +184,7 @@ pub async fn run(
                         Confidence::Low => "low",
                     },
                     paths: g.found_paths.iter().map(|p| p.display().to_string()).collect(),
+                    needs_folder: g.needs_folder,
                     tracked: is_tracked(g),
                 })
                 .collect()
@@ -184,6 +200,7 @@ pub async fn run(
         println!("    medium:          {}", out.medium_confidence);
         println!("    low:             {}", out.low_confidence);
         println!("    with save paths: {}", out.with_save_paths);
+        println!("    needs a folder:  {}", out.needing_folder);
 
         if let Some(games) = &out.games {
             println!();
@@ -194,7 +211,11 @@ pub async fn run(
                     g.slug,
                     g.confidence,
                     if g.tracked { "yes" } else { "no" },
-                    g.paths.join(", ")
+                    if g.needs_folder {
+                        "no save folder located".to_string()
+                    } else {
+                        g.paths.join(", ")
+                    }
                 );
             }
         }

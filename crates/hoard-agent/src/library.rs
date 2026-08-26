@@ -2691,6 +2691,7 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
+                needs_folder: false,
                 steam_cloud: false,
             }],
             catalog_size: 0,
@@ -3202,6 +3203,7 @@ mod tests {
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: None,
             install_dir: None,
+            needs_folder: false,
             steam_cloud: false,
         }
     }
@@ -3428,6 +3430,7 @@ mod tests {
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: None,
             install_dir: None,
+            needs_folder: false,
             steam_cloud: false,
         }
     }

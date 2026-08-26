@@ -572,3 +572,31 @@ fn a_save_folder_named_after_the_install_dir_is_found() {
         );
     });
 }
+
+/// A Steam game with no save folder anywhere is still a true row — the game IS
+/// installed — but it is not a detected save, and saying so is the difference
+/// between an answer and a dead end. The flag is what a caller branches on;
+/// inferring it from an empty list is what made the row look like a find.
+#[test]
+fn a_game_with_no_save_folder_says_so() {
+    with_isolated_linux_env(|home| {
+        build_steam_install(home, &[(413150, "Stardew Valley", "Stardew Valley")]);
+        // No save dir anywhere: not under the XDG roots, not in a prefix.
+
+        let state = CliState::default();
+        let report = block_on_detect(Os::Linux, &state);
+
+        let game = report
+            .games
+            .iter()
+            .find(|g| g.slug == "stardew-valley")
+            .expect("the game is installed, so it is reported");
+        assert!(game.found_paths.is_empty());
+        assert!(game.needs_folder, "the row has to name its own state");
+
+        // And the games that DID resolve are not tarred with it.
+        for g in report.games.iter().filter(|g| !g.found_paths.is_empty()) {
+            assert!(!g.needs_folder, "{} has paths and still asks for one", g.slug);
+        }
+    });
+}

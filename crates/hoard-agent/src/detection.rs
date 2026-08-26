@@ -124,6 +124,21 @@ pub struct DetectedGame {
     /// folder picker — **must not** be used as a backup path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_dir: Option<PathBuf>,
+    /// Detection finished without a save folder for this game.
+    ///
+    /// The row is still true — the game IS installed, that is what the Steam
+    /// manifest or the launcher said — but there is nothing here to back up
+    /// until someone points at a folder. Said out loud rather than left to be
+    /// inferred from an empty `found_paths`, because the inference is what made
+    /// the row a dead end: a caller reading the list sees a detected game, and
+    /// "detected" is not what this is. A frontend answers it with the folder
+    /// picker; a machine caller branches on the field.
+    ///
+    /// Two ways to get here, and both are worth showing: nothing on disk looked
+    /// like this game's save folder, or what the catalog named turned out to
+    /// hold no save at all (see `drop_folders_without_saves`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_folder: bool,
     /// The catalog says this game supports Steam Cloud.
     ///
     /// **Informational only.** It is deliberately not an input to confidence,
@@ -363,7 +378,8 @@ where
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
                 install_dir: Some(app.install_dir.clone()),
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
     }
@@ -977,7 +993,8 @@ where
                             source: DetectionSource::FilesystemHeuristic,
                             steam_app_id: None,
                             install_dir: None,
-                            steam_cloud: false,
+                            needs_folder: false,
+            steam_cloud: false,
                         },
                     );
                     new_games += 1;
@@ -1033,6 +1050,24 @@ where
     // and sort strongest-first, keeping `path_confidences` aligned, so the UI
     // can show a grade per folder and auto-track picks the best.
     grade_and_rank_paths(&mut by_slug, &corr_store);
+
+    // Last word on every row: a game with no folder says so, instead of leaving
+    // it to be inferred from an empty list. Stamped here, after the offer filter
+    // has had its say, so it covers both ways of arriving at nothing — never
+    // found, and found-then-rejected. See [`DetectedGame::needs_folder`].
+    let mut without_folder = 0usize;
+    for g in by_slug.values_mut() {
+        g.needs_folder = g.found_paths.is_empty();
+        if g.needs_folder {
+            without_folder += 1;
+        }
+    }
+    if without_folder > 0 {
+        tracing::info!(
+            games = without_folder,
+            "detection: games installed with no save folder located; they need a folder picked"
+        );
+    }
 
     progress(total_tasks, total_tasks);
 
@@ -1251,7 +1286,8 @@ fn apply_steam_name_fallback(
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(app.app_id),
                 install_dir: Some(app.install_dir.clone()),
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
         if via_fuzzy {
@@ -1356,7 +1392,8 @@ fn apply_launcher_name_fallback(
                         source: DetectionSource::SteamLibrary,
                         steam_app_id: None,
                         install_dir: Some(app.install_dir.clone()),
-                        steam_cloud: false,
+                        needs_folder: false,
+            steam_cloud: false,
                     },
                 );
             }
@@ -1505,7 +1542,8 @@ fn merge_fs_hit(
                     source: DetectionSource::FilesystemHeuristic,
                     steam_app_id: None,
                     install_dir: None,
-                    steam_cloud: false,
+                    needs_folder: false,
+            steam_cloud: false,
                 },
             );
         }
@@ -1799,7 +1837,8 @@ fn apply_manual_overrides(
                     source: DetectionSource::ManualOverride,
                     steam_app_id: entry.steam_app_id,
                     install_dir: None,
-                    steam_cloud: false,
+                    needs_folder: false,
+            steam_cloud: false,
                 },
             );
             applied += 1;
@@ -4548,7 +4587,8 @@ mod tests {
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(42),
                 install_dir: Some(PathBuf::from("/steam/x")),
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -4973,7 +5013,8 @@ mod tests {
                 source: DetectionSource::SteamLibrary,
                 steam_app_id: Some(999),
                 install_dir: Some(PathBuf::from("/steam/Test Game")),
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -5177,7 +5218,8 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -5213,7 +5255,8 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -5249,7 +5292,8 @@ mod tests {
                 source: DetectionSource::Both,
                 steam_app_id: Some(42),
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -5282,7 +5326,8 @@ mod tests {
                 source: DetectionSource::ManualOverride,
                 steam_app_id: None,
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
 
@@ -5361,7 +5406,8 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: Some(281990),
                 install_dir: Some(PathBuf::from("/steam/stellaris")),
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
         let mut overrides = HashMap::new();
@@ -5412,7 +5458,8 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
         let overrides = HashMap::from([("factorio".to_string(), picked.clone())]);
@@ -5441,7 +5488,8 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: None,
                 install_dir: None,
-                steam_cloud: false,
+                needs_folder: false,
+            steam_cloud: false,
             },
         );
         let overrides = HashMap::from([("stellaris".to_string(), b.clone())]);
@@ -6864,6 +6912,7 @@ mod tests {
                 source: DetectionSource::FilesystemHeuristic,
                 steam_app_id: Some(2358720),
                 install_dir: None,
+                needs_folder: false,
                 steam_cloud: true,
             },
         );
@@ -6905,6 +6954,7 @@ mod tests {
             source: DetectionSource::FilesystemHeuristic,
             steam_app_id: Some(2358720),
             install_dir: None,
+            needs_folder: false,
             steam_cloud: true,
         }];
         let warnings = detect_tracked_mirrors(&state, &games);

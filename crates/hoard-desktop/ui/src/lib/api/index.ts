@@ -116,6 +116,14 @@ export type DetectedGame = {
    */
   install_dir?: string | null;
   /**
+   * Detection finished without a save folder for this game: `found_paths` is
+   * empty and stays empty until someone picks one. The row is still true — the
+   * game is installed — but it is not a detected save, and the card answers it
+   * with the folder picker. Absent (not `false`) on reports from older builds,
+   * where `!found_paths.length` is the same fact.
+   */
+  needs_folder?: boolean;
+  /**
    * The catalog says this game supports Steam Cloud. Purely a note for the
    * user — it must not reorder, re-rank or gate anything. Steam Cloud only
    * covers the Steam copy, can be turned off per game, and keeps no history

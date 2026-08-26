@@ -212,6 +212,8 @@ pub async fn scan_folder(path: String) -> Result<Vec<DetectedGame>, String> {
                 // catálogo: es lo que le da carátula a la fila del modal.
                 steam_app_id: a.steam_app_id,
                 install_dir: None,
+                // La carpeta la señaló el usuario: la ruta es justo lo que hay.
+                needs_folder: false,
                 // Escaneo de una carpeta suelta: no hay entrada de catálogo
                 // resuelta aquí, así que no hay nota que dar.
                 steam_cloud: false,

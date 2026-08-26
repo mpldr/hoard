@@ -77,6 +77,15 @@ pub trait BlobStore: Send + Sync {
     /// `spool_dir` if the backend isn't local. Never buffers the whole object
     /// in RAM. The caller deletes the returned path iff `cleanup` is set.
     async fn local_ref(&self, key: &str, spool_dir: &Path) -> Result<LocalRef>;
+
+    /// The directory keys resolve under, for the one backend that has one.
+    /// `None` everywhere else — a remote bucket has no directories, only keys
+    /// that happen to contain slashes. Only for tidying up empty directories
+    /// after a purge; never for reading or writing an object, which always
+    /// goes through the methods above.
+    fn local_root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 // ─── Local filesystem backend ───────────────────────────────────────────────
@@ -146,6 +155,10 @@ impl BlobStore for LocalFs {
             path: self.resolve(key),
             cleanup: false,
         })
+    }
+
+    fn local_root(&self) -> Option<&Path> {
+        Some(&self.data_dir)
     }
 }
 
@@ -315,6 +328,80 @@ pub async fn build_backend(
 /// so the rest of the server is backend-agnostic.
 pub async fn build_store(cfg: &crate::config::Config) -> Result<Arc<dyn BlobStore>> {
     build_backend(cfg, cfg.storage.backend).await
+}
+
+/// Delete every stored object belonging to one user, driven off the index
+/// rather than off the filesystem.
+///
+/// Deleting the `users` row cascades the `blobs`/`chunks` rows away, so this
+/// has to run **first** — afterwards there is nothing left to say which keys
+/// were theirs. Going through [`BlobStore`] instead of `remove_dir_all` is
+/// what makes it work on an S3 bucket too, where there are no directories to
+/// remove and the objects would otherwise stay (and keep costing) forever.
+///
+/// It replaces `data_dir/<user_id>`, which is where user data lived before the
+/// content-addressed store landed. Nothing has been written there since, so
+/// `hoard-admin user delete` was reporting that it had removed a user's data
+/// while leaving every byte of it on disk.
+///
+/// Returns how many objects went and how many bytes they held. A key that is
+/// already gone is not an error: the point is that it is not there afterwards.
+pub async fn purge_user_objects(
+    pool: &sqlx::SqlitePool,
+    store: &Arc<dyn BlobStore>,
+    user_id: &str,
+) -> Result<(u64, i64)> {
+    use sqlx::Row;
+
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for (table, is_blob) in [("blobs", true), ("chunks", false)] {
+        let rows = sqlx::query(&format!(
+            "SELECT sha256, size_bytes FROM {table} WHERE user_id = ?"
+        ))
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+        keys.extend(rows.iter().map(|r| {
+            let sha: String = r.get("sha256");
+            let key = if is_blob {
+                blob_key(user_id, &sha)
+            } else {
+                chunk_key(user_id, &sha)
+            };
+            (key, r.get::<i64, _>("size_bytes"))
+        }));
+    }
+
+    let mut removed = 0u64;
+    let mut bytes = 0i64;
+    for (key, size) in &keys {
+        match store.delete(key).await {
+            Ok(()) => {
+                removed += 1;
+                bytes += size;
+            }
+            // One unreadable object must not strand the rest: the row is about
+            // to disappear either way, so a failure here only means an orphan
+            // left behind, which the operator can see in the admin overview.
+            Err(e) => tracing::warn!(key, error = %e, "purge: could not delete object"),
+        }
+    }
+
+    // The empty per-user shard directories the local backend leaves behind.
+    // Harmless, but they make `du` and a file browser lie about who still has
+    // an account on the box.
+    if let Some(local) = store.local_root() {
+        for prefix in ["blobs", "chunks"] {
+            let dir = local.join(prefix).join(user_id);
+            if dir.exists() {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::warn!(dir = %dir.display(), error = %e, "purge: could not remove directory");
+                }
+            }
+        }
+    }
+
+    Ok((removed, bytes))
 }
 
 /// Startup guard (self-host): datos en disco pero **base vacía**.

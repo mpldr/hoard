@@ -226,7 +226,7 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
             println!("'{}' is no longer an admin", username);
         }
         UserCommand::Delete { username } => {
-            let row = sqlx::query("SELECT id FROM users WHERE username = ?")
+            let row = sqlx::query("SELECT id, is_admin FROM users WHERE username = ?")
                 .bind(&username)
                 .fetch_optional(&pool)
                 .await?;
@@ -236,6 +236,26 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
             };
 
             let user_id: String = row.get("id");
+            let is_admin: i64 = row.get("is_admin");
+
+            // The admin flag guards its own route, so a server with zero
+            // admins cannot promote anyone back from the panel — it needs this
+            // command and a shell. Deleting the last one is how you lock
+            // yourself out of your own server, and nothing used to stop it.
+            if is_admin != 0 {
+                let (admins,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_admin <> 0")
+                        .fetch_one(&pool)
+                        .await?;
+                if admins <= 1 {
+                    anyhow::bail!(
+                        "'{}' is the only admin. Promote someone else first \
+                         (`hoard-admin user promote <name>`).",
+                        username
+                    );
+                }
+            }
+
             print!("Delete user '{}' and ALL their data? [y/N] ", username);
             use std::io::BufRead;
             let mut line = String::new();
@@ -245,18 +265,27 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
                 return Ok(());
             }
 
+            // Stored objects first: the ON DELETE CASCADE below takes the
+            // blobs/chunks rows, which are the only record of which keys were
+            // theirs. This used to be a `remove_dir_all` of
+            // `data_dir/<user_id>` — a path nothing has written to since the
+            // content-addressed store landed, so the command reported success
+            // while leaving every byte on disk.
+            let store = hoard_server::store::build_store(cfg).await?;
+            let (objects, bytes) =
+                hoard_server::store::purge_user_objects(&pool, &store, &user_id).await?;
+
             sqlx::query("DELETE FROM users WHERE id = ?")
                 .bind(&user_id)
                 .execute(&pool)
                 .await?;
 
-            // Clean up physical data directory
-            let data_path = cfg.storage.data_dir.join(&user_id);
-            if data_path.exists() {
-                tokio::fs::remove_dir_all(&data_path).await?;
-            }
-
-            println!("Deleted user '{}' and their data.", username);
+            println!(
+                "Deleted user '{}' and their data ({} objects, {:.1} MiB).",
+                username,
+                objects,
+                bytes as f64 / (1024.0 * 1024.0)
+            );
         }
     }
     Ok(())

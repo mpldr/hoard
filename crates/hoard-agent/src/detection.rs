@@ -714,12 +714,15 @@ where
                 let Some(entry) = hoard_manifest::ludusavi::find_by_steam_app_id(app.app_id) else {
                     continue;
                 };
+                let shields = crate::savefilter::shields_for_slug(&entry.slug);
                 let mut hits: Vec<PathBuf> = Vec::new();
                 let mut seen: HashSet<PathBuf> = HashSet::new();
                 for ud in &user_dirs {
-                    let remote = ud.join(app.app_id.to_string()).join("remote");
-                    if remote.is_dir() && seen.insert(remote.clone()) {
-                        hits.push(remote);
+                    let Some(dir) = steam_cloud_dir_for(ud, app.app_id, &shields) else {
+                        continue;
+                    };
+                    if seen.insert(dir.clone()) {
+                        hits.push(dir);
                     }
                 }
                 if hits.is_empty() {
@@ -2312,7 +2315,7 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
     if let Some(appid) = entry.steam_app_id {
         let mut step = TraceStep {
             kind: "steam_cloud".into(),
-            template: Some(format!("userdata/<user>/{appid}/remote")),
+            template: Some(format!("userdata/<user>/{appid}/remote (or the appid dir itself)")),
             expanded: Vec::new(),
             kept: Vec::new(),
             dropped: Vec::new(),
@@ -2325,17 +2328,19 @@ pub async fn diagnose(slug: &str, os: Os, state: &CliState) -> DetectionTrace {
                 reason: "no Steam userdata dirs found on this machine".into(),
             });
         }
+        let shields = crate::savefilter::shields_for_slug(slug);
         for ud in &user_dirs {
-            let remote = ud.join(appid.to_string()).join("remote");
-            step.expanded.push(remote.display().to_string());
-            if remote.is_dir() {
-                step.kept.push(remote.display().to_string());
-                merged_direct.push(remote);
-            } else {
-                step.dropped.push(DroppedPath {
-                    path: remote.display().to_string(),
-                    reason: "no remote/ dir for this appid under this Steam user".into(),
-                });
+            let app_dir = ud.join(appid.to_string());
+            step.expanded.push(app_dir.join("remote").display().to_string());
+            match steam_cloud_dir_for(ud, appid, &shields) {
+                Some(dir) => {
+                    step.kept.push(dir.display().to_string());
+                    merged_direct.push(dir);
+                }
+                None => step.dropped.push(DroppedPath {
+                    path: app_dir.display().to_string(),
+                    reason: "no remote/ dir for this appid under this Steam user, and the appid dir holds no save".into(),
+                }),
             }
         }
         attempts.push(step);
@@ -2991,6 +2996,32 @@ pub fn discover_by_name(
             reason: "folder named after the game in a standard save root".to_string(),
         })
         .collect()
+}
+
+/// The Steam Cloud folder for one appid under one Steam account, if there is
+/// one.
+///
+/// The documented layout is `userdata/<storeUserId>/<appid>/remote/`, and that
+/// is the only shape the pipeline looked for. Not every game uses it: Mojo:
+/// Hanako writes straight into `userdata/<storeUserId>/892630`, one level up,
+/// and every title that does was invisible — its only save is here, so missing
+/// it meant missing the game.
+///
+/// `remote/` still wins where it exists: it is the folder Valve documents and
+/// the one whose contents are the game's, while the appid folder also holds
+/// Steam's own bookkeeping next to it. The fallback is gated on the folder
+/// holding actual player data, which is what keeps a stray `remotecache.vdf`
+/// from passing for a save.
+fn steam_cloud_dir_for(user_dir: &Path, app_id: u64, shields: &[String]) -> Option<PathBuf> {
+    let app_dir = user_dir.join(app_id.to_string());
+    let remote = app_dir.join("remote");
+    if remote.is_dir() {
+        return Some(remote);
+    }
+    if app_dir.is_dir() && inspect_folder(&app_dir, shields) == FolderContents::SaveData {
+        return Some(app_dir);
+    }
+    None
 }
 
 /// Look for a game's save folder under the standard roots by its **installDir**
@@ -5041,6 +5072,52 @@ mod tests {
         apply_steam_name_fallback(&catalog, &steam_apps, &mut by_slug);
 
         assert!(by_slug.is_empty());
+    }
+
+    /// Steam Cloud without the `remote/` level: Mojo: Hanako writes straight
+    /// into `userdata/<storeUserId>/892630`. Its only save lives there, so the
+    /// game was invisible, not merely short a path.
+    #[test]
+    fn a_steam_cloud_save_without_a_remote_dir_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("userdata/76561198041773665");
+        let app = user.join("892630");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("slot1.sav"), "x").unwrap();
+
+        assert_eq!(steam_cloud_dir_for(&user, 892630, &[]), Some(app));
+    }
+
+    /// Where both exist, `remote/` is the answer: it is the folder Valve
+    /// documents, and the appid folder around it also holds Steam's own
+    /// bookkeeping.
+    #[test]
+    fn the_remote_dir_still_wins_where_there_is_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("userdata/1");
+        let app = user.join("646270");
+        let remote = app.join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(remote.join("save.dat"), "x").unwrap();
+        std::fs::write(app.join("stray.dat"), "x").unwrap();
+
+        assert_eq!(steam_cloud_dir_for(&user, 646270, &[]), Some(remote));
+    }
+
+    /// Steam's own bookkeeping is not a save. An appid folder holding nothing
+    /// but `remotecache.vdf` is what every Cloud-enabled game has, played or
+    /// not, and offering it would mint a save folder for all of them.
+    #[test]
+    fn an_appid_dir_holding_only_steam_bookkeeping_is_not_a_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("userdata/1");
+        let app = user.join("999999");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("remotecache.vdf"), "x").unwrap();
+
+        assert_eq!(steam_cloud_dir_for(&user, 999999, &[]), None);
+        // And an appid this account never touched at all.
+        assert_eq!(steam_cloud_dir_for(&user, 123, &[]), None);
     }
 
     /// The installDir is a different string from the retail name often enough to

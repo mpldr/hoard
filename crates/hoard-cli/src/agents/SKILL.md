@@ -55,10 +55,19 @@ exists, a backup mirror tracked instead of the real save, a row named after an
 installer, a game whose saves detection found somewhere else — and each finding
 carries a `command` field with the exact fix.
 
-To find games that are installed but not backed up, use
-`hoard scan --verbose --json`: each detected game carries `tracked`, so the
-useful set is the ones where it is false. Plain `hoard scan --json` returns only
-the summary counts.
+To find games that are installed but not backed up, use `hoard scan --json`:
+every detected game is listed, and each carries `tracked`, so the useful set is
+the ones where it is false. `--verbose` is not needed — it only controls how
+much the human table prints; under `--json` the list is always there.
+
+A game whose `needs_folder` is true is installed with no save folder located.
+It is not something to track as-is: there is no path to give `hoard track`, so
+either the user picks the folder or you leave it alone. `paths` is empty for
+exactly these.
+
+Do not parse the human table. Its PATHS column holds real paths, and real save
+paths contain commas (`…/unity3d/Cipher Prime Studios, Inc./…`); one path per
+line is as far as that format goes. `--json` is the contract.
 
 Show the user the findings and the commands. Run one only after they say so, and
 run it as given: the `save_id` in it is the one that matters, and assembling

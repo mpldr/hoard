@@ -139,7 +139,8 @@ enum Commands {
     /// Benchmark the local game-detection scan (the heavy half of what Automatic
     /// Mode runs each tick). No server needed; writes nothing.
     Scan {
-        /// List every detected game, not just the summary counts.
+        /// List every detected game, not just the summary counts. Implied by
+        /// --json, which always carries the list.
         #[arg(long)]
         verbose: bool,
         /// Run the exhaustive deep scan: arbitrary Wine prefixes

@@ -63,9 +63,62 @@ pub struct ScanOut {
     pub excluded_added: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_removed: Vec<String>,
-    /// Only with `--verbose`: absent, not empty, when it wasn't asked for.
+    /// The detected games. Always present under `--json`, and only with
+    /// `--verbose` in the human output.
+    ///
+    /// `--verbose` is a knob for how much a person wants printed; a caller
+    /// parsing JSON always wants the list, and getting the counts alone reads
+    /// as "nothing found" rather than as "you didn't ask". Absent, not empty,
+    /// when it genuinely wasn't produced — so an empty list means no games.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<Vec<ScanGame>>,
+}
+
+/// Where the PATHS column starts, so the paths after the first line up under
+/// it. Sum of the three left-hand columns and their separating spaces.
+const PATH_COLUMN: usize = 32 + 1 + 7 + 1 + 8 + 1;
+
+/// Does this invocation carry the per-game list?
+///
+/// `--verbose` says how much a person wants printed. A caller parsing JSON
+/// always wants the list: handing it the counts alone reads as "nothing found"
+/// rather than as "you didn't ask for it", and there is no way to tell those
+/// apart from the envelope. So under `--json` the list is not optional.
+fn should_list_games(verbose: bool, json: bool) -> bool {
+    verbose || json
+}
+
+/// The human table: one row per game, and **one path per line**.
+///
+/// The paths used to be joined with `", "`, in a column whose values contain
+/// that separator for real — `…/unity3d/Cipher Prime Studios, Inc./…` is one
+/// save folder, not two — so the row could not be split back apart by anything
+/// but guesswork. The machine-readable answer to that is `--json`, which is the
+/// contract; this is so a person reading the table can still see where one path
+/// ends and the next begins.
+fn render_table(games: &[ScanGame]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<32} {:<7} {:<8} PATHS", "SLUG", "CONF", "TRACKED");
+    for g in games {
+        let first = if g.needs_folder {
+            "-- no save folder located --"
+        } else {
+            g.paths.first().map(String::as_str).unwrap_or("")
+        };
+        let _ = writeln!(
+            out,
+            "{:<32} {:<7} {:<8} {first}",
+            g.slug,
+            g.confidence,
+            if g.tracked { "yes" } else { "no" },
+        );
+        for path in g.paths.iter().skip(1) {
+            let _ = writeln!(out, "{:PATH_COLUMN$}{path}", "");
+        }
+    }
+    out
 }
 
 /// The exclusion list, for `--list-excluded`.
@@ -171,7 +224,7 @@ pub async fn run(
         needing_folder,
         excluded_added: exclude.clone(),
         excluded_removed: unexclude.clone(),
-        games: verbose.then(|| {
+        games: should_list_games(verbose, output::json()).then(|| {
             report
                 .games
                 .iter()
@@ -204,20 +257,58 @@ pub async fn run(
 
         if let Some(games) = &out.games {
             println!();
-            println!("{:<32} {:<7} {:<8} PATHS", "SLUG", "CONF", "TRACKED");
-            for g in games {
-                println!(
-                    "{:<32} {:<7} {:<8} {}",
-                    g.slug,
-                    g.confidence,
-                    if g.tracked { "yes" } else { "no" },
-                    if g.needs_folder {
-                        "no save folder located".to_string()
-                    } else {
-                        g.paths.join(", ")
-                    }
-                );
-            }
+            print!("{}", render_table(games));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(slug: &str, paths: &[&str]) -> ScanGame {
+        ScanGame {
+            slug: slug.into(),
+            display_name: slug.into(),
+            confidence: "high",
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            needs_folder: paths.is_empty(),
+            tracked: false,
+        }
+    }
+
+    /// A save path with a comma in it — a real one, from a studio that put a
+    /// comma in its name — has to come back out of the table whole.
+    #[test]
+    fn every_path_gets_its_own_line() {
+        let comma = "/home/u/.config/unity3d/Cipher Prime Studios, Inc./Splice";
+        let plain = "/home/u/.local/share/Splice/saves";
+        let table = render_table(&[game("splice", &[comma, plain])]);
+
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "header, the row, the second path: {table}");
+        assert!(lines[1].ends_with(comma), "{}", lines[1]);
+        assert_eq!(lines[2].trim(), plain);
+        // And nothing joined them, which is what made the old format
+        // unsplittable: the comma in the line is the one inside the path.
+        assert_eq!(lines[1].matches(", ").count(), 1);
+    }
+
+    /// A game with no folder says so where the paths would be, rather than
+    /// leaving the column blank.
+    #[test]
+    fn a_game_without_a_folder_says_so_in_the_table() {
+        let table = render_table(&[game("mojo-hanako", &[])]);
+        assert!(table.contains("no save folder located"), "{table}");
+    }
+
+    /// The per-game list is a `--verbose` choice for a person and not
+    /// negotiable for a machine: `--json` alone has to carry it.
+    #[test]
+    fn json_always_carries_the_games() {
+        assert!(should_list_games(false, true), "--json alone");
+        assert!(should_list_games(true, true));
+        assert!(should_list_games(true, false), "--verbose alone");
+        assert!(!should_list_games(false, false), "plain scan stays a summary");
+    }
 }

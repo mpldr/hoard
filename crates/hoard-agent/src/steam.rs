@@ -106,13 +106,30 @@ pub fn detect_steam_libraries(os: Os) -> Vec<PathBuf> {
     libraries
 }
 
-/// Normalised key for de-duplicating library paths. On Windows the same
-/// directory can arrive spelled two ways — the registry gives
-/// `c:/program files (x86)/steam` (forward slashes, lower-case) while the
-/// `%ProgramFiles%` guess gives `C:\Program Files (x86)\Steam` — so fold case
-/// and slash direction there. Elsewhere paths are case-sensitive; leave them.
+/// Normalised key for de-duplicating library paths.
+///
+/// Two spellings of the same directory have to collapse to one key, and there
+/// are two ways they diverge:
+///
+/// * **Symlinks.** Every standard Steam install on Linux ships
+///   `~/.steam/steam` as a symlink to `~/.local/share/Steam`, and both are
+///   probed by [`linux_roots`]. Left as raw strings they are different keys, so
+///   the same library was listed twice and every Steam Cloud save under it was
+///   reported twice — the same `userdata/<id>/<appid>/remote` folder spelled
+///   two ways, which the UI has no way to tell apart from two real folders.
+///   Resolving the path is what makes them one key.
+/// * **Case and slashes.** On Windows the registry gives
+///   `c:/program files (x86)/steam` while the `%ProgramFiles%` guess gives
+///   `C:\Program Files (x86)\Steam`, so fold both there.
+///
+/// The key is only ever a key: what goes into the library list is the caller's
+/// original path, so no display or stored path gains a `\\?\` prefix or loses
+/// the spelling the user knows.
 fn lib_key(p: &Path) -> String {
-    let s = p.to_string_lossy();
+    // A path that can't be resolved (it just vanished, or we can't traverse to
+    // it) keeps its literal spelling — the worst case is the old behaviour.
+    let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = resolved.to_string_lossy();
     #[cfg(windows)]
     {
         s.replace('\\', "/").to_lowercase()
@@ -337,8 +354,14 @@ fn home() -> Option<PathBuf> {
 fn linux_roots() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(h) = home() {
-        v.push(h.join(".steam/steam"));
+        // `~/.local/share/Steam` first, `~/.steam/steam` second: on a standard
+        // Linux install the second is a symlink to the first, `lib_key` folds
+        // the two into one entry, and whichever is listed first is the spelling
+        // every save path downstream inherits. The real directory is the better
+        // one to inherit — it survives Steam rebuilding its compatibility
+        // symlinks, and it is what the rest of the system shows the user.
         v.push(h.join(".local/share/Steam"));
+        v.push(h.join(".steam/steam"));
         v.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
         // Snap package (canonical/steam) keeps its own HOME under ~/snap.
         v.push(h.join("snap/steam/common/.local/share/Steam"));
@@ -706,8 +729,13 @@ fn tokenize_vdf(text: &str) -> Vec<String> {
 /// account. Steam writes per-user save data under
 /// `<root>/userdata/<storeUserId>/<appid>/remote/`. Detection consumers can
 /// fan a `<storeUserId>` placeholder out across these.
+///
+/// De-duplicated by [`lib_key`], the same way the library list is: a user
+/// folder reached through two spellings of one library is one account, and
+/// returning it twice makes every Steam Cloud save of every game show up twice.
 pub fn steam_user_dirs(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for lib in libraries {
         let userdata = lib.join("userdata");
         let entries = match std::fs::read_dir(&userdata) {
@@ -716,7 +744,7 @@ pub fn steam_user_dirs(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            if path.is_dir() && seen.insert(lib_key(&path)) {
                 out.push(path);
             }
         }
@@ -984,6 +1012,58 @@ mod tests {
             !out.iter().any(|p| p.starts_with(base.join("Windows"))),
             "system-named dir skipped"
         );
+    }
+
+    /// The compatibility symlink every Linux Steam install ships
+    /// (`~/.steam/steam` → `~/.local/share/Steam`) must not turn one library
+    /// into two. It did, and with it every Steam Cloud save under `userdata`
+    /// was reported twice — 34 duplicate paths across 24 games on one machine.
+    ///
+    /// The symlink is created for real, not simulated with two separate
+    /// directories: the whole bug is that two *different* paths name one
+    /// directory, and two real directories can't reproduce that.
+    #[cfg(unix)]
+    #[test]
+    fn the_steam_compatibility_symlink_is_one_library_not_two() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // The real install, and the symlink Steam leaves next to it.
+        let real = home.join(".local/share/Steam");
+        std::fs::create_dir_all(real.join("steamapps")).unwrap();
+        std::fs::create_dir_all(home.join(".steam")).unwrap();
+        let link = home.join(".steam/steam");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(link.join("steamapps").is_dir(), "the symlink resolves");
+
+        // One Steam account with one Cloud-saving game under it.
+        let user = real.join("userdata/76561198041773665");
+        std::fs::create_dir_all(user.join("646270/remote")).unwrap();
+
+        // The vdf names the library by the symlinked spelling, which is the
+        // third way the same directory arrives.
+        std::fs::write(
+            real.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n  \"0\" {{ \"path\" \"{}\" }}\n}}\n",
+                link.display()
+            ),
+        )
+        .unwrap();
+
+        with_home(home, || {
+            let libs = detect_steam_libraries(Os::Linux);
+            assert_eq!(
+                libs.len(),
+                1,
+                "one directory reached three ways is one library; got {libs:?}"
+            );
+            assert_eq!(libs[0], real, "the real directory is the one kept");
+
+            let users = steam_user_dirs(&libs).expect("userdata is readable");
+            assert_eq!(users.len(), 1, "one account, not one per spelling: {users:?}");
+            assert_eq!(users[0], user);
+        });
     }
 
     #[test]

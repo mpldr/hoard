@@ -2628,56 +2628,72 @@ enum FolderContents {
 /// file patterns come in as `shields` so a game whose saves really are `.ini`
 /// (582 catalog templates say `*.ini`) is not judged by extension alone.
 fn inspect_folder(dir: &Path, shields: &[String]) -> FolderContents {
-    fn scan(
-        dir: &Path,
-        shields: &[String],
-        depth: usize,
-        budget: &mut usize,
-        saw_file: &mut bool,
-        truncated: &mut bool,
-    ) -> bool {
-        if depth > OFFER_SCAN_MAX_DEPTH {
-            *truncated = true;
-            return false;
-        }
-        let Ok(read) = std::fs::read_dir(dir) else {
-            // Unreadable is not empty and not junk: it is unknown.
-            *truncated = true;
-            return false;
-        };
-        let mut subdirs: Vec<PathBuf> = Vec::new();
-        for entry in read.flatten() {
-            if *budget == 0 {
-                *truncated = true;
-                return false;
-            }
-            *budget -= 1;
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                subdirs.push(entry.path());
-                continue;
-            }
-            *saw_file = true;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if fileclass::classify(name, shields) == fileclass::FileClass::SaveData {
-                return true;
-            }
-        }
-        for d in &subdirs {
-            if scan(d, shields, depth + 1, budget, saw_file, truncated) {
-                return true;
-            }
-        }
-        false
+    struct Walk<'a> {
+        shields: &'a [String],
+        budget: usize,
+        saw_file: bool,
+        truncated: bool,
     }
 
-    let mut budget = OFFER_SCAN_BUDGET;
-    let mut saw_file = false;
-    let mut truncated = false;
-    if scan(dir, shields, 0, &mut budget, &mut saw_file, &mut truncated) {
+    impl Walk<'_> {
+        /// `rel` is the path so far **relative to the candidate root**, with
+        /// `/` separators — the shape [`fileclass::classify`] expects. Passing
+        /// only the file name would blind its segment rules, and those are what
+        /// recognise the Unity analytics queue and the engine telemetry dirs
+        /// that make up most of a false offer's contents.
+        fn scan(&mut self, dir: &Path, rel: &str, depth: usize) -> bool {
+            if depth > OFFER_SCAN_MAX_DEPTH {
+                self.truncated = true;
+                return false;
+            }
+            let Ok(read) = std::fs::read_dir(dir) else {
+                // Unreadable is not empty and not junk: it is unknown.
+                self.truncated = true;
+                return false;
+            };
+            let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
+            for entry in read.flatten() {
+                if self.budget == 0 {
+                    self.truncated = true;
+                    return false;
+                }
+                self.budget -= 1;
+                let Ok(ft) = entry.file_type() else { continue };
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let child = if rel.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if ft.is_dir() {
+                    subdirs.push((entry.path(), child));
+                    continue;
+                }
+                self.saw_file = true;
+                if fileclass::classify(&child, self.shields) == fileclass::FileClass::SaveData {
+                    return true;
+                }
+            }
+            for (path, child) in &subdirs {
+                if self.scan(path, child, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    let mut walk = Walk {
+        shields,
+        budget: OFFER_SCAN_BUDGET,
+        saw_file: false,
+        truncated: false,
+    };
+    if walk.scan(dir, "", 0) {
         return FolderContents::SaveData;
     }
+    let (saw_file, truncated) = (walk.saw_file, walk.truncated);
     if truncated {
         return FolderContents::Unknown;
     }
@@ -2729,11 +2745,23 @@ fn drop_folders_without_saves(g: &mut DetectedGame) -> HashSet<PathBuf> {
     empty
 }
 
-/// Pin every empty folder's grade to `Low` and re-roll the game's own grade.
+/// What an empty candidate folder gets told about itself.
+const EMPTY_OFFER_REASON: &str = "empty: the game has not written a save here yet";
+
+/// Pin every empty folder's **path** grade to `Low`.
 ///
-/// Runs after grading so it wins: a folder that scored `High` on its name and
-/// its position is still a folder with nothing in it, and saying so is the
-/// difference between "we found your saves" and "this is where they will be".
+/// A folder that scored `High` on its name and its position is still a folder
+/// with nothing in it, and saying so is the difference between "we found your
+/// saves" and "this is where they will be". Applied before the ranking in the
+/// multi-path case, so an empty folder also sinks below a sibling that holds
+/// something instead of leading `found_paths` and becoming what automatic
+/// tracking picks.
+///
+/// The game's own grade is deliberately left alone. `DetectedGame::confidence`
+/// answers "is this game installed here", and an empty save folder is no
+/// evidence against that — the game is installed, it has not been played. It is
+/// also what lets an untouched folder adopt a save that already exists in the
+/// cloud, which is exactly the case a `Low` here would break.
 fn cap_empty_offers(g: &mut DetectedGame, empty: &HashSet<PathBuf>) {
     if empty.is_empty() {
         return;
@@ -2746,16 +2774,8 @@ fn cap_empty_offers(g: &mut DetectedGame, empty: &HashSet<PathBuf>) {
             *c = Confidence::Low;
         }
         if let Some(r) = g.path_reasons.get_mut(i) {
-            *r = "empty: the game has not written a save here yet".into();
+            *r = EMPTY_OFFER_REASON.into();
         }
-    }
-    if let Some(max) = g
-        .path_confidences
-        .iter()
-        .copied()
-        .max_by_key(|c| confidence_rank(*c))
-    {
-        g.confidence = max;
     }
 }
 
@@ -4220,6 +4240,9 @@ fn grade_and_rank_paths(
             .found_paths
             .iter()
             .map(|p| {
+                if empty_offers.contains(p) {
+                    return (p.clone(), Confidence::Low, EMPTY_OFFER_REASON.to_string());
+                }
                 let (c, r) = grade_path_reasoned(p, store);
                 (p.clone(), c, r)
             })
@@ -4245,15 +4268,20 @@ fn grade_and_rank_paths(
         });
         let ranked: Vec<_> = order.iter().map(|&i| graded[i].clone()).collect();
 
-        g.confidence = ranked
+        // An empty folder never decides the game's grade — see
+        // [`cap_empty_offers`]. With nothing but empty folders left there is
+        // nothing to re-roll from, so the grade the pipeline arrived at stands.
+        if let Some(max) = ranked
             .iter()
+            .filter(|(p, _, _)| !empty_offers.contains(p))
             .map(|(_, c, _)| *c)
             .max_by_key(|c| confidence_rank(*c))
-            .unwrap_or(g.confidence);
+        {
+            g.confidence = max;
+        }
         g.found_paths = ranked.iter().map(|(p, _, _)| p.clone()).collect();
         g.path_confidences = ranked.iter().map(|(_, c, _)| *c).collect();
         g.path_reasons = ranked.iter().map(|(_, _, r)| r.clone()).collect();
-        cap_empty_offers(g, &empty_offers);
     }
 }
 
@@ -4871,6 +4899,220 @@ mod tests {
         apply_steam_name_fallback(&catalog, &steam_apps, &mut by_slug);
 
         assert!(by_slug.is_empty());
+    }
+
+    /// A folder that exists and holds nothing but settings is not a save
+    /// folder. `~/.config/SiNKR` holds one `settings.ini`; the catalog points
+    /// at it, so it was offered alongside the folder with the actual saves.
+    #[test]
+    fn a_settings_only_folder_is_not_offered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decoy = tmp.path().join("SiNKR");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("settings.ini"), "fullscreen=1").unwrap();
+
+        assert_eq!(inspect_folder(&decoy, &[]), FolderContents::NoSaveData);
+    }
+
+    /// The same folder when the manifest says `.ini` IS this game's save
+    /// format. 582 catalog templates do, which is why extension alone can't
+    /// decide.
+    #[test]
+    fn a_shielded_ini_is_player_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Game");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("slot1.ini"), "hp=3").unwrap();
+
+        assert_eq!(inspect_folder(&dir, &[]), FolderContents::NoSaveData);
+        assert_eq!(
+            inspect_folder(&dir, &["*.ini".to_string()]),
+            FolderContents::SaveData
+        );
+    }
+
+    /// Engine leftovers are not player data either — that is the whole Unity
+    /// `LocalLow` shape, which exists for every Unity game whether it saves
+    /// there or not.
+    #[test]
+    fn an_engine_log_folder_is_not_offered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Harrow House").join("SiNKR");
+        std::fs::create_dir_all(dir.join("Unity/abc-123/Analytics")).unwrap();
+        std::fs::write(dir.join("Player.log"), "boot").unwrap();
+        std::fs::write(dir.join("Unity/abc-123/Analytics/events"), "{}").unwrap();
+
+        assert_eq!(inspect_folder(&dir, &[]), FolderContents::NoSaveData);
+
+        // The real one, one level down, is the one worth offering.
+        let saves = dir.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("profile1.dat"), "x").unwrap();
+        assert_eq!(inspect_folder(&saves, &[]), FolderContents::SaveData);
+    }
+
+    /// Installed, never played: the folder is real and empty, and that is a
+    /// state worth showing rather than hiding.
+    #[test]
+    fn an_empty_save_folder_is_told_apart_from_a_junk_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Saves");
+        std::fs::create_dir_all(dir.join("nothing/in/here")).unwrap();
+
+        assert_eq!(inspect_folder(&dir, &[]), FolderContents::Empty);
+    }
+
+    /// Running out of road means "don't know", never "no". A save four levels
+    /// down is not evidence that there is no save.
+    #[test]
+    fn a_folder_deeper_than_the_walk_is_unknown_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Game");
+        let deep = dir.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("save.dat"), "x").unwrap();
+
+        assert_eq!(inspect_folder(&dir, &[]), FolderContents::Unknown);
+    }
+
+    /// The end-to-end shape of the filter: the settings decoy goes, the real
+    /// save folder stays, and the game keeps its grade.
+    #[test]
+    fn grading_drops_the_decoy_and_keeps_the_save_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("LocalLow/Harrow House/SiNKR/saves");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("profile1.dat"), "x").unwrap();
+        let decoy = tmp.path().join(".config/SiNKR");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("settings.ini"), "fullscreen=1").unwrap();
+
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "sinkr".to_string(),
+            DetectedGame {
+                slug: "sinkr".into(),
+                display_name: "SiNKR".into(),
+                found_paths: vec![decoy.clone(), real.clone()],
+                path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
+                confidence: Confidence::Medium,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+
+        grade_and_rank_paths(&mut by_slug, &CorrelationStore::default());
+
+        let g = &by_slug["sinkr"];
+        assert_eq!(g.found_paths, vec![real], "only the folder with saves");
+        assert_eq!(g.path_confidences.len(), g.found_paths.len());
+    }
+
+    /// An empty folder is offered, but never above `Low` and never ahead of a
+    /// sibling that holds something — `found_paths[0]` is what automatic
+    /// tracking picks.
+    #[test]
+    fn an_empty_folder_is_offered_last_and_low() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("Saves");
+        std::fs::create_dir_all(&empty).unwrap();
+        let full = tmp.path().join("savegames");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("slot1.sav"), "x").unwrap();
+
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "x".to_string(),
+            DetectedGame {
+                slug: "x".into(),
+                display_name: "X".into(),
+                found_paths: vec![empty.clone(), full.clone()],
+                path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
+                confidence: Confidence::High,
+                source: DetectionSource::FilesystemHeuristic,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+
+        grade_and_rank_paths(&mut by_slug, &CorrelationStore::default());
+
+        let g = &by_slug["x"];
+        assert_eq!(g.found_paths.len(), 2, "the empty one is kept, not hidden");
+        assert_eq!(g.found_paths[0], full, "the one with saves leads");
+        assert_eq!(g.path_confidences[1], Confidence::Low);
+        assert!(g.path_reasons[1].starts_with("empty:"), "{:?}", g.path_reasons);
+    }
+
+    /// A game whose every candidate was a settings folder keeps its row and
+    /// loses its paths: "installed, we don't know where it saves" is the state
+    /// the folder picker answers, and it beats pointing at the wrong folder.
+    #[test]
+    fn a_game_left_with_no_offerable_folder_keeps_its_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decoy = tmp.path().join("Game");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("graphics.cfg"), "1920x1080").unwrap();
+
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "x".to_string(),
+            DetectedGame {
+                slug: "x".into(),
+                display_name: "X".into(),
+                found_paths: vec![decoy],
+                path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
+                confidence: Confidence::High,
+                source: DetectionSource::Both,
+                steam_app_id: Some(42),
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+
+        grade_and_rank_paths(&mut by_slug, &CorrelationStore::default());
+
+        let g = &by_slug["x"];
+        assert!(g.found_paths.is_empty());
+        assert!(g.path_confidences.is_empty());
+        assert_eq!(g.slug, "x", "the game is still reported");
+    }
+
+    /// The user's own pick is never second-guessed.
+    #[test]
+    fn a_hand_picked_folder_is_exempt_from_the_offer_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chosen = tmp.path().join("Game");
+        std::fs::create_dir_all(&chosen).unwrap();
+        std::fs::write(chosen.join("settings.ini"), "x").unwrap();
+
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "x".to_string(),
+            DetectedGame {
+                slug: "x".into(),
+                display_name: "X".into(),
+                found_paths: vec![chosen.clone()],
+                path_confidences: Vec::new(),
+                path_reasons: Vec::new(),
+                confidence: Confidence::High,
+                source: DetectionSource::ManualOverride,
+                steam_app_id: None,
+                install_dir: None,
+                steam_cloud: false,
+            },
+        );
+
+        grade_and_rank_paths(&mut by_slug, &CorrelationStore::default());
+
+        assert_eq!(by_slug["x"].found_paths, vec![chosen]);
+        assert_eq!(by_slug["x"].confidence, Confidence::High);
     }
 
     /// Same Stellaris regression test as before, adapted to the new

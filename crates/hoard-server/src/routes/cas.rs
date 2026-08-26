@@ -340,6 +340,41 @@ fn non_fast_forward(head: i64, base: i64) -> ApiError {
 
 // ─── PUT /v1/cas/blobs/:upload_id/:sha256 ───────────────────────────────────
 
+/// How much body we swallow as a courtesy before answering an error, while the
+/// client is still writing.
+///
+/// This exists because answering and closing without reading is not free: hyper
+/// closes the socket with data unconsumed, TCP sends RST, and **Windows throws
+/// away the response already sitting in its receive buffer**. The client never
+/// gets to see the 404 or the 413 — only an `error writing a body to
+/// connection` (os error 10053/10054) that says nothing. Half of issue #17.
+///
+/// Capped, because the body can be gigabytes and swallowing all of it just to
+/// be able to say "no" is exactly the work the error was trying to avoid. Past
+/// the cap we stop and the client gets the same reset as before: no worse than
+/// it was.
+const MAX_DRAIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Empty whatever is left of the body (up to [`MAX_DRAIN_BYTES`]) and return the
+/// error unchanged, so the response leaves through a socket the client can
+/// still read. See [`MAX_DRAIN_BYTES`].
+async fn drain_then(
+    stream: &mut axum::body::BodyDataStream,
+    error: ApiError,
+    already_read: u64,
+) -> ApiError {
+    let mut drained = already_read;
+    while drained < MAX_DRAIN_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => drained += chunk.len() as u64,
+            // A body that dies on its own is no longer in the way: nothing to
+            // drain.
+            Some(Err(_)) | None => break,
+        }
+    }
+    error
+}
+
 /// Un blob que falta. El cuerpo son los bytes en crudo; se escriben en staging
 /// hasheando por el camino, y si el sha no cuadra con el que promete la URL el
 /// fichero se borra y la petición se rechaza.
@@ -358,32 +393,47 @@ pub async fn upload_blob(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let user_id = user.user_id.to_string();
+    // The body is taken as a stream before the first validation: every error
+    // from here on has to empty it before answering, or the client never gets
+    // to read the response. See `drain_then`.
+    let mut stream = body.into_data_stream();
+
     if !valid_upload_id(&upload_id) {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid upload id"));
+        let e = err(StatusCode::BAD_REQUEST, "invalid upload id");
+        return Err(drain_then(&mut stream, e, 0).await);
     }
     if !valid_sha256(&sha) {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid sha256"));
+        let e = err(StatusCode::BAD_REQUEST, "invalid sha256");
+        return Err(drain_then(&mut stream, e, 0).await);
     }
 
     let dir = staging_dir(&state.config.storage.data_dir, &upload_id);
-    let owner = tokio::fs::read_to_string(owner_file(&dir))
-        .await
-        .map_err(|_| err(StatusCode::NOT_FOUND, "upload not found or expired"))?;
+    let owner = match tokio::fs::read_to_string(owner_file(&dir)).await {
+        Ok(o) => o,
+        Err(_) => {
+            let e = err(StatusCode::NOT_FOUND, "upload not found or expired");
+            return Err(drain_then(&mut stream, e, 0).await);
+        }
+    };
     if owner != user_id {
         // Mismo cuerpo que "no existe": quien no es el dueño no debe poder
         // distinguir un id ajeno de uno inventado.
-        return Err(err(StatusCode::NOT_FOUND, "upload not found or expired"));
+        let e = err(StatusCode::NOT_FOUND, "upload not found or expired");
+        return Err(drain_then(&mut stream, e, 0).await);
     }
 
     let dest = dir.join(&sha);
     let max_per_blob = (state.config.storage.max_snapshot_size_mb as i64) * 1024 * 1024;
 
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| internal_logged("creating the uploaded file", e))?;
+    let mut file = match tokio::fs::File::create(&dest).await {
+        Ok(f) => f,
+        Err(e) => {
+            let e = internal_logged("creating the uploaded file", e);
+            return Err(drain_then(&mut stream, e, 0).await);
+        }
+    };
     let mut hasher = Sha256::new();
     let mut size: i64 = 0;
-    let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
@@ -396,13 +446,18 @@ pub async fn upload_blob(
         size += chunk.len() as i64;
         if size > max_per_blob {
             let _ = tokio::fs::remove_file(&dest).await;
-            return Err(snapshot_too_large(max_per_blob, size));
+            // What we already read counts against the drain cap: a blob over
+            // the server's limit is precisely the one not worth swallowing
+            // whole just to reject it politely.
+            let e = snapshot_too_large(max_per_blob, size);
+            return Err(drain_then(&mut stream, e, size.max(0) as u64).await);
         }
         hasher.update(&chunk);
         if let Err(e) = file.write_all(&chunk).await {
             warn!(error = %e, "cas blob write error");
             let _ = tokio::fs::remove_file(&dest).await;
-            return Err(internal_logged("writing the uploaded blob", e));
+            let e = internal_logged("writing the uploaded blob", e);
+            return Err(drain_then(&mut stream, e, size.max(0) as u64).await);
         }
     }
     if let Err(e) = file.flush().await {

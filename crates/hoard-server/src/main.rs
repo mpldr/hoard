@@ -259,11 +259,15 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         // Operator views behind the panel's server section. Each handler
         // checks `is_admin` itself — see the comment in `routes::admin`.
         .route("/v1/admin/overview", get(admin_routes::overview))
+        .route("/v1/admin/users", post(admin_routes::create_user))
         .route(
             "/v1/admin/users/:id",
-            axum::routing::patch(admin_routes::patch_user),
+            axum::routing::patch(admin_routes::patch_user).delete(admin_routes::delete_user),
         )
-        .route("/v1/admin/tokens", get(admin_routes::tokens))
+        .route(
+            "/v1/admin/tokens",
+            get(admin_routes::tokens).post(admin_routes::create_token),
+        )
         .route(
             "/v1/admin/tokens/:id/revoke",
             post(admin_routes::revoke_token),

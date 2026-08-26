@@ -770,7 +770,151 @@ function userRow(u) {
         type: "button",
         text: u.is_admin ? t("users.demote") : t("users.promote"),
         onclick: () => toggleAdmin(u),
+      }),
+      h("button", {
+        class: "link",
+        type: "button",
+        text: t("users.rename"),
+        onclick: () => renameUser(u),
+      }),
+      h("button", {
+        class: "link",
+        type: "button",
+        text: t("users.password"),
+        onclick: () => setPassword(u),
+      }),
+      // Deleting yourself is the one the server refuses outright, so the row
+      // does not offer it rather than explaining the refusal afterwards.
+      u.username === me.username ? null : h("button", {
+        class: "link warn",
+        type: "button",
+        text: t("common.delete"),
+        onclick: () => deleteUser(u),
       }))));
+}
+
+// Collect values from a dialog built out of `fields`, or null if cancelled.
+// The same modal `editQuota` fills in by hand, generalized: every admin action
+// added here would otherwise repeat the showModal/close/returnValue dance.
+async function formDialog(title, fields, okLabel) {
+  const dlg = $("dlg-confirm");
+  const inputs = fields.map((f) => h("input", {
+    type: f.type || "text",
+    value: f.value || "",
+    placeholder: f.placeholder || "",
+    autocomplete: f.type === "password" ? "new-password" : "off",
+    onkeydown: (e) => {
+      if (e.key === "Enter") { e.preventDefault(); $("confirm-ok").click(); }
+    },
+  }));
+  $("confirm-title").textContent = title;
+  clear($("confirm-body"),
+    fields.map((f, i) => h("label", { class: "field" },
+      h("span", { text: f.label }), inputs[i])),
+    fields.some((f) => f.hint)
+      ? h("p", { class: "sub", text: fields.find((f) => f.hint).hint })
+      : null);
+  $("confirm-ok").textContent = okLabel || t("common.save");
+
+  const ok = await new Promise((resolve) => {
+    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+    dlg.showModal();
+    inputs[0]?.focus();
+  });
+  if (!ok) return null;
+  return inputs.map((i) => i.value);
+}
+
+async function newUser() {
+  const vals = await formDialog(t("users.new_title"), [
+    { label: t("users.username_label"), placeholder: "player-two" },
+    { label: t("users.password_label"), type: "password", hint: t("users.password_hint") },
+  ], t("users.create"));
+  if (!vals) return;
+  const [username, password] = vals;
+  try {
+    const created = await api("/v1/admin/users", {
+      method: "POST",
+      body: JSON.stringify({ username: username.trim(), password, is_admin: false }),
+    });
+    toast(t("users.created", { user: created.username }));
+    await renderUsers();
+    // The account is useless until a PC can reach it, and the operator is
+    // already here — offer the token instead of making them find the button.
+    await newToken(created.id);
+  } catch (e) {
+    toast(errorText(e), true);
+  }
+}
+
+async function renameUser(user) {
+  const vals = await formDialog(
+    t("users.rename_title", { user: user.username }),
+    [{ label: t("users.username_label"), value: user.username, hint: t("users.rename_hint") }],
+    t("users.rename"));
+  if (!vals) return;
+  const username = vals[0].trim();
+  if (!username || username === user.username) return;
+  try {
+    await api("/v1/admin/users/" + user.id, {
+      method: "PATCH",
+      body: JSON.stringify({ username }),
+    });
+    toast(t("users.renamed", { from: user.username, to: username }));
+    await renderUsers();
+    // The header still greets you by the old name otherwise.
+    if (user.username === me.username) location.reload();
+  } catch (e) {
+    toast(errorText(e), true);
+  }
+}
+
+async function setPassword(user) {
+  const vals = await formDialog(
+    t("users.password_title", { user: user.username }),
+    [{ label: t("users.password_label"), type: "password", hint: t("users.password_sessions") }],
+    t("common.save"));
+  if (!vals) return;
+  const password = vals[0];
+  if (!password) return;
+  try {
+    await api("/v1/admin/users/" + user.id, {
+      method: "PATCH",
+      body: JSON.stringify({ password }),
+    });
+    toast(t("users.password_done", { user: user.username }));
+    // Setting your own password revokes your own session along with it.
+    if (user.username === me.username) return location.reload();
+    await renderUsers();
+  } catch (e) {
+    toast(errorText(e), true);
+  }
+}
+
+async function deleteUser(user) {
+  // Typing the name, not clicking OK: this is the only button in the panel
+  // that destroys saves, and the row above it holds how much is about to go.
+  const vals = await formDialog(
+    t("users.delete_title", { user: user.username }),
+    [{
+      label: t("users.delete_label", { user: user.username }),
+      placeholder: user.username,
+      hint: t("users.delete_hint", {
+        user: user.username,
+        size: bytes(user.used_bytes),
+        versions: num(user.versions),
+      }),
+    }],
+    t("common.delete"));
+  if (!vals) return;
+  if (vals[0].trim() !== user.username) return toast(t("users.delete_mismatch"), true);
+  try {
+    const gone = await api("/v1/admin/users/" + user.id, { method: "DELETE" });
+    toast(t("users.deleted", { user: gone.username, size: bytes(gone.bytes_removed) }));
+    await renderUsers();
+  } catch (e) {
+    toast(errorText(e), true);
+  }
 }
 
 async function editQuota(user) {
@@ -823,6 +967,86 @@ async function toggleAdmin(user) {
   } catch (e) {
     toast(errorText(e), true);
   }
+}
+
+// Mint a device token. `presetUserId` skips the picker, for the hand-off
+// straight after creating an account.
+async function newToken(presetUserId) {
+  const users = (adminData || (await loadAdmin())).users;
+  const dlg = $("dlg-confirm");
+  const picker = h("select", {},
+    users.map((u) => h("option", { value: u.id, selected: u.id === presetUserId }, u.username)));
+  const device = h("input", {
+    type: "text",
+    placeholder: t("users.device_placeholder"),
+    onkeydown: (e) => {
+      if (e.key === "Enter") { e.preventDefault(); $("confirm-ok").click(); }
+    },
+  });
+
+  $("confirm-title").textContent = t("users.token_title");
+  clear($("confirm-body"),
+    presetUserId ? null : h("label", { class: "field" },
+      h("span", { text: t("col.user") }), picker),
+    h("label", { class: "field" }, h("span", { text: t("users.device_label") }), device),
+    h("p", { class: "sub", text: t("users.token_hint") }));
+  $("confirm-ok").textContent = t("users.token_create");
+
+  const ok = await new Promise((resolve) => {
+    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+    dlg.showModal();
+    device.focus();
+  });
+  if (!ok) return;
+
+  try {
+    const minted = await api("/v1/admin/tokens", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: presetUserId || picker.value,
+        device_name: device.value.trim() || null,
+      }),
+    });
+    await renderTokens();
+    await showToken(minted);
+  } catch (e) {
+    toast(errorText(e), true);
+  }
+}
+
+// The token in the clear, once. Only its SHA-256 is stored, so closing this
+// without copying means minting another one — which is why the dialog says so
+// and the only button is "done".
+async function showToken(minted) {
+  const dlg = $("dlg-confirm");
+  const field = h("input", { type: "text", readonly: true, value: minted.token, class: "token" });
+  const copy = h("button", {
+    class: "ghost",
+    type: "button",
+    text: t("common.copy"),
+    onclick: async () => {
+      // navigator.clipboard is undefined on a plain-HTTP origin, which is
+      // exactly how a NAS panel is reached. Select the text so Ctrl+C works.
+      try {
+        await navigator.clipboard.writeText(minted.token);
+        toast(t("users.token_copied"));
+      } catch {
+        field.select();
+        toast(t("users.token_select"), true);
+      }
+    },
+  });
+
+  $("confirm-title").textContent = t("users.token_ready");
+  clear($("confirm-body"),
+    h("p", { class: "sub", text: t("users.token_once", { user: minted.username }) }),
+    h("div", { class: "token-row" }, field, copy));
+  $("confirm-ok").textContent = t("common.done");
+  await new Promise((resolve) => {
+    dlg.addEventListener("close", resolve, { once: true });
+    dlg.showModal();
+    field.select();
+  });
 }
 
 async function renderTokens() {
@@ -1076,6 +1300,8 @@ function wire() {
   $("btn-refresh").addEventListener("click", refresh);
   $("btn-limits").addEventListener("click", applyLimits);
   $("btn-logs").addEventListener("click", () => renderLogs().catch((e) => toast(errorText(e), true)));
+  $("btn-new-user").addEventListener("click", () => newUser());
+  $("btn-new-token").addEventListener("click", () => newToken());
   $("f-log-search").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); renderLogs().catch(() => {}); }
   });

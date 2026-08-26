@@ -260,6 +260,15 @@ button { font: inherit; cursor: pointer; border-radius: var(--radius); }
 }
 
 .block { margin-bottom: 38px; }
+.block-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+/* The caption above a table already carries the bottom margin; a second one
+   from the button row would push the table off its heading. */
+.block-head .caption { margin-bottom: 10px; }
 .block h2 {
   margin: 0 0 4px;
   font-size: 12px;
@@ -440,6 +449,17 @@ button { font: inherit; cursor: pointer; border-radius: var(--radius); }
 
 .limits { display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap; }
 .limits .primary { width: auto; }
+
+/* The token is 71 characters of hex and has to be copyable in one go, so it
+   gets the width and a font that does not turn 0 into O. */
+.token-row { display: flex; gap: 8px; align-items: center; }
+.token-row .token {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.token-row .ghost { white-space: nowrap; }
 
 .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .row-actions .link { color: var(--dim); }

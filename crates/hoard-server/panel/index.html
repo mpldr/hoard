@@ -174,13 +174,23 @@
 
     <section id="panel-users" class="panel" hidden>
       <div class="block">
-        <h2 data-i18n="users.title"></h2>
-        <p class="caption" data-i18n="users.caption"></p>
+        <div class="block-head">
+          <div>
+            <h2 data-i18n="users.title"></h2>
+            <p class="caption" data-i18n="users.caption"></p>
+          </div>
+          <button id="btn-new-user" class="ghost" type="button" data-i18n="users.new"></button>
+        </div>
         <div id="users-list"></div>
       </div>
       <div class="block">
-        <h2 data-i18n="users.tokens"></h2>
-        <p class="caption" data-i18n="users.tokens_caption"></p>
+        <div class="block-head">
+          <div>
+            <h2 data-i18n="users.tokens"></h2>
+            <p class="caption" data-i18n="users.tokens_caption"></p>
+          </div>
+          <button id="btn-new-token" class="ghost" type="button" data-i18n="users.token_new"></button>
+        </div>
         <div id="tokens-list"></div>
       </div>
     </section>

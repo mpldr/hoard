@@ -76,7 +76,8 @@ const PACED_WAIT_BUDGET: Duration = Duration::from_secs(900);
 /// re-sending the same PUT can only make it worse — those keep travelling up to
 /// the agent, which parks the save and comes back later.
 fn paced_wait_hint(e: &anyhow::Error) -> Option<u32> {
-    e.chain()
+    if let Some(hint) = e
+        .chain()
         .find_map(|c| c.downcast_ref::<ApiError>())
         .and_then(|api| match api {
             ApiError::RateLimited {
@@ -86,6 +87,41 @@ fn paced_wait_hint(e: &anyhow::Error) -> Option<u32> {
             } => Some(*retry_after_seconds),
             _ => None,
         })
+    {
+        return Some(hint);
+    }
+    // A pacer that answers 429 **without draining the body** does not read as a
+    // 429: the socket dies while we are still writing the PUT and the response
+    // goes with it. On Windows always — the stack discards whatever was already
+    // buffered when the RST lands, so the 429 does not exist for us. That is
+    // issue #17: a 173-file folder that never finished, with `error writing a
+    // body to connection` for its only clue.
+    //
+    // Treated as pacing with no hint. A genuine network drop lands here too and
+    // gets that blob retried a few times, which beats throwing away the whole
+    // batch over one stumble; and if it is persistent,
+    // `MAX_PACED_RETRIES_PER_BLOB` turns it back into the same failure as
+    // before, just a few seconds later.
+    is_body_write_reset(e).then_some(0)
+}
+
+/// Did the connection die while we were writing the request body?
+///
+/// Matched on the `io::Error` at the bottom of the chain, never on the text:
+/// the message comes in the language of the Windows install — the issue's
+/// arrived in German — and comparing localised strings is an expensive way to
+/// detect nothing.
+fn is_body_write_reset(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionAborted   // WSAECONNABORTED (10053)
+                    | std::io::ErrorKind::ConnectionReset // WSAECONNRESET (10054)
+                    | std::io::ErrorKind::BrokenPipe // EPIPE, el mismo caso en unix
+            )
+        })
+    })
 }
 
 /// Run one blob's upload, retrying it — and only it — while a pacer says
@@ -1705,6 +1741,68 @@ mod tests {
             size_bytes: size,
             modified: Some(UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs)),
         }
+    }
+
+    /// The heart of the issue #17 fix: a server that answers and closes without
+    /// draining the body must be recognised as pacing.
+    ///
+    /// Assuming the `io::Error` survives the `reqwest` → `hyper` → `anyhow`
+    /// trip is not good enough, so the real failure is manufactured here: a
+    /// listener that accepts, reads a little and aborts with RST while the
+    /// client is still writing a large body. Exactly what the per-IP limiter
+    /// does when it turns a PUT away.
+    #[tokio::test]
+    async fn a_reset_while_writing_the_body_reads_as_pacing() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Just enough for the client to have started writing the body.
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            // Closed with the body half-arrived. The client keeps writing,
+            // those bytes land on a closed socket and the server's stack
+            // answers RST: exactly what a client sees when its PUT is turned
+            // away undrained.
+            drop(sock);
+        });
+
+        // Large, lazy body: it has to still be writing when the RST lands, or
+        // the failure would be reading the response rather than writing.
+        let body = reqwest::Body::wrap_stream(stream::iter(
+            (0..4096).map(|_| Ok::<_, std::io::Error>(vec![0u8; 16 * 1024])),
+        ));
+        let sent = reqwest::Client::new()
+            .put(format!("http://{addr}/v1/cas/blobs/x/y"))
+            .body(body)
+            .send()
+            .await;
+
+        let err = anyhow::Error::from(sent.expect_err("the server aborts the connection"))
+            .context("uploading promo/sandbox/junkyard.jpg");
+
+        assert!(
+            is_body_write_reset(&err),
+            "an aborted body write must be recognised; got: {err:#}"
+        );
+        assert_eq!(
+            paced_wait_hint(&err),
+            Some(0),
+            "and must be treated as pacing without a hint"
+        );
+    }
+
+    /// The other half: an error that is not a socket teardown still aborts the
+    /// batch. Without this the pacer would swallow any failure and retry a blob
+    /// that is never going to upload six times over.
+    #[test]
+    fn an_unrelated_error_is_not_pacing() {
+        let err = anyhow::anyhow!("opening /x/save.dat: no such file or directory");
+        assert!(!is_body_write_reset(&err));
+        assert_eq!(paced_wait_hint(&err), None);
     }
 
     /// El stream que alimenta el PUT tiene que hashear **lo que manda**, no lo

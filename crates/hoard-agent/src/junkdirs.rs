@@ -84,12 +84,74 @@ pub fn is_cache_dir_name(name: &str) -> bool {
     CACHE_DIR_NAMES.contains(&n.as_str()) || CACHE_DIR_SUFFIXES.iter().any(|s| n.ends_with(s))
 }
 
+/// Folders that are added content rather than player data: mods, Workshop
+/// subscriptions, screenshots. Not junk — the user is fond of them — but not
+/// their save either, and orders of magnitude heavier than it.
+///
+/// They exist for [`holds_foreign_subdir`]: never used to exclude files from a
+/// save already being tracked, only to decide that a folder does **not** deserve
+/// to be adopted whole. See issue #17: `AppData\Local\Teardown` keeps a
+/// `savegame.xml` of a few KB next to a 42 MB `mods\`.
+const FOREIGN_DIR_NAMES: &[&str] = &[
+    "mods",
+    "mod",
+    "modding",
+    "workshop",
+    "addons",
+    "addon",
+    "plugins",
+    "screenshots",
+    "screenshot",
+    "videos",
+    "replays",
+    "recordings",
+];
+
 /// `true` si el nombre sugiere datos de save: `Saves`, `savegames`,
 /// `SaveData`, `AutoSave`, `SAVE`… Comparación insensible a caja y a
 /// separadores. Más laxo que `detection::SAVE_PATTERNS` (que exige igualdad
 /// exacta) a propósito: aquí ya venimos de un árbol acotado.
 pub fn looks_like_save_dir_name(name: &str) -> bool {
     !is_cache_dir_name(name) && normalize_dir_name(name).contains("save")
+}
+
+/// `true` when the name gives away added content — mods, Workshop, screenshots
+/// — rather than player data. See [`FOREIGN_DIR_NAMES`].
+///
+/// A name that also sounds like saves wins: `SaveMods` is odd enough that
+/// whoever created it knew what they were doing, and being wrong here costs a
+/// save that never gets backed up.
+pub fn is_foreign_dir_name(name: &str) -> bool {
+    if looks_like_save_dir_name(name) {
+        return false;
+    }
+    FOREIGN_DIR_NAMES.contains(&normalize_dir_name(name).as_str())
+}
+
+/// `true` when `dir` has, directly below it, a folder that is added content or
+/// regenerable cache — the sign that `dir` is the **game's** folder rather than
+/// its saves' folder, and that adopting it whole would drag in hundreds of
+/// megabytes nobody asked for.
+///
+/// One level only: what is being decided is whether `dir` itself gets offered,
+/// and a `mods\` buried three levels down does not change that answer. An IO
+/// error answers `false` — not being able to read a folder is no reason to stop
+/// backing it up.
+pub fn holds_foreign_subdir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_foreign_dir_name(&name) || is_cache_dir_name(&name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Suffixes that give away a COPY of saves rather than the live save:

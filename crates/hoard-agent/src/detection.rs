@@ -1566,9 +1566,22 @@ fn refine_save_dir(slug: &str, hits: Vec<PathBuf>) -> Vec<PathBuf> {
         // espera respaldar y agrupa los saves hermanos. Sólo cuando esa
         // carpeta es demasiado ancha para ofrecerla (el perfil, Documentos, la
         // raíz de instalación del juego) se rastrea el fichero suelto.
+        //
+        // …or when the folder keeps mods, Workshop or cache next to the save
+        // (`junkdirs::holds_foreign_subdir`). That does not make it broad — it
+        // belongs to the game, and `is_too_broad` approves it — but it does make
+        // it the GAME's folder rather than its saves' folder, and adopting it
+        // whole uploads hundreds of megabytes of content nobody asked for.
+        // Issue #17: Teardown's save is a `savegame.xml` of a few KB, and its
+        // folder dragged along 42 MB of `mods\` across 173 files. There we
+        // track the lone file, which is what the catalog named.
         if hit.is_file() {
             let candidate = match hit.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() && !is_too_broad(parent) => {
+                Some(parent)
+                    if !parent.as_os_str().is_empty()
+                        && !is_too_broad(parent)
+                        && !junkdirs::holds_foreign_subdir(parent) =>
+                {
                     parent.to_path_buf()
                 }
                 _ => hit.clone(),
@@ -2575,6 +2588,175 @@ fn holds_player_data(dir: &Path, shields: &[String]) -> bool {
     }
     let mut budget = 200usize;
     scan(dir, shields, 0, &mut budget)
+}
+
+/// How deep the offer filter looks inside a candidate folder, and how many
+/// entries it is allowed to touch. Generous compared with
+/// [`holds_player_data`]'s two levels, because this walk **rejects**: running
+/// out of road has to mean "don't know", and the fewer folders end up there the
+/// better the filter works.
+const OFFER_SCAN_MAX_DEPTH: usize = 3;
+const OFFER_SCAN_BUDGET: usize = 400;
+
+/// What a candidate folder holds, as far as deciding whether to offer it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderContents {
+    /// At least one file inside is player data. Offer it.
+    SaveData,
+    /// Files inside, and [`fileclass`] says not one of them is player data:
+    /// settings, logs, engine bookkeeping. Not a save folder.
+    NoSaveData,
+    /// No files at all. The game is installed and has not written a save yet —
+    /// which is a real state, not a mistake.
+    Empty,
+    /// The walk ran out of depth or budget before it could say. Never used to
+    /// reject: a save that lives four levels down is not evidence of absence.
+    Unknown,
+}
+
+/// Look inside a candidate folder and say what it holds.
+///
+/// The counterpart of [`holds_player_data`], and deliberately stricter: that one
+/// asks "is there anything worth backing up here", which a folder holding one
+/// `settings.ini` passes — config is uploaded so it is never lost, so it counts
+/// as backup-worthy. Offering is a different question. `~/.config/SiNKR` holds
+/// exactly one `settings.ini` and the catalog points at it, so it was offered
+/// next to the folder that holds the actual saves, and the decoy scenario of an
+/// external measurement pass turned up twenty more of the same shape.
+///
+/// Only [`fileclass::FileClass::SaveData`] counts here, and the manifest's own
+/// file patterns come in as `shields` so a game whose saves really are `.ini`
+/// (582 catalog templates say `*.ini`) is not judged by extension alone.
+fn inspect_folder(dir: &Path, shields: &[String]) -> FolderContents {
+    fn scan(
+        dir: &Path,
+        shields: &[String],
+        depth: usize,
+        budget: &mut usize,
+        saw_file: &mut bool,
+        truncated: &mut bool,
+    ) -> bool {
+        if depth > OFFER_SCAN_MAX_DEPTH {
+            *truncated = true;
+            return false;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            // Unreadable is not empty and not junk: it is unknown.
+            *truncated = true;
+            return false;
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in read.flatten() {
+            if *budget == 0 {
+                *truncated = true;
+                return false;
+            }
+            *budget -= 1;
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                subdirs.push(entry.path());
+                continue;
+            }
+            *saw_file = true;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if fileclass::classify(name, shields) == fileclass::FileClass::SaveData {
+                return true;
+            }
+        }
+        for d in &subdirs {
+            if scan(d, shields, depth + 1, budget, saw_file, truncated) {
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut budget = OFFER_SCAN_BUDGET;
+    let mut saw_file = false;
+    let mut truncated = false;
+    if scan(dir, shields, 0, &mut budget, &mut saw_file, &mut truncated) {
+        return FolderContents::SaveData;
+    }
+    if truncated {
+        return FolderContents::Unknown;
+    }
+    if saw_file {
+        FolderContents::NoSaveData
+    } else {
+        FolderContents::Empty
+    }
+}
+
+/// Drop the candidate folders that hold no player data, and report which of the
+/// survivors are empty.
+///
+/// Two outcomes and two different answers, which is the whole point of telling
+/// them apart:
+///
+/// * **Files inside, none of them a save.** Dropped. There is nothing to back
+///   up there and there never was; offering it is how a user ends up tracking a
+///   settings folder and getting "nothing to back up" for their trouble.
+/// * **No files at all.** Kept, but never above `Low`. The game is installed
+///   and has not been played, and the folder it will save into is genuinely
+///   useful to show — hiding it would mean a freshly installed game looks
+///   undetected. `Low` is also what keeps automatic tracking off it, alongside
+///   the empty-folder check auto-track already makes.
+///
+/// A folder the walk could not finish reading is kept as-is: the filter only
+/// ever removes something it has seen all of.
+fn drop_folders_without_saves(g: &mut DetectedGame) -> HashSet<PathBuf> {
+    let shields = crate::savefilter::shields_for_slug(&g.slug);
+    let mut empty: HashSet<PathBuf> = HashSet::new();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(g.found_paths.len());
+    for path in std::mem::take(&mut g.found_paths) {
+        match inspect_folder(&path, &shields) {
+            FolderContents::NoSaveData => {
+                tracing::debug!(
+                    slug = %g.slug,
+                    path = %path.display(),
+                    "offer filter: nothing inside is player data; not offering this folder"
+                );
+            }
+            FolderContents::Empty => {
+                empty.insert(path.clone());
+                kept.push(path);
+            }
+            FolderContents::SaveData | FolderContents::Unknown => kept.push(path),
+        }
+    }
+    g.found_paths = kept;
+    empty
+}
+
+/// Pin every empty folder's grade to `Low` and re-roll the game's own grade.
+///
+/// Runs after grading so it wins: a folder that scored `High` on its name and
+/// its position is still a folder with nothing in it, and saying so is the
+/// difference between "we found your saves" and "this is where they will be".
+fn cap_empty_offers(g: &mut DetectedGame, empty: &HashSet<PathBuf>) {
+    if empty.is_empty() {
+        return;
+    }
+    for (i, path) in g.found_paths.iter().enumerate() {
+        if !empty.contains(path) {
+            continue;
+        }
+        if let Some(c) = g.path_confidences.get_mut(i) {
+            *c = Confidence::Low;
+        }
+        if let Some(r) = g.path_reasons.get_mut(i) {
+            *r = "empty: the game has not written a save here yet".into();
+        }
+    }
+    if let Some(max) = g
+        .path_confidences
+        .iter()
+        .copied()
+        .max_by_key(|c| confidence_rank(*c))
+    {
+        g.confidence = max;
+    }
 }
 
 /// The directories of the standard save roots, indexed by normalised name.
@@ -4006,10 +4188,32 @@ fn grade_and_rank_paths(
             g.path_reasons.clear();
             continue;
         }
-        if matches!(g.source, DetectionSource::ManualOverride) || g.found_paths.len() == 1 {
+        // Offer filter (see [`drop_folders_without_saves`]): existing on disk is
+        // not the same as holding a save, and until now the pipeline treated it
+        // as if it were. A folder the catalog named, that exists, and that holds
+        // nothing but settings is not an answer to "where are my saves".
+        //
+        // A hand-picked folder is exempt: the user said this one, and being told
+        // their own choice looks empty to us is not an improvement.
+        let manual = matches!(g.source, DetectionSource::ManualOverride);
+        let empty_offers = if manual {
+            HashSet::new()
+        } else {
+            drop_folders_without_saves(g)
+        };
+        if g.found_paths.is_empty() {
+            // Everything it had was settings folders. The row stays — the game
+            // IS installed — with no path, which is the state the UI answers
+            // with the folder picker.
+            g.path_confidences.clear();
+            g.path_reasons.clear();
+            continue;
+        }
+        if manual || g.found_paths.len() == 1 {
             // Trust the existing grade; just make the parallel vecs match.
             g.path_confidences = vec![g.confidence; g.found_paths.len()];
             g.path_reasons = vec![String::new(); g.found_paths.len()];
+            cap_empty_offers(g, &empty_offers);
             continue;
         }
         let graded: Vec<(PathBuf, Confidence, String)> = g
@@ -4049,6 +4253,7 @@ fn grade_and_rank_paths(
         g.found_paths = ranked.iter().map(|(p, _, _)| p.clone()).collect();
         g.path_confidences = ranked.iter().map(|(_, c, _)| *c).collect();
         g.path_reasons = ranked.iter().map(|(_, _, r)| r.clone()).collect();
+        cap_empty_offers(g, &empty_offers);
     }
 }
 
@@ -4270,6 +4475,64 @@ mod tests {
 
         let refined = refine_save_dir("stellaris", vec![root.clone()]);
         assert_eq!(refined, vec![root.join("save games")]);
+    }
+
+    /// A literal-file template widens to its folder — that is the recall fix
+    /// for the ~4.900 catalog entries that only name a file — but only when the
+    /// folder is the save's and not the game's.
+    #[test]
+    fn refine_save_dir_widens_a_file_hit_to_its_clean_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("SomeGame");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("savegame.xml");
+        std::fs::write(&file, b"<save/>").unwrap();
+
+        let refined = refine_save_dir("some-game", vec![file]);
+        assert_eq!(refined, vec![dir]);
+    }
+
+    /// Issue #17: `AppData\Local\Teardown` holds `savegame.xml` next to a
+    /// `mods\` folder of promo art. Widening there turned a few KB of save into
+    /// 42 MB across 173 files, so a folder with foreign content keeps the file.
+    #[test]
+    fn refine_save_dir_keeps_the_file_when_the_folder_holds_mods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Teardown");
+        std::fs::create_dir_all(dir.join("mods").join("promo")).unwrap();
+        let file = dir.join("savegame.xml");
+        std::fs::write(&file, b"<save/>").unwrap();
+
+        let refined = refine_save_dir("teardown", vec![file.clone()]);
+        assert_eq!(refined, vec![file]);
+    }
+
+    /// Same guard, cache flavour: a `ShaderCache/` sibling is just as much a
+    /// sign that the folder belongs to the game rather than to its saves.
+    #[test]
+    fn refine_save_dir_keeps_the_file_when_the_folder_holds_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("SomeGame");
+        std::fs::create_dir_all(dir.join("ShaderCache")).unwrap();
+        let file = dir.join("player.sav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let refined = refine_save_dir("some-game", vec![file.clone()]);
+        assert_eq!(refined, vec![file]);
+    }
+
+    /// The guard must not fire on a folder whose odd name merely *contains* a
+    /// foreign word while still announcing itself as saves.
+    #[test]
+    fn refine_save_dir_widens_when_the_sibling_still_says_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("SomeGame");
+        std::fs::create_dir_all(dir.join("SaveMods")).unwrap();
+        let file = dir.join("savegame.xml");
+        std::fs::write(&file, b"<save/>").unwrap();
+
+        let refined = refine_save_dir("some-game", vec![file]);
+        assert_eq!(refined, vec![dir]);
     }
 
     /// Same as above with a `Saves/` subdir (the most common shape).

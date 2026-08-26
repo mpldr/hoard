@@ -4,14 +4,14 @@
 
 > Steam Cloud is not a backup strategy. Hoard is.
 
-**Hoard is an open-source (AGPL-3.0) game save backup and sync system.** Run the
-server on your own hardware, or use [Hoard Cloud](https://hoard.services) hosted
-in the EU — the desktop app and the CLI work the same against either. Self-hosting
+**Hoard is an open-source (AGPL-3.0) game save backup and sync system.** 
+You can Self-Host **Without Account or Telemetry**, or log in and play.
+The desktop app and the CLI work the same against either. Self-hosting
 needs no Hoard account and has no quota beyond your own disk.
 
 ![Hoard app photo](web/static/WEB.png)
 
-> *Ships in eight languages, Spanish included.*
+> *Ships in eight languages, You can ask for other Language.*
 
 Steam Cloud, GOG Galaxy and friends work fine — right up until they overwrite
 a 200-hour save with a corrupted one from another machine, the publisher
@@ -30,54 +30,38 @@ Rolls back when things go wrong. That's it. That's Hoard.
 |---------|----------------------|
 | **Versioned** | Every session = new snapshot. Roll back to *any* previous version. Old saves never expire (self-hosted) or until you hit your quota (Cloud). |
 | **Verified** | Every file SHA256-hashed on upload, re-verified on restore. Corruption caught before it overwrites your good save. |
-| **Compact** | Content-hash deduplication: 10 versions of a 2 GB save cost ~2 GB, not 20 GB. Transfers are zstd-compressed; restores byte-for-byte (SHA-256 verified). Since 1.1.3 the same dedup applies on upload: a second backup of the same game moves only the files that changed — megabytes, not the whole folder. |
-| **Auto-detect** | 20,000+ games from the Ludusavi manifest + your Steam libraries + running processes + filesystem scan. Zero config for normal games. |
-| **Emulator support (beta)** | PCSX2, RPCS3, DuckStation, PPSSPP, Dolphin, Cemu, Ryujinx, yuzu, Citra/Azahar, RetroArch, mGBA, melonDS, Project64, shadPS4, Vita3K, Eden, Suyu, Citron, Sudachi, xemu and Flycast. Pick from presets, tracked like any other gam -- you can manually add others. |
-| **Cross-platform** | Windows · Linux · macOS. One click install, no compiler, no dependencies -- Steam Deck compatible |
-| **In-app updates** | New release? The app downloads the right installer for your OS and installs it with one click (signed, verified). Self-hosted servers upgrade in place with `hoard-server upgrade`. |
-| **Presence** | See which of your machines are online right now and what each one is playing, live — the Eye panel, self-hosted included. |
+| **Compact** | Content-hash deduplication: 10 versions of a 2 GB save cost ~2 GB, not 20 GB. Transfers are zstd-compressed; restores byte-for-byte (SHA-256 verified). The same dedup applies on upload: a second backup of the same game moves only the files that changed, only megabytes, not the whole folder. |
+| **Auto-detect** | +20,000 games from the Ludusavi manifest, found through 10 signals: Steam libraries, Epic/GOG/Xbox launchers, running processes, filesystem scan, Windows registry, Steam Cloud stubs, Proton/Wine prefixes, wrappers and +20 emulators. Zero config. |
+| **Emulator support** | PCSX2, RPCS3, DuckStation, PPSSPP, Dolphin, Cemu, Ryujinx, yuzu, Citra/Azahar, RetroArch, mGBA, melonDS, Project64, shadPS4, Vita3K, Eden, Suyu, Citron, Sudachi, xemu and Flycast. Pick from presets, tracked like any other game, you can manually add others, is easy. |
 | **Self-hosted storage** | The server keeps your blobs on local disk or any S3-compatible bucket — MinIO, Backblaze B2, Cloudflare R2, or an `rclone serve s3` bridge in front of OneDrive/Drive/Dropbox. |
+|**Why a cloud and not P2P?**|Your other PC is off. Your laptop is dead. Who has the save? An always-on server does, every version, ready before you sit down.|
+| **Cross-platform** | Windows · Linux · macOS · SteamOS · BazziteOS - If you can play doom you can run Hoard, not a joke. |
 
-Available on Windows, Linux, and macOS. 
 Also includes a headless CLI — the sync engine (`hoardd`) runs as a background
 service and the terminal (`hoard`) talks to it. Perfect for servers and Steam
 Decks. No desktop required, just set it and forget it.
 
-## Cloud, self-hosted, or both
+## Cloud or Self-Host??
 
 One codebase, two ways to run it:
 
 ![Hoard server photo](web/static/cloud.png)
 
+- **Self-hosted** — run the same `hoard-server` binary on your own box and
+  point the app at it. No account, no quota — just your cloud. On a NAS it is
+  two boxes to fill in: the [Unraid template](Unraid.md), or the [Docker image](https://github.com/rleeon/hoard/pkgs/container/hoard) — `docker pull ghcr.io/rleeon/hoard`, 
+  mirrored to Docker Hub as `rleeon/hoard` (amd64 and arm64, published on every release). 
+  [Self-hosting guide](SELF-HOST_GUIDE.md) for the rest.
+&nbsp;
 - **Hoard Cloud** — the hosted service at [hoard.services](https://hoard.services).
   Sign in with Google, install the app, done. Free tier: 2 GB, 3 devices,
   full version history — free forever.
-- **Self-hosted** — run the same `hoard-server` binary on your own box and
-  point the app at it. No account, no quota — just your cloud. On a NAS it is
-  two boxes to fill in: the [Unraid template](Unraid.md), or the
-  [Docker image](https://github.com/rleeon/hoard/pkgs/container/hoard) —
-  `docker pull ghcr.io/rleeon/hoard`, mirrored to Docker Hub as `rleeon/hoard`
-  (amd64 and arm64, published on every release). [Self-hosting guide](SELF-HOST_GUIDE.md) for the rest.
 
-Pro (from 1.99 €/month) gives you 100 GB — [I don't profit from it](https://github.com/rleeon/hoard). It unlocks
-**Hoard Screen**, an in-game overlay to browse and roll back snapshots without
-alt-tabbing. Free includes a 1-week trial.
+I have a Pro feature to all guys wanna help Hoard, gives you 100 GB. And unlocks
+**Hoard Screen**, an in-game overlay to see YT or other windows without
+alt-tabbing. Free includes a 1-week trial to this overlay feature, and a free user
+dont need Pro, is just comodity, only limit is Storage 2GB, if you hit it, [Self-Host](SELF-HOST_GUIDE.md).
 
-**Hoard Wrapped** is completely free — just a Spotify-Wrapped-style recap of
-your year in games.
-
-Pricing and free trial at [hoard.services/pricing](https://hoard.services/pricing).
-
-## What devices does Hoard work on?
-
-Works in any plataform -- except phone, you can install in: [hoard.services/download](https://hoard.services/download)
-
-If you are in gamemode in steamos/brazzite/cachyos the same installer puts the app,
-the engine and the terminal in one pass — [Hoard-CLI](https://hoard.services/cli) is just the terminal face.
-
-|
-
-v
 
 ## One installer, whatever your machine is
 
@@ -94,19 +78,12 @@ terminal.
 Prefer the terminal, or running on a headless box (NAS / server / Steam Deck)?
 Add `--headless` and it never fetches the app. Everything ships as standalone
 binaries with no GUI deps.
-Download it in [cli latest release](https://hoard.services/cli):
+
+You dont need install it, when you install the desktop you install Hoard-Cli, but
+here is the [installer](https://hoard.services/cli).
 
 ![Hoard cli photo](web/static/CLI.png)
 
-Or just install it using:
-
-Linux: 
-
-curl -fsSL https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.sh | sh
-
-Windows: 
-
-irm https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.ps1 | iex
 
 
 ## Documentation

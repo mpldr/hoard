@@ -841,45 +841,68 @@ where
             let prefix_root = prefix_root_by_slug.get(&slug).cloned();
             (install_dir, prefix_root, g.display_name.clone())
         };
-        // Primero por nombre en las raíces donde de verdad viven los saves, y
-        // sólo si ahí no aparece se baja a barrer el directorio de instalación.
-        // El orden es el arreglo: al revés, un juego cuya ruta de catálogo no
-        // resuelve acababa ofreciendo una carpeta de dentro de la instalación
-        // —3,6 GB en el caso que destapó esto— teniendo la buena a un `read_dir`
-        // de distancia en `LocalLow`.
+        // Tres intentos, del más exacto al más caro, y el orden es el arreglo:
+        // al revés, un juego cuya ruta de catálogo no resuelve acababa ofreciendo
+        // una carpeta de dentro de la instalación —3,6 GB en el caso que destapó
+        // esto— teniendo la buena a un `read_dir` de distancia en `LocalLow`.
         //
         // Se hace aunque no haya `install_dir` ni prefijo: un juego que no es de
         // Steam no tiene ninguno de los dos y hasta ahora se quedaba sin fallback
         // ninguno (el `continue` de abajo lo descartaba antes de mirar nada).
         let shields = crate::savefilter::shields_for_slug(&slug);
-        let extra_names: Vec<String> = install_dir
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(|n| vec![n.to_string()])
-            .unwrap_or_default();
-        // Las raíces del host se indexan una vez; las del prefijo, una vez por
-        // prefijo — varios juegos comparten el mismo y no hay que reescanearlo.
-        let host = || host_dirs.get_or_init(|| NamedDirs::scan(&roots::user_save_roots(os)));
-        let index = match prefix_root.as_deref() {
-            Some(prefix) => {
-                if !prefix_indexes.contains_key(prefix) {
-                    let mut idx = NamedDirs::scan(&roots::prefix_user_roots(prefix));
-                    idx.absorb(host());
-                    prefix_indexes.insert(prefix.to_path_buf(), idx);
-                }
-                &prefix_indexes[prefix]
-            }
-            None => host(),
-        };
-        let mut discoveries = discover_by_name(index, &display_name, &extra_names, &shields);
+
+        // 1. El installDir: una cadena exacta que Valve escribió, resuelta con un
+        //    `stat` por raíz en vez de con un barrido con presupuesto. Un juego
+        //    cuya carpeta de instalación tiene nombre en clave —Aven Colony
+        //    instala en `prj_juniper`— no se parece a su nombre comercial por
+        //    ningún lado, así que ninguna búsqueda por nombre lo encuentra.
+        let mut discoveries = discover_by_install_dir_name(
+            os,
+            &slug,
+            install_dir.as_deref(),
+            prefix_root.as_deref(),
+            &shields,
+        );
         if !discoveries.is_empty() {
             tracing::debug!(
                 slug = %slug,
                 hits = discoveries.len(),
-                "detection: found the save folder by name in a standard root"
+                "detection: found the save folder by the game's install-dir name"
             );
         }
+        // 2. Por nombre en las raíces donde de verdad viven los saves. El índice
+        //    se construye sólo si hace falta: las raíces del host una vez, las
+        //    del prefijo una vez por prefijo —varios juegos comparten el mismo y
+        //    no hay que reescanearlo.
+        if discoveries.is_empty() {
+            let extra_names: Vec<String> = install_dir
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| vec![n.to_string()])
+                .unwrap_or_default();
+            let host = || host_dirs.get_or_init(|| NamedDirs::scan(&roots::user_save_roots(os)));
+            let index = match prefix_root.as_deref() {
+                Some(prefix) => {
+                    if !prefix_indexes.contains_key(prefix) {
+                        let mut idx = NamedDirs::scan(&roots::prefix_user_roots(prefix));
+                        idx.absorb(host());
+                        prefix_indexes.insert(prefix.to_path_buf(), idx);
+                    }
+                    &prefix_indexes[prefix]
+                }
+                None => host(),
+            };
+            discoveries = discover_by_name(index, &display_name, &extra_names, &shields);
+            if !discoveries.is_empty() {
+                tracing::debug!(
+                    slug = %slug,
+                    hits = discoveries.len(),
+                    "detection: found the save folder by name in a standard root"
+                );
+            }
+        }
+        // 3. Barrer el directorio de instalación y el prefijo.
         if discoveries.is_empty() {
             if install_dir.is_none() && prefix_root.is_none() {
                 continue;
@@ -2931,6 +2954,84 @@ pub fn discover_by_name(
         .collect()
 }
 
+/// Look for a game's save folder under the standard roots by its **installDir**
+/// — the folder name Steam's own `appmanifest_<appid>.acf` records, which is not
+/// always the name the game is sold under.
+///
+/// Aven Colony installs into `prj_juniper` and saves into
+/// `<xdgData>/prj_juniper/savegames`. Nothing about "Aven Colony" appears
+/// anywhere near the save, so every name-based lookup misses it, and the catalog
+/// has no Linux path to expand — the game came back installed and with nowhere
+/// to back up. The codename was on disk the whole time, in a field already
+/// parsed and already carried on the row.
+///
+/// This is the same pairing [`discover_unattributed`] does with the correlation
+/// store, with a signal that needs no observed play session: an exact string
+/// match against a name Valve wrote down. It is a direct `stat` per root rather
+/// than a scan, so unlike [`NamedDirs`] it has no budget to run out of — which
+/// is what makes it worth having next to a lookup that already passes the
+/// installDir in as an extra name.
+///
+/// The folder is refined the same way a catalog hit is (`prj_juniper` →
+/// `prj_juniper/savegames`), falling back to the folder itself for games that
+/// save straight into it. Minting a path is a stronger act than keeping one, so
+/// the gate is the strict one: something inside has to be player data, not
+/// merely worth backing up. A folder sharing the install name and holding one
+/// `settings.ini` is the same decoy [`inspect_folder`] exists to reject.
+fn discover_by_install_dir_name(
+    os: Os,
+    slug: &str,
+    install_dir: Option<&Path>,
+    prefix_root: Option<&Path>,
+    shields: &[String],
+) -> Vec<DiscoveredSavePath> {
+    let Some(name) = install_dir
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return Vec::new();
+    };
+    // Same floor as the name lookup: a two-character folder name matches
+    // anything, and pointing at the wrong folder costs more than pointing at
+    // none.
+    if name_key(name).len() < 3 {
+        return Vec::new();
+    }
+
+    let mut search_roots = roots::user_save_roots(os);
+    if let Some(prefix) = prefix_root {
+        search_roots.extend(roots::prefix_user_roots(prefix));
+    }
+
+    let mut out: Vec<DiscoveredSavePath> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for root in search_roots {
+        let candidate = root.join(name);
+        if !candidate.is_dir() {
+            continue;
+        }
+        let refined = refine_save_dir(slug, vec![candidate.clone()]);
+        let hits = if refined.is_empty() {
+            vec![candidate]
+        } else {
+            refined
+        };
+        for hit in hits {
+            if !seen.insert(hit.clone())
+                || inspect_folder(&hit, shields) != FolderContents::SaveData
+            {
+                continue;
+            }
+            out.push(DiscoveredSavePath {
+                path: hit,
+                confidence: Confidence::High,
+                reason: format!("folder named after the game's install dir ({name})"),
+            });
+        }
+    }
+    out
+}
+
 /// Aggressive filesystem walker for slugs that finished the main pipeline
 /// without any `found_paths`. Walks `install_dir` and the Proton prefix
 /// user dir (if present) down to `max_depth`, skipping the
@@ -4899,6 +5000,82 @@ mod tests {
         apply_steam_name_fallback(&catalog, &steam_apps, &mut by_slug);
 
         assert!(by_slug.is_empty());
+    }
+
+    /// The installDir is a different string from the retail name often enough to
+    /// matter: Aven Colony installs into `prj_juniper` and saves into
+    /// `<xdgData>/prj_juniper/savegames`. Nothing that looks like "Aven Colony"
+    /// exists anywhere near the save.
+    #[test]
+    fn the_install_dir_name_finds_a_codenamed_save_folder() {
+        with_isolated_home(|home| {
+            let data = home.join("xdg-data");
+            let saves = data.join("prj_juniper/savegames");
+            std::fs::create_dir_all(&saves).unwrap();
+            std::fs::write(saves.join("colony1.sav"), "x").unwrap();
+
+            let install = PathBuf::from("/lib/steamapps/common/prj_juniper");
+
+            // The name index cannot help: nothing here is named after the game.
+            let empty = NamedDirs::default();
+            assert!(discover_by_name(&empty, "Aven Colony", &[], &[]).is_empty());
+
+            let found = discover_by_install_dir_name(
+                Os::Linux,
+                "aven-colony",
+                Some(&install),
+                None,
+                &[],
+            );
+            let paths: Vec<&PathBuf> = found.iter().map(|d| &d.path).collect();
+            assert_eq!(paths, vec![&saves], "refined down to the save subdir");
+            assert_eq!(found[0].confidence, Confidence::High);
+        });
+    }
+
+    /// A game that saves straight into its install-named folder, with no save
+    /// subdir to refine down to, still gets the folder itself.
+    #[test]
+    fn the_install_dir_name_keeps_a_folder_with_no_save_subdir() {
+        with_isolated_home(|home| {
+            let data = home.join("xdg-data");
+            let dir = data.join("prj_juniper");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("colony1.sav"), "x").unwrap();
+
+            let install = PathBuf::from("/lib/steamapps/common/prj_juniper");
+            let found = discover_by_install_dir_name(
+                Os::Linux,
+                "aven-colony",
+                Some(&install),
+                None,
+                &[],
+            );
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].path, dir);
+        });
+    }
+
+    /// And a folder that merely shares the name while holding no player data is
+    /// still not offered — the install-dir signal is exact, not a licence.
+    #[test]
+    fn the_install_dir_name_does_not_offer_a_settings_folder() {
+        with_isolated_home(|home| {
+            let data = home.join("xdg-data");
+            let dir = data.join("prj_juniper");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("settings.ini"), "x").unwrap();
+
+            let install = PathBuf::from("/lib/steamapps/common/prj_juniper");
+            assert!(discover_by_install_dir_name(
+                Os::Linux,
+                "aven-colony",
+                Some(&install),
+                None,
+                &[]
+            )
+            .is_empty());
+        });
     }
 
     /// A folder that exists and holds nothing but settings is not a save

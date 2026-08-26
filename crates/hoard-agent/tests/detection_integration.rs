@@ -221,6 +221,12 @@ fn first_linux_expansion(slug: &str) -> PathBuf {
         })
 }
 
+/// `<xdgData>` under the pinned test environment — `~/.local/share` on a real
+/// host, a tempdir here.
+fn xdg_data(_home: &Path) -> PathBuf {
+    PathBuf::from(std::env::var_os("XDG_DATA_HOME").expect("XDG_DATA_HOME is pinned"))
+}
+
 /// Sibling of [`first_linux_expansion`] for the Windows side.
 fn first_windows_expansion(slug: &str) -> PathBuf {
     let entry = catalog_entry(slug);
@@ -532,6 +538,36 @@ fn manual_override_wins_over_heuristic() {
         assert!(
             game.found_paths.contains(&heuristic_dir),
             "the heuristic path stays listed behind it; got {:?}",
+            game.found_paths,
+        );
+    });
+}
+
+/// A Steam game whose install folder is a codename: Aven Colony installs into
+/// `prj_juniper` and saves into `~/.local/share/prj_juniper/savegames`. The
+/// catalog only knows the retail name, so nothing it says resolves — but the
+/// installDir is sitting in the appmanifest, exact and already parsed.
+#[test]
+fn a_save_folder_named_after_the_install_dir_is_found() {
+    with_isolated_linux_env(|home| {
+        build_steam_install(home, &[(484900, "Aven Colony", "prj_juniper")]);
+        let save_dir = xdg_data(home).join("prj_juniper/savegames");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::fs::write(save_dir.join("colony1.sav"), "x").unwrap();
+
+        let state = CliState::default();
+        let report = block_on_detect(Os::Linux, &state);
+
+        let game = report
+            .games
+            .iter()
+            .find(|g| g.slug == "aven-colony")
+            .expect("aven-colony should appear in the report");
+        assert!(
+            game.found_paths
+                .iter()
+                .any(|p| p == &save_dir || save_dir.starts_with(p)),
+            "the save folder should be reported; got {:?}",
             game.found_paths,
         );
     });

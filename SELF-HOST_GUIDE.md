@@ -85,7 +85,9 @@ Copy it, open the desktop app on your gaming PC, pick **Self-Host**, and give
 it `http://IP:12421` plus that token. Remember changue "IP" pls --  The container's *WebUI* button 
 opens the web panel, where the same username and password get you in.
 
-Another PC later? Container → *Console*:
+Another PC later? *WebUI* → **Users** → *New token*. It is shown once, so copy
+it before closing the dialog. The same tab creates accounts for other people in
+the house. From a terminal instead, Container → *Console*:
 
 ```sh
 hoard-admin token create myuser --device 'living-room PC'
@@ -293,19 +295,41 @@ What you get:
   the first thing that reads it.
 
 Admin accounts get three more sections: server-wide storage (logical vs. real
-size, orphan objects, database size), users (quotas and roles), and the
-diagnostic logs your clients upload. Non-admins cannot reach them — the check
-is server-side, so hiding the tab is not what protects them.
+size, orphan objects, database size), users, and the diagnostic logs your
+clients upload. Non-admins cannot reach them — the check is server-side, so
+hiding the tab is not what protects them.
 
-Deliberately **not** in the panel: creating or deleting accounts, migrating
-storage backends, and verifying every object. Those stay in `hoard-admin`,
-where a terminal can show progress and refuse to be closed halfway.
+The users tab does the whole of account administration: create an account,
+rename one, set a password, change a quota, grant or remove admin, delete an
+account, and issue a device token for a machine. Between them that is every
+`hoard-admin user` and `hoard-admin token` subcommand, so a server on a NAS
+never needs a shell for day-to-day work. Three things behave the way they do
+for a reason:
+
+- **A new token is shown once.** Only its SHA-256 is stored, here as everywhere
+  else, so a token you close the dialog on is a token you mint again.
+- **Deleting an account deletes its saves**, every version of them, and cannot
+  be undone. The dialog asks you to type the account's name and tells you how
+  much is about to go.
+- **Setting someone's password closes their browser sessions but leaves their
+  devices syncing.** A device token is how a PC backs up; nobody changing a
+  password is asking to re-pair every machine they own.
+
+You cannot delete the account you are signed in as. That is also what keeps a
+server from ending up with no admin at all: the admin flag guards its own
+route, and getting it back would need a shell.
+
+Deliberately **not** in the panel: migrating storage backends and verifying
+every object. Those stay in `hoard-admin`, where a terminal can show progress
+and refuse to be closed halfway.
 
 Two things worth knowing:
 
 - Browser sessions are ordinary API tokens with a short life, so they show up
-  in `hoard-admin token list <user>` next to your devices' tokens and revoking
-  one signs that browser out.
+  in `hoard-admin token list <user>` — and in the panel's own token list —
+  next to your devices' tokens, and revoking one signs that browser out. They
+  are told apart by their device name, which is why the panel refuses to issue
+  a device token called `web panel`.
 - Five wrong passwords in a row shut that account's door for
   `panel.login_throttle_secs` (10 by default), and the reply carries a
   `Retry-After`. It is deliberately short — the point is to stop the password

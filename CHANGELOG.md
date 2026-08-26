@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Accounts are managed from the web panel.** Creating a user, renaming one,
+  setting a password, deleting an account and issuing a device token were all
+  `hoard-admin` subcommands, so on a NAS the second person to use the server
+  meant opening the container's console. The Users tab does all five now. The
+  irreversible one asks you to type the name, and shows how much it is about to
+  delete before you do: an account's saves go with it.
+- **A device token can be issued from the panel.** The container prints one for
+  the first PC on first boot; every PC after that needed a shell. The token is
+  shown once — only its SHA-256 is stored — with a copy button that falls back
+  to selecting the text, because `navigator.clipboard` does not exist on the
+  plain-HTTP origin a NAS panel is reached over.
+
+### Fixed
+- **Deleting a user left every byte of their saves on disk.** `hoard-admin user
+  delete` removed `data_dir/<user_id>`, a path nothing has written to since the
+  content-addressed store landed, and reported success. The blobs and chunks are
+  now deleted through the storage backend, driven off the index and before the
+  row cascades away — which also means it works on an S3-compatible bucket,
+  where there was no directory to remove and the objects stayed for good.
+- **`hoard-admin user delete` would delete the only admin.** The panel refuses
+  to demote the last one, because the admin flag guards its own route and a
+  server with zero admins needs a shell to come back. The command that runs on
+  that shell had no such check, and would happily leave the server without one.
+
 ## [1.1.5] - 2026-08-24
 
 ### Added

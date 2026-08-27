@@ -1113,6 +1113,39 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    /// `POST /v1/cloud/playtime` (cloud) or `/v1/playtime` (self-hosted) —
+    /// ship this machine's playtime breakdown so the recap can merge it with
+    /// the account's other devices.
+    ///
+    /// Picks the path off the cached deployment probe rather than guessing:
+    /// posting the cloud path at a self-hosted server is a 404, and the reverse
+    /// is worse (a silent no-op). An unresolved probe means "don't know yet" —
+    /// we skip this round and try again on the next one instead of picking a
+    /// protocol by coin flip.
+    ///
+    /// The caller is responsible for the consent gate (`prefs.wrapple_telemetry`);
+    /// this is only the transport.
+    pub async fn push_playtime(
+        &self,
+        body: &crate::cloud_account::PlaytimeUploadBody,
+    ) -> Result<()> {
+        let _ = self.server_mode().await;
+        let path = match self.probed_is_cloud() {
+            Some(true) => "/v1/cloud/playtime",
+            Some(false) => "/v1/playtime",
+            None => anyhow::bail!("deployment mode unresolved; not guessing a playtime endpoint"),
+        };
+        let resp = self
+            .http
+            .post(self.url(path))
+            .header("authorization", self.auth_header())
+            .json(body)
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
     pub async fn list_games(&self, query: Option<&str>) -> Result<Vec<Game>> {
         let mut req = self
             .http

@@ -35,6 +35,7 @@ export async function hydratePrefs(): Promise<void> {
       start_minimised: true,
       seen_tray_hint: false,
       anonymous_telemetry: true,
+      wrapple_telemetry: true,
       language: null,
       auto_restore: false,
       global_sync: false,

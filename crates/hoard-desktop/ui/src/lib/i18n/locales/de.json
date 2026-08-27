@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "Startet mit ausgeblendetem Fenster — nur das Tray-Symbol erscheint.",
   "settings.telemetry_label": "Anonyme Nutzungs-Pings senden",
   "settings.telemetry_desc": "Hilf uns zu sehen, wie viele Hoard nutzen. Wir zählen nur Ereignisse (Sicherung, Wiederherstellung, Erstinstallation) — niemals Benutzername, Spielnamen, Pfade, Inhalte oder Tokens. Standardmäßig aus.",
+  "settings.wrapple_telemetry_label": "Meine Spielzeit mit Wrapple teilen",
+  "settings.wrapple_telemetry_desc": "Sendet, wie lange du jedes Spiel spielst, pro Tag, damit Wrapple deine echten Stunden über alle Geräte hinweg zeigen kann. Das ist das Einzige, was den Rückblick speist: schaltest du es aus, funktioniert Wrapple nicht mehr — es hat dann nichts zu zeigen. Deine Stunden werden auf diesem Gerät weiter gezählt, beim Wiedereinschalten kommt dein Verlauf also zurück. Unabhängig von der Einstellung darüber; ausgeschaltet wird gar nichts gesendet.",
   "settings.notify_success_label": "Bei erfolgreicher Sicherung benachrichtigen",
   "settings.notify_success_desc": "Eine kleine Benachrichtigung bei erfolgreichem Upload.",
   "settings.notify_failure_label": "Bei fehlgeschlagener Sicherung benachrichtigen",

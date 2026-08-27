@@ -1071,6 +1071,58 @@ impl CloudHeads {
 /// Best-effort de principio a fin: cualquier fallo se reporta como
 /// `versions: None` (la marca de frescura no se sella y la ceguera sigue siendo
 /// visible) y se reintenta al siguiente plazo.
+/// How often the engine ships this machine's playtime. Playtime is a daily
+/// aggregate, not an event stream, so the only thing a short interval buys is
+/// a fresher recap for someone who opens Wrapple right now; 30 min keeps a
+/// long session from being invisible without costing more than a couple of
+/// requests an hour.
+const PLAYTIME_SHIP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Ship the local playtime breakdown to the account's server.
+///
+/// **Why the engine and not the window.** Until now the only caller of the
+/// playtime push was the Wrapple screen itself, so the hours reached the server
+/// only when a user opened the recap — which meant the recap showed real hours
+/// exclusively to people who had already opened it before. Everyone else saw
+/// zero and concluded it was broken. The store has always accrued correctly in
+/// `process_poll`; it was the delivery that depended on someone looking. Same
+/// lesson as D.12: an engine that needs a client alive to do its job is an
+/// engine that goes quiet the moment the window closes.
+///
+/// Gated on `prefs.wrapple_telemetry`, read fresh so flipping the switch takes
+/// effect within one interval. Off means nothing is sent — the daemon does not
+/// report the fact that it is off, which would be exactly the telemetry the
+/// user just declined.
+///
+/// Best-effort: any failure is a debug line and a retry next interval.
+async fn ship_playtime(api: ApiClient, path: Option<PathBuf>) {
+    // Unreadable prefs mean the default (on), same as everywhere else the
+    // engine reads them: a missing file must not silently revoke consent the
+    // user never withdrew.
+    let allowed = crate::prefs::Prefs::load_default()
+        .map(|(p, _)| p.wrapple_telemetry)
+        .unwrap_or(true);
+    if !allowed {
+        return;
+    }
+    let Some(path) = path else { return };
+    let store = crate::playtime::PlaytimeStore::load(&path);
+    let rows = store.upload_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let dev = crate::logship::device_identity();
+    let body = crate::cloud_account::PlaytimeUploadBody {
+        device_fp: dev.fingerprint,
+        authoritative: store.is_authoritative(),
+        rows,
+    };
+    match api.push_playtime(&body).await {
+        Ok(()) => tracing::debug!("agent: playtime shipped"),
+        Err(e) => tracing::debug!(error = %e, "agent: playtime ship failed; retrying next round"),
+    }
+}
+
 async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>) {
     // Probe cacheado tras el primer éxito; un fallo NO se cachea, así que el
     // siguiente intento vuelve a preguntar.
@@ -1549,6 +1601,14 @@ async fn run_agent(
     // "ocupado" para siempre — que es justo cómo enmudeció el poller del
     // desktop (D.11) y cómo desapareció su tarea entera (D.12).
     let mut cloud_probe: Option<JoinHandle<()>> = None;
+
+    // El envío de playtime en vuelo, con su plazo. Mismo `JoinHandle` y no
+    // booleano que `cloud_probe`, y por el mismo motivo: una tarea que muere
+    // por pánico no puede dejar el hueco ocupado para siempre. El primer envío
+    // sale al primer tick (no esperamos media hora a que un equipo recién
+    // arrancado cuente lo que ya tenía en disco).
+    let mut playtime_ship: Option<JoinHandle<()>> = None;
+    let mut playtime_ship_due = tokio::time::Instant::now();
 
     // Channel used by every fs watcher — debounced events all funnel here
     // and we route them by path. mpsc::unbounded would be fine since the
@@ -2123,6 +2183,19 @@ async fn run_agent(
                     cloud_probe = Some(tokio::spawn(observe_cloud_heads(
                         api.clone(),
                         cmd_tx.clone(),
+                    )));
+                }
+
+                // PLAYTIME: y observar el mundo incluye contarle al servidor lo
+                // que este equipo lleva jugado. La puerta de consentimiento se
+                // lee dentro de la tarea, fresca, para que apagar el interruptor
+                // valga dentro del mismo intervalo.
+                let ship_free = playtime_ship.as_ref().is_none_or(JoinHandle::is_finished);
+                if ship_free && tokio::time::Instant::now() >= playtime_ship_due {
+                    playtime_ship_due = tokio::time::Instant::now() + PLAYTIME_SHIP_INTERVAL;
+                    playtime_ship = Some(tokio::spawn(ship_playtime(
+                        api.clone(),
+                        playtime_path.clone(),
                     )));
                 }
 

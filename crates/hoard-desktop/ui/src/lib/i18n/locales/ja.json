@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "ウィンドウを表示せず起動 — トレイアイコンのみ表示。",
   "settings.telemetry_label": "匿名の利用状況を送信",
   "settings.telemetry_desc": "Hoard の利用者数把握にご協力ください。イベント数のみ集計（バックアップ成功・復元・初回完了）— ユーザー名・ゲーム名・パス・内容・トークンは送りません。既定はオフ。",
+  "settings.wrapple_telemetry_label": "プレイ時間を Wrapple と共有する",
+  "settings.wrapple_telemetry_desc": "各ゲームのプレイ時間を日ごとに送信し、すべての端末を合算した実際の時間を Wrapple に表示できるようにします。振り返りを支えているのはこれだけです。オフにすると Wrapple は動かなくなり、表示できるものがなくなります。この端末での計測は続くので、オンに戻せば履歴もそのまま戻ります。上の設定とは独立していて、オフのときは何も送信しません。",
   "settings.notify_success_label": "バックアップ成功時に通知",
   "settings.notify_success_desc": "アップロード成功時の小さな通知。",
   "settings.notify_failure_label": "バックアップ失敗時に通知",

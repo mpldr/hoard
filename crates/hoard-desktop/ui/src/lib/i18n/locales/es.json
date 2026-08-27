@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "Inicia con la ventana oculta — sólo aparece el icono de la bandeja.",
   "settings.telemetry_label": "Enviar pings de uso anónimos",
   "settings.telemetry_desc": "Ayúdanos a ver cuánta gente usa Hoard. Sólo contamos eventos (copia exitosa, restauración, primer arranque completado) — nunca tu usuario, nombres de juegos, rutas, contenido o tokens. Desactivado por defecto.",
+  "settings.wrapple_telemetry_label": "Compartir mis horas con Wrapple",
+  "settings.wrapple_telemetry_desc": "Envía cuánto juegas a cada juego, por día, para que Wrapple pueda enseñarte tus horas reales sumando todos tus equipos. Es lo único que alimenta el resumen: si lo desactivas, Wrapple deja de funcionar — no tendrá nada que mostrar. Tus horas se siguen contando en este equipo igualmente, así que al volver a activarlo recuperas tu historial. Es independiente del ajuste de arriba, y desactivarlo no envía absolutamente nada.",
   "settings.notify_success_label": "Notificar tras copia exitosa",
   "settings.notify_success_desc": "Una pequeña notificación cuando una copia se sube correctamente.",
   "settings.notify_failure_label": "Notificar fallo de copia",

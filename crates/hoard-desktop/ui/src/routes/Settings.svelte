@@ -22,6 +22,7 @@
     FileText,
     ChevronRight,
     BarChart3,
+    Clock,
     RefreshCw,
     Database,
     Languages,
@@ -603,12 +604,22 @@
     },
   ]);
 
+  // Dos interruptores, no uno: la telemetría de diagnóstico promete en su
+  // texto que nunca manda nombres de juegos, y el playtime son nombres de
+  // juegos por construcción. Apagar el de Wrapple no manda nada — tampoco un
+  // aviso de que está apagado — y su descripción dice lo que cuesta.
   const privacyRows: Row[] = $derived([
     {
       field: "anonymous_telemetry",
       label: $_("settings.telemetry_label"),
       description: $_("settings.telemetry_desc"),
       icon: BarChart3,
+    },
+    {
+      field: "wrapple_telemetry",
+      label: $_("settings.wrapple_telemetry_label"),
+      description: $_("settings.wrapple_telemetry_desc"),
+      icon: Clock,
     },
   ]);
 

@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "启动时窗口隐藏 — 仅显示托盘图标。",
   "settings.telemetry_label": "发送匿名使用统计",
   "settings.telemetry_desc": "帮助我们了解 Hoard 用户数。仅统计事件（备份成功、还原、首次完成）— 绝不发送用户名、游戏名、路径、文件内容或令牌。默认关闭。",
+  "settings.wrapple_telemetry_label": "与 Wrapple 分享我的游玩时长",
+  "settings.wrapple_telemetry_desc": "按天发送你每款游戏的游玩时长，让 Wrapple 能汇总你所有设备、显示真实的时长。这是回顾页面唯一的数据来源：关闭后 Wrapple 将无法工作，因为它没有任何内容可显示。本机仍会继续计时，所以重新打开时历史记录会一并回来。它与上面的设置相互独立，关闭时不会发送任何内容。",
   "settings.notify_success_label": "备份成功时通知",
   "settings.notify_success_desc": "上传成功时的小提示。",
   "settings.notify_failure_label": "备份失败时通知",

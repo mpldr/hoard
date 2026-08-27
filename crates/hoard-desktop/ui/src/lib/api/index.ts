@@ -837,6 +837,13 @@ export type Prefs = {
   start_minimised: boolean;
   seen_tray_hint: boolean;
   anonymous_telemetry: boolean;
+  /** When `true`, this machine ships its playtime breakdown so Wrapple can
+   *  show real hours merged across the account's devices. Off means nothing
+   *  leaves the machine and the recap has nothing to read — the local store
+   *  keeps accruing, so turning it back on restores the history. Deliberately
+   *  independent of `anonymous_telemetry`, whose consent copy promises never
+   *  to send game names. */
+  wrapple_telemetry: boolean;
   /** ISO-639 code for the desktop UI language, e.g. "en", "fr". `null` means
    *  the user hasn't picked one yet — we then fall back to the browser
    *  language at boot. */

@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "Launch with the window hidden — only the tray icon shows up.",
   "settings.telemetry_label": "Send anonymous usage pings",
   "settings.telemetry_desc": "Help us see how many people are using Hoard. We only count events (successful backup, restore, first-run completed) — never your username, game names, save paths, file contents, or tokens. Off by default.",
+  "settings.wrapple_telemetry_label": "Share my playtime with Wrapple",
+  "settings.wrapple_telemetry_desc": "Sends how long you play each game, per day, so Wrapple can show your real hours across all your devices. This is the only thing that feeds the recap: turn it off and Wrapple stops working — it will have nothing to show. Your hours keep being counted on this machine either way, so turning it back on brings your history with it. Separate from the setting above, and turning it off sends nothing at all.",
   "settings.notify_success_label": "Notify on successful backup",
   "settings.notify_success_desc": "A small desktop notification when a backup uploads successfully.",
   "settings.notify_failure_label": "Notify on backup failure",

@@ -43,6 +43,7 @@
     X,
   } from "@lucide/svelte";
   import { tr, fmtBytes } from "./lib";
+  import { prefs } from "../stores/prefs";
 
   // --- identity ----------------------------------------------------------
   // The recap prefers the Hoard Cloud account (it carries the Google avatar +
@@ -683,7 +684,21 @@
         </div>
       </div>
 
-      {#if stats.totalSecs <= 0}
+      {#if $prefs && !$prefs.wrapple_telemetry}
+        <!-- The recap reads only what this machine ships, so with the switch
+             off there is nothing to read. Say so plainly instead of showing a
+             convincing zero: the hours ARE still being counted locally, and
+             they come back the moment it is turned on again. -->
+        <div
+          class="mt-3 flex items-center gap-2 rounded-xl bg-white/[0.03] px-3 py-2 text-xs text-zinc-400 ring-1 ring-white/[0.05]"
+        >
+          <Clock size={14} class="text-amber-300" />
+          {tr({
+            es: "Wrapple está desactivado en Ajustes › Privacidad. Tus horas se siguen contando en este equipo, pero no salen de él, así que aquí no hay nada que enseñar.",
+            en: "Wrapple is turned off in Settings › Privacy. Your hours are still counted on this machine, but they never leave it, so there's nothing to show here.",
+          })}
+        </div>
+      {:else if stats.totalSecs <= 0}
         <div
           class="mt-3 flex items-center gap-2 rounded-xl bg-white/[0.03] px-3 py-2 text-xs text-zinc-400 ring-1 ring-white/[0.05]"
         >

@@ -1125,6 +1125,21 @@ pub async fn cloud_sync_playtime(
 ) -> Result<hoard_agent::playtime::PlaytimeSummary, String> {
     use hoard_agent::playtime::{PlaytimeStore, PlaytimeSummary};
 
+    // Consent gate. Wrapple is the one screen that reads playtime, so the
+    // switch that turns off shipping also turns off the recap — with the local
+    // store still accruing on disk, so turning it back on restores the history
+    // rather than starting from zero. Nothing is sent to say it is off.
+    //
+    // The engine ships on its own schedule now (`hoard_agent::agent`); this
+    // command stays because opening Wrapple should show hours that include the
+    // last few minutes, not whatever the last 30-minute round happened to catch.
+    if !hoard_agent::prefs::Prefs::load_default()
+        .map(|(p, _)| p.wrapple_telemetry)
+        .unwrap_or(true)
+    {
+        return Ok(PlaytimeSummary::default());
+    }
+
     // Adopta el playtime legacy al contexto activo una sola vez (idempotente),
     // para que el store que subimos sea el de esta cuenta y no el global.
     let _ = PlaytimeStore::migrate_legacy_into_current_context();

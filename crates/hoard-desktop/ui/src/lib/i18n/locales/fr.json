@@ -455,6 +455,8 @@
   "settings.start_minimised_desc": "Démarre la fenêtre cachée — seule l'icône de la barre apparaît.",
   "settings.telemetry_label": "Envoyer des pings d'usage anonymes",
   "settings.telemetry_desc": "Aidez-nous à voir combien de gens utilisent Hoard. Nous comptons seulement les événements (sauvegarde, restauration, première installation) — jamais votre identifiant, les noms de jeux, chemins, contenus ou jetons. Désactivé par défaut.",
+  "settings.wrapple_telemetry_label": "Partager mes heures de jeu avec Wrapple",
+  "settings.wrapple_telemetry_desc": "Envoie le temps que vous passez sur chaque jeu, par jour, pour que Wrapple affiche vos vraies heures sur tous vos appareils. C'est la seule chose qui alimente le récapitulatif : si vous le désactivez, Wrapple cesse de fonctionner — il n'aura rien à montrer. Vos heures continuent d'être comptées sur cette machine, donc le réactiver ramène votre historique. Indépendant du réglage ci-dessus, et le désactiver n'envoie strictement rien.",
   "settings.notify_success_label": "Notifier après une sauvegarde réussie",
   "settings.notify_success_desc": "Une petite notification quand une sauvegarde est téléversée.",
   "settings.notify_failure_label": "Notifier les échecs",

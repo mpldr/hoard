@@ -90,6 +90,24 @@ pub struct Prefs {
     #[serde(default)]
     pub anonymous_telemetry: bool,
 
+    /// When `true`, this machine ships its playtime breakdown (day, game,
+    /// seconds) to the account's server so Wrapple can show real hours merged
+    /// across devices. When `false` nothing leaves the machine: the local
+    /// store keeps accruing on disk, but no push happens and Wrapple has
+    /// nothing to read, so the recap is empty by design.
+    ///
+    /// **Separate from [`Self::anonymous_telemetry`] on purpose.** That flag
+    /// covers diagnostic log shipping and its consent copy promises never to
+    /// send game names; playtime is game names by construction, and it is a
+    /// feature the user consumes rather than a measurement we take. One switch
+    /// could not honestly describe both, so there are two, and turning this one
+    /// off sends nothing at all — not even a note saying it is off.
+    ///
+    /// Opt-out (`true` by default) so Wrapple works out of the box; the copy in
+    /// Settings states that turning it off disables the recap.
+    #[serde(default = "default_true")]
+    pub wrapple_telemetry: bool,
+
     /// ISO-639 code for the desktop UI's display language (e.g. "en", "fr",
     /// "ja"). `None` means "follow the browser/OS locale" — the desktop
     /// frontend falls back to that on first run. The agent itself doesn't
@@ -255,6 +273,11 @@ impl Default for Prefs {
             // seconds. NOTE: payload carries a device fingerprint — the consent
             // copy must say so (it's diagnostics, not anonymous counters).
             anonymous_telemetry: true,
+            // Default on: Wrapple is the whole reason the playtime store
+            // exists, and a recap that is empty until the user hunts for a
+            // switch reads as broken. Off means "send nothing", never "tell
+            // the server it is off".
+            wrapple_telemetry: true,
             language: None,
             auto_restore: false,
             global_sync: false,
@@ -412,6 +435,10 @@ mod tests {
         assert!(p.autostart);
         assert!(p.start_minimised);
         assert!(p.anonymous_telemetry);
+        // Opt-out, and independent of `anonymous_telemetry`: Wrapple needs the
+        // playtime push to have anything to show, so it ships by default and
+        // the Settings copy says what turning it off costs.
+        assert!(p.wrapple_telemetry);
         assert!(!p.auto_restore);
         // 1.5.3: toggle off by default. 1.9.14: the single 6h interval was
         // split into a cheap 10-min scan and an expensive 1h hash sweep.
@@ -509,6 +536,12 @@ mod tests {
         assert_eq!(parsed.conflict_retention_days, 14);
         assert!(parsed.auto_restore);
         assert!(parsed.automatic_mode);
+        // A file written before the switch existed must read as "on": every
+        // install that predates it was already shipping playtime, and silently
+        // flipping it off would empty their recap on upgrade.
+        assert!(parsed.wrapple_telemetry);
+        // ...and it must NOT inherit the diagnostics flag, which is `false` here.
+        assert!(!parsed.anonymous_telemetry);
     }
 
     /// Invariante crítico de 1.5.3: el deserializador NO debe acoplar

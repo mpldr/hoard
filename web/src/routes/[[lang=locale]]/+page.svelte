@@ -108,7 +108,7 @@
         class="max-w-4xl text-balance text-[2.4rem] font-semibold leading-[1.05] text-ink sm:text-6xl lg:text-[4.4rem] animate-fade-up"
         style="animation-delay:0.05s"
       >
-        {$_('hero.title_1')}
+        {$_('hero.title_1')}<br />
         <span class="text-accent">{$_('hero.title_2')}</span>
       </h1>
 
@@ -133,7 +133,10 @@
       </div>
 
       <p class="mt-4 font-mono text-xs tracking-wide text-ink-faint animate-fade-up" style="animation-delay:0.26s">
-        {$_('hero.subnote', { values: { v: $version } })}
+        {$_('hero.subnote_features')}
+      </p>
+      <p class="mt-1 font-mono text-xs tracking-wide text-ink-faint animate-fade-up" style="animation-delay:0.26s">
+        {$_('hero.subnote_platforms', { values: { v: $version } })}
       </p>
     </div>
   </div>

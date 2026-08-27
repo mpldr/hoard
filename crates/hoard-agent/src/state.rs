@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use hoard_core::ids::{canon_token, GameSlug, Repair, SaveId};
+use hoard_core::ids::{GameSlug, Repair, SaveId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -298,6 +298,33 @@ fn migrate_legacy_state(device_path: &Path, context_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Un slug del que ya nos hemos quejado en este proceso.
+///
+/// `cleanse` corre en **cada** carga de `state.json` — unas veinticinco veces
+/// por hora — y el estado no se reescribe, así que el mismo slug envenenado se
+/// redescubre íntegro cada vez. Dos usuarios con un save llamado `user`
+/// generaron 3.669 avisos idénticos en tres días: eso no son 3.669 incidentes,
+/// es uno visto 3.669 veces, y enterró el resto del log.
+///
+/// La primera vez se cuenta entera; las siguientes son `debug`. El conjunto es
+/// por proceso: un reinicio del daemon vuelve a avisar una vez, que es
+/// exactamente lo que se quiere de un problema que sigue ahí.
+fn warn_once(slug: &str, emit: impl FnOnce()) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = match seen.lock() {
+        Ok(mut g) => g.insert(slug.to_string()),
+        // Un lock envenenado no puede silenciar un aviso: se cuenta.
+        Err(_) => true,
+    };
+    if first {
+        emit();
+    } else {
+        tracing::debug!(slug, "state: slug still quarantined (already reported)");
+    }
+}
+
 /// Pasa el estado recién leído por la **puerta indulgente** de
 /// `hoard_core::ids` (ADR 0021, C.3).
 ///
@@ -318,35 +345,36 @@ fn migrate_legacy_state(device_path: &Path, context_path: &Path) -> Result<()> {
 ///
 /// La limpieza durable (reescribir el estado migrado) es del Slice 5; esto es la
 /// reparación en memoria que hace que el motor arranque mientras tanto.
+///
+/// **El veredicto es `GameSlug::repair` y sólo él.** Antes se recomprobaba
+/// además con `agent::is_generic_identity_token`, que amplía la lista estática
+/// con los componentes del home de ESTA máquina. Eso es lo correcto para casar
+/// procesos vivos (bajo `C:\Users\<user>\` cuelga todo) y lo incorrecto aquí:
+/// la identidad de un save es `(user, game_slug, label)` en el servidor y tiene
+/// que significar lo mismo en todos los equipos. Con el criterio local, un save
+/// llamado como el usuario quedaba en cuarentena en su portátil y limpio en el
+/// de al lado, para el mismo `state.json` sincronizado.
 fn cleanse(state: &mut CliState) {
-    // `repair` sólo conoce la lista estática de tokens de fontanería; el
-    // nombre de usuario real —el caso que rompió— lo aporta el shell.
-    let degenerate = |slug: &str| crate::agent::is_generic_identity_token(&canon_token(slug));
-
     let mut quarantined: HashSet<String> = HashSet::new();
 
     let mut triage = |raw: &str| -> Option<String> {
         match GameSlug::repair(raw) {
-            Repair::Clean(v) => {
-                if degenerate(v.as_str()) {
-                    tracing::warn!(
-                        slug = raw,
-                        "state: slug degenerado (token genérico); en cuarentena para correlación"
-                    );
-                    quarantined.insert(raw.to_string());
-                }
-                None
-            }
+            Repair::Clean(_) => None,
             Repair::Repaired { value, .. } => {
-                tracing::warn!(raw, repaired = %value, "state: slug inválido reparado al cargar");
-                let repaired = value.into_inner();
-                if degenerate(&repaired) {
-                    quarantined.insert(repaired.clone());
-                }
-                Some(repaired)
+                warn_once(
+                    raw,
+                    || tracing::warn!(raw, repaired = %value, "state: slug inválido reparado al cargar"),
+                );
+                Some(value.into_inner())
             }
             Repair::Quarantined { reason, .. } => {
-                tracing::warn!(slug = raw, %reason, "state: slug irrecuperable; en cuarentena");
+                // El motivo va en el campo, no en el texto: `Degenerate` y
+                // `Unrecoverable` son cosas distintas y el mensaje llamaba
+                // "irrecuperable" a los degenerados, que son la inmensa mayoría.
+                warn_once(
+                    raw,
+                    || tracing::warn!(slug = raw, %reason, "state: slug quarantined at load"),
+                );
                 quarantined.insert(raw.to_string());
                 None
             }
@@ -434,10 +462,16 @@ impl CliState {
 
     /// ¿Este slug quedó marcado al cargar? Un slug en cuarentena está bien
     /// formado pero significa cualquier cosa (`users`, el nombre de usuario del
-    /// perfil…): quien lo use para **correlacionar** —casar procesos vivos con
-    /// un save— debe ignorarlo, o cualquier proceso del perfil pasa por "estás
-    /// jugando". Para todo lo demás (rutas, subidas, identidad server-side)
+    /// perfil…). Para todo lo demás (rutas, subidas, identidad server-side)
     /// sigue siendo el slug de ese save y se usa tal cual.
+    ///
+    /// **No es lo que protege la correlación**, aunque el doc lo prometiera:
+    /// quien casa procesos vivos con saves es `agent::game_identity_tokens`, y
+    /// ése ya descarta el mismo token por su cuenta —con el criterio ampliado
+    /// al home local, que ahí sí corresponde—. Cablear además esta consulta
+    /// sería duplicar la defensa con un criterio más flojo. Vive como
+    /// diagnóstico: qué slugs de este estado no significan nada, para la UI y
+    /// para el log.
     pub fn is_slug_quarantined(&self, slug: &str) -> bool {
         self.quarantined_slugs.contains(slug)
     }

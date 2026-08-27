@@ -1101,7 +1101,35 @@ fn conflicting_save<'a>(
 /// server (cloud la materializa en el primer upload) y escribe el mapping local.
 /// Devuelve la fila + el `WatchedSave` a enganchar. La CLI (`track.rs`) y el
 /// desktop llaman aquí en vez de reimplementar el flujo.
+/// Reject a save whose slug is plumbing rather than a game — `user`, `desktop`,
+/// `appdata` and friends (`GENERIC_IDENTITY_TOKENS`).
+///
+/// **This is the only gate that can actually prevent one.** `CliState::cleanse`
+/// spots the same slugs, but it runs when the state is *loaded*: by then the
+/// save exists, it has been uploaded, and the server has a row for it. Fourteen
+/// such rows across thirteen accounts reached production that way — the
+/// detection was never wrong, it was always too late. Refusing at the door is
+/// what keeps them out.
+///
+/// Deliberately uses `GameSlug::repair` and nothing else. The wider
+/// `agent::is_generic_identity_token` also vetoes the components of *this*
+/// machine's home directory, which is right for matching live processes and
+/// wrong here: a save's identity is `(user, game_slug, label)` on the server and
+/// must mean the same thing on every device. Judging it against the local
+/// username would quarantine a save on one machine and wave it through on
+/// another.
+fn reject_degenerate_slug(slug: &str) -> Result<()> {
+    match hoard_core::ids::GameSlug::repair(slug) {
+        hoard_core::ids::Repair::Quarantined { reason, .. } => anyhow::bail!(
+            "'{slug}' doesn't name a game ({reason}) — it looks like part of a folder path. \
+             Pick the game by name, or point Hoard at the save folder and let it identify it."
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<TrackOutcome> {
+    reject_degenerate_slug(&args.game_slug)?;
     // The slot outranks the label: `label` only survives for the older
     // free-form labels (and for the CLI, which still accepts them).
     let label = args
@@ -1346,6 +1374,9 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
 /// cursor de versión abierto para que el auto-restore on-add baje el último
 /// snapshot (sync). Núcleo del cross-device sync.
 pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> {
+    // Same door, same guard: adopting a cloud row is still how a bad slug
+    // enters this machine's state.
+    reject_degenerate_slug(&args.game_slug)?;
     // La sesión debe existir (el caller ya construyó `client`); no hay llamada
     // server aquí, la fila cloud ya existe.
     let _ = client;
@@ -3476,5 +3507,58 @@ mod tests {
         apply_excluded_paths(&mut after, &CliState::default());
         assert_eq!(after.games.len(), before.games.len());
         assert_eq!(after.games[1].found_paths, before.games[1].found_paths);
+    }
+}
+
+#[cfg(test)]
+mod slug_gate_tests {
+    use super::reject_degenerate_slug;
+
+    /// Los catorce saves basura que llegaron a producción se llamaban así.
+    #[test]
+    fn plumbing_never_gets_tracked() {
+        for bad in [
+            "user",
+            "users",
+            "desktop",
+            "appdata",
+            "roaming",
+            "documents",
+        ] {
+            assert!(
+                reject_degenerate_slug(bad).is_err(),
+                "'{bad}' should never be trackable as a game"
+            );
+        }
+    }
+
+    #[test]
+    fn real_games_pass() {
+        for good in [
+            "stardew-valley",
+            "factorio",
+            "the-witcher-3-wild-hunt",
+            "hearts-of-iron-iv",
+        ] {
+            assert!(reject_degenerate_slug(good).is_ok(), "'{good}' is a game");
+        }
+    }
+
+    /// El veredicto no puede depender de esta máquina: la identidad de un save
+    /// es la misma en todos los equipos de la cuenta. `insider` es el usuario
+    /// de la máquina de desarrollo y aun así tiene que pasar, porque en el
+    /// portátil de al lado sería un juego perfectamente válido.
+    #[test]
+    fn the_local_username_is_not_a_verdict() {
+        assert!(reject_degenerate_slug("insider").is_ok());
+    }
+
+    /// El mensaje tiene que decir qué hacer, no sólo que no.
+    #[test]
+    fn the_error_tells_the_user_what_to_do() {
+        let err = reject_degenerate_slug("user").expect_err("rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("user"), "names the offending slug: {msg}");
+        assert!(msg.contains("folder"), "points at the folder flow: {msg}");
     }
 }

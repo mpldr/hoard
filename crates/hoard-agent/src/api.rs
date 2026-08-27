@@ -540,7 +540,45 @@ pub struct ApiClient {
     /// ¿Lleva este server censo de dispositivos y presencia (`/v1/devices`,
     /// `/v1/presence/heartbeat`)? Se rellena en la misma sonda, por lo mismo.
     devices: Arc<OnceCell<bool>>,
+    /// El tope por save del plan, aprendido del último 413.
+    ///
+    /// **No es una sonda como las de arriba, y por eso no es un `OnceCell`.**
+    /// El tope cambia cuando el usuario cambia de plan, así que tiene que poder
+    /// reescribirse; lo que no puede es tener que redescubrirse en cada copia.
+    /// Hoy el único modo de conocerlo es que el servidor te rechace: no existe
+    /// ningún `GET` que lo diga, así que el 413 es a la vez el error y el canal
+    /// de configuración. Recordarlo convierte el rechazo en algo que ocurre una
+    /// vez por sesión en lugar de una vez por autoguardado — cinco usuarios con
+    /// partidas grandes generaron 12.996 de estos en una semana, todos con la
+    /// misma respuesta.
+    ///
+    /// Vive en el cliente y no en el estado del save porque el tope es del
+    /// **plan**, no de la partida: descubrirlo subiendo Factorio vale igual
+    /// para Skyrim.
+    plan_cap: Arc<RwLock<Option<PlanCap>>>,
 }
+
+/// Tope por save del plan y a qué plan pertenece. Ver [`ApiClient::plan_cap`].
+#[derive(Debug, Clone)]
+pub struct PlanCap {
+    pub limit_bytes: u64,
+    pub plan: String,
+    /// Cuándo lo aprendimos. Ver [`PLAN_CAP_TTL`].
+    learned_at: std::time::Instant,
+}
+
+/// Cuánto vale un tope aprendido antes de volver a comprobarlo.
+///
+/// **Existe por el upgrade.** Quien pasa a Pro multiplica su tope, pero el
+/// cliente sólo se entera si vuelve a preguntar — y todo el sentido de recordar
+/// el tope es dejar de preguntar. Sin caducidad, alguien que acaba de pagar
+/// seguiría subiendo copias recortadas contra el tope de Free hasta reiniciar
+/// el servicio, que es exactamente el momento en que menos se le puede fallar.
+///
+/// Media hora es el compromiso: el rechazo pasa de uno por autoguardado a como
+/// mucho uno cada 30 min (dos órdenes de magnitud menos), y un cambio de plan
+/// tarda como mucho eso en notarse solo.
+const PLAN_CAP_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 impl ApiClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self> {
@@ -579,6 +617,7 @@ impl ApiClient {
             mode: Arc::new(OnceCell::new()),
             cas: Arc::new(OnceCell::new()),
             devices: Arc::new(OnceCell::new()),
+            plan_cap: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -691,6 +730,33 @@ impl ApiClient {
     /// `/v1/saves` + multipart one.
     pub async fn is_cloud(&self) -> bool {
         self.server_mode().await.as_deref() == Some("cloud")
+    }
+
+    /// El tope por save que este cliente ya conoce, si alguno.
+    ///
+    /// `None` = todavía no nos han rechazado nada, así que no se sabe y no se
+    /// adivina: subir con un tope inventado recortaría copias que sí cabían.
+    pub fn plan_cap(&self) -> Option<PlanCap> {
+        self.plan_cap
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|c| c.learned_at.elapsed() < PLAN_CAP_TTL)
+    }
+
+    /// Apunta el tope que acaba de llegar en un 413. Idempotente; un valor
+    /// distinto (el usuario cambió de plan) pisa al anterior.
+    pub fn remember_plan_cap(&self, limit_bytes: u64, plan: &str) {
+        if limit_bytes == 0 {
+            return;
+        }
+        if let Ok(mut g) = self.plan_cap.write() {
+            *g = Some(PlanCap {
+                limit_bytes,
+                plan: plan.to_string(),
+                learned_at: std::time::Instant::now(),
+            });
+        }
     }
 
     /// The deployment mode **already probed**, without touching the network:
@@ -1833,5 +1899,61 @@ mod rate_limit_tests {
         let (kind, secs) = classify_rate_limit("slow down", Some(5));
         assert_eq!(kind, RateLimitKind::Paced);
         assert_eq!(secs, 5);
+    }
+}
+
+#[cfg(test)]
+mod plan_cap_tests {
+    use super::*;
+
+    fn client() -> ApiClient {
+        ApiClient::new("http://127.0.0.1:1", "t").expect("client")
+    }
+
+    /// Sin rechazo previo no se sabe el tope, y no se inventa: recortar contra
+    /// un número adivinado mutilaría copias que sí cabían.
+    #[test]
+    fn unknown_until_a_rejection_teaches_it() {
+        assert!(client().plan_cap().is_none());
+    }
+
+    #[test]
+    fn remembers_what_the_rejection_said() {
+        let c = client();
+        c.remember_plan_cap(50 * 1024 * 1024, "free");
+        let cap = c.plan_cap().expect("learned");
+        assert_eq!(cap.limit_bytes, 50 * 1024 * 1024);
+        assert_eq!(cap.plan, "free");
+    }
+
+    /// Cambiar de plan pisa el tope viejo en cuanto el server lo dice.
+    #[test]
+    fn a_new_limit_replaces_the_old_one() {
+        let c = client();
+        c.remember_plan_cap(50, "free");
+        c.remember_plan_cap(500, "pro");
+        let cap = c.plan_cap().expect("learned");
+        assert_eq!(cap.limit_bytes, 500);
+        assert_eq!(cap.plan, "pro");
+    }
+
+    /// Un cuerpo sin `limit_bytes` utilizable (un proxy que devolvió su propio
+    /// 413) no enseña nada: mejor no saber que aprender un cero y recortarlo
+    /// todo.
+    #[test]
+    fn a_zero_limit_teaches_nothing() {
+        let c = client();
+        c.remember_plan_cap(0, "free");
+        assert!(c.plan_cap().is_none());
+    }
+
+    /// Todas las copias de un cliente comparten el tope: aprenderlo subiendo
+    /// un juego vale para el siguiente.
+    #[test]
+    fn clones_share_the_learned_cap() {
+        let c = client();
+        let clone = c.clone();
+        c.remember_plan_cap(50, "free");
+        assert_eq!(clone.plan_cap().expect("shared").limit_bytes, 50);
     }
 }

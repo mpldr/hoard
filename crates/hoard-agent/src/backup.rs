@@ -271,6 +271,46 @@ pub struct TrimInfo {
     pub limit_bytes: u64,
 }
 
+/// Recorta `working` a lo que quepa bajo `limit`, quedándose con los ficheros
+/// más nuevos, y describe lo que se quedó fuera.
+///
+/// `working` viene ordenado por mtime descendente, así que "lo que cabe" es
+/// también "lo más reciente": una carpeta de partidas enorme sube parcial en
+/// vez de fallar entera, y lo que se pierde es lo más viejo. Regla genérica a
+/// propósito —recencia y tamaño, cero conocimiento por juego—.
+///
+/// `None` cuando ni el fichero más nuevo cabe: ahí no hay recorte posible y el
+/// llamante tiene que tratarlo como un "demasiado grande" terminal.
+///
+/// Extraído para que el recorte preventivo (contra el tope ya conocido) y el
+/// reactivo (contra el 413) sean literalmente el mismo código: dos criterios
+/// que se separasen darían dos versiones distintas del mismo save según quién
+/// hubiera recortado.
+fn trim_to_cap(working: &mut Vec<&UploadFile>, limit: u64, plan: &str) -> Option<TrimInfo> {
+    let mut kept: Vec<&UploadFile> = Vec::new();
+    let mut kept_bytes = 0u64;
+    for f in working.iter() {
+        if kept_bytes + f.size_bytes <= limit {
+            kept.push(*f);
+            kept_bytes += f.size_bytes;
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let full_bytes: u64 = working.iter().map(|f| f.size_bytes).sum();
+    let info = TrimInfo {
+        kept_files: kept.len(),
+        kept_bytes,
+        omitted_files: working.len() - kept.len(),
+        omitted_bytes: full_bytes - kept_bytes,
+        plan: plan.to_string(),
+        limit_bytes: limit,
+    };
+    *working = kept;
+    Some(info)
+}
+
 /// Un fichero que el recorrido enumeró pero cuyos bytes no se pueden leer.
 ///
 /// No es un fallo del backup: es contenido que **esta** copia no puede llevarse.
@@ -1197,6 +1237,30 @@ where
     working.sort_by_key(|f| std::cmp::Reverse(f.modified));
     let mut trimmed: Option<TrimInfo> = None;
 
+    // Recorte PREVENTIVO: si ya sabemos el tope de este plan, no hace falta que
+    // el servidor nos lo recuerde otra vez.
+    //
+    // El tope sólo se aprende siendo rechazado —no hay endpoint que lo diga—,
+    // así que la primera copia grande de la sesión sigue costando un 413. Las
+    // demás no: se recortan aquí y suben a la primera. Es la diferencia entre
+    // preguntar una vez y preguntar en cada autoguardado, que es lo que
+    // convirtió a cinco usuarios en 12.996 rechazos semanales.
+    if let Some(cap) = client.plan_cap() {
+        if total_bytes > cap.limit_bytes {
+            if let Some(info) = trim_to_cap(&mut working, cap.limit_bytes, &cap.plan) {
+                tracing::debug!(
+                    save_id,
+                    game_slug,
+                    limit_bytes = cap.limit_bytes,
+                    kept_files = info.kept_files,
+                    omitted_files = info.omitted_files,
+                    "cloud: trimmed to the known per-save cap without asking"
+                );
+                trimmed = Some(info);
+            }
+        }
+    }
+
     // 2/3/4. Declare manifest → upload missing blobs → commit. Wrapped in a
     // loop so a per-save-cap 413 can trim the working set and retry exactly
     // once (the trim can only shrink, so it converges).
@@ -1258,39 +1322,24 @@ where
                 let Some(detail) = cap else {
                     return Err(e).context("cloud cas init");
                 };
-                let limit = detail.limit_bytes;
-                let mut kept: Vec<&UploadFile> = Vec::new();
-                let mut kept_bytes = 0u64;
-                for f in &working {
-                    if kept_bytes + f.size_bytes <= limit {
-                        kept.push(*f);
-                        kept_bytes += f.size_bytes;
-                    }
-                }
-                if kept.is_empty() {
+                // Apúntalo antes de nada: aunque este recorte falle, la próxima
+                // copia ya no tendrá que preguntar.
+                client.remember_plan_cap(detail.limit_bytes, &detail.plan);
+                let Some(info) = trim_to_cap(&mut working, detail.limit_bytes, &detail.plan) else {
                     // Even the single newest file is over the cap — nothing to
                     // trim to; let the caller surface it as terminal too-large.
                     return Err(e).context("cloud cas init");
-                }
-                let full_bytes: u64 = working.iter().map(|f| f.size_bytes).sum();
-                trimmed = Some(TrimInfo {
-                    kept_files: kept.len(),
-                    kept_bytes,
-                    omitted_files: working.len() - kept.len(),
-                    omitted_bytes: full_bytes - kept_bytes,
-                    plan: detail.plan.clone(),
-                    limit_bytes: limit,
-                });
+                };
                 tracing::warn!(
                     save_id,
                     game_slug,
                     plan = %detail.plan,
-                    limit_bytes = limit,
-                    kept_files = kept.len(),
-                    omitted_files = working.len() - kept.len(),
+                    limit_bytes = detail.limit_bytes,
+                    kept_files = info.kept_files,
+                    omitted_files = info.omitted_files,
                     "cloud: save exceeds plan per-save cap — uploading only the newest files that fit"
                 );
-                working = kept;
+                trimmed = Some(info);
                 continue;
             }
         }
@@ -1728,6 +1777,59 @@ pub async fn remember_save(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    fn f(path: &str, size: u64, secs: u64) -> UploadFile {
+        UploadFile {
+            relative_path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            size_bytes: size,
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    /// El recorte se queda con los más nuevos, no con los primeros que vea.
+    #[test]
+    fn keeps_the_newest_files_that_fit() {
+        let files = vec![f("old", 60, 100), f("new", 30, 300), f("mid", 30, 200)];
+        let mut working: Vec<&UploadFile> = files.iter().collect();
+        working.sort_by_key(|f| std::cmp::Reverse(f.modified));
+
+        let info = trim_to_cap(&mut working, 60, "free").expect("something fits");
+
+        let kept: Vec<&str> = working.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(kept, ["new", "mid"]);
+        assert_eq!(info.kept_bytes, 60);
+        assert_eq!(info.omitted_files, 1);
+        assert_eq!(info.omitted_bytes, 60);
+        assert_eq!(info.limit_bytes, 60);
+    }
+
+    /// Ni el más nuevo cabe: no hay recorte, y el llamante debe tratarlo como
+    /// un "demasiado grande" terminal en vez de subir una copia vacía.
+    #[test]
+    fn refuses_when_even_the_newest_file_is_over_the_cap() {
+        let files = vec![f("huge", 500, 300)];
+        let mut working: Vec<&UploadFile> = files.iter().collect();
+        assert!(trim_to_cap(&mut working, 100, "free").is_none());
+        // Y no toca el conjunto: nada se ha decidido todavía.
+        assert_eq!(working.len(), 1);
+    }
+
+    /// Todo cabe: se conserva entero y el informe dice que no se omitió nada.
+    #[test]
+    fn keeps_everything_when_it_all_fits() {
+        let files = vec![f("a", 10, 100), f("b", 10, 200)];
+        let mut working: Vec<&UploadFile> = files.iter().collect();
+        let info = trim_to_cap(&mut working, 1000, "pro").expect("all fits");
+        assert_eq!(working.len(), 2);
+        assert_eq!(info.omitted_files, 0);
+        assert_eq!(info.omitted_bytes, 0);
+    }
 }
 
 #[cfg(test)]

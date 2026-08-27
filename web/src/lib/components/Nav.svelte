@@ -69,50 +69,50 @@
   >
     <a
       href={$localeHref('/')}
-      class="flex items-center gap-2.5 rounded-md ring-focus md:justify-self-start"
+      class="nav-pill flex items-center gap-2.5 ring-focus md:justify-self-start"
       aria-label="Hoard home"
     >
       <LogoMark size={28} />
       <span class="font-display text-base font-semibold tracking-tight text-ink">Hoard</span>
     </a>
 
-    <div class="hidden items-center gap-7 md:flex md:justify-self-center">
+    <div class="hidden items-center gap-1 md:flex md:justify-self-center">
       <a
         href={$localeHref('/download')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/download')
-          ? 'text-ink'
+        class="nav-pill ring-focus text-sm {isActive('/download')
+          ? 'nav-pill-active'
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.download')}
       </a>
       <a
         href={$localeHref('/pricing')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/pricing')
-          ? 'text-ink'
+        class="nav-pill ring-focus text-sm {isActive('/pricing')
+          ? 'nav-pill-active'
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.pricing')}
       </a>
       <a
         href={$localeHref('/cli')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/cli')
-          ? 'text-ink'
+        class="nav-pill ring-focus text-sm {isActive('/cli')
+          ? 'nav-pill-active'
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.cli')}
       </a>
       <a
         href={$localeHref('/guides')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/guides')
-          ? 'text-ink'
+        class="nav-pill ring-focus text-sm {isActive('/guides')
+          ? 'nav-pill-active'
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.guides')}
       </a>
       <a
         href={$localeHref('/help')}
-        class="link-underline ring-focus text-sm transition-colors {isActive('/help')
-          ? 'text-ink'
+        class="nav-pill ring-focus text-sm {isActive('/help')
+          ? 'nav-pill-active'
           : 'text-ink-soft hover:text-ink'}"
       >
         {$_('nav.help')}
@@ -127,7 +127,7 @@
         class="group relative"
       >
         <summary
-          class="flex cursor-pointer list-none items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-ink-soft ring-focus transition-colors hover:text-ink [&::-webkit-details-marker]:hidden"
+          class="nav-pill flex cursor-pointer list-none items-center gap-1.5 text-sm text-ink-soft ring-focus [&::-webkit-details-marker]:hidden"
           aria-label="Language"
         >
           <Globe class="h-4 w-4" />

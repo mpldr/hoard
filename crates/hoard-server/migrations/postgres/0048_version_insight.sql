@@ -1,0 +1,24 @@
+-- What a version is *about*, derived from its own manifest.
+--
+-- Every row of the history read `save_v47 · 2026-08-06 04:16`: that it is a
+-- backup, and when — the two things the user already knew. Which of the 70
+-- Factorio worlds in that folder moved, and by how much, was in the data all
+-- along (`save_version_files` carries path, sha, size and mtime per version)
+-- but nothing ever looked at it.
+--
+-- The server derives it once, at commit, and stores it here: the name of the
+-- save the version is about, how many saves the folder holds, and the diff
+-- against the previous version. Doing it here and not in the client means it
+-- works for versions uploaded by clients that never heard of this, and that a
+-- single implementation (`hoard_core::kernel::insight`) serves cloud and
+-- self-hosted alike.
+--
+-- JSONB and not columns because this is the base a per-game probe writes over
+-- later (a thumbnail's sha, the in-game name, stats): those fields don't exist
+-- yet and shouldn't each cost a migration. Nothing in the server queries
+-- inside it — it is written whole and returned whole.
+--
+-- NULL = not computed: every pre-existing row, plus legacy whole-archive
+-- versions that have no manifest to derive anything from. The client renders
+-- those exactly as it does today.
+ALTER TABLE save_versions ADD COLUMN IF NOT EXISTS insight JSONB;

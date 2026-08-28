@@ -221,6 +221,11 @@
       .then((p) => (presets = p))
       .catch(() => (presets = []));
     void refreshArchivedSaves();
+    // Local y barato; si falla, los grupos se quedan sin la línea de horas.
+    api
+      .listPlaytime()
+      .then((p) => (playtime = p))
+      .catch(() => (playtime = null));
     await hydrate();
   });
 
@@ -254,6 +259,91 @@
         toastError(typeof e === "string" ? e : (e as Error).message);
       }
     }
+  }
+
+  // Horas jugadas por día, calculadas en local por el agente (no toca la red).
+  // La cabecera de cada grupo puede así decir cuánto se jugó ESE día a ESTE
+  // juego, que es el contexto que una fecha sola nunca da.
+  let playtime = $state<api.PlaytimeSummary | null>(null);
+
+  const playedByDay = $derived.by(() => {
+    const slug = save?.game_slug;
+    const daily = playtime?.daily_by_game;
+    const out: Record<string, number> = {};
+    if (!slug || !daily) return out;
+    for (const [day, games] of Object.entries(daily)) {
+      const secs = games[slug];
+      if (secs) out[day] = secs;
+    }
+    return out;
+  });
+
+  /** Clave de día LOCAL (`YYYY-MM-DD`), la misma forma que usa el playtime. */
+  function dayKey(iso: string): string {
+    const d = new Date(iso);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  type SnapshotGroup = {
+    key: string;
+    label: string;
+    snaps: SnapshotEntry[];
+    playedSecs: number;
+  };
+
+  /** La lista, partida por día.
+   *
+   *  Un juego que autoguarda cada minuto produce cuarenta filas idénticas, y
+   *  leerlas como una lista plana es leer un muro. Agrupadas por día la
+   *  ráfaga se lee como lo que fue: una tarde jugando. */
+  const groups = $derived.by<SnapshotGroup[]>(() => {
+    const out: SnapshotGroup[] = [];
+    let current: SnapshotGroup | null = null;
+    for (const snap of snapshots) {
+      const key = dayKey(snap.created_at);
+      if (!current || current.key !== key) {
+        current = {
+          key,
+          label: dayLabel(snap.created_at),
+          snaps: [],
+          playedSecs: playedByDay[key] ?? 0,
+        };
+        out.push(current);
+      }
+      current.snaps.push(snap);
+    }
+    return out;
+  });
+
+  function dayLabel(iso: string): string {
+    const key = dayKey(iso);
+    const today = dayKey(new Date().toISOString());
+    if (key === today) return $_("history.group_today");
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (key === dayKey(yesterday.toISOString()))
+      return $_("history.group_yesterday");
+    return new Date(iso).toLocaleDateString(undefined, {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+    });
+  }
+
+  function formatDuration(secs: number): string {
+    const h = Math.floor(secs / 3600);
+    const m = Math.round((secs % 3600) / 60);
+    if (h > 0) return $_("history.dur_hm", { values: { h, m } });
+    return $_("history.dur_m", { values: { m: Math.max(m, 1) } });
+  }
+
+  /** Bytes con signo: lo que esta versión pesa de más (o de menos) que la
+   *  anterior. El signo es la mitad del dato — "+2 MB" y "−2 MB" cuentan
+   *  historias opuestas sobre la misma partida. */
+  function formatDelta(n: number): string {
+    const sign = n < 0 ? "−" : "+";
+    return `${sign}${formatBytes(Math.abs(n))}`;
   }
 
   function formatBytes(n: number): string {
@@ -830,166 +920,266 @@
         </div>
       </Card>
     {:else}
-      <ol class="space-y-2.5">
-        {#each snapshots as snap (snap.version_num)}
-          {@const isOpen = expanded[snap.version_num] ?? false}
-          {@const isDeleted = !!snap.deleted_at}
-          <li
-            class="group rounded-xl border border-white/[0.08] bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12]
-              {isDeleted ? 'opacity-60' : ''}"
-          >
-            <div class="flex items-center gap-3 px-4 py-3">
-              {#if !isDeleted}
-                <input
-                  type="checkbox"
-                  class="h-3.5 w-3.5 shrink-0 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
-                  checked={selected.has(snap.version_num)}
-                  onchange={() => toggleSelected(snap.version_num)}
-                  aria-label={$_("history.select_version", {
-                    values: { version: snap.version_num },
-                  })}
-                />
+      {#each groups as group (group.key)}
+        <section class="mb-5">
+          <!-- Cabecera del día. Un juego que autoguarda cada minuto llena la
+               lista de filas iguales; partirla por días la vuelve legible y le
+               pone al lado lo único que explica la ráfaga: cuánto se jugó. -->
+          <div class="mb-2 flex items-baseline gap-2 px-1">
+            <h3 class="text-xs font-medium tracking-wide text-zinc-400 uppercase">
+              {group.label}
+            </h3>
+            <span class="text-[11px] text-zinc-600">
+              {$_("history.versions_count", {
+                values: { count: group.snaps.length },
+              })}
+              {#if group.playedSecs > 0}
+                · {$_("history.played_time", {
+                  values: { time: formatDuration(group.playedSecs) },
+                })}
               {/if}
-              <button
-                type="button"
-                onclick={() => toggleExpanded(snap.version_num)}
-                class="text-zinc-500 transition-colors hover:text-zinc-200"
-                aria-label={isOpen
-                  ? $_("history.collapse")
-                  : $_("history.expand")}
+            </span>
+          </div>
+          <ol class="space-y-2.5">
+            {#each group.snaps as snap (snap.version_num)}
+              {@const isOpen = expanded[snap.version_num] ?? false}
+              {@const isDeleted = !!snap.deleted_at}
+              {@const insight = snap.insight}
+              <li
+                class="group rounded-xl border border-white/[0.08] bg-zinc-950/40 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] transition-all duration-150 hover:border-white/[0.12]
+                  {isDeleted ? 'opacity-60' : ''}"
               >
-                {#if isOpen}
-                  <ChevronDown size={16} />
-                {:else}
-                  <ChevronRight size={16} />
-                {/if}
-              </button>
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2 text-sm">
-                  <!-- Self-describing label: `save_v3 · 2026-05-08 14:30`.
-                       The plain `v3` was useful but ambiguous in bug
-                       reports; the timestamp suffix makes it copy-paste
-                       friendly.
-
-                       Con la máquina detrás cuando se sabe (`save_v3 ·
-                       2026-05-08 14:30 · ubserver`): con la misma partida
-                       sincronizada en dos equipos, la fecha no basta para
-                       elegir cuál restaurar. Las versiones subidas antes de que
-                       el server lo guardara no traen nombre, y entonces la
-                       etiqueta se queda como estaba en vez de decir
-                       "desconocido", que ocuparía sitio para no informar. -->
-                  <span
-                    class="font-mono font-medium text-zinc-100"
-                    title={formatAbsolute(snap.created_at)}
-                  >
-                    {snap.device_name
-                      ? $_("history.snapshot_label_device", {
-                          values: {
-                            version: snap.version_num,
-                            date: snapshotStamp(snap.created_at),
-                            device: snap.device_name,
-                          },
-                        })
-                      : $_("history.snapshot_label", {
-                          values: {
-                            version: snap.version_num,
-                            date: snapshotStamp(snap.created_at),
-                          },
-                        })}
-                  </span>
-                  {#if snap.is_pinned}
-                    <Pin size={12} class="text-amber-400" />
+                <div class="flex items-center gap-3 px-4 py-3">
+                  {#if !isDeleted}
+                    <input
+                      type="checkbox"
+                      class="h-3.5 w-3.5 shrink-0 rounded border-zinc-700 bg-zinc-900 text-emerald-500"
+                      checked={selected.has(snap.version_num)}
+                      onchange={() => toggleSelected(snap.version_num)}
+                      aria-label={$_("history.select_version", {
+                        values: { version: snap.version_num },
+                      })}
+                    />
                   {/if}
-                  {#if isDeleted}
-                    <span
-                      class="inline-flex items-center gap-1 rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400"
-                    >
-                      <Trash2 size={10} /> {$_("history.recoverable")}
-                    </span>
-                  {/if}
-                </div>
-                <div
-                  class="mt-1 flex items-center gap-3 text-xs text-zinc-500"
-                >
-                  <span title={formatAbsolute(snap.created_at)}>
-                    {formatRelative(snap.created_at)}
-                  </span>
-                  <span>·</span>
-                  <span>
-                    {$_("history.files_count", {
-                      values: { count: snap.file_count },
-                    })}
-                  </span>
-                  <span>·</span>
-                  <span>{formatBytes(snap.total_size_bytes)}</span>
-                </div>
-              </div>
-              <div class="flex items-center gap-1">
-                {#if isDeleted}
-                  <Button
-                    variant="secondary"
-                    size="md"
-                    onclick={() => recover(snap.version_num)}
+                  <button
+                    type="button"
+                    onclick={() => toggleExpanded(snap.version_num)}
+                    class="text-zinc-500 transition-colors hover:text-zinc-200"
+                    aria-label={isOpen
+                      ? $_("history.collapse")
+                      : $_("history.expand")}
                   >
-                    <RotateCcw size={12} /> {$_("history.recover")}
-                  </Button>
-                {:else}
-                  <Button
-                    variant="secondary"
-                    size="md"
-                    onclick={() => openRestore(snap)}
-                  >
-                    <RotateCcw size={12} /> {$_("history.restore")}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="md"
-                    onclick={() => (deleteTarget = snap)}
-                    aria-label={$_("history.delete_aria")}
-                  >
-                    <Trash2 size={12} />
-                  </Button>
-                {/if}
-              </div>
-            </div>
-
-            {#if isOpen}
-              <div class="border-t border-white/[0.08] bg-zinc-950/20 px-4 py-3">
-                {#if detailCache[snap.version_num]}
-                  {#if detailCache[snap.version_num].files.length === 0}
-                    <p class="text-xs text-zinc-500">
-                      {$isCloudLoggedIn
-                        ? $_("history.cloud_no_file_index")
-                        : $_("history.no_files")}
-                    </p>
-                  {:else}
-                  <ul class="divide-y divide-zinc-900">
-                    {#each detailCache[snap.version_num].files as f (f.relative_path)}
-                      <li
-                        class="flex items-center justify-between gap-3 py-1.5"
-                      >
+                    {#if isOpen}
+                      <ChevronDown size={16} />
+                    {:else}
+                      <ChevronRight size={16} />
+                    {/if}
+                  </button>
+                  <!-- El sitio de la foto de la partida. Hasta que la haya,
+                       la carátula del juego: una fila con imagen se lee de un
+                       vistazo, y dejar el hueco vacío ahora obligaría a
+                       recolocar la fila entera después. -->
+                  <Cover
+                    slug={save.game_slug}
+                    name={insight?.t ?? save.game_slug}
+                    class="h-10 w-10 shrink-0 rounded-lg"
+                    initialClass="text-sm"
+                  />
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 text-sm">
+                      <!-- La partida manda. Cuando el server sabe de qué va la
+                           versión, el nombre del save es el titular y el
+                           `v47 · fecha · equipo` baja a la línea de abajo: con
+                           70 mundos en la carpeta, saber cuál se tocó importa
+                           más que el número de versión. Sin insight (versiones
+                           viejas, o sin manifiesto por fichero) la fila se
+                           queda con la etiqueta de siempre. -->
+                      {#if insight?.t}
                         <span
-                          class="truncate font-mono text-xs text-zinc-300"
+                          class="truncate font-medium text-zinc-100"
+                          title={insight.p ?? insight.t}
                         >
-                          {f.relative_path}
+                          {insight.t}
                         </span>
-                        <span class="shrink-0 text-xs text-zinc-500">
-                          {formatBytes(f.size_bytes)}
+                      {:else}
+                        <span
+                          class="font-mono font-medium text-zinc-100"
+                          title={formatAbsolute(snap.created_at)}
+                        >
+                          {$_("history.snapshot_label", {
+                            values: {
+                              version: snap.version_num,
+                              date: snapshotStamp(snap.created_at),
+                            },
+                          })}
                         </span>
-                      </li>
-                    {/each}
-                  </ul>
-                  {/if}
-                {:else}
-                  <p class="text-xs text-zinc-500">
-                    {$_("history.loading_files")}
-                  </p>
+                      {/if}
+                      {#if snap.is_pinned}
+                        <Pin size={12} class="shrink-0 text-amber-400" />
+                      {/if}
+                      {#if isDeleted}
+                        <span
+                          class="inline-flex shrink-0 items-center gap-1 rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400"
+                        >
+                          <Trash2 size={10} /> {$_("history.recoverable")}
+                        </span>
+                      {/if}
+                    </div>
+                    <div
+                      class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500"
+                    >
+                      <span class="font-mono">v{snap.version_num}</span>
+                      <span>·</span>
+                      <span title={formatAbsolute(snap.created_at)}>
+                        {formatRelative(snap.created_at)}
+                      </span>
+                      {#if snap.device_name}
+                        <span>·</span>
+                        <span class="truncate">{snap.device_name}</span>
+                      {/if}
+                    </div>
+                    <!-- Qué cambió, no cuánto pesa todo. El peso total se
+                         repetía idéntico en las cuarenta filas de una tarde;
+                         el diff es lo que distingue una versión de la de
+                         antes. Sigue estando entero al desplegar. -->
+                    <div
+                      class="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]"
+                    >
+                      {#if insight && (insight.c || insight.r || insight.d)}
+                        {#if insight.c}
+                          <span
+                            class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                          >
+                            {$_("history.changed_files", {
+                              values: { count: insight.c },
+                            })}
+                          </span>
+                        {/if}
+                        {#if insight.r}
+                          <span
+                            class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                          >
+                            {$_("history.removed_files", {
+                              values: { count: insight.r },
+                            })}
+                          </span>
+                        {/if}
+                        {#if insight.d}
+                          <span
+                            class="rounded px-1.5 py-0.5 ring-1 ring-inset {insight.d <
+                            0
+                              ? 'bg-emerald-500/[0.08] text-emerald-300/90 ring-emerald-500/20'
+                              : 'bg-white/[0.05] text-zinc-400 ring-white/[0.06]'}"
+                          >
+                            {formatDelta(insight.d)}
+                          </span>
+                        {/if}
+                      {:else}
+                        <span
+                          class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                        >
+                          {$_("history.files_count", {
+                            values: { count: snap.file_count },
+                          })}
+                        </span>
+                        <span
+                          class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                        >
+                          {formatBytes(snap.total_size_bytes)}
+                        </span>
+                      {/if}
+                      <!-- La versión se llevó la carpeta entera; el titular
+                           nombra a una sola de las partidas que hay dentro.
+                           Decirlo evita que la fila prometa menos de lo que
+                           restaura. -->
+                      {#if insight?.t && (insight.n ?? 0) > 1}
+                        <span class="text-zinc-600">
+                          {$_("history.more_saves", {
+                            values: { count: (insight.n ?? 1) - 1 },
+                          })}
+                        </span>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-1">
+                    {#if isDeleted}
+                      <Button
+                        variant="secondary"
+                        size="md"
+                        onclick={() => recover(snap.version_num)}
+                      >
+                        <RotateCcw size={12} /> {$_("history.recover")}
+                      </Button>
+                    {:else}
+                      <Button
+                        variant="secondary"
+                        size="md"
+                        onclick={() => openRestore(snap)}
+                      >
+                        <RotateCcw size={12} /> {$_("history.restore")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="md"
+                        onclick={() => (deleteTarget = snap)}
+                        aria-label={$_("history.delete_aria")}
+                      >
+                        <Trash2 size={12} />
+                      </Button>
+                    {/if}
+                  </div>
+                </div>
+
+                {#if isOpen}
+                  <div
+                    class="border-t border-white/[0.08] bg-zinc-950/20 px-4 py-3"
+                  >
+                    <p class="mb-2 text-[11px] text-zinc-500">
+                      {$_("history.files_count", {
+                        values: { count: snap.file_count },
+                      })}
+                      · {formatBytes(snap.total_size_bytes)}
+                    </p>
+                    {#if detailCache[snap.version_num]}
+                      {#if detailCache[snap.version_num].files.length === 0}
+                        <p class="text-xs text-zinc-500">
+                          {$isCloudLoggedIn
+                            ? $_("history.cloud_no_file_index")
+                            : $_("history.no_files")}
+                        </p>
+                      {:else}
+                        <ul class="divide-y divide-zinc-900">
+                          {#each detailCache[snap.version_num].files as f (f.relative_path)}
+                            <li
+                              class="flex items-center justify-between gap-3 py-1.5"
+                            >
+                              <span
+                                class="truncate font-mono text-xs {f.relative_path ===
+                                insight?.p
+                                  ? 'text-zinc-100'
+                                  : 'text-zinc-300'}"
+                              >
+                                {f.relative_path}
+                              </span>
+                              <span class="shrink-0 text-xs text-zinc-500">
+                                {formatBytes(f.size_bytes)}
+                              </span>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                    {:else}
+                      <p class="text-xs text-zinc-500">
+                        {$_("history.loading_files")}
+                      </p>
+                    {/if}
+                  </div>
                 {/if}
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ol>
+              </li>
+            {/each}
+          </ol>
+        </section>
+      {/each}
     {/if}
   {/if}
 </div>

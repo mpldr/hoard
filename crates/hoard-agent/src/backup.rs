@@ -1035,6 +1035,10 @@ where
             sha256: Sha256Hex::parse(sha)
                 .with_context(|| format!("hashing {}", f.relative_path))?,
             size_bytes: f.size_bytes as i64,
+            modified_at: f
+                .modified
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64),
         });
     }
 
@@ -1459,6 +1463,10 @@ where
         is_pinned: false,
         created_at: OffsetDateTime::now_utc(),
         deleted_at: None,
+        // Derived server-side from the manifest, and the cloud commit response
+        // doesn't carry it back. Nothing is lost: this synthetic snapshot only
+        // reports what just landed, and the History view reads the real row.
+        insight: None,
     };
     Ok(UploadOutcome {
         snapshot,
@@ -1493,6 +1501,7 @@ fn landed_snapshot(
         is_pinned: false,
         created_at: OffsetDateTime::now_utc(),
         deleted_at: None,
+        insight: None,
     }
 }
 

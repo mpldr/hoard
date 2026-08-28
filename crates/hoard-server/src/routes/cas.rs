@@ -255,7 +255,7 @@ pub async fn init(
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
     if let Some(base) = body.base_version {
         if base != head {
-            return Err(non_fast_forward(head, base));
+            return Err(non_fast_forward(&save_id, head, base));
         }
     }
 
@@ -326,7 +326,13 @@ pub async fn init(
     }))
 }
 
-fn non_fast_forward(head: i64, base: i64) -> ApiError {
+/// The divergence 409. It carries `save_id` even though here it is always the
+/// id the client asked for — self-hosted never relabels rows, the route already
+/// names one — so the body has a single shape across both deployments: on Cloud
+/// that field is the canonical row the push was rejected against, which may not
+/// be the one the client thought it was writing to, and the client parses one
+/// structure instead of branching on which server answered.
+fn non_fast_forward(save_id: &str, head: i64, base: i64) -> ApiError {
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
@@ -334,6 +340,7 @@ fn non_fast_forward(head: i64, base: i64) -> ApiError {
             "code": "non_fast_forward",
             "head_version": head,
             "base_version": base,
+            "save_id": save_id,
         })),
     )
 }
@@ -748,7 +755,7 @@ pub async fn commit(
         if base != head {
             rollback(&placed);
             cleanup_staging();
-            return Err(non_fast_forward(head, base));
+            return Err(non_fast_forward(&save_id, head, base));
         }
     }
     let new_version = head + 1;
@@ -783,14 +790,15 @@ pub async fn commit(
         let sha = f.sha256.as_str();
         let size = size_by_sha.get(sha).copied().unwrap_or(0);
         sqlx::query(
-            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256)
-             VALUES (?,?,?,?,?)",
+            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256, modified_at)
+             VALUES (?,?,?,?,?,?)",
         )
         .bind(&file_id)
         .bind(&snapshot_id)
         .bind(&f.relative_path)
         .bind(size)
         .bind(sha)
+        .bind(f.modified_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -969,6 +977,17 @@ pub async fn commit(
         },
     );
 
+    // What the history row will say. After the commit and never fatal: the
+    // version is stored, and a row that fails to get a label is cosmetic.
+    let insight = match crate::insight::record_selfhosted(&state.pool, &save_id, new_version).await
+    {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(error = %e, save_id = %save_id, version = new_version, "insight: not recorded");
+            None
+        }
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(Snapshot {
@@ -983,6 +1002,7 @@ pub async fn commit(
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),
+            insight,
         }),
     ))
 }
@@ -1008,6 +1028,7 @@ mod tests {
             relative_path: path.into(),
             sha256: Sha256Hex::parse(s).unwrap(),
             size_bytes: size,
+            modified_at: None,
         }
     }
 

@@ -39,6 +39,11 @@ pub struct SnapshotWire {
     pub device_name: Option<String>,
     pub created_at: String,
     pub deleted_at: Option<String>,
+    /// Qué cuenta esta versión: de qué partida va, qué cambió desde la
+    /// anterior, cuántas partidas hay en la carpeta. Lo deriva el server del
+    /// manifiesto, así que es `None` en todo lo subido antes de que existiera
+    /// y en las versiones sin manifiesto por fichero.
+    pub insight: Option<hoard_core::kernel::insight::VersionInsight>,
 }
 
 /// Wire shape for the per-snapshot detail view.
@@ -69,6 +74,7 @@ fn snapshot_to_wire(s: hoard_agent::api::Snapshot) -> SnapshotWire {
         device_name: s.device_name,
         created_at: fmt_time(s.created_at),
         deleted_at: s.deleted_at.map(fmt_time),
+        insight: s.insight,
     }
 }
 

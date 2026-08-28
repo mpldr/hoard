@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::ids::{GameSlug, MachineId, SaveId, Sha256, Username};
+use crate::kernel::insight::VersionInsight;
 
 /// RFC3339, la misma representación que ya cruzaba el wire.
 ///
@@ -339,6 +340,12 @@ pub struct Snapshot {
     pub deleted_at: Option<OffsetDateTime>,
     #[serde(with = "ts")]
     pub created_at: OffsetDateTime,
+    /// What this version is *about* — the save's name, what changed since the
+    /// previous one, how many saves the folder holds. Derived by the server
+    /// from the manifest, so an old client that ignores it loses nothing and a
+    /// server that doesn't know about it omits the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<VersionInsight>,
 }
 
 /// Snapshot + su listado de ficheros (`GET /v1/saves/{id}/snapshots/{n}`).
@@ -409,6 +416,14 @@ pub struct CasFile {
     pub relative_path: String,
     pub sha256: Sha256,
     pub size_bytes: i64,
+    /// mtime del fichero en origen, en segundos unix. Es lo que deja al
+    /// historial decir *qué* partida se tocó: sin él, todas las de la carpeta
+    /// se ven igual de recientes. Cloud ya lo guardaba; aquí faltaba.
+    ///
+    /// Ausente cuando el sistema de ficheros no lo reporta, y en todo cliente
+    /// anterior a esto — el server lo trata como desconocido, nunca como cero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
 }
 
 /// Cuerpo de `POST /v1/saves/{id}/cas/init`.

@@ -1047,6 +1047,48 @@ export function setTrayState(state: TrayStateName): Promise<void> {
 // Snapshot history, restore, manual override, logs
 // ---------------------------------------------------------------------------
 
+/** One labelled fact about a version. `kind` picks the formatting so a single
+ *  renderer can draw every game — a per-game probe adds fields, never a
+ *  component. */
+export type InsightField = {
+  kind: "text" | "number" | "duration" | "date" | "money" | "badge";
+  label: string;
+  value: string;
+};
+
+/** What a version is *about*, derived by the server from the version's own file
+ *  manifest: which save moved, how much changed, how many saves the folder
+ *  holds. Absent on versions uploaded before the server derived any of this,
+ *  and on legacy whole-archive versions with no per-file manifest — those rows
+ *  render exactly as they always did.
+ *
+ *  Field names are one or two letters because this is stored once per version;
+ *  the shape is `hoard_core::kernel::insight::VersionInsight`. */
+export type VersionInsight = {
+  /** Schema version. Unknown values render what we recognise and ignore the
+   *  rest. */
+  v: number;
+  /** The save's display name. */
+  t?: string;
+  /** Free line under the title; only a per-game probe sets it. */
+  s?: string;
+  /** Manifest path of the file the row is about. */
+  p?: string;
+  /** Distinct saves in the folder — worlds, characters, slots. */
+  n?: number;
+  /** Files added or rewritten since the previous version. */
+  c?: number;
+  /** Files the previous version had and this one doesn't. */
+  r?: number;
+  /** Signed size delta against the previous version, in bytes. */
+  d?: number;
+  /** sha256 of the thumbnail blob, once there are thumbnails. */
+  th?: string;
+  f?: InsightField[];
+  /** `generic`, or the name of the probe that filled this in. */
+  src: string;
+};
+
 export type SnapshotEntry = {
   version_num: number;
   file_count: number;
@@ -1058,6 +1100,7 @@ export type SnapshotEntry = {
   device_name: string | null;
   created_at: string;
   deleted_at: string | null;
+  insight: VersionInsight | null;
 };
 
 export type SnapshotFile = {

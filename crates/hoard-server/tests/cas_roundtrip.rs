@@ -144,12 +144,21 @@ fn sha_of(bytes: &[u8]) -> String {
 }
 
 fn manifest(files: &[(&str, &[u8])]) -> Vec<CasFile> {
+    manifest_at(files, &[])
+}
+
+/// Como [`manifest`], con mtime por fichero: `mtimes[i]` es el del fichero
+/// `files[i]`. Sin mtime todos los ficheros empatan y el protagonista del
+/// historial se elige por tamaño, que es lo que pasa con un cliente viejo.
+fn manifest_at(files: &[(&str, &[u8])], mtimes: &[i64]) -> Vec<CasFile> {
     files
         .iter()
-        .map(|(path, bytes)| CasFile {
+        .enumerate()
+        .map(|(i, (path, bytes))| CasFile {
             relative_path: (*path).into(),
             sha256: Sha256Hex::parse(&sha_of(bytes)).unwrap(),
             size_bytes: bytes.len() as i64,
+            modified_at: mtimes.get(i).copied(),
         })
         .collect()
 }
@@ -157,7 +166,18 @@ fn manifest(files: &[(&str, &[u8])]) -> Vec<CasFile> {
 /// Una copia completa: init → subir lo que falte → commit. Devuelve
 /// (versión, blobs que hubo que transmitir, bytes transmitidos).
 async fn backup(h: &Harness, files: &[(&str, &[u8])], base: Option<i64>) -> (i64, usize, i64) {
-    let m = manifest(files);
+    backup_at(h, files, &[], base).await.0
+}
+
+/// Una copia con mtimes declarados, que además devuelve el `Snapshot` entero
+/// para poder mirar lo que la fila del historial va a contar.
+async fn backup_at(
+    h: &Harness,
+    files: &[(&str, &[u8])],
+    mtimes: &[i64],
+    base: Option<i64>,
+) -> ((i64, usize, i64), hoard_core::wire::Snapshot) {
+    let m = manifest_at(files, mtimes);
     let init = cas::init(
         State(h.state.clone()),
         Extension(h.user.clone()),
@@ -207,7 +227,7 @@ async fn backup(h: &Harness, files: &[(&str, &[u8])], base: Option<i64>) -> (i64
     .1
      .0;
 
-    (snap.version_num, asked, asked_bytes)
+    ((snap.version_num, asked, asked_bytes), snap)
 }
 
 async fn used_bytes(pool: &SqlitePool) -> i64 {
@@ -405,6 +425,15 @@ async fn a_diverged_head_is_refused_before_and_after_the_upload() {
     .await
     .expect_err("non-fast-forward");
     assert_eq!(err.0, StatusCode::CONFLICT);
+    // The body has to name the row it rejected against, not just the versions.
+    // On Cloud that id can be a row the client has never heard of (its local id
+    // resolves by game+label), and a client that can't read it back has no way
+    // to find the head it must reconcile with — it looks itself up by the id it
+    // knows, finds nothing, and parks the conflict forever.
+    assert_eq!(err.1["code"], "non_fast_forward");
+    assert_eq!(err.1["head_version"], 1);
+    assert_eq!(err.1["base_version"], 0);
+    assert_eq!(err.1["save_id"], SAVE);
 
     // Init correcto, y entre medias otro equipo avanza la cabeza: el commit
     // tiene que negarse igual.
@@ -440,6 +469,8 @@ async fn a_diverged_head_is_refused_before_and_after_the_upload() {
     .await
     .expect_err("non-fast-forward en el commit");
     assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(err.1["head_version"], 9);
+    assert_eq!(err.1["save_id"], SAVE);
 }
 
 /// El tope por versión se mide sobre el tamaño lógico de la partida, y ahora se
@@ -453,6 +484,7 @@ async fn the_snapshot_cap_is_answered_before_any_byte_moves() {
         relative_path: "enorme.bin".into(),
         sha256: Sha256Hex::parse(&sha_of(b"x")).unwrap(),
         size_bytes: 200 * 1024 * 1024,
+        modified_at: None,
     }];
     let err = cas::init(
         State(h.state.clone()),
@@ -525,4 +557,48 @@ async fn another_users_upload_area_is_not_reachable() {
     .await
     .expect_err("id inválido");
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
+}
+
+/// Lo que la fila del historial cuenta de una versión.
+///
+/// Con 70 mundos en la misma carpeta, la fila tiene que nombrar el que se tocó
+/// y decir cuánto cambió; el número de versión y la fecha, que es todo lo que
+/// decía antes, no distinguen una copia de la siguiente. Se comprueba de punta
+/// a punta —mtime declarado por el cliente, manifiesto guardado, diff contra la
+/// versión anterior— porque cada pieza vive en un sitio distinto.
+#[tokio::test]
+async fn the_history_row_says_which_save_moved() {
+    let h = harness().await;
+    let world = vec![1u8; 4_000];
+    let world_v2 = vec![2u8; 5_000];
+    let autosave = vec![3u8; 4_000];
+
+    let (_, first) = backup_at(
+        &h,
+        &[("adwdaw.zip", &world), ("_autosave1.zip", &autosave)],
+        &[1_000, 2_000],
+        None,
+    )
+    .await;
+    let i = first.insight.expect("la primera versión ya trae insight");
+    // Nada cambió porque no hay versión anterior, pero la carpeta ya tiene dos
+    // partidas y una de ellas tiene nombre: el autosave no puede ser el titular.
+    assert_eq!(i.title.as_deref(), Some("adwdaw"));
+    assert_eq!(i.entries, 2);
+    assert_eq!(i.changed_files, 0);
+    assert_eq!(i.delta_bytes, 0);
+
+    let (_, second) = backup_at(
+        &h,
+        &[("adwdaw.zip", &world_v2), ("_autosave1.zip", &autosave)],
+        &[3_000, 2_000],
+        Some(1),
+    )
+    .await;
+    let i = second.insight.expect("la segunda versión también");
+    assert_eq!(i.title.as_deref(), Some("adwdaw"));
+    assert_eq!(i.primary_path.as_deref(), Some("adwdaw.zip"));
+    assert_eq!(i.changed_files, 1);
+    assert_eq!(i.removed_files, 0);
+    assert_eq!(i.delta_bytes, 1_000);
 }

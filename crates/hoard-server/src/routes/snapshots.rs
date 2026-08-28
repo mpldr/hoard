@@ -676,6 +676,10 @@ pub async fn create(
                     "code": "non_fast_forward",
                     "head_version": head,
                     "base_version": base,
+                    // Always the route's id: self-hosted never relabels rows.
+                    // Sent anyway so the body has one shape across both
+                    // deployments (see `cas::non_fast_forward`).
+                    "save_id": save_id,
                 })),
             ));
         }
@@ -892,6 +896,16 @@ pub async fn create(
         },
     );
 
+    // What the history row will say. After the commit and never fatal.
+    let insight = match crate::insight::record_selfhosted(&state.pool, &save_id, new_version).await
+    {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(error = %e, save_id = %save_id, version = new_version, "insight: not recorded");
+            None
+        }
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(Snapshot {
@@ -906,6 +920,7 @@ pub async fn create(
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),
+            insight,
         }),
     ))
 }
@@ -935,12 +950,12 @@ pub async fn list(
     // can be selected without regenerating the offline sqlx cache.
     let sql = if q.include_deleted {
         "SELECT id, version_num, parent_version, device_name, notes, total_size_bytes,
-                file_count, is_pinned, deleted_at, created_at
+                file_count, is_pinned, deleted_at, created_at, insight
          FROM snapshots WHERE save_id=?
          ORDER BY version_num DESC LIMIT ? OFFSET ?"
     } else {
         "SELECT id, version_num, parent_version, device_name, notes, total_size_bytes,
-                file_count, is_pinned, deleted_at, created_at
+                file_count, is_pinned, deleted_at, created_at, insight
          FROM snapshots WHERE save_id=? AND deleted_at IS NULL
          ORDER BY version_num DESC LIMIT ? OFFSET ?"
     };
@@ -967,8 +982,30 @@ pub async fn list(
                 .as_deref()
                 .map(repair_ts),
             created_at: repair_ts(&r.get::<String, _>("created_at")),
+            insight: crate::insight::parse_stored(r.get::<Option<String>, _>("insight").as_deref()),
         })
         .collect();
+
+    // Mismo motivo que en cloud: las versiones anteriores a esto salen sin
+    // etiqueta, y el sitio donde se nota es justo este. Se calculan fuera del
+    // camino de la respuesta, con tope, y la siguiente carga ya las trae.
+    let pending: Vec<i64> = rows
+        .iter()
+        .filter(|s| s.insight.is_none())
+        .map(|s| s.version_num)
+        .take(crate::insight::BACKFILL_PER_LISTING)
+        .collect();
+    if !pending.is_empty() {
+        let pool = state.pool.clone();
+        let sid = save_id.clone();
+        tokio::spawn(async move {
+            for version in pending {
+                if let Err(e) = crate::insight::record_selfhosted(&pool, &sid, version).await {
+                    tracing::debug!(error = %e, save_id = %sid, version, "insight: backfill failed");
+                }
+            }
+        });
+    }
 
     Ok(Json(rows))
 }
@@ -991,7 +1028,7 @@ pub async fn detail(
 
     let snap = sqlx::query(
         "SELECT id, version_num, parent_version, device_name, notes, total_size_bytes,
-                file_count, is_pinned, deleted_at, created_at
+                file_count, is_pinned, deleted_at, created_at, insight
          FROM snapshots WHERE save_id=? AND version_num=?",
     )
     .bind(&save_id)
@@ -1045,6 +1082,9 @@ pub async fn detail(
                 .as_deref()
                 .map(repair_ts),
             created_at: repair_ts(&snap.get::<String, _>("created_at")),
+            insight: crate::insight::parse_stored(
+                snap.get::<Option<String>, _>("insight").as_deref(),
+            ),
         },
         files,
     }))

@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod clientip;
 pub mod config;
 pub mod db;
+pub mod insight;
 pub mod ratelimit;
 pub mod retention;
 pub mod routes;

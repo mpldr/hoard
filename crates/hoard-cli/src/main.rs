@@ -521,6 +521,14 @@ struct SnapshotRow {
     /// trashed version still lists, and restoring one by accident is exactly
     /// the mistake worth making impossible to stumble into.
     state: &'static str,
+    /// The save this version is about, derived by the server from the manifest.
+    /// `None` on versions stored before it did that, and on servers that don't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_name: Option<String>,
+    /// Files added or rewritten since the previous version. `None` when there
+    /// is no insight to say — never `0`, which would claim nothing changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_files: Option<u32>,
 }
 
 async fn list_snapshots(
@@ -544,6 +552,8 @@ async fn list_snapshots(
             } else {
                 "active"
             },
+            save_name: s.insight.as_ref().and_then(|i| i.title.clone()),
+            changed_files: s.insight.as_ref().map(|i| i.changed_files),
         })
         .collect();
 
@@ -556,14 +566,17 @@ async fn list_snapshots(
         // partida sincronizada en dos equipos, la fecha no dice cuál de las dos
         // copias es. Las versiones anteriores a que el server lo guardara salen
         // con "—".
+        // La columna SAVE es la que contesta "¿cuál de mis partidas es esta?"
+        // con varias en la misma carpeta. Vacía donde el server no lo derivó.
         println!(
-            "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  STATE",
-            "VER", "FILES", "SIZE", "CREATED", "DEVICE"
+            "{:>5}  {:<20}  {:>5}  {:>10}  {:<25}  {:<16}  STATE",
+            "VER", "SAVE", "FILES", "SIZE", "CREATED", "DEVICE"
         );
         for s in rows {
             println!(
-                "{:>5}  {:>5}  {:>10}  {:<25}  {:<16}  {}",
+                "{:>5}  {:<20}  {:>5}  {:>10}  {:<25}  {:<16}  {}",
                 s.version_num,
+                s.save_name.as_deref().unwrap_or("—"),
                 s.file_count,
                 fmt_bytes(s.total_size_bytes as u64),
                 s.created_at,

@@ -59,13 +59,27 @@ pub struct UploadInit {
 }
 
 /// 409 response for a divergent (non-fast-forward) push. Carries the current
-/// head so the client knows which version it must reconcile against.
+/// head so the client knows which version it must reconcile against, and the
+/// canonical save id it must reconcile *as*.
+///
+/// The id matters as much as the version. Clients key saves by their own
+/// device-local id; `resolve_save_row` accepts one that this server has never
+/// seen and resolves it by `(user, game_slug, label)`. When that happens the
+/// client is pushing against a row whose id it doesn't know, so it can't find
+/// itself in the manifest afterwards: it looks itself up by the local id,
+/// finds nothing, concludes there is nothing to pull, and parks the conflict
+/// with no way out. Answering with the row we actually rejected against is
+/// what lets it reconcile instead of stalling.
 #[derive(Debug, Serialize)]
 struct NonFastForwardResponse {
     error: &'static str,
     code: &'static str,
     head_version: i64,
     base_version: i64,
+    /// The cloud's own id for the save this upload resolved to. Equal to the
+    /// requested id in the common case; different when two devices track the
+    /// same (game, label) under different local ids.
+    save_id: String,
 }
 
 impl IntoResponse for NonFastForwardResponse {
@@ -206,6 +220,7 @@ pub async fn init_upload(
             code: "non_fast_forward",
             head_version: head,
             base_version: base,
+            save_id: save_row.0.clone(),
         }
         .into_response());
     }
@@ -686,6 +701,7 @@ pub async fn cas_init(
             code: "non_fast_forward",
             head_version: head,
             base_version: base,
+            save_id: save_row.0.clone(),
         }
         .into_response());
     }
@@ -1073,12 +1089,27 @@ pub async fn cas_commit(
         "cas_commit: committed"
     );
 
+    // What the history row will say about this version. Off the critical path
+    // and never fatal: the version is committed, and a row that fails to get a
+    // label is a cosmetic loss.
+    if let Err(e) = crate::insight::record_cloud(&state.pool, &save_id, version).await {
+        tracing::warn!(error = ?e, save_id = %save_id, version, "insight: not recorded");
+    }
+
     // Reclaim space if this commit pushed the user over their plan threshold.
     // Off the response path: a slow R2 delete sweep mustn't delay the client.
     // Then enforce the user's own max-versions cap on the fresh history.
     let st = state.clone();
     let uid = user.user_id;
+    let sid = save_id.clone();
     tokio::spawn(async move {
+        // What the history row will say about this version. Off the response
+        // path and never fatal: the version is committed, and a row that fails
+        // to get a label is a cosmetic loss — not two more queries on the
+        // client's 60 s commit budget.
+        if let Err(e) = crate::insight::record_cloud(&st.pool, &sid, version).await {
+            tracing::warn!(error = ?e, save_id = %sid, version, "insight: not recorded");
+        }
         if let Err(e) = crate::cloud::purge::maybe_purge(&st, uid).await {
             tracing::warn!(error = ?e, user_id = %uid, "quota purge after commit failed");
         }
@@ -1454,6 +1485,11 @@ pub struct VersionEntry {
     pub created_at: time::OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     pub deleted_at: Option<time::OffsetDateTime>,
+    /// Lo que la fila cuenta de esta versión: de qué partida va, qué cambió
+    /// desde la anterior. Ausente en todo lo subido antes de que el server lo
+    /// derivara, y el cliente lo pinta como siempre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insight: Option<hoard_core::kernel::insight::VersionInsight>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1493,10 +1529,11 @@ pub async fn list_versions(
         Option<String>,
         time::OffsetDateTime,
         Option<time::OffsetDateTime>,
+        Option<sqlx::types::JsonValue>,
     );
     let rows: Vec<Row> = sqlx::query_as(
         r#"
-        SELECT version_num, size_bytes, parent_version, file_count, is_pinned, device_name, created_at, deleted_at
+        SELECT version_num, size_bytes, parent_version, file_count, is_pinned, device_name, created_at, deleted_at, insight
           FROM save_versions
          WHERE save_id = $1
            AND sha256 <> ''
@@ -1512,7 +1549,17 @@ pub async fn list_versions(
     let out = rows
         .into_iter()
         .map(
-            |(version_num, size, parent, file_count, is_pinned, device_name, created, deleted)| {
+            |(
+                version_num,
+                size,
+                parent,
+                file_count,
+                is_pinned,
+                device_name,
+                created,
+                deleted,
+                insight,
+            )| {
                 VersionEntry {
                     id: version_num.to_string(),
                     save_id: save_id.clone(),
@@ -1524,10 +1571,37 @@ pub async fn list_versions(
                     device_name,
                     created_at: created,
                     deleted_at: deleted,
+                    // Stored state, so a value this binary can't read is a row
+                    // without a label, never a failed listing.
+                    insight: insight
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 }
             },
         )
+        .collect::<Vec<VersionEntry>>();
+
+    // Label whatever this listing found unlabelled. Everything uploaded before
+    // the server derived any of this has no insight, and the history page is
+    // exactly where someone notices; computing it here means the next load
+    // shows it, without a migration that walks every version of every user.
+    let pending: Vec<i64> = out
+        .iter()
+        .filter(|v: &&VersionEntry| v.insight.is_none())
+        .map(|v| v.version_num)
+        .take(crate::insight::BACKFILL_PER_LISTING)
         .collect();
+    if !pending.is_empty() {
+        let pool = state.pool.clone();
+        let sid = save_id.clone();
+        tokio::spawn(async move {
+            for version in pending {
+                if let Err(e) = crate::insight::record_cloud(&pool, &sid, version).await {
+                    tracing::debug!(error = ?e, save_id = %sid, version, "insight: backfill failed");
+                }
+            }
+        });
+    }
+
     Ok(Json(out))
 }
 

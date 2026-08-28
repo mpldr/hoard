@@ -63,6 +63,28 @@ pub enum ApiError {
     /// (or send to their ISP) and the part that carries no signature.
     #[error("can't reach the storage endpoint ({host}): {reason}")]
     StorageUnreachable { host: String, reason: String },
+    /// HTTP 409 with `code:"non_fast_forward"` — the server's head moved past
+    /// the `base_version` this upload declared, so another device advanced the
+    /// save since we last synced.
+    ///
+    /// Typed, and not left inside [`Self::Conflict`]'s message, because the
+    /// body answers the two questions the caller has to answer to recover, and
+    /// as a string both were being thrown away:
+    ///
+    /// - **which version** is the head now (`head_version`), so the retry can
+    ///   fast-forward from it instead of asking a second endpoint;
+    /// - **which row** the push was rejected against (`save_id`). A client keys
+    ///   saves by its own device-local id and the server resolves that id by
+    ///   `(user, game_slug, label)`, so the row it rejected against can be one
+    ///   whose id this device has never seen. That is what stalled a save for
+    ///   two weeks in aug-2026: the reconcile looked itself up in the manifest
+    ///   by the local id, found nothing, reported "nothing to pull", and parked
+    ///   the conflict — with the head it needed sitting unread in this body.
+    ///
+    /// A server too old to send `code` still lands in [`Self::Conflict`], and
+    /// the callers keep their message-text fallback for exactly that.
+    #[error("{}", .0.human())]
+    NonFastForward(NonFastForward),
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -163,6 +185,54 @@ pub struct SaveTooLarge {
     /// [`Self::from_foreign_body`], never deserialized.
     #[serde(skip)]
     pub from_proxy: bool,
+}
+
+/// Structured body of a `non_fast_forward` 409, from either deployment. Same
+/// defaulting discipline as [`SaveTooLarge`]: a body we can't fully parse still
+/// yields a usable error, it just recovers less.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NonFastForward {
+    /// The server's current head for this save. `0` when the body didn't say
+    /// (a server older than this field), which the callers read as "unknown"
+    /// and fall back to asking the manifest.
+    #[serde(default)]
+    pub head_version: i64,
+    /// The base this upload declared and that the server refused.
+    #[serde(default)]
+    pub base_version: i64,
+    /// The server's own id for the row it rejected against. Usually the id we
+    /// sent; different when this device's local id resolved to another row.
+    /// Empty from a server that predates the field.
+    #[serde(default)]
+    pub save_id: String,
+}
+
+impl NonFastForward {
+    /// The head to reconcile against, when the server named one. `None` keeps
+    /// "the server didn't say" distinct from "the head is version 0" — the
+    /// caller must go ask rather than rebase onto a number we invented.
+    pub fn head(&self) -> Option<i64> {
+        (self.head_version > 0).then_some(self.head_version)
+    }
+
+    /// The canonical save id, when the server named one **and** it isn't the
+    /// one we already believe. `None` means "nothing to relabel".
+    pub fn canonical_id_for<'a>(&'a self, local_id: &str) -> Option<&'a str> {
+        (!self.save_id.is_empty() && self.save_id != local_id).then_some(self.save_id.as_str())
+    }
+
+    pub fn human(&self) -> String {
+        let mut s = String::from(
+            "non-fast-forward: another device advanced this save since your base version",
+        );
+        if self.head_version > 0 {
+            s.push_str(&format!(
+                " (head {}, base {})",
+                self.head_version, self.base_version
+            ));
+        }
+        s
+    }
 }
 
 /// Structured body of a Hoard Cloud `quota_exceeded` 402. Same defaulting
@@ -353,6 +423,14 @@ impl ApiError {
                     .filter(|d| !d.code.is_empty())
                     .unwrap_or_else(SaveTooLarge::from_foreign_body),
             ),
+            // Only the tagged one is typed. Every other 409 on these clients is
+            // a duplicate label on rename, which has nothing to reconcile and
+            // whose callers match on `Conflict`.
+            StatusCode::CONFLICT if extract_code(&body).as_deref() == Some("non_fast_forward") => {
+                ApiError::NonFastForward(
+                    serde_json::from_str::<NonFastForward>(&body).unwrap_or_default(),
+                )
+            }
             StatusCode::CONFLICT => ApiError::Conflict(extract_message(&body)),
             StatusCode::BAD_REQUEST => ApiError::BadRequest(extract_message(&body)),
             StatusCode::TOO_MANY_REQUESTS => {
@@ -1632,6 +1710,47 @@ pub struct CloudManifest {
     pub saves: Vec<CloudManifestEntry>,
 }
 
+/// The cloud keys a save by `(user, game_slug, label)`; this device keys it by
+/// a local uuid it made up. `cas_init` bridges the two — it accepts an id the
+/// server has never seen and resolves it by name — so a device whose local id
+/// drifted (a folder re-detected, a rebuilt state file) keeps uploading fine
+/// while being unable to find itself in anything the server hands back.
+///
+/// That asymmetry is what has to be undone here, and in one place: every
+/// lookup of "what does the cloud say about this save" goes through
+/// [`CloudManifest::entry_for`], which tries the id and then the name — the
+/// same two steps, in the same order, as the server's own `resolve_save_row`.
+/// Matching by name can't collide: the cloud holds at most one row per
+/// `(user, game_slug, label)`, which is also why multi-folder slots put their
+/// number in the label.
+impl CloudManifest {
+    pub fn entry_for(
+        &self,
+        save_id: &str,
+        game_slug: &str,
+        label: &str,
+    ) -> Option<&CloudManifestEntry> {
+        if let Some(e) = self.saves.iter().find(|e| e.save_id == save_id) {
+            return Some(e);
+        }
+        let want = canonical_label(label);
+        self.saves
+            .iter()
+            .find(|e| e.game_slug == game_slug && canonical_label(&e.label) == want)
+    }
+}
+
+/// An empty label is the server's `"default"` — `resolve_save_row` substitutes
+/// it on the way in, so a client that stored the empty string would otherwise
+/// fail to match its own row.
+fn canonical_label(label: &str) -> &str {
+    if label.is_empty() {
+        "default"
+    } else {
+        label
+    }
+}
+
 // ---- Cloud content-addressed (per-file dedup) DTOs ---------------------
 
 /// One file in a content-addressed upload manifest. Mirrors the server's
@@ -1852,7 +1971,10 @@ mod rate_limit_tests {
         let d = paced_quota_detail(body).expect("the quota figures ride in the paced body");
         assert_eq!(d.plan, "free");
         assert_eq!(d.limit_bytes, 2 * 1024 * 1024 * 1024);
-        assert_eq!(d.upgrade_url.as_deref(), Some("https://hoard.services/upgrade"));
+        assert_eq!(
+            d.upgrade_url.as_deref(),
+            Some("https://hoard.services/upgrade")
+        );
 
         // Every other budget 429 is genuinely just a wait — nothing to offer,
         // nothing to explain, and inventing a "you are full" prompt out of a
@@ -1955,5 +2077,142 @@ mod plan_cap_tests {
         let clone = c.clone();
         c.remember_plan_cap(50, "free");
         assert_eq!(clone.plan_cap().expect("shared").limit_bytes, 50);
+    }
+}
+
+/// The two-key bridge: the cloud names a save `(user, game, label)`, this
+/// machine names it a uuid, and `cas_init` accepts either. These pin the
+/// resolution order down, because getting it wrong is silent — a miss reads
+/// exactly like "the server has nothing for this save".
+#[cfg(test)]
+mod manifest_resolution_tests {
+    use super::*;
+
+    fn entry(save_id: &str, game_slug: &str, label: &str, v: i64) -> CloudManifestEntry {
+        CloudManifestEntry {
+            save_id: save_id.into(),
+            game_slug: game_slug.into(),
+            label: label.into(),
+            latest_version_num: v,
+            latest_parent_version: None,
+            latest_size_bytes: 0,
+            latest_file_count: 0,
+            latest_sha256: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn manifest(saves: Vec<CloudManifestEntry>) -> CloudManifest {
+        CloudManifest {
+            generated_at: String::new(),
+            saves,
+        }
+    }
+
+    /// The id wins when the server knows it. Nothing clever happens in the
+    /// common case.
+    #[test]
+    fn the_id_matches_first() {
+        let m = manifest(vec![
+            entry("mine", "factorio", "main", 7),
+            entry("theirs", "factorio", "other", 9),
+        ]);
+        let e = m.entry_for("mine", "factorio", "main").expect("by id");
+        assert_eq!(e.save_id, "mine");
+    }
+
+    /// The aug-2026 case. A local id the cloud has never seen still finds its
+    /// row by name — the same fallback `resolve_save_row` does on the way in,
+    /// so the client sees the row it is actually uploading to.
+    #[test]
+    fn an_unknown_id_falls_back_to_game_and_label() {
+        let m = manifest(vec![entry("cloud-side", "factorio", "main", 284)]);
+        let e = m
+            .entry_for("local-only", "factorio", "main")
+            .expect("by name");
+        assert_eq!(e.save_id, "cloud-side");
+        assert_eq!(e.latest_version_num, 284);
+    }
+
+    /// Two folders of one game are two rows, told apart by the label (that is
+    /// what multi-folder slots put their number in). The fallback must not
+    /// collapse them onto whichever came first.
+    #[test]
+    fn the_label_keeps_slots_of_one_game_apart() {
+        let m = manifest(vec![
+            entry("row-1", "factorio", "main", 284),
+            entry("row-2", "factorio", "2 · shit3", 23),
+        ]);
+        let e = m
+            .entry_for("local-only", "factorio", "2 · shit3")
+            .expect("by name");
+        assert_eq!(e.save_id, "row-2");
+    }
+
+    /// An empty label is the server's `"default"`, on both sides of the
+    /// comparison — otherwise a save stored with one spelling never matches
+    /// its own row.
+    #[test]
+    fn an_empty_label_is_the_servers_default() {
+        let m = manifest(vec![entry("cloud-side", "factorio", "default", 3)]);
+        assert_eq!(
+            m.entry_for("local-only", "factorio", "")
+                .expect("empty matches default")
+                .save_id,
+            "cloud-side"
+        );
+        let m = manifest(vec![entry("cloud-side", "factorio", "", 3)]);
+        assert_eq!(
+            m.entry_for("local-only", "factorio", "default")
+                .expect("default matches empty")
+                .save_id,
+            "cloud-side"
+        );
+    }
+
+    /// No row for this game at all stays a miss. The fallback resolves an id,
+    /// it doesn't invent a save.
+    #[test]
+    fn a_game_with_no_row_still_misses() {
+        let m = manifest(vec![entry("row-1", "stellaris", "main", 4)]);
+        assert!(m.entry_for("local-only", "factorio", "main").is_none());
+    }
+}
+
+/// The 409 body carries the two things the retry needs. It used to arrive as a
+/// string and both were dropped on the floor.
+#[cfg(test)]
+mod non_fast_forward_tests {
+    use super::*;
+
+    #[test]
+    fn a_tagged_409_parses_head_and_canonical_id() {
+        let body = r#"{"error":"non-fast-forward: another device advanced this save since your base version","code":"non_fast_forward","head_version":284,"base_version":283,"save_id":"cloud-side"}"#;
+        let d: NonFastForward = serde_json::from_str(body).expect("parses");
+        assert_eq!(d.head(), Some(284));
+        assert_eq!(d.canonical_id_for("local-only"), Some("cloud-side"));
+        assert!(d.human().contains("head 284, base 283"));
+    }
+
+    /// A server that answers with the id we sent has nothing to relabel — the
+    /// caller must not log a divergence that didn't happen.
+    #[test]
+    fn the_same_id_back_is_not_a_divergence() {
+        let body =
+            r#"{"code":"non_fast_forward","head_version":9,"base_version":8,"save_id":"mine"}"#;
+        let d: NonFastForward = serde_json::from_str(body).expect("parses");
+        assert_eq!(d.canonical_id_for("mine"), None);
+    }
+
+    /// A server too old to send the fields degrades to "we diverged, and that
+    /// is all I know" — `head()` stays `None` rather than claiming version 0,
+    /// which is what keeps the caller from rebasing onto a number we invented.
+    #[test]
+    fn an_older_server_says_nothing_rather_than_zero() {
+        let body = r#"{"error":"non-fast-forward: another device advanced this save since your base version","code":"non_fast_forward"}"#;
+        let d: NonFastForward = serde_json::from_str(body).expect("parses");
+        assert_eq!(d.head(), None);
+        assert_eq!(d.canonical_id_for("mine"), None);
+        assert!(!d.human().contains("head"));
     }
 }

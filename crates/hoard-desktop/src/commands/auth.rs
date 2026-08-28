@@ -408,6 +408,7 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
                  so this is the connection between this machine and the storage — a VPN, \
                  a firewall, or the network's route to it."
             ),
+            ApiError::NonFastForward(d) => d.human(),
             ApiError::Conflict(msg) | ApiError::BadRequest(msg) => msg.clone(),
         };
     }

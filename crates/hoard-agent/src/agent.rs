@@ -453,7 +453,13 @@ enum AgentCommand {
     /// el motor observa la cabeza por su cuenta ([`Self::CloudHeadsObserved`])
     /// cuando este empujón se retrasa, así que un poller muerto ya no lo deja
     /// ciego.
-    SetCloudVersions(HashMap<String, i64>),
+    SetCloudVersions {
+        versions: HashMap<String, i64>,
+        /// `(game_slug, label)` → `save_id`, from the same manifest the versions
+        /// came from. See [`CloudHeads::aliases`] for why a version map keyed by
+        /// the server's ids alone can't answer for every tracked save.
+        aliases: HashMap<(String, String), String>,
+    },
     /// Interno (ADR 0021 D.12): resultado de la observación de la nube que el
     /// **propio motor** dispara desde su tick. La consulta vive en el shell —el
     /// kernel no hace IO— y entra al reductor como parte de la `Observation`.
@@ -463,6 +469,10 @@ enum AgentCommand {
         /// caída, 401, self-hosted): la marca de frescura **no** se sella, así
         /// que la ceguera sigue siendo visible en vez de disfrazarse de feed.
         versions: Option<HashMap<String, i64>>,
+        /// `(game_slug, label)` → `save_id`, from the same manifest pass. Lets
+        /// the cache answer for a save whose local id the cloud has never seen
+        /// (see [`CloudHeads::aliases`]).
+        aliases: Option<HashMap<(String, String), String>>,
         /// Qué contenido tiene cada cabeza (digest del manifiesto), para el
         /// chequeo anti-relanzamiento de D.8.3. Viaja junto a `versions` y de
         /// la misma pasada del manifiesto, así que los dos describen el mismo
@@ -574,9 +584,13 @@ impl AgentHandle {
     /// `cloud_pull` poller's manifest. Lets the reconciliation sweep skip the
     /// per-save metadata fetch it would otherwise make. See
     /// [`AgentCommand::SetCloudVersions`].
-    pub async fn set_cloud_versions(&self, versions: HashMap<String, i64>) -> Result<()> {
+    pub async fn set_cloud_versions(
+        &self,
+        versions: HashMap<String, i64>,
+        aliases: HashMap<(String, String), String>,
+    ) -> Result<()> {
         self.tx
-            .send(AgentCommand::SetCloudVersions(versions))
+            .send(AgentCommand::SetCloudVersions { versions, aliases })
             .await?;
         Ok(())
     }
@@ -960,6 +974,18 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
 struct CloudHeads {
     /// Última versión cloud por `save_id`, tal cual la trajo el manifest.
     versions: HashMap<String, i64>,
+    /// `(game_slug, label)` → the `save_id` the cloud knows that row by.
+    ///
+    /// The bridge between the two keys. The cloud identifies a save by name and
+    /// this machine by a uuid it made up; `cas_init` takes the uuid and resolves
+    /// it by name, so a device whose local id drifted (a re-detected folder, a
+    /// rebuilt `state.json`) keeps uploading fine while being unable to find
+    /// itself in anything the server hands back. Without this index
+    /// `versions.get(local_id)` is `None` forever: the row goes blind to the
+    /// cloud — it sees no new versions and can't clear a conflict — and does it
+    /// silently, because "absent from the manifest" and "converged" read the
+    /// same. That is what left a save fourteen days out of sync in aug-2026.
+    aliases: HashMap<(String, String), String>,
     /// **Qué contenido** tiene esa cabeza, por `save_id`: el digest del
     /// manifiesto que publica el server (ADR 0021 D.8.3). Sólo lo llena la
     /// observación propia del motor —el empujón del cliente trae versiones, no
@@ -987,6 +1013,7 @@ impl CloudHeads {
     fn new(now: OffsetDateTime) -> Self {
         Self {
             versions: HashMap::new(),
+            aliases: HashMap::new(),
             digests: HashMap::new(),
             as_of: None,
             last_attempt_at: None,
@@ -1001,14 +1028,50 @@ impl CloudHeads {
     fn feed(
         &mut self,
         versions: HashMap<String, i64>,
+        aliases: Option<HashMap<(String, String), String>>,
         digests: Option<HashMap<String, ServerHead>>,
         now: OffsetDateTime,
     ) {
         self.versions = versions;
+        // Same deal as `digests`: a push that carries no names leaves the ones
+        // already here. A stale alias can only point at a row that is no longer
+        // in `versions`, and `cloud_id_for` throws it out when it is.
+        if let Some(aliases) = aliases {
+            self.aliases = aliases;
+        }
         if let Some(digests) = digests {
             self.digests = digests;
         }
         self.as_of = Some(now);
+    }
+
+    /// The id the cloud knows this save by: ours if it recognises it, otherwise
+    /// the row carrying its `(game, label)` — the same two steps the server
+    /// itself takes in `resolve_save_row`, in the same order.
+    ///
+    /// An alias only counts while the row it names is still in this pass's feed;
+    /// otherwise it describes a row that has been deleted.
+    fn cloud_id_for<'a>(&'a self, save: &'a WatchedSave) -> &'a str {
+        if self.versions.contains_key(&save.save_id) {
+            return &save.save_id;
+        }
+        let label = if save.label.is_empty() {
+            "default"
+        } else {
+            save.label.as_str()
+        };
+        match self
+            .aliases
+            .get(&(save.game_slug.clone(), label.to_string()))
+        {
+            Some(id) if self.versions.contains_key(id) => id.as_str(),
+            _ => &save.save_id,
+        }
+    }
+
+    /// A save's head, resolving first which id the cloud knows it by.
+    fn version_for(&self, save: &WatchedSave) -> Option<i64> {
+        self.versions.get(self.cloud_id_for(save)).copied()
     }
 
     /// La cabeza de un save **con su contenido**, para el chequeo
@@ -1019,9 +1082,10 @@ impl CloudHeads {
     /// describiría un contenido que ya no es el del server, y creérselo sería
     /// saltarse una subida que sí hace falta. Emparejar en vez de mantener dos
     /// mapas sueltos es lo que hace imposible ese fallo.
-    fn head_for(&self, save_id: &str) -> Option<&ServerHead> {
-        let head = self.digests.get(save_id)?;
-        (self.versions.get(save_id) == Some(&head.version_num)).then_some(head)
+    fn head_for(&self, save: &WatchedSave) -> Option<&ServerHead> {
+        let id = self.cloud_id_for(save);
+        let head = self.digests.get(id)?;
+        (self.versions.get(id) == Some(&head.version_num)).then_some(head)
     }
 
     /// El ancla del margen de arranque que va en la [`kernel::Observation`]:
@@ -1138,9 +1202,26 @@ async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>)
                 // juntos a propósito — un digest de una pasada distinta
                 // describiría un contenido que ya no es el de esa versión.
                 let mut versions: HashMap<String, i64> = HashMap::new();
+                let mut aliases: HashMap<(String, String), String> = HashMap::new();
                 let mut digests: HashMap<String, ServerHead> = HashMap::new();
                 for e in manifest.saves {
                     versions.insert(e.save_id.clone(), e.latest_version_num);
+                    // The name→id index. Built from the same pass so it can
+                    // never describe a row this feed doesn't carry. The cloud
+                    // holds one row per (user, game, label), so the key is
+                    // unique by construction; an empty label is the server's
+                    // "default" (see `resolve_save_row`).
+                    aliases.insert(
+                        (
+                            e.game_slug.clone(),
+                            if e.label.is_empty() {
+                                "default".to_string()
+                            } else {
+                                e.label.clone()
+                            },
+                        ),
+                        e.save_id.clone(),
+                    );
                     digests.insert(
                         e.save_id,
                         ServerHead {
@@ -1150,7 +1231,7 @@ async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>)
                     );
                 }
                 tracing::debug!(count = versions.len(), "agent: observed cloud heads");
-                Some((versions, digests))
+                Some((versions, aliases, digests))
             }
             Err(e) => {
                 // A warn, no debug: desde D.12 esto es la vía principal de
@@ -1166,13 +1247,14 @@ async fn observe_cloud_heads(api: ApiClient, cmd_tx: mpsc::Sender<AgentCommand>)
         }
         None
     };
-    let (versions, digests) = match observed {
-        Some((versions, digests)) => (Some(versions), Some(digests)),
-        None => (None, None),
+    let (versions, aliases, digests) = match observed {
+        Some((versions, aliases, digests)) => (Some(versions), Some(aliases), Some(digests)),
+        None => (None, None, None),
     };
     let _ = cmd_tx
         .send(AgentCommand::CloudHeadsObserved {
             versions,
+            aliases,
             digests,
             is_cloud,
         })
@@ -1212,7 +1294,7 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
         save_files_locked: !slot.is_running
             && !slot.save.track_only
             && crate::locks::any_file_locked(&slot.save.local_path),
-        cloud_version: cloud.versions.get(&slot.save.save_id).copied(),
+        cloud_version: cloud.version_for(&slot.save),
         // La marca es del *feed*, no del save: el manifest viene entero, así que
         // un save ausente de él tiene `cloud_version: None` con la marca igual
         // de fresca. Es lo que deja al kernel distinguir "convergido" de
@@ -1278,6 +1360,9 @@ fn reconcile_all(
         // next go out, and the shell owes the user that number (see the
         // `Hold` arm below).
         let floor = kernel::reconcile::backup_floor(&next);
+        // Read while `slot` is still borrowed — `execute_action` takes the whole
+        // map, so the head has to be resolved and cloned before that.
+        let server_head = cloud.head_for(&slot.save).cloned();
         apply_state_to_slot(slot, next);
 
         // Eventos stuck/recovered puramente del delta de la escalada de fallos.
@@ -1351,7 +1436,7 @@ fn reconcile_all(
                     cmd_tx,
                     config,
                     done_tx,
-                    cloud.head_for(&id).cloned(),
+                    server_head.clone(),
                 ),
                 kernel::Decision::Hold { reason } => {
                     tracing::debug!(save_id = %id, reason, "agent: reconcile hold");
@@ -1823,7 +1908,7 @@ async fn run_agent(
                             &cloud_heads,
                         );
                     }
-                    Some(AgentCommand::SetCloudVersions(map)) => {
+                    Some(AgentCommand::SetCloudVersions { versions: map, aliases }) => {
                         tracing::debug!(
                             count = map.len(),
                             "agent: cloud version cache updated from poller"
@@ -1840,7 +1925,7 @@ async fn run_agent(
                         // permite al reductor decir "ciego" en vez de
                         // "convergido" si el poller vuelve a enmudecer (ADR 0021
                         // D.10).
-                        cloud_heads.feed(map, None, OffsetDateTime::now_utc());
+                        cloud_heads.feed(map, Some(aliases), None, OffsetDateTime::now_utc());
                         // Un empujón sólo puede venir de un cliente cloud (el
                         // poller del desktop o `cloud_live` de la CLI, ambos
                         // detrás de una sesión cloud), así que sirve de
@@ -1860,7 +1945,7 @@ async fn run_agent(
                             &cloud_heads,
                         );
                     }
-                    Some(AgentCommand::CloudHeadsObserved { versions, digests, is_cloud }) => {
+                    Some(AgentCommand::CloudHeadsObserved { versions, aliases, digests, is_cloud }) => {
                         // El motor miró la nube por su cuenta (ADR 0021 D.12).
                         // El latch de contexto sólo se mueve con una respuesta
                         // definida: un probe fallido no puede degradar un
@@ -1878,7 +1963,7 @@ async fn run_agent(
                                 count = map.len(),
                                 "agent: cloud version cache updated from the engine's own observation"
                             );
-                            cloud_heads.feed(map, digests, OffsetDateTime::now_utc());
+                            cloud_heads.feed(map, aliases, digests, OffsetDateTime::now_utc());
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
@@ -2520,7 +2605,7 @@ fn spawn_auto_restore(
     // cache yet) the first task pulls `/v1/cloud/sync` once and the rest
     // reuse it, instead of N tasks fetching the identical manifest (the
     // startup burst that tripped the server's poll guard).
-    shared_manifest: Option<Arc<tokio::sync::OnceCell<HashMap<String, i64>>>>,
+    shared_manifest: Option<Arc<tokio::sync::OnceCell<crate::api::CloudManifest>>>,
 ) {
     tokio::spawn(async move {
         tracing::debug!(
@@ -2551,7 +2636,7 @@ fn spawn_auto_restore(
         )
         .await
         {
-            Ok(Some(outcome)) => {
+            Ok(AutoRestorePull::Merged(outcome)) => {
                 // We downloaded and diffed against this version; remember it so
                 // the next sweep can short-circuit.
                 synced_version = Some(outcome.version_num);
@@ -2612,12 +2697,14 @@ fn spawn_auto_restore(
                 }
                 // else: every file present and identical — silent no-op.
             }
-            Ok(None) => {
-                // Nothing to pull. `run_auto_restore` already logged which
-                // case it was (already synced vs. no snapshots on the server)
-                // — don't second-guess it here, the old unconditional "no
-                // snapshots yet" line contradicted the up-to-date path.
-            }
+            // Nothing to pull, either way. `run_auto_restore` already logged
+            // which case it was — don't second-guess it here, the old
+            // unconditional "no snapshots yet" line contradicted the up-to-date
+            // path. Neither arm touches `synced_version`: the gate only fires
+            // when this device is already at or past head, so writing the
+            // server's number back could walk our own cursor backwards.
+            Ok(AutoRestorePull::AlreadyAtHead { .. }) => {}
+            Ok(AutoRestorePull::NothingRemote) => {}
             Err(e) => {
                 // A 404 means the save has no record/snapshot on the backend
                 // (carried over from another account, stale state, or the
@@ -2869,9 +2956,14 @@ async fn run_auto_restore(
     conflict_root: Option<&Path>,
     retention: Duration,
     known_version: Option<i64>,
+    // A head somebody else already learned, to skip the fetch. It carries a
+    // version but no id, so it can only be trusted for a save whose local id
+    // *is* the cloud's — every caller today passes `None` and takes the
+    // resolving path below. Don't start passing it without carrying the id
+    // alongside: a version read off one row and downloaded from another 404s.
     cached_latest: Option<i64>,
-    shared_manifest: Option<Arc<tokio::sync::OnceCell<HashMap<String, i64>>>>,
-) -> Result<Option<AutoRestoreOutcome>> {
+    shared_manifest: Option<Arc<tokio::sync::OnceCell<crate::api::CloudManifest>>>,
+) -> Result<AutoRestorePull> {
     // Prefer the version the cloud_pull poller already learned this tick: it
     // fetched the whole manifest once, so reusing it spares us a per-save
     // `cloud_sync`/`get_save` round-trip (the old sweep N+1). When the poller
@@ -2879,35 +2971,47 @@ async fn run_auto_restore(
     // that role: one fetch for the whole batch of restores. Only the
     // authoritative force-restore / pre-launch barrier paths (which pass
     // neither) and self-hosted / headless one-offs hit the network per save.
-    let latest = match cached_latest {
-        Some(v) => Some(v),
+    // Which cloud row is this save, and how far ahead is it? The two answers
+    // come together on purpose: the id we must do the IO with is not always the
+    // id we track locally (see `CloudManifest::entry_for`), and a version read
+    // off one row while downloading from another is how a restore 404s.
+    let (cloud_id, latest) = match cached_latest {
+        Some(v) => (save.save_id.clone(), Some(v)),
         None => {
             if api.is_cloud().await {
-                match &shared_manifest {
+                let manifest = match &shared_manifest {
                     Some(cell) => cell
-                        .get_or_try_init(|| async {
-                            Ok::<_, anyhow::Error>(
-                                api.cloud_sync()
-                                    .await?
-                                    .saves
-                                    .into_iter()
-                                    .map(|e| (e.save_id, e.latest_version_num))
-                                    .collect::<HashMap<String, i64>>(),
-                            )
-                        })
+                        .get_or_try_init(|| async { api.cloud_sync().await })
                         .await?
-                        .get(&save.save_id)
-                        .copied(),
-                    None => api
-                        .cloud_sync()
-                        .await?
-                        .saves
-                        .into_iter()
-                        .find(|e| e.save_id == save.save_id)
-                        .map(|e| e.latest_version_num),
+                        .clone(),
+                    None => api.cloud_sync().await?,
+                };
+                match manifest.entry_for(&save.save_id, &save.game_slug, &save.label) {
+                    Some(e) => {
+                        if e.save_id != save.save_id {
+                            // Loud, because for two weeks this was silent: the
+                            // lookup missed, the sweep read "the server has
+                            // nothing", and a save that was fourteen versions
+                            // behind looked converged.
+                            tracing::warn!(
+                                local_save_id = %save.save_id,
+                                cloud_save_id = %e.save_id,
+                                game_slug = %save.game_slug,
+                                label = %save.label,
+                                "agent: local save id isn't the cloud's — matched by (game, label) instead"
+                            );
+                        }
+                        (e.save_id.clone(), Some(e.latest_version_num))
+                    }
+                    None => (save.save_id.clone(), None),
                 }
             } else {
-                api.get_save(&save.save_id).await?.latest_version_num
+                // Self-hosted addresses rows by the id in the URL and never
+                // relabels them, so there is nothing to resolve.
+                (
+                    save.save_id.clone(),
+                    api.get_save(&save.save_id).await?.latest_version_num,
+                )
             }
         }
     };
@@ -2936,7 +3040,7 @@ async fn run_auto_restore(
                     tracing::debug!(error = %e, "cleanup_old_conflicts failed (up-to-date path)");
                 }
             }
-            return Ok(None);
+            return Ok(AutoRestorePull::AlreadyAtHead { version_num: v });
         }
     }
     let Some(version) = latest else {
@@ -2951,7 +3055,7 @@ async fn run_auto_restore(
                 tracing::debug!(error = %e, "cleanup_old_conflicts failed (no-snapshot path)");
             }
         }
-        return Ok(None);
+        return Ok(AutoRestorePull::NothingRemote);
     };
     // Stage the snapshot in a unique temp dir so we never overwrite the
     // user's local files during extraction. The staging dir is empty by
@@ -2964,7 +3068,10 @@ async fn run_auto_restore(
 
     let download_result = crate::restore::download_snapshot(
         api,
-        &save.save_id,
+        // The cloud's id for this row, which is what the manifest and blob
+        // endpoints answer to. Passing the local one 404s whenever the two
+        // drifted apart.
+        &cloud_id,
         version,
         &staging,
         crate::restore::RestoreOptions {
@@ -3052,7 +3159,7 @@ async fn run_auto_restore(
     .ok()
     .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
 
-    Ok(Some(AutoRestoreOutcome {
+    Ok(AutoRestorePull::Merged(AutoRestoreOutcome {
         version_num: version,
         files_restored: stats.restored as u64,
         conflicts_local_wins: stats.conflicts_resolved_local as u64,
@@ -3062,6 +3169,22 @@ async fn run_auto_restore(
         local_diverged,
         disk_set_hash,
     }))
+}
+
+/// What a reconcile pull found. Three answers and not `Option`, because the two
+/// empty ones are not the same fact and the 409 handler has to tell them apart:
+/// "the local folder already holds the server's head" is a safe place to
+/// fast-forward from, while "the server has no row I can see" means we know
+/// nothing about the remote content and must not push over it.
+enum AutoRestorePull {
+    /// Downloaded and merged into the live folder.
+    Merged(AutoRestoreOutcome),
+    /// The version gate held: this device is already at the server's head, so
+    /// there was nothing newer to pull.
+    AlreadyAtHead { version_num: i64 },
+    /// The server has no snapshot for this save — purged, or a row we can't
+    /// resolve.
+    NothingRemote,
 }
 
 /// Build a unique staging directory under the system temp dir. We embed
@@ -3840,18 +3963,23 @@ async fn run_backup_with_retry(
                 // Only a *non-fast-forward* 409 means "you're behind, reconcile
                 // first" — that's the single 409 the upload path emits today
                 // (`init_upload`/`cas_init`), and the server tags it in the body
-                // (`code: "non_fast_forward"`, surfaced here as the message
-                // "non-fast-forward: …"). Gate on that text so a hypothetical
-                // future 409 on this path doesn't get silently reconciled +
-                // retried as if it were a version conflict; it falls through to
-                // the normal failure handling instead.
-                let is_nff = e.chain().any(|c| {
-                    matches!(
-                        c.downcast_ref::<crate::api::ApiError>(),
-                        Some(crate::api::ApiError::Conflict(m)) if m.contains("non-fast-forward")
-                    )
+                // (`code: "non_fast_forward"`). A tagged body arrives typed and
+                // carries the head we have to reconcile against; the message
+                // fallback is for a server too old to send the code, which
+                // leaves us knowing only *that* we diverged.
+                let nff = e.chain().find_map(|c| {
+                    match c.downcast_ref::<crate::api::ApiError>() {
+                        Some(crate::api::ApiError::NonFastForward(d)) => Some(Some(d)),
+                        // Untagged: still a divergence, just a mute one.
+                        Some(crate::api::ApiError::Conflict(m))
+                            if m.contains("non-fast-forward") =>
+                        {
+                            Some(None)
+                        }
+                        _ => None,
+                    }
                 });
-                if is_nff {
+                if let Some(detail) = nff {
                     if conflict_reconciles >= MAX_CONFLICT_RECONCILES {
                         let chain = format!("{e:#}");
                         tracing::warn!(
@@ -3872,10 +4000,19 @@ async fn run_backup_with_retry(
                         return;
                     }
                     conflict_reconciles += 1;
+                    // The head the server named, when it named one. It is the
+                    // whole point of reading the 409's body: without it the only
+                    // way to learn where the line went is to ask a second
+                    // endpoint, and when that second answer disagreed (a row we
+                    // couldn't resolve, a head that raced) the conflict got
+                    // parked with the number sitting unread in the rejection.
+                    let server_head = detail.and_then(|d| d.head());
                     tracing::info!(
                         save_id = %save.save_id,
                         game_slug = %save.game_slug,
                         base_version = ?base_version,
+                        server_head = ?server_head,
+                        cloud_save_id = ?detail.and_then(|d| d.canonical_id_for(&save.save_id)),
                         conflict_reconciles,
                         "agent: backup rejected (non-fast-forward) — reconciling remote head before retry"
                     );
@@ -3897,7 +4034,7 @@ async fn run_backup_with_retry(
                     )
                     .await
                     {
-                        Ok(Some(outcome)) => {
+                        Ok(AutoRestorePull::Merged(outcome)) => {
                             let touched = outcome.files_restored + outcome.conflicts_backed_up;
                             if touched > 0 {
                                 let _ = events_tx
@@ -3968,11 +4105,43 @@ async fn run_backup_with_retry(
                             base_version = Some(outcome.version_num);
                             continue;
                         }
-                        Ok(None) => {
+                        // The reconcile pulled nothing because this folder
+                        // already holds the server's head. That is not a dead
+                        // end — it is the one case where fast-forwarding is
+                        // provably safe: our tree contains everything the head
+                        // has, so pushing head+1 buries nobody, and the version
+                        // we descend from stays in history either way.
+                        //
+                        // It needs the server's own number to do it. Asking the
+                        // manifest a second time is what used to fail here: on a
+                        // save whose local id isn't the cloud's, the lookup
+                        // missed and this arm read it as "nothing to pull" and
+                        // parked a conflict that could never clear itself.
+                        // Both answers have to name the same version. They come
+                        // from two reads of the server a moment apart, and a
+                        // manifest that lags (or leads) the rejection describes a
+                        // head this folder was never checked against — rebasing
+                        // onto that is how you push over content you never saw.
+                        Ok(AutoRestorePull::AlreadyAtHead { version_num })
+                            if server_head == Some(version_num) =>
+                        {
+                            tracing::info!(
+                                save_id = %save.save_id,
+                                game_slug = %save.game_slug,
+                                head = version_num,
+                                "agent: backup conflict — local tree already holds head; fast-forwarding the base and retrying"
+                            );
+                            base_version = Some(version_num);
+                            continue;
+                        }
+                        Ok(AutoRestorePull::AlreadyAtHead { .. })
+                        | Ok(AutoRestorePull::NothingRemote) => {
                             // 409 said we're behind, yet the reconcile found
-                            // nothing newer to pull (remote purged or the head
-                            // raced backwards). We can't pick a safe new base, so
-                            // surface the conflict rather than risk a loop.
+                            // nothing newer to pull and the server didn't name a
+                            // head we can rebase onto (an old server, a purged
+                            // remote, a row we can't resolve). We can't pick a
+                            // safe new base, so surface the conflict rather than
+                            // risk pushing over content we never saw.
                             let chain = format!("{e:#}");
                             tracing::warn!(
                                 save_id = %save.save_id,
@@ -4424,14 +4593,14 @@ async fn run_backup_with_retry(
                 // contract as the exhausted-retries path below: the bytes are
                 // still only on disk, `has_pending` has to survive, and the long
                 // backoff is the recovery that doesn't need a new fs event.
-                let unreachable = e.chain().find_map(|c| {
-                    match c.downcast_ref::<crate::api::ApiError>() {
-                        Some(crate::api::ApiError::StorageUnreachable { host, .. }) => {
-                            Some(host.clone())
-                        }
-                        _ => None,
-                    }
-                });
+                let unreachable =
+                    e.chain()
+                        .find_map(|c| match c.downcast_ref::<crate::api::ApiError>() {
+                            Some(crate::api::ApiError::StorageUnreachable { host, .. }) => {
+                                Some(host.clone())
+                            }
+                            _ => None,
+                        });
                 if let Some(host) = unreachable {
                     let chain = format!("{e:#}");
                     tracing::warn!(
@@ -5462,7 +5631,7 @@ mod tests {
         assert!(heads.due_for_self_observation(t0));
 
         // Con un feed recién llegado (poller vivo) no hay nada que buscar…
-        heads.feed(HashMap::new(), None, secs(10));
+        heads.feed(HashMap::new(), None, None, secs(10));
         assert!(!heads.due_for_self_observation(secs(10 + due - 1)));
         // …hasta que ese feed se hace viejo: el poller enmudeció y el motor
         // cubre el hueco por su cuenta.
@@ -5595,6 +5764,128 @@ mod tests {
             pull_pending: false,
             deferred_notified: false,
         }
+    }
+
+    fn tracked(save_id: &str, game_slug: &str, label: &str) -> WatchedSave {
+        WatchedSave {
+            save_id: save_id.into(),
+            game_slug: game_slug.into(),
+            display_name: game_slug.into(),
+            label: label.into(),
+            local_path: PathBuf::from("/tmp/saves/x"),
+            steam_install_dir: None,
+            processes: vec![],
+            shared_processes: false,
+            policy: Default::default(),
+            allow_device_local: None,
+            known_version: None,
+            set_hash: None,
+            track_only: false,
+        }
+    }
+
+    fn heads_with(rows: &[(&str, &str, &str, i64)]) -> CloudHeads {
+        let mut versions = HashMap::new();
+        let mut aliases = HashMap::new();
+        for (id, slug, label, v) in rows {
+            versions.insert((*id).to_string(), *v);
+            aliases.insert(
+                ((*slug).to_string(), (*label).to_string()),
+                (*id).to_string(),
+            );
+        }
+        let mut heads = CloudHeads::new(OffsetDateTime::UNIX_EPOCH);
+        heads.feed(
+            versions,
+            Some(aliases),
+            None,
+            OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1),
+        );
+        heads
+    }
+
+    /// A save whose local id the cloud has never seen must still read its own
+    /// head. This is the whole aug-2026 failure in one assertion: the lookup
+    /// missed, `cloud_version` came back `None`, and a row fourteen versions
+    /// behind was reported as converged — while every upload it tried was
+    /// rejected as non-fast-forward by the row it couldn't see.
+    #[test]
+    fn a_drifted_local_id_still_reads_its_cloud_head() {
+        let heads = heads_with(&[("cloud-side", "factorio", "main", 284)]);
+        let save = tracked("local-only", "factorio", "main");
+        assert_eq!(heads.cloud_id_for(&save), "cloud-side");
+        assert_eq!(heads.version_for(&save), Some(284));
+    }
+
+    /// The id still wins when the cloud knows it, alias or no alias.
+    #[test]
+    fn a_known_local_id_is_used_as_is() {
+        let heads = heads_with(&[
+            ("mine", "factorio", "main", 7),
+            ("theirs", "factorio", "2 · slot", 99),
+        ]);
+        let save = tracked("mine", "factorio", "main");
+        assert_eq!(heads.cloud_id_for(&save), "mine");
+        assert_eq!(heads.version_for(&save), Some(7));
+    }
+
+    /// An alias left over from an older feed points at a row this pass doesn't
+    /// carry (deleted server-side, or a manifest that came back partial).
+    /// Believing it would hand the reducer another save's version.
+    #[test]
+    fn an_alias_for_a_row_thats_gone_is_ignored() {
+        let mut heads = heads_with(&[("cloud-side", "factorio", "main", 284)]);
+        // A later feed without that row, and without names — the aliases stay.
+        heads.feed(
+            HashMap::new(),
+            None,
+            None,
+            OffsetDateTime::UNIX_EPOCH + Duration::from_secs(2),
+        );
+        let save = tracked("local-only", "factorio", "main");
+        assert_eq!(heads.cloud_id_for(&save), "local-only");
+        assert_eq!(heads.version_for(&save), None);
+    }
+
+    /// Genuinely absent from the cloud stays absent. The fallback resolves an
+    /// id; it never invents a head, because "blind" and "converged" have to
+    /// stay distinguishable (ADR 0021 D.10).
+    #[test]
+    fn a_save_the_cloud_doesnt_have_reads_as_absent() {
+        let heads = heads_with(&[("cloud-side", "stellaris", "main", 4)]);
+        let save = tracked("local-only", "factorio", "main");
+        assert_eq!(heads.version_for(&save), None);
+    }
+
+    /// The digest is only trusted when it belongs to the version that is head
+    /// *now*, and that check has to happen after the id is resolved — a digest
+    /// looked up under the local id would simply never be found.
+    #[test]
+    fn the_head_digest_follows_the_resolved_id() {
+        let mut heads = heads_with(&[("cloud-side", "factorio", "main", 284)]);
+        heads.digests.insert(
+            "cloud-side".into(),
+            ServerHead {
+                version_num: 284,
+                digest: "abc".into(),
+            },
+        );
+        let save = tracked("local-only", "factorio", "main");
+        assert_eq!(
+            heads.head_for(&save).map(|h| h.digest.as_str()),
+            Some("abc")
+        );
+
+        // A digest from an older version describes content that is no longer
+        // head, so it is refused rather than used to skip a real upload.
+        heads.digests.insert(
+            "cloud-side".into(),
+            ServerHead {
+                version_num: 283,
+                digest: "stale".into(),
+            },
+        );
+        assert!(heads.head_for(&save).is_none());
     }
 
     #[test]

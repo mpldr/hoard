@@ -138,9 +138,25 @@ async fn run_pull(
     };
 
     let mut latest: HashMap<String, i64> = HashMap::with_capacity(manifest.saves.len());
+    // The name→id index from the same pass: without it the agent's cache can't
+    // answer for a save whose local id the cloud has never seen (see
+    // `CloudHeads::aliases`).
+    let mut aliases: HashMap<(String, String), String> =
+        HashMap::with_capacity(manifest.saves.len());
     let mut advanced: Vec<String> = Vec::new();
     for e in &manifest.saves {
         latest.insert(e.save_id.clone(), e.latest_version_num);
+        aliases.insert(
+            (
+                e.game_slug.clone(),
+                if e.label.is_empty() {
+                    "default".to_string()
+                } else {
+                    e.label.clone()
+                },
+            ),
+            e.save_id.clone(),
+        );
         // Solo cuenta como avance si ya teníamos una versión previa y subió.
         // Los que vemos por primera vez (`None`) solo fijan línea base.
         if let Some(prev) = seen.get(&e.save_id) {
@@ -154,7 +170,7 @@ async fn run_pull(
     // Alimenta la caché de versiones del agente en cada pasada (no solo en
     // deltas) para que el sweep de reconciliación gatee por versión sin re-pedir
     // el manifest por cada save.
-    if let Err(e) = handle.set_cloud_versions(latest).await {
+    if let Err(e) = handle.set_cloud_versions(latest, aliases).await {
         tracing::warn!(error = %format!("{e:#}"), "cloud-live: no pude alimentar la caché de versiones");
     }
 

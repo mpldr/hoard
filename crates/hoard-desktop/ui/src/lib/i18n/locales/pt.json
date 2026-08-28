@@ -340,6 +340,8 @@
   "history.dur_m": "{m} min",
   "history.changed_files": "{count, plural, one {# ficheiro alterado} other {# ficheiros alterados}}",
   "history.removed_files": "{count, plural, one {# removido} other {# removidos}}",
+  "history.delta_vs": "em comparação com a v{version}",
+  "history.delta_vs_previous": "em comparação com a versão anterior",
   "history.more_saves": "e mais {count, plural, one {# save} other {# saves}}",
   "history.loading_files": "A carregar ficheiros…",
   "history.no_files": "Sem ficheiros neste snapshot.",

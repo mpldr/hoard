@@ -991,7 +991,7 @@ pub async fn list(
     // camino de la respuesta, con tope, y la siguiente carga ya las trae.
     let pending: Vec<i64> = rows
         .iter()
-        .filter(|s| s.insight.is_none())
+        .filter(|s| crate::insight::needs_refresh(s.insight.as_ref()))
         .map(|s| s.version_num)
         .take(crate::insight::BACKFILL_PER_LISTING)
         .collect();

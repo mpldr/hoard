@@ -340,6 +340,8 @@
   "history.dur_m": "{m} 分",
   "history.changed_files": "{count, plural, other {# ファイル変更}}",
   "history.removed_files": "{count, plural, other {# 件削除}}",
+  "history.delta_vs": "v{version} との比較",
+  "history.delta_vs_previous": "前のバージョンとの比較",
   "history.more_saves": "他 {count, plural, other {# 件のセーブ}}",
   "history.loading_files": "ファイル一覧を読み込み中…",
   "history.no_files": "このスナップショットにファイルはありません。",

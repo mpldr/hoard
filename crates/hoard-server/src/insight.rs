@@ -167,6 +167,20 @@ fn into_manifest_file(
 /// harmless UPDATE twice.
 pub const BACKFILL_PER_LISTING: usize = 25;
 
+/// Does this row want computing again?
+///
+/// Missing, or written by an older schema than this binary derives. The rules
+/// that pick what a row says get better — a name that used to come out as
+/// `murray heath_31852938(m)` now comes out as `murray heath` — and a stored
+/// label must not outlive the improvement. The row still serves what it has
+/// meanwhile, so nothing blinks to empty while the recompute runs.
+pub fn needs_refresh(stored: Option<&VersionInsight>) -> bool {
+    match stored {
+        None => true,
+        Some(i) => i.schema < hoard_core::kernel::insight::SCHEMA,
+    }
+}
+
 /// Read a stored insight back, tolerating anything the column may hold.
 ///
 /// The column is written by this server and by no one else, but it is persisted

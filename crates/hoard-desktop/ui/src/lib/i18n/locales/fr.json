@@ -340,6 +340,8 @@
   "history.dur_m": "{m} min",
   "history.changed_files": "{count, plural, one {# fichier modifié} other {# fichiers modifiés}}",
   "history.removed_files": "{count, plural, one {# supprimé} other {# supprimés}}",
+  "history.delta_vs": "par rapport à la v{version}",
+  "history.delta_vs_previous": "par rapport à la version précédente",
   "history.more_saves": "et {count, plural, one {# autre sauvegarde} other {# autres sauvegardes}}",
   "history.loading_files": "Chargement de la liste de fichiers…",
   "history.no_files": "Aucun fichier dans cet instantané.",

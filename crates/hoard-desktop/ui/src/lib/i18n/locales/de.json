@@ -340,6 +340,8 @@
   "history.dur_m": "{m} Min.",
   "history.changed_files": "{count, plural, one {# Datei geändert} other {# Dateien geändert}}",
   "history.removed_files": "{count, plural, one {# entfernt} other {# entfernt}}",
+  "history.delta_vs": "verglichen mit v{version}",
+  "history.delta_vs_previous": "verglichen mit der vorherigen Version",
   "history.more_saves": "und {count, plural, one {# weiterer Spielstand} other {# weitere Spielstände}}",
   "history.loading_files": "Dateiliste lädt…",
   "history.no_files": "Keine Dateien in diesem Snapshot.",

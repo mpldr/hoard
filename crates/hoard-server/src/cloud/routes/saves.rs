@@ -1586,7 +1586,7 @@ pub async fn list_versions(
     // shows it, without a migration that walks every version of every user.
     let pending: Vec<i64> = out
         .iter()
-        .filter(|v: &&VersionEntry| v.insight.is_none())
+        .filter(|v: &&VersionEntry| crate::insight::needs_refresh(v.insight.as_ref()))
         .map(|v| v.version_num)
         .take(crate::insight::BACKFILL_PER_LISTING)
         .collect();

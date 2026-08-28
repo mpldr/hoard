@@ -37,7 +37,14 @@ use super::fileclass::{classify, FileClass};
 /// Current shape of the serialised insight. Bumped when a field changes
 /// meaning; readers that see a higher number than they know render what they
 /// recognise and ignore the rest.
-pub const SCHEMA: u8 = 1;
+///
+/// A stored insight below this is served as-is but queued to be recomputed:
+/// the rules that derive it get better, and a label computed by an older
+/// version of them should not outlive the improvement.
+///
+/// * 2 — display names drop the game's own bookkeeping (`murray
+///   heath_31852938(m)` → `murray heath`).
+pub const SCHEMA: u8 = 2;
 
 /// How many distinct save entries a folder may hold before we stop counting.
 /// The count only feeds a "and N more" suffix, so an exact answer past this is
@@ -370,12 +377,50 @@ fn display_name(rel_path: &str) -> String {
         .rsplit_once('/')
         .map(|(parent, _)| file_name(parent))
         .filter(|f| !f.is_empty());
-    match folder {
+    let picked = match folder {
         // The folder wins ties because it is what groups the save: with
         // `SavedGame0/sav.dat` the player's answer to "which one" is the
         // folder, and `sav.dat` is the same in all of them.
-        Some(folder) if name_quality(folder) >= name_quality(stem) => folder.to_string(),
-        _ => stem.to_string(),
+        Some(folder) if name_quality(folder) >= name_quality(stem) => folder,
+        _ => stem,
+    };
+    tidy_name(picked)
+}
+
+/// Strip the bookkeeping a game staples onto the name the player chose.
+///
+/// The Universim writes `murray heath_31852938(m)`, Stardew writes
+/// `<farm name>_150130751`: an id and a marker that mean something to the game
+/// and nothing to the person reading a row. What is left — `murray heath` —
+/// is what they actually named it.
+///
+/// Two saves can tidy down to the same name. That is fine for a label: the row
+/// carries the full path in its tooltip, and a name that repeats is still more
+/// use than a number that never meant anything.
+fn tidy_name(name: &str) -> String {
+    let trimmed = name.trim();
+    // A short parenthesised suffix: `(m)`/`(a)` for manual and auto, `(1)` for
+    // a copy. Long ones are left alone — they may be the name.
+    let without_marker = match trimmed.strip_suffix(')').and_then(|s| s.rsplit_once('(')) {
+        Some((head, marker)) if marker.len() <= 3 && !head.trim().is_empty() => head.trim(),
+        _ => trimmed,
+    };
+    // A trailing run of digits behind a separator, six or more of them: an id
+    // or a timestamp. Below six it is a number the player can read and may have
+    // chosen — `mipartida-12379`, `world2`, `save01` — and it stays.
+    let cleaned = match without_marker.rsplit_once(|c| c == '_' || c == '-' || c == ' ') {
+        Some((head, tail))
+            if tail.len() >= 6 && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() =>
+        {
+            head
+        }
+        _ => without_marker,
+    };
+    let cleaned = cleaned.trim_end_matches([' ', '_', '-']).trim();
+    if cleaned.is_empty() {
+        trimmed.to_string()
+    } else {
+        cleaned.to_string()
     }
 }
 
@@ -532,9 +577,10 @@ mod tests {
         let p = pick_protagonist(&files, &[]).expect("a save is present");
         assert_eq!(p.display_name, "SavedGame0");
 
+        // Y el id que Stardew le cuelga detrás no es parte del nombre.
         let files = vec![f("Farm_123456/SaveGameInfo", 4_000, 5_000, true)];
         let p = pick_protagonist(&files, &[]).expect("a save is present");
-        assert_eq!(p.display_name, "Farm_123456");
+        assert_eq!(p.display_name, "Farm");
     }
 
     #[test]
@@ -548,6 +594,23 @@ mod tests {
         ];
         let p = pick_protagonist(&files, &[]).expect("a save is present");
         assert_eq!(p.display_name, "mygame");
+    }
+
+    #[test]
+    fn the_games_own_bookkeeping_is_not_part_of_the_name() {
+        // The Universim: id + a marker for manual vs auto.
+        assert_eq!(tidy_name("murray heath_31852938(m)"), "murray heath");
+        // Stardew: the farm's name is what the player typed; the id is not.
+        assert_eq!(tidy_name("Roble_150130751"), "Roble");
+        // Short numbers are readable and may well be the name.
+        assert_eq!(tidy_name("mipartida-12379"), "mipartida-12379");
+        assert_eq!(tidy_name("world2"), "world2");
+        assert_eq!(tidy_name("_autosave1"), "_autosave1");
+        // Nothing to strip.
+        assert_eq!(tidy_name("adwdaw"), "adwdaw");
+        // Stripping everything would leave the row nameless, so it doesn't.
+        assert_eq!(tidy_name("31852938"), "31852938");
+        assert_eq!(tidy_name("(m)"), "(m)");
     }
 
     #[test]
@@ -652,7 +715,7 @@ mod tests {
         i.title = Some("adwdaw".into());
         i.changed_files = 3;
         let json = serde_json::to_string(&i).unwrap();
-        assert_eq!(json, r#"{"v":1,"t":"adwdaw","c":3,"src":"generic"}"#);
+        assert_eq!(json, r#"{"v":2,"t":"adwdaw","c":3,"src":"generic"}"#);
         let back: VersionInsight = serde_json::from_str(&json).unwrap();
         assert_eq!(back, i);
     }

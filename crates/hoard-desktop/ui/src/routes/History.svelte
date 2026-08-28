@@ -339,12 +339,22 @@
   }
 
   /** Bytes con signo: lo que esta versión pesa de más (o de menos) que la
-   *  anterior. El signo es la mitad del dato — "+2 MB" y "−2 MB" cuentan
+   *  anterior. El signo es la mitad del dato — "+2 MB" y "-2 MB" cuentan
    *  historias opuestas sobre la misma partida. */
   function formatDelta(n: number): string {
-    const sign = n < 0 ? "−" : "+";
+    const sign = n < 0 ? "-" : "+";
     return `${sign}${formatBytes(Math.abs(n))}`;
   }
+
+  /** Contra qué versión se compara cada fila: la anterior que exista en la
+   *  lista. Un "-29 MB" a secas no dice nada; "29 MB menos que la v41" sí. */
+  const previousVersion = $derived.by(() => {
+    const out: Record<number, number> = {};
+    for (let i = 0; i < snapshots.length - 1; i++) {
+      out[snapshots[i].version_num] = snapshots[i + 1].version_num;
+    }
+    return out;
+  });
 
   function formatBytes(n: number): string {
     if (n < 1024) return `${n} B`;
@@ -1049,6 +1059,13 @@
                         {#if insight.c}
                           <span
                             class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                            title={previousVersion[snap.version_num]
+                              ? $_("history.delta_vs", {
+                                  values: {
+                                    version: previousVersion[snap.version_num],
+                                  },
+                                })
+                              : $_("history.delta_vs_previous")}
                           >
                             {$_("history.changed_files", {
                               values: { count: insight.c },
@@ -1058,6 +1075,13 @@
                         {#if insight.r}
                           <span
                             class="rounded bg-white/[0.05] px-1.5 py-0.5 text-zinc-400 ring-1 ring-inset ring-white/[0.06]"
+                            title={previousVersion[snap.version_num]
+                              ? $_("history.delta_vs", {
+                                  values: {
+                                    version: previousVersion[snap.version_num],
+                                  },
+                                })
+                              : $_("history.delta_vs_previous")}
                           >
                             {$_("history.removed_files", {
                               values: { count: insight.r },
@@ -1070,6 +1094,13 @@
                             0
                               ? 'bg-emerald-500/[0.08] text-emerald-300/90 ring-emerald-500/20'
                               : 'bg-white/[0.05] text-zinc-400 ring-white/[0.06]'}"
+                            title={previousVersion[snap.version_num]
+                              ? $_("history.delta_vs", {
+                                  values: {
+                                    version: previousVersion[snap.version_num],
+                                  },
+                                })
+                              : $_("history.delta_vs_previous")}
                           >
                             {formatDelta(insight.d)}
                           </span>

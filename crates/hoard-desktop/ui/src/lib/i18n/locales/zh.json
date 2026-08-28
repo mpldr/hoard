@@ -340,6 +340,8 @@
   "history.dur_m": "{m} 分钟",
   "history.changed_files": "{count, plural, other {# 个文件已更改}}",
   "history.removed_files": "{count, plural, other {已移除 # 个}}",
+  "history.delta_vs": "与 v{version} 相比",
+  "history.delta_vs_previous": "与上一个版本相比",
   "history.more_saves": "另有 {count, plural, other {# 个存档}}",
   "history.loading_files": "正在加载文件列表…",
   "history.no_files": "此快照中没有文件。",

@@ -1,0 +1,48 @@
+[package]
+name = "hoard-installer"
+# Deliberately not `version.workspace`: this is the owner's private build number
+# for the installer, bumped by hand while it is being tried out, and the
+# workspace version belongs to the release train. What the welcome screen shows
+# is neither — it is the release fetched from GitHub.
+version = "8.8.8"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hoard's front door — the same install window on Windows, Linux and macOS"
+
+[[bin]]
+name = "hoard-installer"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[dependencies]
+# The installer doesn't reimplement installing: it drives it. Everything it
+# knows how to do — which components this machine wants, which asset matches,
+# how a signature is checked and how each package is applied — has lived in the
+# agent since `hoard install` existed. This is that engine's third face.
+hoard-agent = { path = "../hoard-agent" }
+# Only for `autostart`: declaring and starting the service is what turns
+# "there are binaries on disk" into "this syncs on its own".
+hoardd = { path = "../hoardd" }
+
+# No webview, on purpose. An installer is the first thing that runs on a machine
+# where nothing is installed yet, so it cannot depend on WebView2 (Windows) or
+# WebKitGTK (Linux) being there — those are what it is here to install. The
+# software renderer takes the last graphics assumption out too: it draws on a
+# machine with no usable GPU driver, which is where a VM, an RDP session and a
+# handheld in a strange mode all live.
+slint = { version = "1.17", default-features = false, features = [
+    "compat-1-2",
+    "std",
+    "backend-winit",
+    "renderer-software",
+] }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `setsid`, so the app we start outlives the installer that started it.
+libc = "0.2"

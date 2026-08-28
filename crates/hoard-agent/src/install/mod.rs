@@ -38,6 +38,7 @@
 
 pub mod auto;
 pub mod fetch;
+pub mod remove;
 pub mod stage;
 
 use std::path::{Path, PathBuf};
@@ -600,6 +601,16 @@ impl Drop for Swap {
 pub fn ensure_cli_reachable() -> Result<CliReach> {
     let exe = std::env::current_exe().context("resolving our own path")?;
     let dir = exe.parent().context("our own path has no parent")?;
+    ensure_dir_reachable(dir)
+}
+
+/// The same, for a directory that isn't ours.
+///
+/// An installer needs it: it has just dropped `hoard` into a folder, and that
+/// folder is not where the installer itself lives — so [`ensure_cli_reachable`],
+/// which starts from `current_exe()`, would look in the wrong place and conclude
+/// [`CliReach::NotBundled`].
+pub fn ensure_dir_reachable(dir: &Path) -> Result<CliReach> {
     let cli = dir.join(format!("hoard{}", std::env::consts::EXE_SUFFIX));
     if !cli.is_file() {
         return Ok(CliReach::NotBundled);
@@ -608,6 +619,94 @@ pub fn ensure_cli_reachable() -> Result<CliReach> {
         return Ok(CliReach::AlreadyReachable);
     }
     platform_reach(dir, &cli)
+}
+
+/// Puts `dir` on the `PATH` of the user's **future** terminals, and says whether
+/// it touched anything.
+///
+/// [`ensure_dir_reachable`] solves "can I invoke `hoard`" with a symlink from a
+/// directory that is already on the `PATH`. That doesn't work when the real
+/// binary already lives in `~/.local/bin` and it is that directory missing from
+/// the `PATH`: the link would point at itself. This fixes the `PATH` instead,
+/// which is what `install.sh` does at the end of a terminal install and what an
+/// installer with a window has to do the same way — otherwise whoever installs
+/// through the window ends up with a CLI they can't type.
+///
+/// Best-effort and idempotent: an install doesn't fail over this, and calling it
+/// twice doesn't leave the line in the file twice.
+pub fn ensure_on_shell_path(dir: &Path) -> Result<PathNudge> {
+    if std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d == dir))
+        .unwrap_or(false)
+    {
+        return Ok(PathNudge::AlreadyThere);
+    }
+    shell_path(dir)
+}
+
+/// What [`ensure_on_shell_path`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathNudge {
+    /// The directory was already there. Nothing to do.
+    AlreadyThere,
+    /// Written to the shell's startup file (or to the registry, on Windows). A
+    /// new terminal is needed to see it.
+    Added(PathBuf),
+    /// Couldn't, with the reason. Not fatal to the install.
+    Skipped(String),
+}
+
+/// Windows: the user's `PATH` lives in the registry, and we already know how to
+/// write it.
+#[cfg(target_os = "windows")]
+fn shell_path(dir: &Path) -> Result<PathNudge> {
+    match platform_reach(dir, &dir.join("hoard.exe"))? {
+        CliReach::AddedToPath(d) => Ok(PathNudge::Added(d)),
+        CliReach::AlreadyReachable => Ok(PathNudge::AlreadyThere),
+        other => Ok(PathNudge::Skipped(format!("{other:?}"))),
+    }
+}
+
+/// Unix: the line into the login shell's startup file, same as `install.sh`.
+///
+/// Picked by `$SHELL` rather than by what happens to exist in the home
+/// directory: writing to the `.bashrc` of someone who uses zsh is writing to a
+/// file nobody reads. Without `$SHELL` — an app launched from the desktop menu
+/// may not have it — it falls to `.profile`, which every login shell reads.
+#[cfg(unix)]
+fn shell_path(dir: &Path) -> Result<PathNudge> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(PathNudge::Skipped("no HOME in the environment".into()));
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let rc = if shell.ends_with("/zsh") {
+        home.join(".zshrc")
+    } else if shell.ends_with("/bash") {
+        home.join(".bashrc")
+    } else {
+        home.join(".profile")
+    };
+
+    let line = format!("export PATH=\"{}:$PATH\"", dir.display());
+    let existing = std::fs::read_to_string(&rc).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == line) {
+        return Ok(PathNudge::Added(rc));
+    }
+    let block = format!("\n# Added by the Hoard installer\n{line}\n");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, block.as_bytes()))
+    {
+        Ok(()) => Ok(PathNudge::Added(rc)),
+        Err(e) => Ok(PathNudge::Skipped(format!("{}: {e}", rc.display()))),
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn shell_path(_dir: &Path) -> Result<PathNudge> {
+    Ok(PathNudge::Skipped("unsupported platform".into()))
 }
 
 /// Qué pasó al intentar dejar la terminal a mano.
@@ -794,6 +893,93 @@ fn platform_reach(_dir: &Path, _cli: &Path) -> Result<CliReach> {
     Ok(CliReach::Unreachable("unsupported platform".into()))
 }
 
+/// What this machine already has, asked by something that is **not** part of
+/// the install.
+///
+/// [`observe`] can't answer this. It starts from `current_exe().parent()`,
+/// which is right when the asker is `hoard` or `hoardd` — they live in the
+/// directory it is looking for — and wrong for an installer, which sits in
+/// whatever downloads folder it was saved to and would report that folder as
+/// the place Hoard lives.
+///
+/// `core_hint` is where the caller *would* install the core. It is tried first
+/// and then the `PATH`, so a machine that got its core from `install.sh` and a
+/// machine that got it from a package both come back found.
+pub fn detect(core_hint: &Path) -> Option<Installed> {
+    let daemon = format!("hoardd{}", std::env::consts::EXE_SUFFIX);
+
+    let core_dir = Some(core_hint.to_path_buf())
+        .filter(|d| d.join(&daemon).is_file())
+        .or_else(|| {
+            std::env::var_os("PATH")
+                .and_then(|paths| std::env::split_paths(&paths).find(|d| d.join(&daemon).is_file()))
+        });
+    // The manifest is the only thing that knows which version this is; without
+    // one (an install older than the manifest, or a hand-placed binary) the
+    // honest answer is "we don't know", not a guess.
+    let manifest = Manifest::load().ok().flatten();
+
+    // Path and delivery have to come from the same source or they contradict
+    // each other, and removing the app is what pays for that: a path found by
+    // scanning paired with a delivery read from the manifest can mean running
+    // `dpkg -r` against an AppImage, which removes a package that isn't the
+    // copy we found and leaves the copy we found in place. The manifest's own
+    // pair wins whenever the path it names is really there.
+    let recorded = manifest
+        .as_ref()
+        .and_then(|m| m.desktop_path.clone())
+        .filter(|p| p.exists());
+    let (desktop, delivery) = match recorded {
+        Some(path) => {
+            let delivery = manifest
+                .as_ref()
+                .and_then(|m| m.delivery)
+                .unwrap_or_else(|| observed_delivery(&path));
+            (Some(path), Some(delivery))
+        }
+        None => {
+            let found = installed_desktop();
+            let delivery = found.as_deref().map(observed_delivery);
+            (found, delivery)
+        }
+    };
+
+    // Neither half present means nothing to update and nothing to remove.
+    if core_dir.is_none() && desktop.is_none() {
+        return None;
+    }
+
+    Some(Installed {
+        version: manifest.as_ref().map(|m| m.version.clone()),
+        delivery,
+        core_dir,
+        desktop,
+        manifest,
+    })
+}
+
+/// The answer from [`detect`].
+#[derive(Debug, Clone)]
+pub struct Installed {
+    /// What the manifest says is installed. `None` when there is no manifest.
+    pub version: Option<String>,
+    /// Where `hoard` and `hoardd` are, if they are anywhere.
+    pub core_dir: Option<PathBuf>,
+    /// The app's executable, if it is installed.
+    pub desktop: Option<PathBuf>,
+    /// How the app got here — needed to take it away again the same way.
+    pub delivery: Option<Delivery>,
+    /// The manifest itself, when there is one.
+    pub manifest: Option<Manifest>,
+}
+
+impl Installed {
+    /// Is the graphical app part of this?
+    pub fn has_desktop(&self) -> bool {
+        self.desktop.is_some()
+    }
+}
+
 /// Qué hay instalado **según el disco**, sin manifiesto de por medio.
 fn observe() -> Manifest {
     let core_dir = observed_core_dir();
@@ -842,6 +1028,19 @@ fn observed_desktop() -> Option<PathBuf> {
             return Some(sibling);
         }
     }
+    installed_desktop()
+}
+
+/// La app **donde la dejan las vías de instalación**, sin mirar junto a quien
+/// pregunta.
+///
+/// El descarte importa: [`observed_desktop`] empieza por su propio directorio
+/// porque quien pregunta suele ser `hoard` o `hoardd`, que viajan con la app. Un
+/// instalador no — vive en la carpeta de descargas, o en `target/debug` durante
+/// el desarrollo, y ahí «hay un hoard-desktop al lado» significa «alguien acaba
+/// de compilar el workspace», no «esta máquina tiene Hoard instalado».
+pub(crate) fn installed_desktop() -> Option<PathBuf> {
+    let name = format!("hoard-desktop{}", std::env::consts::EXE_SUFFIX);
     for dir in known_desktop_dirs() {
         let candidate = dir.join(&name);
         if candidate.is_file() {

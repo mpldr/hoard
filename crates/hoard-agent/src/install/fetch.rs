@@ -276,19 +276,163 @@ pub async fn apply_desktop(
             if !status.success() {
                 bail!("the installer exited with {status}");
             }
-            Ok(path.to_path_buf())
+            // Where it *landed*, not the setup file we just ran. Returning the
+            // installer's own path put a `…\Temp\Hoard_x.y.z_x64-setup.exe`
+            // into `Manifest::desktop_path` — a file that gets swept minutes
+            // later. Two things then break quietly: "Open Hoard" runs the
+            // installer again instead of the app, and an uninstall looks for a
+            // path that no longer exists, finds nothing, and reports success
+            // having removed nothing.
+            super::installed_desktop().with_context(|| {
+                format!(
+                    "{} ran and reported success, but no hoard-desktop.exe turned up where \
+                     it installs",
+                    path.display()
+                )
+            })
         }
-        Delivery::Dmg => {
-            bail!(
-                "a .dmg can't be installed unattended — open {} and drag Hoard to \
-                 Applications.",
-                path.display()
-            )
-        }
+        Delivery::Dmg => install_dmg(path).await,
         Delivery::Managed => {
             bail!("this install is managed by your package manager; nothing to do")
         }
     }
+}
+
+/// Mounts the `.dmg`, copies the `.app` into `/Applications`, unmounts.
+///
+/// This is the macOS half of "the installer does the same thing on all three
+/// systems". It used to fail on purpose — "open it and drag Hoard to
+/// Applications" — which is reasonable guidance for a person with the Finder in
+/// front of them and no guidance at all for the updater, or for an install
+/// window that claims to be installing.
+///
+/// Mounted with `-nobrowse` so a Finder window doesn't open on top of ours, and
+/// unmounted whatever happens above — a volume nobody detaches sits on the
+/// user's desktop until they reboot.
+#[cfg(target_os = "macos")]
+async fn install_dmg(path: &Path) -> Result<PathBuf> {
+    use tokio::process::Command;
+
+    let out = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-plist"])
+        .arg(path)
+        .output()
+        .await
+        .context("running `hdiutil attach`")?;
+    if !out.status.success() {
+        bail!(
+            "`hdiutil attach` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mount = mount_point(&String::from_utf8_lossy(&out.stdout)).with_context(|| {
+        format!(
+            "{} mounted but no volume came back from hdiutil",
+            path.display()
+        )
+    })?;
+
+    let result = copy_app_out(&mount).await;
+
+    // Whatever happened above, the volume gets detached. `-force` because
+    // Spotlight may still be indexing it and a polite unmount would fail.
+    let _ = Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(&mount)
+        .output()
+        .await;
+
+    result
+}
+
+/// The mount point inside the plist `hdiutil attach -plist` prints.
+///
+/// No plist parser: we look for the `<string>` that starts with `/Volumes/`,
+/// the only field in that output shaped like this. A whole XML dependency to
+/// read one path would be expensive for the same answer.
+#[cfg(target_os = "macos")]
+fn mount_point(plist: &str) -> Option<PathBuf> {
+    plist
+        .split("<string>")
+        .skip(1)
+        .filter_map(|rest| rest.split("</string>").next())
+        .map(str::trim)
+        .find(|s| s.starts_with("/Volumes/"))
+        .map(PathBuf::from)
+}
+
+/// Copies the volume's single `.app` into `/Applications`, or into the home
+/// directory when that folder isn't ours.
+///
+/// `ditto` rather than `cp -R`: it preserves extended attributes and code
+/// signatures, and a bundle copied without them is a bundle Gatekeeper refuses
+/// to open. The destination is removed first instead of copied over, because an
+/// update that leaves stray files from the previous version inside the bundle
+/// produces failures that look nothing like their cause.
+#[cfg(target_os = "macos")]
+async fn copy_app_out(mount: &Path) -> Result<PathBuf> {
+    use tokio::process::Command;
+
+    let app = std::fs::read_dir(mount)
+        .with_context(|| format!("listing {}", mount.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .with_context(|| format!("no .app inside {}", mount.display()))?;
+    let name = app
+        .file_name()
+        .context("the .app bundle has no name")?
+        .to_owned();
+
+    // `/Applications` is the right answer and isn't always writable (an account
+    // without admin rights). `~/Applications` always is, and Launchpad looks
+    // there too, so the fallback is a complete install and not a consolation
+    // prize.
+    let mut targets = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        targets.push(home.join("Applications"));
+    }
+
+    let mut last = String::from("no destination directory");
+    for dir in targets {
+        if std::fs::create_dir_all(&dir).is_err() && !dir.is_dir() {
+            last = format!("{} is not writable", dir.display());
+            continue;
+        }
+        let dest = dir.join(&name);
+        if dest.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dest) {
+                last = format!("replacing {}: {e}", dest.display());
+                continue;
+            }
+        }
+        let out = Command::new("ditto")
+            .arg(&app)
+            .arg(&dest)
+            .output()
+            .await
+            .context("running `ditto`")?;
+        if out.status.success() {
+            return Ok(dest);
+        }
+        last = format!(
+            "copying to {}: {}",
+            dest.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    bail!("could not install the app bundle — {last}")
+}
+
+/// Off macOS a `.dmg` is installable by nobody. We never get here:
+/// [`super::resolve_delivery`] only picks it on macOS, and this exists so
+/// [`apply_desktop`]'s match stays total on the other platforms.
+#[cfg(not(target_os = "macos"))]
+async fn install_dmg(path: &Path) -> Result<PathBuf> {
+    bail!(
+        "{} is a macOS disk image and this isn't macOS",
+        path.display()
+    )
 }
 
 /// Corre un gestor de paquetes con privilegios: `pkexec` primero (pinta su propio
@@ -309,6 +453,14 @@ pub async fn apply_desktop(
 async fn elevated(cmd: &[&str], path: &Path, noninteractive: bool) -> Result<()> {
     let mut argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
     argv.push(path.to_string_lossy().to_string());
+    elevated_argv(&argv, noninteractive).await
+}
+
+/// The same, for a command whose last word isn't a path — `dpkg -r hoard`
+/// takes a package name, not a file, and taking one away needs the same
+/// privileges as putting it there.
+pub(super) async fn elevated_argv(argv: &[String], noninteractive: bool) -> Result<()> {
+    let argv: Vec<String> = argv.to_vec();
 
     let is_root = {
         #[cfg(unix)]

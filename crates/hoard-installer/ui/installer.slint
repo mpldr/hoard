@@ -1,0 +1,769 @@
+// Hoard Setup — the same four screens on Windows, Linux and macOS.
+//
+// Nothing here is platform-specific, and that is the point: the paths, the
+// package format and the service manager all differ underneath, and none of
+// them reaches this file. What differs is decided in `hoard_agent::install`,
+// where it can be tested without three machines.
+//
+// The palette is `crates/hoard-desktop/ui/src/app.css` ("Obsidian Vault"),
+// converted from oklch to sRGB because Slint has no oklch. Keep the two in
+// step by hand: an installer that doesn't look like the app it installs is a
+// worse first impression than a plain one.
+
+// The app's own faces, compiled into the binary. A downloaded installer has no
+// fonts of ours on disk yet, and falling back to the system sans is exactly the
+// tell that makes an installer look like a stock dialog. `import` of a .ttf is
+// how the Slint compiler registers a font — there is no runtime call for it.
+import "../fonts/GeistSans-Regular.ttf";
+import "../fonts/GeistSans-SemiBold.ttf";
+
+export global Theme {
+    out property <color> bg: #0c0f0e;
+    out property <color> surface-1: #101412;
+    out property <color> surface-2: #191d1b;
+    out property <color> fg: #f2f6f4;
+    out property <color> fg-muted: #9aa09d;
+    out property <color> fg-dim: #717874;
+    out property <color> accent: #00a062;
+    out property <color> accent-hi: #12c281;
+    out property <color> on-accent: #040806;
+    out property <color> gem-from: #46ecd4;
+    out property <color> gem-to: #009869;
+    out property <color> gem-ring: #19ba81;
+    out property <color> edge: #ffffff17;
+    out property <color> edge-strong: #ffffff26;
+    out property <color> danger: #ff6b6b;
+}
+
+// ---------------------------------------------------------------------------
+// The mark
+// ---------------------------------------------------------------------------
+
+// The dark tile with the gradient H, same geometry as the app's `Logo.svelte`
+// so the two marks are the same drawing at different sizes.
+//
+// Drawn as one `Path` rather than three rectangles: the gem is a single
+// gradient sweep across the whole letter, and three rectangles would be three
+// sweeps with visible seams where they meet.
+component Mark inherits Rectangle {
+    in property <length> tile: 64px;
+    in property <float> ring-alpha: 0.25;
+
+    width: root.tile;
+    height: root.tile;
+    border-radius: root.tile / 4;
+    background: #000000;
+    border-width: 1px;
+    border-color: Theme.gem-ring.with-alpha(root.ring-alpha);
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 48;
+        viewbox-height: 48;
+        fill: @linear-gradient(135deg, Theme.gem-from 0%, Theme.gem-to 100%);
+        commands: "M 13 11 L 19.5 11 L 19.5 21 L 28.5 21 L 28.5 11 L 35 11 L 35 37 L 28.5 37 L 28.5 27 L 19.5 27 L 19.5 37 L 13 37 Z";
+    }
+}
+
+// The word, letter by letter.
+//
+// With `animated` off it just sits there — that is the welcome screen and the
+// finished screen. With it on, each letter fades in, holds, and fades out, one
+// index behind the last, forever. That loop is the whole progress indicator:
+// no bar, no percentage, no filenames scrolling past. It stops when the install
+// stops, which is the only thing the user actually needs to read from it.
+component Wordmark inherits HorizontalLayout {
+    in property <bool> animated: false;
+    in property <length> size: 46px;
+
+    // One full sweep. Long enough to read as deliberate, short enough that a
+    // fast install still shows a whole cycle.
+    property <float> cycle: 2600;
+    property <float> stagger: 90;
+    property <float> tick: root.animated ? Math.mod(animation-tick() / 1ms, root.cycle) : 0;
+
+    spacing: 0px;
+
+    for ch[idx] in ["H", "o", "a", "r", "d"]: Rectangle {
+        // Phase 0..1 for this letter, offset behind the one before it.
+        property <float> phase: root.animated
+            ? Math.mod(root.tick - idx * root.stagger + root.cycle, root.cycle) / root.cycle
+            : 1.0;
+        property <float> in-t: root.animated
+            ? Math.max(0.0, Math.min(1.0, phase / 0.16))
+            : 1.0;
+        property <float> out-t: root.animated
+            ? Math.max(0.0, Math.min(1.0, (phase - 0.62) / 0.18))
+            : 0.0;
+
+        width: glyph.preferred-width;
+        height: glyph.preferred-height;
+
+        glyph := Text {
+            text: ch;
+            font-family: "Geist";
+            font-size: root.size;
+            font-weight: 600;
+            letter-spacing: root.size * -0.035;
+            color: Theme.fg;
+            opacity: parent.in-t * (1.0 - parent.out-t);
+            // Slides in from the left and leaves to the right, so the sweep
+            // reads as one movement rather than five blinks.
+            x: -10px * (1.0 - parent.in-t) + 8px * parent.out-t;
+        }
+    }
+}
+
+// The mark and the word side by side, centred. Three of the four screens are
+// this and nothing else.
+component Brand inherits HorizontalLayout {
+    in property <bool> animated: false;
+
+    alignment: center;
+    spacing: 22px;
+
+    VerticalLayout {
+        alignment: center;
+        Mark {
+            tile: 64px;
+            ring-alpha: root.animated ? 0.25 : 0.45;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        Wordmark {
+            animated: root.animated;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+
+component PrimaryButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 38px;
+    width: content.preferred-width + 48px;
+    border-radius: 10px;
+    background: touch.has-hover ? Theme.accent-hi : Theme.accent;
+    animate background { duration: 160ms; }
+
+    content := HorizontalLayout {
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                font-family: "Geist";
+                font-size: 13.5px;
+                font-weight: 600;
+                color: Theme.on-accent;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component GhostButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 38px;
+    width: content.preferred-width + 44px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.edge-strong;
+    background: touch.has-hover ? Theme.surface-2 : transparent;
+    animate background { duration: 160ms; }
+
+    content := HorizontalLayout {
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                font-family: "Geist";
+                font-size: 13.5px;
+                font-weight: 600;
+                color: touch.has-hover ? Theme.fg : Theme.fg-muted;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in-out property <bool> checked: true;
+
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent : Theme.edge-strong;
+    background: root.checked ? Theme.accent : Theme.surface-2;
+    animate background, border-color { duration: 180ms; }
+
+    Rectangle {
+        y: 2px;
+        x: root.checked ? parent.width - self.width - 3px : 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: root.checked ? Theme.on-accent : Theme.fg-dim;
+        animate x, background {
+            duration: 180ms;
+            easing: cubic-bezier(0.3, 0.8, 0.3, 1);
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The four screens
+// ---------------------------------------------------------------------------
+
+// 1 · Welcome. The licence is linked, not pasted: a wall of legal text nobody
+// reads is a toll, not consent. Continuing is accepting, and it says so in one
+// line.
+component Welcome inherits VerticalLayout {
+    in property <string> version;
+    callback close();
+    callback next();
+    callback license();
+
+    padding: 28px;
+    padding-bottom: 24px;
+
+    // The mark and its two lines travel together and sit in the middle of
+    // whatever the buttons leave over. Laid out as one centred group rather
+    // than three stacked items, which is what left the gap under the mark.
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        Brand { }
+
+        VerticalLayout {
+        spacing: 8px;
+
+        Text {
+            text: "VERSION " + root.version;
+            font-family: "Geist";
+            font-size: 10.5px;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            color: Theme.fg-dim;
+            horizontal-alignment: center;
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 5px;
+
+            Text {
+                text: "By continuing you accept the";
+                font-family: "Geist";
+                font-size: 12.5px;
+                color: Theme.fg-dim;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                width: link.preferred-width;
+                height: link.preferred-height + 3px;
+
+                link := Text {
+                    text: "AGPL-3.0 license";
+                    font-family: "Geist";
+                    font-size: 12.5px;
+                    color: linktouch.has-hover ? Theme.accent-hi : Theme.fg-muted;
+                }
+
+                Rectangle {
+                    y: parent.height - 1px;
+                    height: 1px;
+                    background: linktouch.has-hover ? Theme.accent : Theme.edge-strong;
+                }
+
+                linktouch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.license();
+                    }
+                }
+            }
+        }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 10px;
+        padding-top: 18px;
+
+        GhostButton {
+            label: "Close";
+            clicked => {
+                root.close();
+            }
+        }
+        PrimaryButton {
+            label: "Continue";
+            clicked => {
+                root.next();
+            }
+        }
+    }
+}
+
+// 2 · The one question. The core is never asked about — without the engine
+// there is no product — so the only choice is the app, and it is already on:
+// whoever doesn't want it knows they don't, whoever doesn't know what it is
+// gets it.
+component Ask inherits VerticalLayout {
+    in-out property <bool> want-desktop: true;
+    callback back();
+    callback install();
+
+    padding: 28px;
+    padding-bottom: 24px;
+    spacing: 0px;
+
+    Text {
+        text: "Desktop app";
+        font-family: "Geist";
+        font-size: 20px;
+        font-weight: 600;
+        color: Theme.fg;
+    }
+
+    VerticalLayout {
+        alignment: center;
+
+        Rectangle {
+            height: 78px;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.edge;
+            background: Theme.surface-1;
+
+            HorizontalLayout {
+                padding: 20px;
+                spacing: 18px;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+
+                    Text {
+                        text: "Install the desktop app";
+                        font-family: "Geist";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: Theme.fg;
+                    }
+                    Text {
+                        text: "Turn this off on a server or a NAS.";
+                        font-family: "Geist";
+                        font-size: 12.5px;
+                        color: Theme.fg-dim;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Toggle {
+                        checked <=> root.want-desktop;
+                    }
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 10px;
+        padding-top: 18px;
+
+        GhostButton {
+            label: "Back";
+            clicked => {
+                root.back();
+            }
+        }
+        PrimaryButton {
+            label: "Install";
+            clicked => {
+                root.install();
+            }
+        }
+    }
+}
+
+// 2b · There is already a Hoard here.
+//
+// Reached instead of the question, because on a machine that already has it
+// the question has already been answered — what is open now is what to do with
+// what is there. Two ways out and no default hidden behind a menu.
+component Existing inherits VerticalLayout {
+    in property <string> headline;
+    in property <string> parts;
+    in property <string> action;
+    callback uninstall();
+    callback update();
+
+    padding: 28px;
+    padding-bottom: 24px;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        Brand { }
+
+        VerticalLayout {
+            spacing: 6px;
+
+            Text {
+                text: root.headline;
+                font-family: "Geist";
+                font-size: 13px;
+                color: Theme.fg-muted;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.parts;
+                font-family: "Geist";
+                font-size: 11.5px;
+                color: Theme.fg-dim;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 10px;
+        padding-top: 18px;
+
+        GhostButton {
+            label: "Uninstall";
+            clicked => {
+                root.uninstall();
+            }
+        }
+        PrimaryButton {
+            label: root.action;
+            clicked => {
+                root.update();
+            }
+        }
+    }
+}
+
+// 3 · Installing. No text at all.
+component Doing inherits VerticalLayout {
+    padding: 28px;
+    Brand {
+        animated: true;
+    }
+}
+
+// 4 · Done. The name arrives once more and stays put.
+component Done inherits VerticalLayout {
+    in property <bool> can-launch;
+    // Only after an uninstall, and only to say where the saves still are. An
+    // uninstaller that leaves gigabytes behind in silence is one the user will
+    // hunt for later; one that seems to have deleted them is worse.
+    in property <string> note;
+    callback close();
+    callback launch();
+
+    padding: 28px;
+    padding-bottom: 24px;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        Brand { }
+
+        if root.note != "": Text {
+            text: root.note;
+            font-family: "Geist";
+            font-size: 11.5px;
+            color: Theme.fg-dim;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 10px;
+        padding-top: 18px;
+
+        GhostButton {
+            label: "Close";
+            clicked => {
+                root.close();
+            }
+        }
+        if root.can-launch: PrimaryButton {
+            label: "Open Hoard";
+            clicked => {
+                root.launch();
+            }
+        }
+    }
+}
+
+// 5 · It didn't work. Not in the sketch, but an installer without it hangs on
+// the animation for ever and tells the user nothing. The message is whatever
+// the agent said, unedited — it is written for a person.
+component Failed inherits VerticalLayout {
+    in property <string> message;
+    callback close();
+    callback retry();
+
+    padding: 28px;
+    padding-bottom: 24px;
+    spacing: 0px;
+
+    Brand { }
+
+    VerticalLayout {
+        alignment: center;
+        padding-top: 16px;
+
+        Text {
+            text: root.message;
+            font-family: "Geist";
+            font-size: 12.5px;
+            color: Theme.danger;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 10px;
+        padding-top: 18px;
+
+        GhostButton {
+            label: "Close";
+            clicked => {
+                root.close();
+            }
+        }
+        PrimaryButton {
+            label: "Try again";
+            clicked => {
+                root.retry();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The window
+// ---------------------------------------------------------------------------
+
+export component Installer inherits Window {
+    // 0 welcome · 1 ask · 2 installing · 3 done · 4 failed · 5 already here
+    in property <int> screen: 0;
+    in property <string> version: "";
+    in property <string> message: "";
+    in property <bool> can-launch: false;
+    // Set once at startup: is there a Hoard on this machine already?
+    in property <bool> installed: false;
+    in property <string> installed-headline: "";
+    in property <string> installed-parts: "";
+    // "Update" normally, "Reinstall" when it is already at the newest version.
+    in property <string> action-label: "Update";
+    in property <string> note: "";
+    // Where the app landed, so the last button knows what to start.
+    in-out property <string> launch-path: "";
+    in-out property <bool> want-desktop: true;
+
+    callback quit();
+    callback go-ask();
+    callback go-back();
+    callback start-install();
+    callback start-uninstall();
+    callback open-license();
+    callback launch();
+    // Frameless windows have no title bar to grab, so the drag is ours: the
+    // touch area reports a delta and Rust moves the window.
+    callback drag(length, length);
+
+    title: "Hoard Setup";
+    icon: @image-url("../icons/icon.png");
+    no-frame: true;
+    width: 600px;
+    height: 440px;
+    background: Theme.bg;
+    default-font-family: "Geist";
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ---- title bar ----
+        Rectangle {
+            height: 44px;
+            background: Theme.surface-1;
+
+            // The hairline that separates it from the body.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.edge;
+            }
+
+            TouchArea {
+                mouse-cursor: move;
+                moved => {
+                    root.drag(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                }
+            }
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 12px;
+                spacing: 10px;
+
+                VerticalLayout {
+                    alignment: center;
+                    Mark {
+                        tile: 20px;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Hoard Setup";
+                        font-family: "Geist";
+                        font-size: 12.5px;
+                        font-weight: 600;
+                        color: Theme.fg-muted;
+                    }
+                }
+
+                Rectangle { }
+
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 8px;
+                        background: closetouch.has-hover ? Theme.surface-2 : transparent;
+
+                        Text {
+                            text: "✕";
+                            font-size: 12px;
+                            color: closetouch.has-hover ? Theme.fg : Theme.fg-dim;
+                        }
+
+                        closetouch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.quit();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- body ----
+        Rectangle {
+            background: Theme.bg;
+
+            if root.screen == 0: Welcome {
+                version: root.version;
+                close => {
+                    root.quit();
+                }
+                next => {
+                    root.go-ask();
+                }
+                license => {
+                    root.open-license();
+                }
+            }
+
+            if root.screen == 1: Ask {
+                want-desktop <=> root.want-desktop;
+                back => {
+                    root.go-back();
+                }
+                install => {
+                    root.start-install();
+                }
+            }
+
+            if root.screen == 2: Doing { }
+
+            if root.screen == 3: Done {
+                can-launch: root.can-launch;
+                note: root.note;
+                close => {
+                    root.quit();
+                }
+                launch => {
+                    root.launch();
+                }
+            }
+
+            if root.screen == 5: Existing {
+                headline: root.installed-headline;
+                parts: root.installed-parts;
+                action: root.action-label;
+                uninstall => {
+                    root.start-uninstall();
+                }
+                update => {
+                    root.start-install();
+                }
+            }
+
+            if root.screen == 4: Failed {
+                message: root.message;
+                close => {
+                    root.quit();
+                }
+                retry => {
+                    root.start-install();
+                }
+            }
+        }
+    }
+}

@@ -538,6 +538,11 @@ export function renameSaveLabel(
 export type AgentStatus = {
   running: boolean;
   watched_count: number;
+  /** Has anything actually told us this? The store starts at `running: false`
+   *  before the first status arrives, and a banner keyed on `!running` alone
+   *  reads that blank as "the service is stopped" and says so — while the app
+   *  is still opening. Set by the store, never by the service. */
+  known?: boolean;
   /** The sync service sends the native OS notifications itself (ADR 0021
    *  D.14.1), so this app must not send its own or the user sees each one
    *  twice while the window is open. `false` — including on an older service
@@ -577,6 +582,9 @@ export type EngineDownReason =
   | "no_session"
   | "keyring_unreadable"
   | "session_expired"
+  /** The status read itself failed, so nothing is known — not even whether the
+   *  engine is still up. Filled in by this app, never sent by the service. */
+  | "unreachable"
   | "other";
 
 /** Per-slot diagnostic snapshot. Mirrors

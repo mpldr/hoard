@@ -137,9 +137,13 @@ impl AgentStatus {
             running: false,
             watched_count: 0,
             service_notifies: false,
-            // No hemos hablado con el servicio: no sabemos por qué, y decirlo es
-            // más honesto que inventar un motivo.
-            reason: EngineDownReason::Unknown,
+            // We never reached the service, so we don't know whether the engine
+            // is up either: `Unreachable` says that and nothing more. This used
+            // to be `Unknown`, which in the window is the sentence "the sync
+            // service is stopped" — a claim we have no grounds for, and one
+            // that on 2026-08-28 was simply false: the service had been up for
+            // thirteen hours.
+            reason: EngineDownReason::Unreachable,
             last_error: None,
             keyring: None,
         }

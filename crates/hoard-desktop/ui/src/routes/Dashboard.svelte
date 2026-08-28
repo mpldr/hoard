@@ -407,6 +407,8 @@
         return keyringMessageKey(keyring);
       case "session_expired":
         return "dashboard.service_offline_expired";
+      case "unreachable":
+        return "dashboard.service_offline_unreachable";
       default:
         return "dashboard.service_offline_banner";
     }
@@ -425,6 +427,8 @@
         return "dashboard.service_offline_keyring_missing";
       case "locked":
         return "dashboard.service_offline_keyring_locked";
+      case "refused":
+        return "dashboard.service_offline_keyring_refused";
       case "damaged":
         return "dashboard.service_offline_keyring_damaged";
       default:
@@ -547,7 +551,11 @@
     />
   {/if}
 
-  {#if !loading && !$status.running}
+  <!-- `known` and not just `!running`: the store starts blank, and a banner
+       that reads the blank paints "the service is stopped" over an app that is
+       still opening — which is how a service with thirteen hours of uptime got
+       reported as down. -->
+  {#if !loading && $status.known && !$status.running}
     <div
       class="mb-5 flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-200"
     >

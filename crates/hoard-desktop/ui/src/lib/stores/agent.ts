@@ -165,7 +165,18 @@ export const backupBlocked: Writable<Record<string, BlockedBackup>> = writable(
 export const status: Writable<AgentStatus> = writable({
   running: false,
   watched_count: 0,
+  // Nothing has told us anything yet. Every screen that paints a "the service
+  // is down" state has to wait for this to flip, or it paints it during the
+  // second the window takes to boot — which is what the dashboard did.
+  known: false,
 });
+
+/** Adopt a status that actually came from the service. The one place `known`
+ *  gets set, so no caller can forget it and reintroduce the blank-reads-as-down
+ *  banner. */
+function adoptStatus(s: AgentStatus) {
+  status.set({ ...s, known: true });
+}
 
 /** Reduce per-save activity into a single tray-coloring state. Priority is
  * "anything broken first": a failure dominates an in-flight upload, which
@@ -591,7 +602,7 @@ export async function subscribeAgent() {
   );
   unlisteners.push(
     await listen<AgentStatus>("agent://daemon-status", (e) => {
-      status.set(e.payload);
+      adoptStatus(e.payload);
       seedWatcher(e.payload.watched_count);
     }),
   );
@@ -652,7 +663,7 @@ export async function bootAgent() {
     // skip the subscription entirely.
     await subscribeAgent();
     const s = await api.startAgent();
-    status.set(s);
+    adoptStatus(s);
     // Seed the live header's watcher dot from the boot status: `watcher-armed`
     // is emitted per slot by the relay, and this is the number the service
     // reports right now, so the dot is honest from the first paint.
@@ -674,7 +685,8 @@ export async function shutdownAgent() {
     /* logout should never fail because the agent didn't */
   }
   activity.set({});
-  status.set({ running: false, watched_count: 0 });
+  // We stopped it ourselves, so this one *is* known.
+  status.set({ running: false, watched_count: 0, known: true });
   // Drop the tray back to "offline" so the icon doesn't lie.
   api.setTrayState("offline").catch(() => {});
 }

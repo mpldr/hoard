@@ -236,6 +236,11 @@ impl Daemon {
                         if token.rotated {
                             tracing::info!("hoardd: rotated the Cloud token for a client");
                         }
+                        // Lending it meant reading it, and reading it is exactly
+                        // what a engine down on a session fault couldn't do. Tell
+                        // it, instead of letting it sleep out a five-minute
+                        // backoff next to a session that now works.
+                        self.engine.wake_if_a_session_would_help();
                         Reply::Ok(Payload::CloudToken(token))
                     }
                     Err(LendError::Gone(reason)) => {
@@ -290,7 +295,8 @@ impl Daemon {
             Request::ForgetServerSession => match self.forget_server_session().await {
                 Ok(()) => {
                     tracing::info!("hoardd: forgot the self-hosted session at a client's request");
-                    self.engine.request_restart("a client signed out");
+                    self.engine
+                        .request_restart_if_signed_out(false, "a client signed out of its server");
                     Reply::Ok(Payload::Ack)
                 }
                 Err(err) => {
@@ -316,7 +322,8 @@ impl Daemon {
             Request::ForgetSession => match self.forget_session().await {
                 Ok(()) => {
                     tracing::info!("hoardd: forgot the Cloud session at a client's request");
-                    self.engine.request_restart("a client signed out");
+                    self.engine
+                        .request_restart_if_signed_out(true, "a client signed out of Cloud");
                     Reply::Ok(Payload::Ack)
                 }
                 Err(err) => {

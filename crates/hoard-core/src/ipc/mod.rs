@@ -697,6 +697,15 @@ pub enum EngineDownReason {
     KeyringUnreadable,
     /// Sesión terminalmente caducada (Cloud): sólo un login nuevo la arregla.
     SessionExpired,
+    /// We couldn't ask. The service didn't answer a status query, so nothing is
+    /// known about the engine — including whether it is running.
+    ///
+    /// Never sent by the daemon: it is what a *client* fills in when its own
+    /// read failed, and it exists so that "I couldn't ask" stops borrowing the
+    /// sentence for "it is stopped". They are not the same fact, and on
+    /// 2026-08-28 the difference was the whole complaint: the service had been
+    /// up for thirteen hours and the window said it was stopped.
+    Unreachable,
     /// Cualquier otra cosa. `last_error` lleva el detalle.
     Other,
 }

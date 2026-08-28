@@ -327,6 +327,70 @@ impl Engine {
         self.wake.notify_one();
     }
 
+    /// A session was signed out. Restart only if it was *this* engine's.
+    ///
+    /// The two sessions are independent — a machine can hold a Cloud one and a
+    /// self-hosted one at once — but the engine runs against exactly one of
+    /// them, and dropping the other changes nothing it is doing. On 2026-08-28
+    /// the desktop forgot the self-hosted session five seconds after the engine
+    /// had finally come up on Cloud, and the engine was torn down and rebuilt
+    /// for it: a second "watching…" for every save, and a gap in the middle of
+    /// a sync that had nothing to do with the session that went.
+    ///
+    /// A engine that is *down* is restarted either way: the session that is left
+    /// may be the one it was missing.
+    pub fn request_restart_if_signed_out(&self, was_cloud: bool, reason: &str) {
+        let mine = {
+            let guard = self.lock();
+            !guard.status.running || guard.status.is_cloud == was_cloud
+        };
+        if mine {
+            self.request_restart(reason);
+        } else {
+            tracing::info!(
+                signed_out_cloud = was_cloud,
+                "hoardd: a session was signed out, but not the one the engine runs on — leaving it alone"
+            );
+        }
+    }
+
+    /// The session can be read *right now* — somebody just did it. Wake a
+    /// engine that is down because it couldn't.
+    ///
+    /// The backoff after a failed start is five minutes, which is the right
+    /// pace for a keyring that keeps refusing and the wrong one for a keyring
+    /// that has started answering: on 2026-08-28 the desktop opened at 05:34:48
+    /// and lent a Cloud token successfully, and the engine — down since 05:31:08
+    /// for not being able to read that same session — slept until 05:36:10, its
+    /// backoff to the second. Eighty-two seconds of "the sync service is
+    /// stopped" with the session sitting there, readable.
+    ///
+    /// Gated on the reason so this can't turn into a retry loop: only the three
+    /// session faults are unblocked by a session that reads, and the caller only
+    /// calls after a read that worked. A keyring still refusing fails the lend
+    /// first and never gets here.
+    pub fn wake_if_a_session_would_help(&self) {
+        let reason = {
+            let guard = self.lock();
+            if guard.status.running {
+                return;
+            }
+            guard.status.reason
+        };
+        if matches!(
+            reason,
+            EngineDownReason::NoSession
+                | EngineDownReason::KeyringUnreadable
+                | EngineDownReason::SessionExpired
+        ) {
+            tracing::info!(
+                ?reason,
+                "hoardd: the session reads again — waking the engine instead of waiting out its backoff"
+            );
+            self.request_restart("the session became readable");
+        }
+    }
+
     fn take_restart_request(&self) -> Option<String> {
         self.lock().restart_requested.take()
     }
@@ -858,6 +922,103 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un motor caído con un motivo y sin `Running`, que es como queda tras un
+    /// `note_error`. Suficiente para las dos políticas de abajo, que sólo miran
+    /// el estado.
+    fn down_with(reason: EngineDownReason, is_cloud: bool) -> Engine {
+        let engine = Engine::new();
+        {
+            let mut guard = engine.lock();
+            guard.status.running = false;
+            guard.status.reason = reason;
+            guard.status.is_cloud = is_cloud;
+        }
+        engine
+    }
+
+    fn up_on(is_cloud: bool) -> Engine {
+        let engine = Engine::new();
+        {
+            let mut guard = engine.lock();
+            guard.status.running = true;
+            guard.status.is_cloud = is_cloud;
+        }
+        engine
+    }
+
+    fn restart_asked(engine: &Engine) -> bool {
+        engine.lock().restart_requested.is_some()
+    }
+
+    /// Prestar el token prueba que la sesión se lee. Un motor caído por no poder
+    /// leerla tiene que reintentar ya, no agotar cinco minutos de backoff junto a
+    /// una sesión que ya funciona — los 82 s del 28-ago-2026.
+    #[test]
+    fn a_readable_session_wakes_an_engine_that_was_missing_one() {
+        for reason in [
+            EngineDownReason::NoSession,
+            EngineDownReason::KeyringUnreadable,
+            EngineDownReason::SessionExpired,
+        ] {
+            let engine = down_with(reason, true);
+            engine.wake_if_a_session_would_help();
+            assert!(restart_asked(&engine), "{reason:?} lo desbloquea una sesión");
+        }
+    }
+
+    /// Y sólo esos. Un motor que cayó por otra cosa no se arregla porque alguien
+    /// haya podido leer la sesión, y despertarlo en cada préstamo de token
+    /// convertiría el backoff en un bucle.
+    #[test]
+    fn a_readable_session_doesnt_wake_an_engine_that_failed_for_another_reason() {
+        for reason in [EngineDownReason::Other, EngineDownReason::Unknown] {
+            let engine = down_with(reason, true);
+            engine.wake_if_a_session_would_help();
+            assert!(!restart_asked(&engine), "{reason:?} no lo arregla una sesión");
+        }
+    }
+
+    /// Un motor vivo no se toca: el token se presta constantemente, y reiniciar
+    /// en cada préstamo sería cortar la sincronización cada pocos minutos.
+    #[test]
+    fn a_live_engine_is_never_woken() {
+        let engine = up_on(true);
+        engine.wake_if_a_session_would_help();
+        assert!(!restart_asked(&engine));
+    }
+
+    /// Las dos sesiones son independientes y el motor corre contra una sola:
+    /// tirarlo porque se fue la otra es un corte gratis y una segunda tanda de
+    /// "vigilando" por cada save.
+    #[test]
+    fn signing_out_of_the_other_session_leaves_the_engine_alone() {
+        let engine = up_on(true);
+        engine.request_restart_if_signed_out(false, "self-hosted signed out");
+        assert!(!restart_asked(&engine), "el motor va con Cloud");
+
+        let engine = up_on(false);
+        engine.request_restart_if_signed_out(true, "cloud signed out");
+        assert!(!restart_asked(&engine), "el motor va con el self-hosted");
+    }
+
+    /// La suya sí lo tira: está hablando con un servidor cuya sesión ya no
+    /// existe.
+    #[test]
+    fn signing_out_of_its_own_session_restarts_the_engine() {
+        let engine = up_on(true);
+        engine.request_restart_if_signed_out(true, "cloud signed out");
+        assert!(restart_asked(&engine));
+    }
+
+    /// Y un motor caído se reinicia venga de donde venga la baja: la sesión que
+    /// queda puede ser justo la que le faltaba.
+    #[test]
+    fn a_down_engine_restarts_on_either_sign_out() {
+        let engine = down_with(EngineDownReason::NoSession, true);
+        engine.request_restart_if_signed_out(false, "self-hosted signed out");
+        assert!(restart_asked(&engine));
+    }
 
     /// El motivo tiene que sobrevivir a las capas de contexto que le pone el
     /// camino real: `resolve_owned` envuelve el error un par de veces antes de

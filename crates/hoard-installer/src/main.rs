@@ -204,8 +204,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    present(ui.as_weak());
     ui.run()?;
     Ok(())
+}
+
+/// Puts the window in the middle of the screen and in front, once.
+///
+/// Once is the whole point. An installer that opens behind the browser that
+/// downloaded it looks broken, and one that stays pinned above everything is
+/// worse — you can't put it aside to read anything while it runs. So it is
+/// raised on the way in and dropped back to an ordinary window a moment later,
+/// after which clicking any other window puts that one in front, as it should.
+///
+/// It waits on `winit_window()` rather than reaching for the window straight
+/// away: Slint creates it when the event loop gets going, which is *after*
+/// `show()` returns, so anything eager finds nothing there and silently does
+/// nothing at all.
+fn present(weak: slint::Weak<Installer>) {
+    use slint::winit_030::{winit, WinitWindowAccessor};
+
+    let _ = slint::spawn_local(async move {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Ok(window) = ui.window().winit_window().await else {
+            return;
+        };
+
+        // Centre on the monitor it actually landed on, not on the primary one:
+        // with two screens, "the primary monitor" is the wrong answer half the
+        // time.
+        if let Some(monitor) = window
+            .current_monitor()
+            .or_else(|| window.primary_monitor())
+        {
+            let screen = monitor.size();
+            let origin = monitor.position();
+            let size = window.outer_size();
+            window.set_outer_position(winit::dpi::PhysicalPosition::new(
+                origin.x + (screen.width as i32 - size.width as i32) / 2,
+                origin.y + (screen.height as i32 - size.height as i32) / 2,
+            ));
+        }
+
+        window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        window.focus_window();
+
+        // Back to an ordinary window. Long enough that the compositor has
+        // actually raised it, short enough that nobody could have clicked past
+        // it yet.
+        slint::Timer::single_shot(std::time::Duration::from_millis(400), move || {
+            window.set_window_level(winit::window::WindowLevel::Normal);
+        });
+    });
 }
 
 /// The whole thing with no window: install, or take it off, and say what

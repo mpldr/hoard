@@ -17,6 +17,13 @@ path = "src/main.rs"
 [build-dependencies]
 slint-build = "1.17"
 
+[target.'cfg(windows)'.build-dependencies]
+# The icon Explorer draws on the file. Slint's `icon:` property only dresses the
+# window and the taskbar button; what a downloaded `.exe` shows before anyone
+# runs it is a PE resource, and without one it is the blank default — which is
+# exactly what a stranger's executable is not supposed to look like.
+winresource = "0.1"
+
 [dependencies]
 # The installer doesn't reimplement installing: it drives it. Everything it
 # knows how to do — which components this machine wants, which asset matches,
@@ -38,6 +45,10 @@ slint = { version = "1.17", default-features = false, features = [
     "std",
     "backend-winit",
     "renderer-software",
+    # Reaches the winit window underneath, for two things Slint's own API does
+    # not cover: which monitor we are on (to centre) and raising the window at
+    # startup. Marked unstable upstream; the alternative is per-OS window code.
+    "unstable-winit-030",
 ] }
 
 anyhow = { workspace = true }

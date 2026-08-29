@@ -30,7 +30,9 @@
 
 #![cfg(feature = "cloud")]
 
-use hoard_server::cloud::routes::saves::{resolve_save_row, save_has_no_history};
+use hoard_server::cloud::routes::saves::{
+    manifest_covers_head, resolve_save_row, save_has_no_history, CasFileEntry,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -198,6 +200,202 @@ async fn a_real_head_never_takes_the_escape_hatch() {
     assert!(
         !save_has_no_history(&mut conn, &row.0, 7).await.unwrap(),
         "head 7 vs base 4 is the divergence the 409 exists for"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// A file as the client declares it in a CAS manifest.
+fn f(path: &str, sha: &str) -> CasFileEntry {
+    CasFileEntry {
+        relative_path: path.to_string(),
+        sha256: sha.to_string(),
+        size_bytes: 1,
+        modified_at: None,
+    }
+}
+
+/// Seeds `save_versions` + `save_version_files` for one version.
+async fn seed_version(pool: &PgPool, save_id: &str, num: i64, files: &[(&str, &str)]) {
+    sqlx::query(
+        "INSERT INTO save_versions (save_id, version_num, size_bytes, sha256, r2_key, file_count, content_addressed)
+         VALUES ($1, $2, 1, 'x', '', $3, TRUE)",
+    )
+    .bind(save_id)
+    .bind(num)
+    .bind(files.len() as i64)
+    .execute(pool)
+    .await
+    .expect("version");
+    for (path, sha) in files {
+        sqlx::query(
+            "INSERT INTO save_version_files (save_id, version_num, relative_path, sha256, size_bytes)
+             VALUES ($1, $2, $3, $4, 1)",
+        )
+        .bind(save_id)
+        .bind(num)
+        .bind(path)
+        .bind(sha)
+        .execute(pool)
+        .await
+        .expect("manifest row");
+    }
+    sqlx::query("UPDATE saves SET latest_version_num = $2 WHERE id = $1")
+        .bind(save_id)
+        .bind(num)
+        .execute(pool)
+        .await
+        .expect("head");
+}
+
+/// Sandfall, as reported: the client sits ahead of a head it already contains,
+/// and every push is refused for ten days. Carrying the whole head plus new
+/// content of its own means the version about to be written loses none of it.
+#[tokio::test]
+async fn a_manifest_holding_the_whole_head_may_fast_forward() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "sandfall",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    seed_version(&pool, &row.0, 2, &[("save.dat", "aaa"), ("meta.json", "bbb")]).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    // The same two files, plus one the head never had.
+    let push = vec![f("save.dat", "aaa"), f("meta.json", "bbb"), f("new.dat", "ccc")];
+    assert!(
+        manifest_covers_head(&mut conn, &row.0, 2, &push).await.unwrap(),
+        "a push that carries the head whole buries nothing"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// The protection itself: a push that drops a file the head has, or brings an
+/// older copy of one, is the burial the 409 exists to stop.
+#[tokio::test]
+async fn a_manifest_missing_part_of_the_head_is_still_refused() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "victoria-3",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    seed_version(&pool, &row.0, 4, &[("a.sav", "aaa"), ("b.sav", "bbb")]).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    assert!(
+        !manifest_covers_head(&mut conn, &row.0, 4, &[f("a.sav", "aaa")])
+            .await
+            .unwrap(),
+        "dropping b.sav is exactly what the rejection protects"
+    );
+    // Same paths, one of them changed underneath us: the other device's edit
+    // would be lost.
+    assert!(
+        !manifest_covers_head(
+            &mut conn,
+            &row.0,
+            4,
+            &[f("a.sav", "aaa"), f("b.sav", "different")]
+        )
+        .await
+        .unwrap(),
+        "an older copy of a file the head advanced is not coverage"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// A head whose manifest rows aren't there (pending, or pre-CAS) is not
+/// something to reason about, so the ordinary rejection stands.
+#[tokio::test]
+async fn a_head_without_a_manifest_grants_nothing() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "peak",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO save_versions (save_id, version_num, size_bytes, sha256, r2_key, file_count)
+         VALUES ($1, 3, 1, '', '', 0)",
+    )
+    .bind(&row.0)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    assert!(
+        !manifest_covers_head(&mut conn, &row.0, 3, &[f("a.sav", "aaa")])
+            .await
+            .unwrap(),
+        "no manifest to compare against means no concession"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// Carrying the head and nothing more is not a push worth minting a version
+/// for: the agent settles on the head instead, and an identical version would
+/// only pad the history of a device that lost its place.
+#[tokio::test]
+async fn a_manifest_equal_to_the_head_is_not_a_fast_forward() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "openttd",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    seed_version(&pool, &row.0, 5, &[("a.sav", "aaa"), ("b.sav", "bbb")]).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    assert!(
+        !manifest_covers_head(
+            &mut conn,
+            &row.0,
+            5,
+            &[f("a.sav", "aaa"), f("b.sav", "bbb")]
+        )
+        .await
+        .unwrap(),
+        "identical to the head is a settle, not an upload"
     );
 
     drop(conn);

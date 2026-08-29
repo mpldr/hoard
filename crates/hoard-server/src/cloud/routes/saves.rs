@@ -476,6 +476,9 @@ pub async fn commit_upload(
 // ===========================================================================
 
 /// One file in a content-addressed manifest.
+///
+/// Constructible from tests (`orphaned_cursor`), which build manifests to check
+/// what a push does and does not cover.
 #[derive(Debug, Deserialize)]
 pub struct CasFileEntry {
     pub relative_path: String,
@@ -710,7 +713,23 @@ pub async fn cas_init(
             "cas_init: client cursor outlived the save's history — restarting it at version 1"
         );
     }
-    if base != head && !orphaned_cursor {
+    // The other way a mismatched base is harmless: the push already contains
+    // every file the head has, so nothing of the head's can be lost by writing
+    // the next version from it.
+    let covers_head = base != head
+        && !orphaned_cursor
+        && manifest_covers_head(&mut tx, &save_row.0, head, &body.files).await?;
+    if covers_head {
+        tracing::warn!(
+            user_id = %user.user_id,
+            save_id = %save_row.0,
+            game_slug = %body.game_slug,
+            head_version = head,
+            base_version = base,
+            "cas_init: base diverged but the manifest contains the whole head — fast-forwarding it"
+        );
+    }
+    if base != head && !orphaned_cursor && !covers_head {
         tracing::warn!(
             save_id = %save_row.0,
             requested_save_id = %body.save_id,
@@ -1931,6 +1950,63 @@ pub async fn save_has_no_history(
             .await?;
     Ok(existing == 0)
 }
+
+/// Does this push already carry everything the head has?
+///
+/// The second question asked of a mismatched base, after `save_has_no_history`,
+/// and the one that covers a head with real content. A non-fast-forward is
+/// refused to stop a push from burying a version it never saw — but a manifest
+/// that lists every (path, sha) the head lists cannot bury it: the content is
+/// all still there, in the version about to be written, byte for byte. What the
+/// client is doing then is not overwriting the head, it is descending from it
+/// with extra files or none.
+///
+/// This is the same judgement the agent makes for itself when a reconcile tells
+/// it "your folder already holds the head" and it rebases onto that head — but
+/// made here, from the manifest already in the request, so it also works for
+/// clients too old to make it. Those clients could not: reading the head out of
+/// a 409 body only landed in ago-2026, and before it a rejection left them
+/// knowing they diverged but not from what. One save spent ten days retrying
+/// every ten minutes against a head of 2 it already contained.
+///
+/// A *strict* superset: the push must carry the whole head **and** something of
+/// its own. Both halves earn their place. Dropping a file the head has is
+/// exactly the burial the 409 exists for, and still gets one. Carrying the head
+/// and nothing else is a client that has no new content to write — the agent
+/// settles on the head rather than re-uploading it, and minting an identical
+/// version here would pad the history for a device that only lost its place.
+pub async fn manifest_covers_head(
+    conn: &mut sqlx::PgConnection,
+    save_id: &str,
+    head: i64,
+    files: &[CasFileEntry],
+) -> Result<bool, CloudError> {
+    if head <= 0 {
+        return Ok(false);
+    }
+    let head_files: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relative_path, sha256 FROM save_version_files WHERE save_id = $1 AND version_num = $2",
+    )
+    .bind(save_id)
+    .bind(head)
+    .fetch_all(&mut *conn)
+    .await?;
+    // A head with no manifest rows is not something to reason about — it is a
+    // pending version, or one from before content addressing. Say no and let
+    // the ordinary rejection stand.
+    if head_files.is_empty() {
+        return Ok(false);
+    }
+    let incoming: std::collections::HashSet<(&str, &str)> = files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f.sha256.as_str()))
+        .collect();
+    let covers_all = head_files
+        .iter()
+        .all(|(path, sha)| incoming.contains(&(path.as_str(), sha.as_str())));
+    Ok(covers_all && incoming.len() > head_files.len())
+}
+
 
 
 /// `UNIQUE(user_id, game_slug, label)` -> 409 on collision. R2 keys are keyed

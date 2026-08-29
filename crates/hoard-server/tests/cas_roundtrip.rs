@@ -403,6 +403,51 @@ async fn bytes_that_dont_match_their_sha_are_refused() {
     assert_eq!(versions, 0, "no se creó ninguna versión");
 }
 
+/// La otra cara del rechazo anterior: una base que no cuadra pero cuyo
+/// manifiesto trae la cabeza **entera y algo más**. No hay nada que enterrar —
+/// el contenido de la cabeza viaja fichero a fichero en la versión que se va a
+/// escribir— así que pasa. Es la salida para un cliente que perdió su sitio en
+/// la cuenta (historial podado, fila rehecha) y no sabe leer la cabeza del 409:
+/// sin esto reintenta cada diez minutos hasta rendirse.
+#[tokio::test]
+async fn a_diverged_base_passes_when_the_manifest_carries_the_whole_head() {
+    let h = harness().await;
+    let old = b"contenido".to_vec();
+    backup(&h, &[("save", &old)], Some(0)).await;
+
+    // La cabeza es 1. Subimos con base 0 —desfasada— pero llevando el fichero
+    // de la cabeza intacto y uno nuevo encima.
+    let extra = b"nuevo".to_vec();
+    let out = cas::init(
+        State(h.state.clone()),
+        Extension(h.user.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(0),
+            files: manifest(&[("save", &old), ("otro", &extra)]),
+        }),
+    )
+    .await
+    .expect("el manifiesto contiene la cabeza entera")
+    .0;
+    assert_eq!(out.version_num, 2, "descendemos de la cabeza real, no de la base");
+
+    // Y quitando el fichero de la cabeza vuelve a ser el entierro de siempre.
+    let err = cas::init(
+        State(h.state.clone()),
+        Extension(h.user.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(0),
+            files: manifest(&[("otro", &extra)]),
+        }),
+    )
+    .await
+    .expect_err("perder el fichero de la cabeza sigue siendo non-fast-forward");
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(err.1["code"], "non_fast_forward");
+}
+
 /// Otro equipo empujó mientras subíamos. El init lo cortaría antes de mover un
 /// byte; el commit vuelve a comprobarlo porque entre los dos pasan minutos.
 #[tokio::test]

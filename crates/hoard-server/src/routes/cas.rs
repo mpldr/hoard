@@ -254,8 +254,25 @@ pub async fn init(
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
     if let Some(base) = body.base_version {
-        if base != head {
+        // Una base que no cuadra con la cabeza se rechaza para que un push no
+        // entierre una versión que no llegó a ver. Pero un manifiesto que trae
+        // *entera* esa versión no puede enterrarla: su contenido sigue ahí,
+        // fichero a fichero, en la que se va a escribir. Es el mismo juicio que
+        // hace el agente cuando reconcilia y descubre que su carpeta ya
+        // contiene la cabeza — hecho aquí, con el manifiesto que ya viene en la
+        // petición, para los clientes que no saben hacerlo solos: leer la
+        // cabeza del cuerpo de un 409 es de ago-2026, y antes de eso un rechazo
+        // los dejaba sabiendo que divergían pero no de qué.
+        if base != head && !manifest_covers_head(&state.pool, &save_id, head, &body.files).await? {
             return Err(non_fast_forward(&save_id, head, base));
+        }
+        if base != head {
+            tracing::warn!(
+                %save_id,
+                head_version = head,
+                base_version = base,
+                "cas init: la base diverge pero el manifiesto trae la cabeza entera — se deja pasar"
+            );
         }
     }
 
@@ -324,6 +341,49 @@ pub async fn init(
         missing,
         missing_bytes,
     }))
+}
+
+/// ¿Trae este push todo lo que tiene la cabeza?
+///
+/// Superconjunto **estricto**: tiene que traer la cabeza entera *y* algo suyo.
+/// Quitar un fichero que la cabeza tiene es justo el entierro que el 409 existe
+/// para impedir, y lo sigue recibiendo. Traer la cabeza y nada más es un cliente
+/// que no tiene contenido nuevo que escribir — el agente se asienta sobre la
+/// cabeza en vez de re-subirla, y acuñar aquí una versión idéntica sólo engorda
+/// el historial de un equipo que lo único que perdió fue su sitio. Una cabeza
+/// sin ficheros (versión a medias, o anterior al content-addressing) tampoco
+/// concede nada: no hay con qué comparar.
+async fn manifest_covers_head(
+    pool: &sqlx::SqlitePool,
+    save_id: &str,
+    head: i64,
+    files: &[CasFile],
+) -> Result<bool, ApiError> {
+    if head <= 0 {
+        return Ok(false);
+    }
+    let head_files: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sf.relative_path, sf.sha256
+           FROM snapshot_files sf
+           JOIN snapshots s ON s.id = sf.snapshot_id
+          WHERE s.save_id = ? AND s.version_num = ?",
+    )
+    .bind(save_id)
+    .bind(head)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| internal_logged("reading the head's manifest", e))?;
+    if head_files.is_empty() {
+        return Ok(false);
+    }
+    let incoming: std::collections::HashSet<(&str, &str)> = files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f.sha256.as_str()))
+        .collect();
+    let covers_all = head_files
+        .iter()
+        .all(|(path, sha)| incoming.contains(&(path.as_str(), sha.as_str())));
+    Ok(covers_all && incoming.len() > head_files.len())
 }
 
 /// The divergence 409. It carries `save_id` even though here it is always the

@@ -4134,6 +4134,30 @@ async fn run_backup_with_retry(
                             base_version = Some(version_num);
                             continue;
                         }
+                        // The server named head 0: the save it is holding for
+                        // us has no versions at all. Nobody advanced past us —
+                        // the history our cursor descends from is gone (the row
+                        // was deleted while this folder kept its number, e.g. a
+                        // game un-archived and dropped). Descending from 0 buries
+                        // nothing, because there is nothing there, and it is the
+                        // only base the server will accept from here: our own
+                        // number can never come back down on its own, so without
+                        // this the save retries into its conflict budget and
+                        // parks forever. Servers old enough not to send a head
+                        // fall through to the arm below.
+                        Ok(AutoRestorePull::AlreadyAtHead { .. })
+                        | Ok(AutoRestorePull::NothingRemote)
+                            if server_head == Some(0) =>
+                        {
+                            tracing::warn!(
+                                save_id = %save.save_id,
+                                game_slug = %save.game_slug,
+                                base_version = ?base_version,
+                                "agent: backup conflict — the server has no history for this save; restarting from version 1"
+                            );
+                            base_version = Some(0);
+                            continue;
+                        }
                         Ok(AutoRestorePull::AlreadyAtHead { .. })
                         | Ok(AutoRestorePull::NothingRemote) => {
                             // 409 said we're behind, yet the reconcile found

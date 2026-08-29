@@ -214,7 +214,7 @@ pub async fn init_upload(
     // non-fast-forward against anything else. The client already knows this
     // answer — it reconciles and pulls before retrying.
     let base = body.base_version.unwrap_or(0);
-    if base != head {
+    if base != head && !save_has_no_history(&mut conn, &save_row.0, head).await? {
         return Ok(NonFastForwardResponse {
             error: "non-fast-forward: another device advanced this save since your base version",
             code: "non_fast_forward",
@@ -223,6 +223,15 @@ pub async fn init_upload(
             save_id: save_row.0.clone(),
         }
         .into_response());
+    }
+    if base != head {
+        tracing::warn!(
+            user_id = %user.user_id,
+            save_id = %save_row.0,
+            game_slug = %body.game_slug,
+            base_version = base,
+            "init_upload: client cursor outlived the save's history — restarting it at version 1"
+        );
     }
 
     let next_version = head + 1;
@@ -687,7 +696,21 @@ pub async fn cas_init(
     // path for the incident. Treated as base 0: fine on a first upload, a
     // non-fast-forward against anything else.
     let base = body.base_version.unwrap_or(0);
-    if base != head {
+    // An empty row is the one mismatch that isn't a divergence — see
+    // `save_has_no_history`. It reads the versions inside the same transaction
+    // that holds the row lock, so a sibling push can't land one in between.
+    let orphaned_cursor = base != head && save_has_no_history(&mut tx, &save_row.0, head).await?;
+    if orphaned_cursor {
+        tracing::warn!(
+            user_id = %user.user_id,
+            save_id = %save_row.0,
+            requested_save_id = %body.save_id,
+            game_slug = %body.game_slug,
+            base_version = base,
+            "cas_init: client cursor outlived the save's history — restarting it at version 1"
+        );
+    }
+    if base != head && !orphaned_cursor {
         tracing::warn!(
             save_id = %save_row.0,
             requested_save_id = %body.save_id,
@@ -1810,7 +1833,7 @@ pub struct SaveSummary {
 ///
 /// The row's label wins over the client's on purpose — adopting the incoming one
 /// would silently undo the rename made on the other machine.
-async fn resolve_save_row(
+pub async fn resolve_save_row(
     conn: &mut sqlx::PgConnection,
     save_id: &str,
     user_id: uuid::Uuid,
@@ -1868,6 +1891,47 @@ async fn resolve_save_row(
     .fetch_one(&mut *conn)
     .await?)
 }
+
+/// Is this row empty of history? Only asked when a push's base doesn't match the
+/// head, and only when that head is 0.
+///
+/// A head of 0 on a row with no versions at all is not a divergence: there is no
+/// version for another device to have advanced past, and nothing a fast-forward
+/// could bury. What it actually means is that the client is carrying the cursor
+/// of a previous life — the row it used to push to was deleted (a game
+/// un-archived and dropped, a purge, an account rebuilt) and the one it is
+/// talking to now is the empty row `resolve_save_row` just minted for it.
+///
+/// Rejecting that as a non-fast-forward is a trap with no exit. The client's
+/// base only moves when an upload lands or a reconcile pulls a head, and here
+/// neither can ever happen: the upload is refused, and the reconcile finds no
+/// remote history to pull. It retries, gets the same 409, and gives up for good
+/// after its conflict budget — with the rejection blaming "another device" that
+/// does not exist. Worse, the row minted to answer it is rolled back with the
+/// refusal, so the next attempt starts from exactly the same nothing.
+///
+/// Accepting is the safe half of the choice, not the risky one: an empty row has
+/// no content to lose, and the push becomes version 1 of a save whose history is
+/// genuinely gone.
+pub async fn save_has_no_history(
+    conn: &mut sqlx::PgConnection,
+    save_id: &str,
+    head: i64,
+) -> Result<bool, CloudError> {
+    if head != 0 {
+        return Ok(false);
+    }
+    // `latest_version_num` is the fast answer, but it is bookkeeping; the
+    // versions are the fact. Only reached on a mismatch against head 0, so this
+    // costs nothing on the hot path.
+    let existing: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM save_versions WHERE save_id = $1")
+            .bind(save_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(existing == 0)
+}
+
 
 /// `UNIQUE(user_id, game_slug, label)` -> 409 on collision. R2 keys are keyed
 /// by `save_id` + version (not by label), so no blob rename is needed ??? just
@@ -2164,3 +2228,4 @@ async fn plan_for_user(state: &CloudState, user_id: Uuid) -> Result<Option<Plan>
         .await?;
     Ok(row.map(|r| Plan::from_str(&r.0).unwrap_or(Plan::Free)))
 }
+

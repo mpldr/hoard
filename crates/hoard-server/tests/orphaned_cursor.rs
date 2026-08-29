@@ -1,0 +1,205 @@
+//! A client cursor that outlived the save it points at, against a real Postgres.
+//!
+//! The report of ago-2026: a Fallout 4 save was archived, then dropped from the
+//! cloud, while the desktop kept `last_version_num = 398` in its local state.
+//! Every backup after that re-minted the empty row through `resolve_save_row`,
+//! was refused as a non-fast-forward against its own head of 0, and the refusal
+//! rolled the fresh row back with the transaction. So the account showed no
+//! Fallout 4 at all — the row never survived a request — while the client burned
+//! its conflict budget and parked the save for good, told each time that
+//! "another device advanced this save", of which there was none.
+//!
+//! The trap is that it has no exit on the client's side: a base only moves when
+//! an upload lands or a reconcile pulls a head, and an empty remote offers
+//! neither. So the server has to be the one that gives, and what it gives up is
+//! nothing: an empty row has no version to bury.
+//!
+//! What these pin down is the shape of that concession — that it applies to a
+//! row with no history, and *only* to one.
+//!
+//! Skipped unless `HOARD_PG_TEST_URL` is set, like `downgrade_grace`:
+//!
+//! ```sh
+//! docker run -d --name hoard-pg -p 55432:5432 \
+//!   -e POSTGRES_PASSWORD=hoard -e POSTGRES_DB=hoard postgres:17
+//! export HOARD_PG_TEST_URL=postgres://postgres:hoard@localhost:55432/hoard
+//! cargo test -p hoard-server --features cloud --test orphaned_cursor
+//! ```
+//!
+//! **Never point it at production.**
+
+#![cfg(feature = "cloud")]
+
+use hoard_server::cloud::routes::saves::{resolve_save_row, save_has_no_history};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Connect + migrate, or `None` when the env var isn't set (CI's no-op path).
+///
+/// Same Supabase stand-ins as `downgrade_grace`, same advisory lock around them:
+/// `cargo test` runs the tests in this binary in parallel and they would
+/// otherwise race each other on `CREATE OR REPLACE FUNCTION`.
+async fn pool() -> Option<PgPool> {
+    let url = std::env::var("HOARD_PG_TEST_URL").ok()?;
+    let pool = hoard_server::cloud::db::connect(&url, 5)
+        .await
+        .expect("connect to the test database");
+    sqlx::query("SELECT pg_advisory_lock(8_233_119_403)")
+        .execute(&pool)
+        .await
+        .expect("bootstrap lock");
+    for role in ["anon", "authenticated", "service_role"] {
+        let _ = sqlx::query(&format!("CREATE ROLE {role} NOLOGIN"))
+            .execute(&pool)
+            .await;
+    }
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS auth")
+        .execute(&pool)
+        .await
+        .expect("auth schema");
+    sqlx::query("CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("auth.users");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION auth.uid() RETURNS UUID LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("auth.uid()");
+    hoard_server::cloud::db::run_migrations(&pool)
+        .await
+        .expect("migrations");
+    sqlx::query("SELECT pg_advisory_unlock(8_233_119_403)")
+        .execute(&pool)
+        .await
+        .expect("bootstrap unlock");
+    Some(pool)
+}
+
+async fn seed_user(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO auth.users (id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("auth user");
+    sqlx::query("INSERT INTO profiles (user_id, email, plan) VALUES ($1, $2, 'pro')")
+        .bind(id)
+        .bind(format!("{id}@test.invalid"))
+        .execute(pool)
+        .await
+        .expect("profile");
+    id
+}
+
+async fn cleanup(pool: &PgPool, id: Uuid) {
+    let _ = sqlx::query("DELETE FROM saves WHERE user_id = $1")
+        .bind(id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM profiles WHERE user_id = $1")
+        .bind(id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM auth.users WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await;
+}
+
+/// Fallout 4, exactly as reported: the row is gone, the client still says 398.
+#[tokio::test]
+async fn a_deleted_save_does_not_diverge_from_its_own_replacement() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    // Nothing in the cloud carries this id, nor this (game, label): the row
+    // below is the empty one minted to answer the push.
+    let client_save_id = Uuid::new_v4().to_string();
+    let row = resolve_save_row(&mut conn, &client_save_id, user, "fallout-4", &None, false)
+        .await
+        .unwrap();
+    assert_eq!(row.1, 0, "a freshly minted row starts at head 0");
+
+    assert!(
+        save_has_no_history(&mut conn, &row.0, row.1)
+            .await
+            .unwrap(),
+        "a base of 398 against an empty row is a dead cursor, not a divergence"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// The concession is scoped to *no history*, not to a head that reads 0. If the
+/// bookkeeping column ever lags its versions, the versions win and the push is
+/// still refused — that column is the thing this check refuses to trust.
+#[tokio::test]
+async fn history_under_a_stale_head_still_diverges() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "factorio",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO save_versions (save_id, version_num, size_bytes, sha256, r2_key, file_count)
+         VALUES ($1, 1, 10, 'deadbeef', 'k', 1)",
+    )
+    .bind(&row.0)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    assert!(
+        !save_has_no_history(&mut conn, &row.0, 0).await.unwrap(),
+        "a version exists under this head; refusing the push is what protects it"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}
+
+/// And a save with a real head is untouched by any of this: the ordinary
+/// two-devices divergence still rejects, which is the whole point of the check.
+#[tokio::test]
+async fn a_real_head_never_takes_the_escape_hatch() {
+    let Some(pool) = pool().await else { return };
+    let user = seed_user(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let row = resolve_save_row(
+        &mut conn,
+        &Uuid::new_v4().to_string(),
+        user,
+        "stellaris",
+        &None,
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE saves SET latest_version_num = 7 WHERE id = $1")
+        .bind(&row.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    assert!(
+        !save_has_no_history(&mut conn, &row.0, 7).await.unwrap(),
+        "head 7 vs base 4 is the divergence the 409 exists for"
+    );
+
+    drop(conn);
+    cleanup(&pool, user).await;
+}

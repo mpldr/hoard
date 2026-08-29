@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The app itself now ships for ARM.** The core tarball (`hoard` + `hoardd`)
+  has been built for `linux-aarch64` and `windows-aarch64` for a while, but the
+  desktop app was x86-only, so an ARM handheld or an ARM SteamOS device got the
+  terminal half of Hoard and nothing else. The release now carries an ARM64
+  `.deb`, `.rpm` and AppImage for Linux, and an ARM64 installer for Windows.
+  Both build on native runners, and ARM Linux joined CI so an aarch64 build is
+  no longer first attempted on a tag. The download page picks the right
+  architecture for you and lists the rest; the in-app updater already refused to
+  install a bundle from the wrong architecture, and now finds the right one.
+
 - **Accounts are managed from the web panel.** Creating a user, renaming one,
   setting a password, deleting an account and issuing a device token were all
   `hoard-admin` subcommands, so on a NAS the second person to use the server

@@ -39,10 +39,32 @@ jobs:
             label: linux-x86_64
             target: x86_64-unknown-linux-gnu
             args: ""
+          # ARM Linux. `release.yml` has shipped the aarch64 core tarball for a
+          # while; this is the app itself, for the handhelds and the ARM SteamOS
+          # devices people actually asked about. Native runner, like every other
+          # entry — the C dependencies (dbus, keyring) are not worth
+          # cross-compiling. 22.04 rather than 24.04 for the same reason as the
+          # x86_64 entry: it links an older glibc, so the AppImage runs on more
+          # distros than the runner it was built on.
+          - os: ubuntu-22.04-arm
+            label: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            args: ""
           - os: windows-latest
             label: windows-x86_64
             target: x86_64-pc-windows-msvc
             args: ""
+          # ARM Windows. NSIS only, and deliberately: WiX's arm64 support is the
+          # shakier half of the bundler, and NSIS is the installer the updater
+          # reaches for first anyway — it carries the hook that stops a running
+          # `hoardd` before overwriting it (see `install::fetch`). Optional
+          # while it is new: a failure here leaves the release short one bundle
+          # instead of holding up the other five.
+          - os: windows-11-arm
+            label: windows-aarch64
+            target: aarch64-pc-windows-msvc
+            args: "--bundles nsis"
+            optional: true
           # Apple-silicon only — macos-13 (x86_64) is being retired by
           # GitHub and queues for the legacy intel image stall for hours,
           # which used to block the entire `publish` job. macos-14 builds

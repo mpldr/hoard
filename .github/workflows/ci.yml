@@ -105,17 +105,21 @@ jobs:
       - name: i18n locales parity
         run: node scripts/check-i18n.mjs
 
-  # Compile + test across the three host platforms we ship desktop builds for.
-  # Ubuntu carries the full system deps for Tauri; Windows / macOS need only
-  # the Rust toolchain because the desktop crate is *not* built there in CI
-  # (the release workflow handles that). We still build the workspace minus
-  # hoard-desktop to validate the agent / server / CLI on all platforms.
+  # Compile + test across the host platforms we ship builds for. Ubuntu carries
+  # the full system deps for Tauri; Windows / macOS need only the Rust toolchain
+  # because the desktop crate is *not* built there in CI (the release workflow
+  # handles that). We still build the workspace minus hoard-desktop to validate
+  # the agent / server / CLI on all platforms.
+  #
+  # ARM Linux is here because we now publish ARM Linux bundles. Without it the
+  # first thing to compile an aarch64 build would be the release workflow, on a
+  # tag, with nothing left to fix it before the assets go out.
   build-test:
     name: build + test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

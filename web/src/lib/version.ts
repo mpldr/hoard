@@ -17,11 +17,15 @@ export const CHANGELOG_URL = `https://github.com/${REPO}/blob/main/CHANGELOG.md`
  *  instead of landing on the release page. */
 export type ReleaseAssets = {
   windowsSetup: string;
+  windowsSetupArm64: string;
   windowsMsi: string;
   macosDmg: string;
   linuxDeb: string;
+  linuxDebArm64: string;
   linuxAppImage: string;
+  linuxAppImageArm64: string;
   linuxRpm: string;
+  linuxRpmArm64: string;
   // Headless CLI tarballs (`hoard` binary; Linux tarballs also bundle
   // hoard-server + hoard-admin). See `/cli`.
   cliLinuxX64: string;
@@ -39,11 +43,18 @@ function assetsFor(v: string): ReleaseAssets {
   const base = `https://github.com/${REPO}/releases/download/v${v}`;
   return {
     windowsSetup: `${base}/Hoard_${v}_x64-setup.exe`,
+    windowsSetupArm64: `${base}/Hoard_${v}_arm64-setup.exe`,
+    // x64 only: the ARM desktop bundle is NSIS, no MSI. See release-desktop.yml.
     windowsMsi: `${base}/Hoard_${v}_x64_en-US.msi`,
     macosDmg: `${base}/Hoard_${v}_aarch64.dmg`,
     linuxDeb: `${base}/Hoard_${v}_amd64.deb`,
+    linuxDebArm64: `${base}/Hoard_${v}_arm64.deb`,
+    // Not a typo: the AppImage bundler writes `amd64` for x86_64 and
+    // `aarch64` for ARM, where the .deb writes `amd64`/`arm64`.
     linuxAppImage: `${base}/Hoard_${v}_amd64.AppImage`,
+    linuxAppImageArm64: `${base}/Hoard_${v}_aarch64.AppImage`,
     linuxRpm: `${base}/Hoard-${v}-1.x86_64.rpm`,
+    linuxRpmArm64: `${base}/Hoard-${v}-1.aarch64.rpm`,
     cliLinuxX64: `${base}/hoard-${v}-linux-x86_64.tar.gz`,
     cliLinuxArm64: `${base}/hoard-${v}-linux-aarch64.tar.gz`,
     cliMacosArm64: `${base}/hoard-${v}-macos-aarch64.tar.gz`,
@@ -57,12 +68,21 @@ function pickAssets(urls: string[], v: string): ReleaseAssets {
   const find = (re: RegExp) => urls.find((u) => re.test(u));
   const guess = assetsFor(v);
   return {
-    windowsSetup: find(/-setup\.exe$/) ?? guess.windowsSetup,
+    // Every one of these matches on the architecture too, which it did not
+    // have to when a release carried a single bundle per format. Now that ARM
+    // bundles ship alongside, a bare `/\.deb$/` would hand whichever GitHub
+    // happened to list first — an arm64 .deb to an x86 laptop is not a loud
+    // failure, it is dpkg complaining about something that looks unrelated.
+    windowsSetup: find(/x64-setup\.exe$/) ?? guess.windowsSetup,
+    windowsSetupArm64: find(/arm64-setup\.exe$/) ?? guess.windowsSetupArm64,
     windowsMsi: find(/\.msi$/) ?? guess.windowsMsi,
     macosDmg: find(/\.dmg$/) ?? guess.macosDmg,
-    linuxDeb: find(/\.deb$/) ?? guess.linuxDeb,
-    linuxAppImage: find(/\.appimage$/i) ?? guess.linuxAppImage,
-    linuxRpm: find(/\.rpm$/) ?? guess.linuxRpm,
+    linuxDeb: find(/_amd64\.deb$/) ?? guess.linuxDeb,
+    linuxDebArm64: find(/_arm64\.deb$/) ?? guess.linuxDebArm64,
+    linuxAppImage: find(/_amd64\.appimage$/i) ?? guess.linuxAppImage,
+    linuxAppImageArm64: find(/_aarch64\.appimage$/i) ?? guess.linuxAppImageArm64,
+    linuxRpm: find(/\.x86_64\.rpm$/) ?? guess.linuxRpm,
+    linuxRpmArm64: find(/\.aarch64\.rpm$/) ?? guess.linuxRpmArm64,
     // Match the CLI tarballs by their exact platform-arch suffix so they never
     // collide with the desktop `Hoard.app.tar.gz` (which also ends in .tar.gz).
     cliLinuxX64: find(/linux-x86_64\.tar\.gz$/) ?? guess.cliLinuxX64,

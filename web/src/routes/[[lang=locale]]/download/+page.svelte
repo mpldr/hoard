@@ -8,12 +8,17 @@
   import { version, release, ALL_RELEASES, CHANGELOG_URL } from '$lib/version';
 
   type Platform = 'windows' | 'macos' | 'linux';
+  type Arch = 'x64' | 'arm64';
   let detected = $state<Platform | null>(null);
+  let detectedArch = $state<Arch | null>(null);
 
   type Asset = {
     label: string;
     sublabel: string;
     href: string;
+    /** Left off where the platform ships a single build and there is no
+     *  choice to get wrong (the macOS dmg is Apple Silicon, full stop). */
+    arch?: Arch;
   };
 
   const fileName = (url: string) => url.split('/').pop() ?? url;
@@ -28,12 +33,20 @@
         {
           label: fileName($release.assets.windowsSetup),
           sublabel: 'Windows 10/11 · x64',
-          href: $release.assets.windowsSetup
+          href: $release.assets.windowsSetup,
+          arch: 'x64'
+        },
+        {
+          label: fileName($release.assets.windowsSetupArm64),
+          sublabel: 'Windows 11 · ARM64',
+          href: $release.assets.windowsSetupArm64,
+          arch: 'arm64'
         },
         {
           label: fileName($release.assets.windowsMsi),
           sublabel: 'Windows 10/11 · x64 · MSI',
-          href: $release.assets.windowsMsi
+          href: $release.assets.windowsMsi,
+          arch: 'x64'
         }
       ]
     },
@@ -53,17 +66,38 @@
         {
           label: fileName($release.assets.linuxDeb),
           sublabel: 'Debian / Ubuntu · x64',
-          href: $release.assets.linuxDeb
+          href: $release.assets.linuxDeb,
+          arch: 'x64'
         },
         {
           label: fileName($release.assets.linuxAppImage),
           sublabel: 'Universal · x64',
-          href: $release.assets.linuxAppImage
+          href: $release.assets.linuxAppImage,
+          arch: 'x64'
         },
         {
           label: fileName($release.assets.linuxRpm),
           sublabel: 'Fedora / openSUSE · x64',
-          href: $release.assets.linuxRpm
+          href: $release.assets.linuxRpm,
+          arch: 'x64'
+        },
+        {
+          label: fileName($release.assets.linuxDebArm64),
+          sublabel: 'Debian / Ubuntu · ARM64',
+          href: $release.assets.linuxDebArm64,
+          arch: 'arm64'
+        },
+        {
+          label: fileName($release.assets.linuxAppImageArm64),
+          sublabel: 'Universal · ARM64',
+          href: $release.assets.linuxAppImageArm64,
+          arch: 'arm64'
+        },
+        {
+          label: fileName($release.assets.linuxRpmArm64),
+          sublabel: 'Fedora / openSUSE · ARM64',
+          href: $release.assets.linuxRpmArm64,
+          arch: 'arm64'
         }
       ]
     }
@@ -74,7 +108,34 @@
     if (ua.includes('win')) detected = 'windows';
     else if (ua.includes('mac')) detected = 'macos';
     else if (ua.includes('linux')) detected = 'linux';
+
+    // Architecture, best effort. The user-agent string is no help — Windows on
+    // ARM reports x86_64 on purpose, for compatibility — so we ask Client
+    // Hints, which only Chromium answers, and stay on x64 when nobody does.
+    // Getting it wrong costs an ARM visitor one click, not a broken download:
+    // every build stays listed below whatever we guess.
+    const uaData = (navigator as unknown as { userAgentData?: UserAgentDataLike }).userAgentData;
+    uaData
+      ?.getHighEntropyValues(['architecture'])
+      .then((v) => {
+        if (v.architecture === 'arm') detectedArch = 'arm64';
+        else if (v.architecture) detectedArch = 'x64';
+      })
+      .catch(() => {});
   });
+
+  type UserAgentDataLike = {
+    getHighEntropyValues(hints: string[]): Promise<{ architecture?: string }>;
+  };
+
+  /** The download the big button points at: this machine's architecture when
+   *  we know it, and the platform's first (x64) build when we do not. */
+  let primary = $derived(
+    detected
+      ? (downloads[detected].assets.find((a) => a.arch === detectedArch) ??
+        downloads[detected].assets[0])
+      : null
+  );
 
   const order: Platform[] = ['windows', 'macos', 'linux'];
 </script>
@@ -98,7 +159,7 @@
   {#if detected}
     <div class="reveal mt-10 flex justify-center" use:reveal>
       <a
-        href={downloads[detected].assets[0].href}
+        href={(primary ?? downloads[detected].assets[0]).href}
         class="group inline-flex items-center gap-4 rounded-2xl border border-accent bg-accent-tint px-7 py-5 text-left ring-focus transition-colors hover:bg-accent/15"
       >
         <span
@@ -118,7 +179,7 @@
             {$_('download.cta_for', { values: { platform: downloads[detected].name } })}
           </span>
           <span class="font-mono text-xs text-ink-soft">
-            {downloads[detected].assets[0].sublabel}
+            {(primary ?? downloads[detected].assets[0]).sublabel}
           </span>
         </span>
         <ArrowRight

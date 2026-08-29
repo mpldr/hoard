@@ -47,6 +47,7 @@ pub mod state;
 pub mod steam;
 pub mod supervisor;
 pub mod telemetry;
+pub mod tls;
 pub mod update;
 pub mod wine_prefixes;
 pub mod wrappers;

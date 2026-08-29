@@ -207,6 +207,7 @@ async fn connect_once(app: &AppHandle) -> anyhow::Result<()> {
     let anon = cloud::supabase_anon_key();
     let url = format!("{ws_base}/realtime/v1/websocket?apikey={anon}&vsn=2.0.0");
 
+    hoard_agent::tls::ensure_crypto_provider();
     let (ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
     let (mut write, mut read) = ws.split();
 

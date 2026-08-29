@@ -39,8 +39,31 @@ axum = { version = "0.7", features = ["multipart"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# HTTP client.
+#
+# TLS is rustls, not the OpenSSL-backed default, and that is a portability fix
+# rather than a preference. With `default-tls` the binary links the build
+# machine's libssl, which carries that machine's OPENSSLDIR baked in
+# (`/usr/lib/ssl` on Ubuntu). The `.deb` gets away with it because it runs on
+# the same family, but the AppImage bundles that libssl and travels: on
+# Arch-derived systems — SteamOS, Bazzite — nothing lives at `/usr/lib/ssl`, so
+# every handshake dies with `certificate verify failed` plus a `stat
+# (/usr/lib/ssl/certs)` in the error, and the app can reach nothing at all.
+#
+# Both root stores are on, and both are load-bearing: webpki ships the Mozilla
+# roots inside the binary so a handshake works on any distro whatever it keeps
+# on disk, and the native store is what still lets a self-hosted server with a
+# private CA in the system trust be reached. reqwest merges the two.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "stream",
+    "charset",
+    "http2",
+    "system-proxy",
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "time", "uuid"] }
@@ -99,9 +122,18 @@ directories = "5"
 indicatif = "0.17"
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
-# WebSocket client for the Supabase Realtime push (near-instant sync). Uses
-# native-tls to match reqwest's default TLS backend (no extra rustls stack).
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+# WebSocket client for the Supabase Realtime push (near-instant sync). Same
+# rustls pair as reqwest above, for the same reason: with native-tls the
+# AppImage's bundled libssl looks for its cert store where Ubuntu keeps it and
+# finds nothing on SteamOS. Note tokio-tungstenite prefers native-tls whenever
+# that feature is on, so it has to be absent, not merely outvoted.
+tokio-tungstenite = { version = "0.24", features = [
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
+# Direct dep for one call: naming the crypto provider tungstenite's connector
+# would otherwise have to guess at. See `hoard_agent::tls`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 bytes = "1"
 regex = "1"
 strsim = "0.11"

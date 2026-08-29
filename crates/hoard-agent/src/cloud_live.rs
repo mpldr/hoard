@@ -257,6 +257,7 @@ async fn connect_once(kick_tx: &mpsc::Sender<()>) -> anyhow::Result<bool> {
     let anon = cloud_auth::supabase_anon_key();
     let url = format!("{ws_base}/realtime/v1/websocket?apikey={anon}&vsn=1.0.0");
 
+    crate::tls::ensure_crypto_provider();
     let (ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
     let (mut write, mut read) = ws.split();
 

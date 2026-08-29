@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   plain-HTTP origin a NAS panel is reached over.
 
 ### Fixed
+- **The AppImage could reach nothing at all on SteamOS, Bazzite and other
+  Arch-derived systems.** Every HTTPS call died with `certificate verify
+  failed`, the error naming a `stat(/usr/lib/ssl/certs)` nobody asked for: TLS
+  went through the OpenSSL of the machine that builds the release, which carries
+  Ubuntu's cert-store path baked in, and the AppImage bundles that library and
+  travels. Nothing lives at `/usr/lib/ssl` on an Arch base, so the app had no
+  root certificates and no way to say so. TLS is rustls now, with the Mozilla
+  roots compiled into the binary — no path on disk to get wrong — and the
+  system's own store still read on top, so a self-hosted server behind a private
+  CA keeps working. The `.deb` and the tarballs were never affected.
 - **Self-hosted clients never auto-pulled a save that was ahead on the server.**
   After ADR 0021 the engine only restores when `cloud_ahead` is true (or the
   folder is empty). That flag is fed from a head cache the cloud poller fills

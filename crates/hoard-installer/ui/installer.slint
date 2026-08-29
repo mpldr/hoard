@@ -211,6 +211,57 @@ component GhostButton inherits Rectangle {
     }
 }
 
+// The way out.
+//
+// Two things pull against each other here and both are the user's own words:
+// it has to be findable — the first version was a dim glyph nobody spotted —
+// and it must not be easy to hit by accident. So it is drawn rather than set
+// in type (a font may not even carry U+2715, and a hairline stroke reads as
+// quiet in a way a glyph at 12px cannot), and it is pulled a good way in from
+// the corner instead of sitting in it.
+//
+// The corner is exactly where a mouse lands when it is thrown at the top right
+// without aiming — Windows puts the real close button there and Fitts' law
+// makes it a target of infinite size. An installer mid-download should not be
+// that easy to kill, so this one gives up the corner on purpose.
+component CloseButton inherits Rectangle {
+    callback clicked();
+
+    // The inset. It is the whole point of the component.
+    width: 28px + 18px;
+    height: 28px;
+
+    hit := Rectangle {
+        x: 0;
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+        background: touch.has-hover ? Theme.surface-2 : transparent;
+        animate background { duration: 140ms; }
+
+        Path {
+            width: 10px;
+            height: 10px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 10;
+            viewbox-height: 10;
+            stroke: touch.has-hover ? Theme.fg : Theme.fg-dim;
+            stroke-width: 1.25px;
+            commands: "M 0 0 L 10 10 M 10 0 L 0 10";
+        }
+
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.clicked();
+            }
+        }
+    }
+}
+
 component Toggle inherits Rectangle {
     in-out property <bool> checked: true;
 
@@ -655,7 +706,9 @@ export component Installer inherits Window {
 
             HorizontalLayout {
                 padding-left: 16px;
-                padding-right: 12px;
+                // The close button carries its own margin, so the bar stops
+                // well short of the corner. See `CloseButton`.
+                padding-right: 0px;
                 spacing: 10px;
 
                 VerticalLayout {
@@ -680,23 +733,9 @@ export component Installer inherits Window {
 
                 VerticalLayout {
                     alignment: center;
-                    Rectangle {
-                        width: 28px;
-                        height: 28px;
-                        border-radius: 8px;
-                        background: closetouch.has-hover ? Theme.surface-2 : transparent;
-
-                        Text {
-                            text: "✕";
-                            font-size: 12px;
-                            color: closetouch.has-hover ? Theme.fg : Theme.fg-dim;
-                        }
-
-                        closetouch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.quit();
-                            }
+                    CloseButton {
+                        clicked => {
+                            root.quit();
                         }
                     }
                 }

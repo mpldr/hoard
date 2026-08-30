@@ -1,0 +1,64 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: hoard-installer\n"
+"Language: zh\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "VERSION {}"
+msgstr "版本 {}"
+
+msgid "By continuing you accept the"
+msgstr "继续即表示你接受"
+
+msgid "AGPL-3.0 license"
+msgstr "AGPL-3.0 许可证"
+
+msgid "Close"
+msgstr "关闭"
+
+msgid "Continue"
+msgstr "继续"
+
+msgid "Desktop app"
+msgstr "桌面应用"
+
+msgid "Install the desktop app"
+msgstr "安装桌面应用"
+
+msgid "Turn this off on a server or a NAS."
+msgstr "在服务器或 NAS 上请关闭。"
+
+msgid "Back"
+msgstr "返回"
+
+msgid "Install"
+msgstr "安装"
+
+msgid "Uninstall"
+msgstr "卸载"
+
+msgid "Update"
+msgstr "更新"
+
+msgid "Reinstall"
+msgstr "重新安装"
+
+msgid "Try again"
+msgstr "重试"
+
+msgid "Hoard {} is already installed"
+msgstr "已安装 Hoard {}"
+
+msgid "An earlier version of Hoard is already installed"
+msgstr "已安装较早版本的 Hoard"
+
+msgid "sync engine and desktop app"
+msgstr "同步引擎和桌面应用"
+
+msgid "sync engine only"
+msgstr "仅同步引擎"
+
+msgid "Your settings and sync history are still in {}"
+msgstr "你的设置和同步记录仍在 {}"

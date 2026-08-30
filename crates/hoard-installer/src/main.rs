@@ -19,6 +19,23 @@ use std::sync::Arc;
 
 slint::include_modules!();
 
+/// The eight the app itself speaks, in the order the picker lists them.
+///
+/// `(tag, badge, name)`: the tag selects the bundled `.po`, the badge is what
+/// the button shows, and the name is the language written in itself — someone
+/// looking for Deutsch is not helped by the word "German" in a language they
+/// don't read.
+const LANGUAGES: [(&str, &str, &str); 8] = [
+    ("en", "EN", "English"),
+    ("es", "ES", "Español"),
+    ("fr", "FR", "Français"),
+    ("de", "DE", "Deutsch"),
+    ("pt", "PT", "Português"),
+    ("it", "IT", "Italiano"),
+    ("ja", "JA", "日本語"),
+    ("zh", "ZH", "中文"),
+];
+
 /// Screen indices, matching `installer.slint`.
 const WELCOME: i32 = 0;
 const ASK: i32 = 1;
@@ -43,8 +60,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return silent(flag("--uninstall"), !flag("--no-desktop"));
     }
 
+    // Before the window exists, so the first frame is already in the right
+    // language rather than flashing English and correcting itself.
+    let start_lang = system_language();
+    let _ = slint::select_bundled_translation(LANGUAGES[start_lang].0);
+
     let ui = Installer::new()?;
     ui.set_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_language(start_lang as i32);
+    ui.set_language_codes(slint::ModelRc::new(slint::VecModel::from(
+        LANGUAGES
+            .iter()
+            .map(|(_, badge, _)| slint::SharedString::from(*badge))
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_language_names(slint::ModelRc::new(slint::VecModel::from(
+        LANGUAGES
+            .iter()
+            .map(|(_, _, name)| slint::SharedString::from(*name))
+            .collect::<Vec<_>>(),
+    )));
+    ui.on_pick_language(|index| {
+        if let Some((tag, _, _)) = LANGUAGES.get(index as usize) {
+            // Every `@tr` in the tree re-evaluates on its own from here.
+            let _ = slint::select_bundled_translation(tag);
+        }
+    });
 
     // Ask the disk before showing anything: on a machine that already has
     // Hoard, "Continue" leads somewhere different, and finding that out after
@@ -52,8 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let found = steps::detect();
     if let Some(existing) = &found {
         ui.set_installed(true);
-        ui.set_installed_headline(headline(existing).into());
-        ui.set_installed_parts(parts(existing).into());
+        ui.set_installed_version(existing.version.clone().unwrap_or_default().into());
+        ui.set_installed_has_desktop(existing.has_desktop());
     }
     let found = Arc::new(found);
 
@@ -67,12 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rt.spawn(async move {
             if let Ok(version) = steps::latest_version().await {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
-                    // Calling it "Update" when there is nothing to update to is
-                    // a button that lies about what it does.
-                    let installed = ui.get_installed_headline().to_string();
-                    if installed.contains(&version) {
-                        ui.set_action_label("Reinstall".into());
-                    }
+                    // Which decides whether the button says Update or Reinstall.
+                    ui.set_up_to_date(ui.get_installed_version() == version.as_str());
                     ui.set_version(version.into());
                 });
             }
@@ -122,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => ui.get_want_desktop(),
             };
             ui.set_message(Default::default());
-            ui.set_note(Default::default());
+            ui.set_kept_path(Default::default());
             ui.set_screen(DOING);
 
             let weak = weak.clone();
@@ -166,7 +203,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = weak.upgrade_in_event_loop(move |ui| match result {
                     Ok(kept) => {
                         ui.set_can_launch(false);
-                        ui.set_note(kept_note(&kept).into());
+                        // The path only. The sentence around it is in the UI,
+                        // where a translation can reach it.
+                        if let Some(path) = kept.first() {
+                            ui.set_kept_path(path.display().to_string().into());
+                        }
                         ui.set_screen(DONE);
                     }
                     Err(err) => {
@@ -303,42 +344,23 @@ fn silent(uninstall: bool, want_desktop: bool) -> Result<(), Box<dyn std::error:
     std::process::exit(code);
 }
 
-/// The line that names what is already here.
+/// Which of [`LANGUAGES`] this machine asks for, falling back to English.
 ///
-/// The version comes from the manifest, and an install older than the manifest
-/// has none. "an earlier version" is the honest answer there; inventing a
-/// number would be worse than admitting we don't know.
-fn headline(existing: &hoard_agent::install::Installed) -> String {
-    match &existing.version {
-        Some(v) => format!("Hoard {v} is already installed"),
-        None => "An earlier version of Hoard is already installed".to_string(),
-    }
-}
-
-/// Which halves of it are here. The distinction matters on a server, where the
-/// app was deliberately left out and an update must not quietly add it.
-fn parts(existing: &hoard_agent::install::Installed) -> String {
-    if existing.has_desktop() {
-        "sync engine and desktop app".to_string()
-    } else {
-        "sync engine only".to_string()
-    }
-}
-
-/// What the finished screen says after an uninstall.
-///
-/// Never "everything is gone", because it isn't. It names the state directory
-/// rather than "your saves": the save files themselves were never ours to
-/// remove — they are in the games' own folders and, if you were syncing, on the
-/// server. What is left here is what Hoard knew about this machine.
-fn kept_note(kept: &[std::path::PathBuf]) -> String {
-    match kept.first() {
-        Some(path) => format!(
-            "Your settings and sync history are still in {}",
-            path.display()
-        ),
-        None => String::new(),
-    }
+/// Matched on the language part alone: `pt-BR` and `pt-PT` both get `pt`,
+/// which is the honest resolution when only one Portuguese is bundled.
+fn system_language() -> usize {
+    let Some(locale) = sys_locale::get_locale() else {
+        return 0;
+    };
+    let tag = locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    LANGUAGES
+        .iter()
+        .position(|(code, _, _)| *code == tag)
+        .unwrap_or(0)
 }
 
 /// Starts the freshly installed app and lets go of it: the installer is about

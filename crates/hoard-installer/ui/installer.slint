@@ -211,6 +211,95 @@ component GhostButton inherits Rectangle {
     }
 }
 
+// The language picker.
+//
+// Sits to the left of the way out, dressed the same: dim until the pointer is
+// near it. It shows the current code rather than a globe because a globe tells
+// you there is a language setting and not which one is active, and the one
+// person who needs this control is the one for whom the active one is wrong.
+//
+// The list names each language in itself — someone looking for Deutsch is not
+// helped by the word "German" in a language they don't read.
+component LanguagePicker inherits Rectangle {
+    in property <[string]> codes;
+    in property <[string]> names;
+    in-out property <int> current;
+    callback picked(int);
+
+    width: 34px;
+    height: 28px;
+    border-radius: 8px;
+    background: touch.has-hover || popup-open ? Theme.surface-2 : transparent;
+    animate background { duration: 140ms; }
+
+    property <bool> popup-open: false;
+
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.codes[root.current];
+        font-family: "Geist";
+        font-size: 10.5px;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        color: touch.has-hover || root.popup-open ? Theme.fg : Theme.fg-dim;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            menu.show();
+            root.popup-open = true;
+        }
+    }
+
+    menu := PopupWindow {
+        // Hangs under the button and to the left, so an eight-item list on a
+        // 600px window never runs off the right edge.
+        x: root.width - 148px;
+        y: root.height + 6px;
+        width: 148px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            background: Theme.surface-2;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.edge-strong;
+
+            VerticalLayout {
+                padding: 5px;
+                spacing: 1px;
+
+                for name[i] in root.names: Rectangle {
+                    height: 28px;
+                    border-radius: 6px;
+                    background: row.has-hover ? Theme.surface-1 : transparent;
+
+                    Text {
+                        x: 10px;
+                        y: (parent.height - self.height) / 2;
+                        text: name;
+                        font-family: "Geist";
+                        font-size: 12.5px;
+                        color: i == root.current ? Theme.accent : Theme.fg-muted;
+                    }
+
+                    row := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.current = i;
+                            root.picked(i);
+                            root.popup-open = false;
+                            menu.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // The way out.
 //
 // Two things pull against each other here and both are the user's own words:
@@ -323,7 +412,7 @@ component Welcome inherits VerticalLayout {
         spacing: 8px;
 
         Text {
-            text: "VERSION " + root.version;
+            text: @tr("VERSION {}", root.version);
             font-family: "Geist";
             font-size: 10.5px;
             font-weight: 600;
@@ -337,7 +426,7 @@ component Welcome inherits VerticalLayout {
             spacing: 5px;
 
             Text {
-                text: "By continuing you accept the";
+                text: @tr("By continuing you accept the");
                 font-family: "Geist";
                 font-size: 12.5px;
                 color: Theme.fg-dim;
@@ -349,7 +438,7 @@ component Welcome inherits VerticalLayout {
                 height: link.preferred-height + 3px;
 
                 link := Text {
-                    text: "AGPL-3.0 license";
+                    text: @tr("AGPL-3.0 license");
                     font-family: "Geist";
                     font-size: 12.5px;
                     color: linktouch.has-hover ? Theme.accent-hi : Theme.fg-muted;
@@ -378,13 +467,13 @@ component Welcome inherits VerticalLayout {
         padding-top: 18px;
 
         GhostButton {
-            label: "Close";
+            label: @tr("Close");
             clicked => {
                 root.close();
             }
         }
         PrimaryButton {
-            label: "Continue";
+            label: @tr("Continue");
             clicked => {
                 root.next();
             }
@@ -406,7 +495,7 @@ component Ask inherits VerticalLayout {
     spacing: 0px;
 
     Text {
-        text: "Desktop app";
+        text: @tr("Desktop app");
         font-family: "Geist";
         font-size: 20px;
         font-weight: 600;
@@ -432,14 +521,14 @@ component Ask inherits VerticalLayout {
                     spacing: 3px;
 
                     Text {
-                        text: "Install the desktop app";
+                        text: @tr("Install the desktop app");
                         font-family: "Geist";
                         font-size: 15px;
                         font-weight: 600;
                         color: Theme.fg;
                     }
                     Text {
-                        text: "Turn this off on a server or a NAS.";
+                        text: @tr("Turn this off on a server or a NAS.");
                         font-family: "Geist";
                         font-size: 12.5px;
                         color: Theme.fg-dim;
@@ -462,13 +551,13 @@ component Ask inherits VerticalLayout {
         padding-top: 18px;
 
         GhostButton {
-            label: "Back";
+            label: @tr("Back");
             clicked => {
                 root.back();
             }
         }
         PrimaryButton {
-            label: "Install";
+            label: @tr("Install");
             clicked => {
                 root.install();
             }
@@ -482,9 +571,12 @@ component Ask inherits VerticalLayout {
 // the question has already been answered — what is open now is what to do with
 // what is there. Two ways out and no default hidden behind a menu.
 component Existing inherits VerticalLayout {
-    in property <string> headline;
-    in property <string> parts;
-    in property <string> action;
+    // Data, not sentences. Rust used to hand over a finished English string,
+    // which put user-facing copy in the backend where no translation can reach
+    // it. Now it hands over what it found and the wording lives here.
+    in property <string> version;
+    in property <bool> has-desktop;
+    in property <bool> up-to-date;
     callback uninstall();
     callback update();
 
@@ -501,14 +593,20 @@ component Existing inherits VerticalLayout {
             spacing: 6px;
 
             Text {
-                text: root.headline;
+                // No version means an install older than the manifest. Saying
+                // so is honest; inventing a number would not be.
+                text: root.version == ""
+                    ? @tr("An earlier version of Hoard is already installed")
+                    : @tr("Hoard {} is already installed", root.version);
                 font-family: "Geist";
                 font-size: 13px;
                 color: Theme.fg-muted;
                 horizontal-alignment: center;
             }
             Text {
-                text: root.parts;
+                text: root.has-desktop
+                    ? @tr("sync engine and desktop app")
+                    : @tr("sync engine only");
                 font-family: "Geist";
                 font-size: 11.5px;
                 color: Theme.fg-dim;
@@ -523,13 +621,15 @@ component Existing inherits VerticalLayout {
         padding-top: 18px;
 
         GhostButton {
-            label: "Uninstall";
+            label: @tr("Uninstall");
             clicked => {
                 root.uninstall();
             }
         }
         PrimaryButton {
-            label: root.action;
+            // Calling it "Update" when there is nothing to update to is a
+            // button that lies about what it does.
+            label: root.up-to-date ? @tr("Reinstall") : @tr("Update");
             clicked => {
                 root.update();
             }
@@ -551,7 +651,7 @@ component Done inherits VerticalLayout {
     // Only after an uninstall, and only to say where the saves still are. An
     // uninstaller that leaves gigabytes behind in silence is one the user will
     // hunt for later; one that seems to have deleted them is worse.
-    in property <string> note;
+    in property <string> kept-path;
     callback close();
     callback launch();
 
@@ -564,8 +664,8 @@ component Done inherits VerticalLayout {
 
         Brand { }
 
-        if root.note != "": Text {
-            text: root.note;
+        if root.kept-path != "": Text {
+            text: @tr("Your settings and sync history are still in {}", root.kept-path);
             font-family: "Geist";
             font-size: 11.5px;
             color: Theme.fg-dim;
@@ -580,13 +680,13 @@ component Done inherits VerticalLayout {
         padding-top: 18px;
 
         GhostButton {
-            label: "Close";
+            label: @tr("Close");
             clicked => {
                 root.close();
             }
         }
         if root.can-launch: PrimaryButton {
-            label: "Open Hoard";
+            label: @tr("Continue");
             clicked => {
                 root.launch();
             }
@@ -628,13 +728,13 @@ component Failed inherits VerticalLayout {
         padding-top: 18px;
 
         GhostButton {
-            label: "Close";
+            label: @tr("Close");
             clicked => {
                 root.close();
             }
         }
         PrimaryButton {
-            label: "Try again";
+            label: @tr("Try again");
             clicked => {
                 root.retry();
             }
@@ -654,11 +754,17 @@ export component Installer inherits Window {
     in property <bool> can-launch: false;
     // Set once at startup: is there a Hoard on this machine already?
     in property <bool> installed: false;
-    in property <string> installed-headline: "";
-    in property <string> installed-parts: "";
-    // "Update" normally, "Reinstall" when it is already at the newest version.
-    in property <string> action-label: "Update";
-    in property <string> note: "";
+    in property <string> installed-version: "";
+    in property <bool> installed-has-desktop: false;
+    /// True when what is installed is already the newest release.
+    in property <bool> up-to-date: false;
+    in property <string> kept-path: "";
+    // The eight the app itself speaks. Filled from Rust so the list and the
+    // bundled `.po` files can't drift apart.
+    in property <[string]> language-codes;
+    in property <[string]> language-names;
+    in-out property <int> language: 0;
+    callback pick-language(int);
     // Where the app landed, so the last button knows what to start.
     in-out property <string> launch-path: "";
     in-out property <bool> want-desktop: true;
@@ -733,6 +839,18 @@ export component Installer inherits Window {
 
                 VerticalLayout {
                     alignment: center;
+                    LanguagePicker {
+                        codes: root.language-codes;
+                        names: root.language-names;
+                        current <=> root.language;
+                        picked(i) => {
+                            root.pick-language(i);
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
                     CloseButton {
                         clicked => {
                             root.quit();
@@ -773,7 +891,7 @@ export component Installer inherits Window {
 
             if root.screen == 3: Done {
                 can-launch: root.can-launch;
-                note: root.note;
+                kept-path: root.kept-path;
                 close => {
                     root.quit();
                 }
@@ -783,9 +901,9 @@ export component Installer inherits Window {
             }
 
             if root.screen == 5: Existing {
-                headline: root.installed-headline;
-                parts: root.installed-parts;
-                action: root.action-label;
+                version: root.installed-version;
+                has-desktop: root.installed-has-desktop;
+                up-to-date: root.up-to-date;
                 uninstall => {
                     root.start-uninstall();
                 }

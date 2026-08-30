@@ -1,0 +1,64 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: hoard-installer\n"
+"Language: pt\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "VERSION {}"
+msgstr "VERSÃO {}"
+
+msgid "By continuing you accept the"
+msgstr "Ao continuar aceitas a"
+
+msgid "AGPL-3.0 license"
+msgstr "licença AGPL-3.0"
+
+msgid "Close"
+msgstr "Fechar"
+
+msgid "Continue"
+msgstr "Continuar"
+
+msgid "Desktop app"
+msgstr "Aplicação de ambiente de trabalho"
+
+msgid "Install the desktop app"
+msgstr "Instalar a aplicação"
+
+msgid "Turn this off on a server or a NAS."
+msgstr "Desliga isto num servidor ou num NAS."
+
+msgid "Back"
+msgstr "Voltar"
+
+msgid "Install"
+msgstr "Instalar"
+
+msgid "Uninstall"
+msgstr "Desinstalar"
+
+msgid "Update"
+msgstr "Atualizar"
+
+msgid "Reinstall"
+msgstr "Reinstalar"
+
+msgid "Try again"
+msgstr "Tentar de novo"
+
+msgid "Hoard {} is already installed"
+msgstr "O Hoard {} já está instalado"
+
+msgid "An earlier version of Hoard is already installed"
+msgstr "Já está instalada uma versão anterior do Hoard"
+
+msgid "sync engine and desktop app"
+msgstr "motor de sincronização e aplicação"
+
+msgid "sync engine only"
+msgstr "apenas o motor de sincronização"
+
+msgid "Your settings and sync history are still in {}"
+msgstr "As tuas definições e o histórico continuam em {}"

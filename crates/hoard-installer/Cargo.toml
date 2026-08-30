@@ -51,6 +51,11 @@ slint = { version = "1.17", default-features = false, features = [
     "unstable-winit-030",
 ] }
 
+# Which language this machine asks for. Tiny and platform-aware; the
+# alternative is reading `LANG` on unix and calling `GetUserDefaultLocaleName`
+# on Windows by hand.
+sys-locale = "0.3"
+
 anyhow = { workspace = true }
 tokio = { workspace = true }
 

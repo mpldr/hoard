@@ -3978,6 +3978,7 @@ dependencies = [
  "libc",
  "slint",
  "slint-build",
+ "sys-locale",
  "tokio",
  "winresource",
 ]

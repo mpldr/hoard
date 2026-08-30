@@ -101,13 +101,35 @@ pub fn asset_for(delivery: Delivery, assets: &[Asset]) -> Option<&Asset> {
     suffixes.iter().find_map(|suffix| {
         let mut matching = assets
             .iter()
-            .filter(|a| a.name.ends_with(suffix) && !a.name.ends_with(".minisig"))
+            .filter(|a| {
+                a.name.ends_with(suffix) && !a.name.ends_with(".minisig") && !is_our_installer(a)
+            })
             .peekable();
         // Sin candidatos, nada que decidir.
         matching.peek()?;
         let candidates: Vec<&Asset> = matching.collect();
         pick_for_arch(&candidates)
     })
+}
+
+/// Is this asset the graphical installer rather than a package of the app?
+///
+/// Every release carries both, and they collide by construction: the installer
+/// is a `.exe` on Windows and would be an `.AppImage` or a `.dmg` if it were
+/// packaged the way each system expects — the very suffixes [`asset_for`] uses
+/// to recognise the app. [`pick_for_arch`] can't separate them either, since
+/// both carry the same architecture token, so the tie would be broken by
+/// whatever order GitHub happens to list the files in.
+///
+/// Getting it wrong is quiet and bad: the in-app updater would download the
+/// installer, run it as an update, and the user would get a window asking them
+/// to install what they already have.
+///
+/// Matched on the name because that is the only thing a release asset has.
+/// CI publishes ours as `HoardSetup-<arch>[.ext]`; the check is the contract,
+/// so renaming there means changing this too.
+fn is_our_installer(asset: &Asset) -> bool {
+    asset.name.to_ascii_lowercase().starts_with("hoardsetup")
 }
 
 /// Tokens con los que los bundles nombran **nuestra** arquitectura.
@@ -1034,5 +1056,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+#[cfg(test)]
+mod installer_guard_tests {
+    use super::*;
+
+    fn asset(name: &str) -> Asset {
+        Asset {
+            name: name.to_string(),
+            url: format!("https://example.invalid/{name}"),
+        }
+    }
+
+    /// The release that ships both: the updater has to reach past our own
+    /// installer and find the app.
+    ///
+    /// The app's names carry no architecture token on purpose, so
+    /// [`pick_for_arch`] falls through to "the only candidate" and the outcome
+    /// depends on nothing but the filter under test. With real names the answer
+    /// would change with the machine running the test — a `.dmg` is published
+    /// for aarch64 only, so on an x86_64 host the right answer is `None`, and
+    /// this test would be asserting the host rather than the code.
+    #[test]
+    fn picks_the_app_not_the_installer() {
+        let assets = vec![
+            asset("HoardSetup-x86_64.AppImage"),
+            asset("Hoard.AppImage"),
+            asset("HoardSetup-x86_64.exe"),
+            asset("Hoard-setup.exe"),
+            asset("HoardSetup-aarch64.dmg"),
+            asset("Hoard.dmg"),
+        ];
+
+        for (delivery, want) in [
+            (Delivery::AppImage, "Hoard.AppImage"),
+            (Delivery::Nsis, "Hoard-setup.exe"),
+            (Delivery::Dmg, "Hoard.dmg"),
+        ] {
+            assert_eq!(
+                asset_for(delivery, &assets).map(|a| a.name.as_str()),
+                Some(want),
+                "{delivery:?} picked the wrong file"
+            );
+        }
+    }
+
+    /// And with only the installer there, the honest answer is "no package",
+    /// not "here, run the installer again".
+    #[test]
+    fn refuses_when_only_the_installer_is_published() {
+        let assets = vec![
+            asset("HoardSetup-x86_64.AppImage"),
+            asset("HoardSetup-x86_64.exe"),
+            asset("HoardSetup-aarch64.dmg"),
+        ];
+        for delivery in [Delivery::AppImage, Delivery::Nsis, Delivery::Dmg] {
+            assert!(
+                asset_for(delivery, &assets).is_none(),
+                "{delivery:?} settled for our own installer"
+            );
+        }
     }
 }

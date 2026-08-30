@@ -19,6 +19,11 @@
     /** Left off where the platform ships a single build and there is no
      *  choice to get wrong (the macOS dmg is Apple Silicon, full stop). */
     arch?: Arch;
+    /** Hoard Setup rather than a raw package. Listed first, and what the big
+     *  button points at: it works out which package this machine wants, which
+     *  is the question the rest of this page is asking the visitor to answer
+     *  for themselves. */
+    setup?: boolean;
   };
 
   const fileName = (url: string) => url.split('/').pop() ?? url;
@@ -30,6 +35,12 @@
     windows: {
       name: 'Windows',
       assets: [
+        {
+          label: fileName($release.assets.setupWindows),
+          sublabel: 'Installer · Windows 10/11',
+          href: $release.assets.setupWindows,
+          setup: true
+        },
         {
           label: fileName($release.assets.windowsSetup),
           sublabel: 'Windows 10/11 · x64',
@@ -54,6 +65,12 @@
       name: 'macOS',
       assets: [
         {
+          label: fileName($release.assets.setupMacos),
+          sublabel: 'Installer · Apple Silicon',
+          href: $release.assets.setupMacos,
+          setup: true
+        },
+        {
           label: fileName($release.assets.macosDmg),
           sublabel: 'macOS 12+ · Apple Silicon',
           href: $release.assets.macosDmg
@@ -63,6 +80,12 @@
     linux: {
       name: 'Linux',
       assets: [
+        {
+          label: fileName($release.assets.setupLinux),
+          sublabel: 'Installer · chmod +x and run',
+          href: $release.assets.setupLinux,
+          setup: true
+        },
         {
           label: fileName($release.assets.linuxDeb),
           sublabel: 'Debian / Ubuntu · x64',
@@ -128,11 +151,16 @@
     getHighEntropyValues(hints: string[]): Promise<{ architecture?: string }>;
   };
 
-  /** The download the big button points at: this machine's architecture when
-   *  we know it, and the platform's first (x64) build when we do not. */
+  /** The download the big button points at.
+   *
+   *  Hoard Setup, wherever there is one: it resolves the right package for the
+   *  machine it lands on, so it is right even when our architecture guess is
+   *  not. Falling back to picking a bundle by architecture keeps the old
+   *  behaviour for a release published before the installer existed. */
   let primary = $derived(
     detected
-      ? (downloads[detected].assets.find((a) => a.arch === detectedArch) ??
+      ? (downloads[detected].assets.find((a) => a.setup) ??
+        downloads[detected].assets.find((a) => a.arch === detectedArch) ??
         downloads[detected].assets[0])
       : null
   );

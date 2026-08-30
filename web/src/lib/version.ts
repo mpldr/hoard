@@ -16,6 +16,13 @@ export const CHANGELOG_URL = `https://github.com/${REPO}/blob/main/CHANGELOG.md`
 /** Direct-download URL per installer, so clicking starts the download
  *  instead of landing on the release page. */
 export type ReleaseAssets = {
+  // Hoard Setup: the graphical installer, one per platform. It is the normal
+  // way in — it fetches the right package for the machine it is on — and the
+  // raw bundles below stay published for anyone who would rather not be
+  // helped.
+  setupWindows: string;
+  setupMacos: string;
+  setupLinux: string;
   windowsSetup: string;
   windowsSetupArm64: string;
   windowsMsi: string;
@@ -42,6 +49,9 @@ export type ReleaseInfo = { v: string; date: string; assets: ReleaseAssets };
 function assetsFor(v: string): ReleaseAssets {
   const base = `https://github.com/${REPO}/releases/download/v${v}`;
   return {
+    setupWindows: `${base}/HoardSetup-x86_64.exe`,
+    setupMacos: `${base}/HoardSetup-aarch64.zip`,
+    setupLinux: `${base}/HoardSetup-x86_64`,
     windowsSetup: `${base}/Hoard_${v}_x64-setup.exe`,
     windowsSetupArm64: `${base}/Hoard_${v}_arm64-setup.exe`,
     // x64 only: the ARM desktop bundle is NSIS, no MSI. See release-desktop.yml.
@@ -73,6 +83,11 @@ function pickAssets(urls: string[], v: string): ReleaseAssets {
     // bundles ship alongside, a bare `/\.deb$/` would hand whichever GitHub
     // happened to list first — an arm64 .deb to an x86 laptop is not a loud
     // failure, it is dpkg complaining about something that looks unrelated.
+    // Version-less names on purpose: the installer resolves the release
+    // itself, so the file does not go stale between releases.
+    setupWindows: find(/HoardSetup-x86_64\.exe$/) ?? guess.setupWindows,
+    setupMacos: find(/HoardSetup-aarch64\.zip$/) ?? guess.setupMacos,
+    setupLinux: find(/HoardSetup-x86_64$/) ?? guess.setupLinux,
     windowsSetup: find(/x64-setup\.exe$/) ?? guess.windowsSetup,
     windowsSetupArm64: find(/arm64-setup\.exe$/) ?? guess.windowsSetupArm64,
     windowsMsi: find(/\.msi$/) ?? guess.windowsMsi,

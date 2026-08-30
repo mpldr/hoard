@@ -26,6 +26,12 @@ finish-args:
   # Tray icon (tauri-plugin global tray + the community/Pro overlay toggle).
   - --talk-name=org.kde.StatusNotifierWatcher
   - --filesystem=xdg-run/tray-icon:create
+  # The daemon keeps the cloud token in the OS credential store, which on Linux
+  # is libsecret over the session bus (see the `keyring` features in
+  # crates/hoard-agent/Cargo.toml). Without this name the store is simply
+  # absent, credentials.rs falls back to a 0600 file inside the sandbox, and
+  # nothing says out loud that the token stopped being encrypted at rest.
+  - --talk-name=org.freedesktop.secrets
   # Hoard's whole job is finding and backing up game saves wherever they live:
   # Steam libraries on other drives, Proton/Wine prefixes, emulator save
   # folders, self-chosen paths. See crates/hoard-agent/src/{steam,roots,

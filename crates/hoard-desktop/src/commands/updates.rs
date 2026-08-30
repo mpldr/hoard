@@ -978,6 +978,19 @@ mod tests {
     use hoard_agent::install::fetch::asset_for;
     use hoard_agent::install::Delivery;
 
+    /// The architecture token Windows bundles carry on the machine running the
+    /// test. Hardcoding `x64` tied the two tests below to an x86 runner: on
+    /// aarch64 `pick_for_arch` recognises none of the candidates as its own and
+    /// returns `None` — correct behaviour, failing the test for the wrong
+    /// reason. What is under test is the preference for NSIS over MSI, not the
+    /// machine that compiled it.
+    fn arch_token() -> &'static str {
+        match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            _ => "x64",
+        }
+    }
+
     fn assets(names: &[&str]) -> Vec<GhAsset> {
         names
             .iter()
@@ -995,24 +1008,28 @@ mod tests {
     /// aserción se queda aquí.
     #[test]
     fn windows_update_takes_the_nsis_installer_not_the_msi() {
+        let arch = arch_token();
+        let msi = format!("Hoard_1.1.0_{arch}_en-US.msi");
+        let nsis = format!("Hoard_1.1.0_{arch}-setup.exe");
         let rel = assets(&[
-            "Hoard_1.1.0_x64_en-US.msi",
-            "Hoard_1.1.0_x64_en-US.msi.sha256",
-            "Hoard_1.1.0_x64-setup.exe",
-            "Hoard_1.1.0_x64-setup.exe.sha256",
+            &msi,
+            &format!("{msi}.sha256"),
+            &nsis,
+            &format!("{nsis}.sha256"),
         ]);
         assert_eq!(
             asset_for(Delivery::Nsis, &rel).map(|a| a.name.as_str()),
-            Some("Hoard_1.1.0_x64-setup.exe")
+            Some(nsis.as_str())
         );
     }
 
     #[test]
     fn windows_falls_back_to_the_msi_when_theres_no_nsis() {
-        let rel = assets(&["Hoard_1.1.0_x64_en-US.msi"]);
+        let msi = format!("Hoard_1.1.0_{}_en-US.msi", arch_token());
+        let rel = assets(&[&msi]);
         assert_eq!(
             asset_for(Delivery::Nsis, &rel).map(|a| a.name.as_str()),
-            Some("Hoard_1.1.0_x64_en-US.msi")
+            Some(msi.as_str())
         );
     }
 

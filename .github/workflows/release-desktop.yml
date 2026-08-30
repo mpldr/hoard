@@ -167,6 +167,81 @@ jobs:
           tagName: ""
           releaseName: ""
 
+      # Hoard Setup: the graphical installer, which is a separate binary from
+      # the app and not a Tauri bundle at all. It is what the download page
+      # hands people; the packages below stay published for anyone who would
+      # rather drive their own package manager.
+      #
+      # Named `HoardSetup-*` and nothing else: `hoard_agent::install::fetch`
+      # filters the release's assets on that prefix so the in-app updater can
+      # never mistake this for a copy of the app. Renaming here breaks that.
+      - name: Build Hoard Setup
+        shell: bash
+        env:
+          # The published file should carry the release it belongs to, not the
+          # private number the crate is pinned at for local builds.
+          HOARD_SETUP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          set -e
+          if [ -n "$HOARD_SETUP_VERSION" ]; then
+            V="${HOARD_SETUP_VERSION#v}"
+            # Only the installer's own line; the workspace version is not ours
+            # to touch.
+            perl -0pi -e "s/^version = \"[^\"]+\"/version = \"$V\"/m" \
+              crates/hoard-installer/Cargo.toml
+          fi
+          cargo build -p hoard-installer --release ${{ matrix.args }}
+
+      - name: Package Hoard Setup
+        shell: bash
+        run: |
+          set -e
+          mkdir -p setup
+          BIN="target/${{ matrix.target }}/release/hoard-installer"
+          [ -f "$BIN" ] || [ -f "$BIN.exe" ] || BIN="target/release/hoard-installer"
+          case "${{ runner.os }}" in
+            Windows)
+              cp "$BIN.exe" "setup/HoardSetup-x86_64.exe"
+              ;;
+            Linux)
+              # A bare executable, deliberately. The binary is already static
+              # and dependency-free, so an AppImage would add a build step and
+              # a `chmod` the user still has to do either way.
+              cp "$BIN" "setup/HoardSetup-x86_64"
+              chmod +x "setup/HoardSetup-x86_64"
+              ;;
+            macOS)
+              # A loose binary double-clicked out of Finder opens a Terminal,
+              # so it travels as the smallest `.app` that is still an app.
+              APP="setup/Hoard Setup.app"
+              mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+              cp "$BIN" "$APP/Contents/MacOS/HoardSetup"
+              chmod +x "$APP/Contents/MacOS/HoardSetup"
+              cp crates/hoard-installer/icons/icon.icns "$APP/Contents/Resources/HoardSetup.icns"
+              cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Hoard Setup</string>
+            <key>CFBundleDisplayName</key><string>Hoard Setup</string>
+            <key>CFBundleIdentifier</key><string>dev.hoard.setup</string>
+            <key>CFBundleExecutable</key><string>HoardSetup</string>
+            <key>CFBundleIconFile</key><string>HoardSetup</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict></plist>
+          PLIST
+              # Zipped, not a `.dmg`: a second disk image in the release would
+              # sit next to the app's own with the same suffix and the same
+              # architecture token, and only the name filter would tell them
+              # apart. One collision less.
+              ( cd setup && ditto -c -k --keepParent "Hoard Setup.app" "HoardSetup-aarch64.zip" \
+                && rm -rf "Hoard Setup.app" )
+              ;;
+          esac
+          ls -la setup/
+
       - name: Strip host libs from AppImage (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -191,6 +266,9 @@ jobs:
                -o -name '*.msi' -o -name '*.exe' \
                -o -name '*.dmg' -o -name '*.app.tar.gz' \) \
             -exec cp -v {} dist/ \; || true
+          # Hoard Setup rides along so `publish` signs it and hashes it with
+          # everything else — that job works on whatever is in `dist/`.
+          cp setup/* dist/ 2>/dev/null || true
           ls -la dist/
           # macOS runners don't ship GNU coreutils, so `sha256sum` is missing
           # there. Fall back to BSD `shasum -a 256` (present on macOS by

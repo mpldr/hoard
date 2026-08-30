@@ -28,6 +28,16 @@
 
   const fileName = (url: string) => url.split('/').pop() ?? url;
 
+  /** One row, or none at all: a release that does not list the file has no
+   *  business offering a link to it. This is how the ARM bundles and Hoard
+   *  Setup can be listed here before every published release carries them —
+   *  they appear on the releases that have them and nowhere else. */
+  const row = (
+    href: string | null,
+    sublabel: string,
+    extra: { arch?: Arch; setup?: boolean } = {}
+  ): Asset[] => (href ? [{ label: fileName(href), sublabel, href, ...extra }] : []);
+
   // Direct links to the installers of the latest release — clicking starts
   // the download. URLs come from the `release` store, so they follow GitHub
   // automatically when a new version ships.
@@ -35,93 +45,43 @@
     windows: {
       name: 'Windows',
       assets: [
-        {
-          label: fileName($release.assets.setupWindows),
-          sublabel: 'Installer · Windows 10/11',
-          href: $release.assets.setupWindows,
+        ...row($release.assets.setupWindows, 'Installer · Windows 10/11 · x64', {
+          arch: 'x64',
           setup: true
-        },
-        {
-          label: fileName($release.assets.windowsSetup),
-          sublabel: 'Windows 10/11 · x64',
-          href: $release.assets.windowsSetup,
-          arch: 'x64'
-        },
-        {
-          label: fileName($release.assets.windowsSetupArm64),
-          sublabel: 'Windows 11 · ARM64',
-          href: $release.assets.windowsSetupArm64,
-          arch: 'arm64'
-        },
-        {
-          label: fileName($release.assets.windowsMsi),
-          sublabel: 'Windows 10/11 · x64 · MSI',
-          href: $release.assets.windowsMsi,
-          arch: 'x64'
-        }
+        }),
+        ...row($release.assets.setupWindowsArm64, 'Installer · Windows 11 · ARM64', {
+          arch: 'arm64',
+          setup: true
+        }),
+        ...row($release.assets.windowsSetup, 'Windows 10/11 · x64', { arch: 'x64' }),
+        ...row($release.assets.windowsSetupArm64, 'Windows 11 · ARM64', { arch: 'arm64' }),
+        ...row($release.assets.windowsMsi, 'Windows 10/11 · x64 · MSI', { arch: 'x64' })
       ]
     },
     macos: {
       name: 'macOS',
       assets: [
-        {
-          label: fileName($release.assets.setupMacos),
-          sublabel: 'Installer · Apple Silicon',
-          href: $release.assets.setupMacos,
-          setup: true
-        },
-        {
-          label: fileName($release.assets.macosDmg),
-          sublabel: 'macOS 12+ · Apple Silicon',
-          href: $release.assets.macosDmg
-        }
+        ...row($release.assets.setupMacos, 'Installer · Apple Silicon', { setup: true }),
+        ...row($release.assets.macosDmg, 'macOS 12+ · Apple Silicon')
       ]
     },
     linux: {
       name: 'Linux',
       assets: [
-        {
-          label: fileName($release.assets.setupLinux),
-          sublabel: 'Installer · chmod +x and run',
-          href: $release.assets.setupLinux,
+        ...row($release.assets.setupLinux, 'Installer · x64 · chmod +x and run', {
+          arch: 'x64',
           setup: true
-        },
-        {
-          label: fileName($release.assets.linuxDeb),
-          sublabel: 'Debian / Ubuntu · x64',
-          href: $release.assets.linuxDeb,
-          arch: 'x64'
-        },
-        {
-          label: fileName($release.assets.linuxAppImage),
-          sublabel: 'Universal · x64',
-          href: $release.assets.linuxAppImage,
-          arch: 'x64'
-        },
-        {
-          label: fileName($release.assets.linuxRpm),
-          sublabel: 'Fedora / openSUSE · x64',
-          href: $release.assets.linuxRpm,
-          arch: 'x64'
-        },
-        {
-          label: fileName($release.assets.linuxDebArm64),
-          sublabel: 'Debian / Ubuntu · ARM64',
-          href: $release.assets.linuxDebArm64,
-          arch: 'arm64'
-        },
-        {
-          label: fileName($release.assets.linuxAppImageArm64),
-          sublabel: 'Universal · ARM64',
-          href: $release.assets.linuxAppImageArm64,
-          arch: 'arm64'
-        },
-        {
-          label: fileName($release.assets.linuxRpmArm64),
-          sublabel: 'Fedora / openSUSE · ARM64',
-          href: $release.assets.linuxRpmArm64,
-          arch: 'arm64'
-        }
+        }),
+        ...row($release.assets.setupLinuxArm64, 'Installer · ARM64 · chmod +x and run', {
+          arch: 'arm64',
+          setup: true
+        }),
+        ...row($release.assets.linuxDeb, 'Debian / Ubuntu · x64', { arch: 'x64' }),
+        ...row($release.assets.linuxAppImage, 'Universal · x64', { arch: 'x64' }),
+        ...row($release.assets.linuxRpm, 'Fedora / openSUSE · x64', { arch: 'x64' }),
+        ...row($release.assets.linuxDebArm64, 'Debian / Ubuntu · ARM64', { arch: 'arm64' }),
+        ...row($release.assets.linuxAppImageArm64, 'Universal · ARM64', { arch: 'arm64' }),
+        ...row($release.assets.linuxRpmArm64, 'Fedora / openSUSE · ARM64', { arch: 'arm64' })
       ]
     }
   });
@@ -158,8 +118,10 @@
    *  not. Falling back to picking a bundle by architecture keeps the old
    *  behaviour for a release published before the installer existed. */
   let primary = $derived(
-    detected
-      ? (downloads[detected].assets.find((a) => a.setup) ??
+    detected && downloads[detected].assets.length
+      ? (downloads[detected].assets.find((a) => a.setup && a.arch === detectedArch) ??
+        // Platforms with a single build (macOS) tag no architecture at all.
+        downloads[detected].assets.find((a) => a.setup && !a.arch) ??
         downloads[detected].assets.find((a) => a.arch === detectedArch) ??
         downloads[detected].assets[0])
       : null

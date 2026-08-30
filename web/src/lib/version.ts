@@ -20,19 +20,21 @@ export type ReleaseAssets = {
   // way in — it fetches the right package for the machine it is on — and the
   // raw bundles below stay published for anyone who would rather not be
   // helped.
-  setupWindows: string;
-  setupMacos: string;
-  setupLinux: string;
+  setupWindows: string | null;
+  setupWindowsArm64: string | null;
+  setupMacos: string | null;
+  setupLinux: string | null;
+  setupLinuxArm64: string | null;
   windowsSetup: string;
-  windowsSetupArm64: string;
+  windowsSetupArm64: string | null;
   windowsMsi: string;
   macosDmg: string;
   linuxDeb: string;
-  linuxDebArm64: string;
+  linuxDebArm64: string | null;
   linuxAppImage: string;
-  linuxAppImageArm64: string;
+  linuxAppImageArm64: string | null;
   linuxRpm: string;
-  linuxRpmArm64: string;
+  linuxRpmArm64: string | null;
   // Headless CLI tarballs (`hoard` binary; Linux tarballs also bundle
   // hoard-server + hoard-admin). See `/cli`.
   cliLinuxX64: string;
@@ -49,22 +51,29 @@ export type ReleaseInfo = { v: string; date: string; assets: ReleaseAssets };
 function assetsFor(v: string): ReleaseAssets {
   const base = `https://github.com/${REPO}/releases/download/v${v}`;
   return {
-    setupWindows: `${base}/HoardSetup-x86_64.exe`,
-    setupMacos: `${base}/HoardSetup-aarch64.zip`,
-    setupLinux: `${base}/HoardSetup-x86_64`,
+    // Hoard Setup and the ARM bundles are younger than the x86 ones, so a
+    // release from before they existed lists none of them — and a URL built
+    // from the convention would be a 404 wearing a plausible filename, which
+    // is worse than not offering the download at all. No guess for these:
+    // either the release names the file or the page does not offer it.
+    setupWindows: null,
+    setupWindowsArm64: null,
+    setupMacos: null,
+    setupLinux: null,
+    setupLinuxArm64: null,
     windowsSetup: `${base}/Hoard_${v}_x64-setup.exe`,
-    windowsSetupArm64: `${base}/Hoard_${v}_arm64-setup.exe`,
+    windowsSetupArm64: null,
     // x64 only: the ARM desktop bundle is NSIS, no MSI. See release-desktop.yml.
     windowsMsi: `${base}/Hoard_${v}_x64_en-US.msi`,
     macosDmg: `${base}/Hoard_${v}_aarch64.dmg`,
     linuxDeb: `${base}/Hoard_${v}_amd64.deb`,
-    linuxDebArm64: `${base}/Hoard_${v}_arm64.deb`,
+    linuxDebArm64: null,
     // Not a typo: the AppImage bundler writes `amd64` for x86_64 and
     // `aarch64` for ARM, where the .deb writes `amd64`/`arm64`.
     linuxAppImage: `${base}/Hoard_${v}_amd64.AppImage`,
-    linuxAppImageArm64: `${base}/Hoard_${v}_aarch64.AppImage`,
+    linuxAppImageArm64: null,
     linuxRpm: `${base}/Hoard-${v}-1.x86_64.rpm`,
-    linuxRpmArm64: `${base}/Hoard-${v}-1.aarch64.rpm`,
+    linuxRpmArm64: null,
     cliLinuxX64: `${base}/hoard-${v}-linux-x86_64.tar.gz`,
     cliLinuxArm64: `${base}/hoard-${v}-linux-aarch64.tar.gz`,
     cliMacosArm64: `${base}/hoard-${v}-macos-aarch64.tar.gz`,
@@ -85,19 +94,21 @@ function pickAssets(urls: string[], v: string): ReleaseAssets {
     // failure, it is dpkg complaining about something that looks unrelated.
     // Version-less names on purpose: the installer resolves the release
     // itself, so the file does not go stale between releases.
-    setupWindows: find(/HoardSetup-x86_64\.exe$/) ?? guess.setupWindows,
-    setupMacos: find(/HoardSetup-aarch64\.zip$/) ?? guess.setupMacos,
-    setupLinux: find(/HoardSetup-x86_64$/) ?? guess.setupLinux,
+    setupWindows: find(/HoardSetup-x86_64\.exe$/) ?? null,
+    setupWindowsArm64: find(/HoardSetup-aarch64\.exe$/) ?? null,
+    setupMacos: find(/HoardSetup-aarch64\.zip$/) ?? null,
+    setupLinux: find(/HoardSetup-x86_64$/) ?? null,
+    setupLinuxArm64: find(/HoardSetup-aarch64$/) ?? null,
     windowsSetup: find(/x64-setup\.exe$/) ?? guess.windowsSetup,
-    windowsSetupArm64: find(/arm64-setup\.exe$/) ?? guess.windowsSetupArm64,
+    windowsSetupArm64: find(/arm64-setup\.exe$/) ?? null,
     windowsMsi: find(/\.msi$/) ?? guess.windowsMsi,
     macosDmg: find(/\.dmg$/) ?? guess.macosDmg,
     linuxDeb: find(/_amd64\.deb$/) ?? guess.linuxDeb,
-    linuxDebArm64: find(/_arm64\.deb$/) ?? guess.linuxDebArm64,
+    linuxDebArm64: find(/_arm64\.deb$/) ?? null,
     linuxAppImage: find(/_amd64\.appimage$/i) ?? guess.linuxAppImage,
-    linuxAppImageArm64: find(/_aarch64\.appimage$/i) ?? guess.linuxAppImageArm64,
+    linuxAppImageArm64: find(/_aarch64\.appimage$/i) ?? null,
     linuxRpm: find(/\.x86_64\.rpm$/) ?? guess.linuxRpm,
-    linuxRpmArm64: find(/\.aarch64\.rpm$/) ?? guess.linuxRpmArm64,
+    linuxRpmArm64: find(/\.aarch64\.rpm$/) ?? null,
     // Match the CLI tarballs by their exact platform-arch suffix so they never
     // collide with the desktop `Hoard.app.tar.gz` (which also ends in .tar.gz).
     cliLinuxX64: find(/linux-x86_64\.tar\.gz$/) ?? guess.cliLinuxX64,
@@ -118,7 +129,12 @@ function readCache(): (ReleaseInfo & { at: number }) | null {
     const c = JSON.parse(raw) as Partial<ReleaseInfo> & { at: number };
     if (typeof c?.v !== 'string' || typeof c?.at !== 'number') return null;
     // Older cache entries predate `assets` — rebuild them from the version.
-    return { v: c.v, date: c.date ?? SEED_DATE, assets: c.assets ?? assetsFor(c.v), at: c.at };
+    return {
+      v: c.v,
+      date: c.date ?? SEED_DATE,
+      assets: c.assets ?? assetsFor(c.v),
+      at: c.at
+    };
   } catch {
     return null;
   }
@@ -158,7 +174,10 @@ export const release = readable<ReleaseInfo>(
         const assets = pickAssets(urls, tag);
         set({ v: tag, date, assets });
         try {
-          localStorage.setItem(CACHE_KEY, JSON.stringify({ v: tag, date, assets, at: Date.now() }));
+          localStorage.setItem(
+            CACHE_KEY,
+            JSON.stringify({ v: tag, date, assets, at: Date.now() })
+          );
         } catch {
           /* storage disabled — fine, next load refetches */
         }

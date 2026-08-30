@@ -39,6 +39,7 @@ jobs:
             label: linux-x86_64
             target: x86_64-unknown-linux-gnu
             args: ""
+            setup_arch: x86_64
           # ARM Linux. `release.yml` has shipped the aarch64 core tarball for a
           # while; this is the app itself, for the handhelds and the ARM SteamOS
           # devices people actually asked about. Native runner, like every other
@@ -50,10 +51,12 @@ jobs:
             label: linux-aarch64
             target: aarch64-unknown-linux-gnu
             args: ""
+            setup_arch: aarch64
           - os: windows-latest
             label: windows-x86_64
             target: x86_64-pc-windows-msvc
             args: ""
+            setup_arch: x86_64
           # ARM Windows. NSIS only, and deliberately: WiX's arm64 support is the
           # shakier half of the bundler, and NSIS is the installer the updater
           # reaches for first anyway — it carries the hook that stops a running
@@ -64,6 +67,7 @@ jobs:
             label: windows-aarch64
             target: aarch64-pc-windows-msvc
             args: "--bundles nsis"
+            setup_arch: aarch64
             optional: true
           # Apple-silicon only — macos-13 (x86_64) is being retired by
           # GitHub and queues for the legacy intel image stall for hours,
@@ -73,6 +77,7 @@ jobs:
             label: macos-aarch64
             target: aarch64-apple-darwin
             args: "--target aarch64-apple-darwin"
+            setup_arch: aarch64
             optional: true
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.optional == true }}
@@ -199,16 +204,22 @@ jobs:
           mkdir -p setup
           BIN="target/${{ matrix.target }}/release/hoard-installer"
           [ -f "$BIN" ] || [ -f "$BIN.exe" ] || BIN="target/release/hoard-installer"
+          # The architecture comes from the matrix, never hardcoded: every
+          # entry runs this same step, so a fixed `x86_64` would have the ARM
+          # runners writing an aarch64 binary under the x86 name — and
+          # `merge-multiple` in `publish` would then quietly keep whichever of
+          # the two identically-named files it downloaded last.
+          ARCH="${{ matrix.setup_arch }}"
           case "${{ runner.os }}" in
             Windows)
-              cp "$BIN.exe" "setup/HoardSetup-x86_64.exe"
+              cp "$BIN.exe" "setup/HoardSetup-$ARCH.exe"
               ;;
             Linux)
               # A bare executable, deliberately. The binary is already static
               # and dependency-free, so an AppImage would add a build step and
               # a `chmod` the user still has to do either way.
-              cp "$BIN" "setup/HoardSetup-x86_64"
-              chmod +x "setup/HoardSetup-x86_64"
+              cp "$BIN" "setup/HoardSetup-$ARCH"
+              chmod +x "setup/HoardSetup-$ARCH"
               ;;
             macOS)
               # A loose binary double-clicked out of Finder opens a Terminal,
@@ -236,7 +247,7 @@ jobs:
               # sit next to the app's own with the same suffix and the same
               # architecture token, and only the name filter would tell them
               # apart. One collision less.
-              ( cd setup && ditto -c -k --keepParent "Hoard Setup.app" "HoardSetup-aarch64.zip" \
+              ( cd setup && ditto -c -k --keepParent "Hoard Setup.app" "HoardSetup-$ARCH.zip" \
                 && rm -rf "Hoard Setup.app" )
               ;;
           esac

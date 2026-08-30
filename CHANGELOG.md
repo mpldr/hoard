@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   plain-HTTP origin a NAS panel is reached over.
 
 ### Fixed
+- **The download page offered files no release had.** Hoard Setup and the ARM
+  bundles are newer than the page that lists them, and every link was built from
+  the naming convention rather than from what the release actually publishes —
+  so the buttons pointed at `HoardSetup-x86_64.exe` on a release whose newest
+  asset is `Hoard_1.1.5_x64-setup.exe`, and a download that 404s wearing a
+  plausible filename looks exactly like a broken site. The page now lists a file
+  only when the release names it, so each of those rows appears by itself on the
+  first release that carries it, and nothing on the page is a guess.
+
 - **The AppImage could reach nothing at all on SteamOS, Bazzite and other
   Arch-derived systems.** Every HTTPS call died with `certificate verify
   failed`, the error naming a `stat(/usr/lib/ssl/certs)` nobody asked for: TLS
